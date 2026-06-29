@@ -231,8 +231,9 @@ impl AusfClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nudm::SubscriberDb;
     use hex_literal::hex;
+    use std::sync::Arc;
+    use subscriber_db::{InMemoryStore, SubscriberStore};
 
     fn test_subscriber() -> aka::SubscriberKey {
         aka::SubscriberKey {
@@ -244,11 +245,12 @@ mod tests {
 
     /// Spin a UDM + AUSF and return (ausf_base, udm provisioned with `supi`).
     async fn spin(supi: &str, sub: aka::SubscriberKey) -> String {
-        let db = SubscriberDb::new();
-        db.insert(supi, sub);
+        let store = Arc::new(InMemoryStore::new());
+        store.provision(supi, sub);
+        let store: Arc<dyn SubscriberStore> = store;
         let udm = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udm_addr = udm.local_addr().unwrap();
-        tokio::spawn(async move { crate::run_on(udm, crate::nudm::router(db)).await.unwrap() });
+        tokio::spawn(async move { crate::run_on(udm, crate::nudm::router(store)).await.unwrap() });
 
         let ausf = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ausf_addr = ausf.local_addr().unwrap();

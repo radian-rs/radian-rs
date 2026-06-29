@@ -8,6 +8,7 @@ members = [
     "crates/pfcp",
     "crates/gtpu",
     "crates/aka",
+    "crates/subscriber-db",
     "nf/nf-nrf",
     "nf/nf-amf",
     "nf/nf-smf",
@@ -32,6 +33,7 @@ nas = { path = "crates/nas" }
 pfcp = { path = "crates/pfcp" }
 gtpu = { path = "crates/gtpu" }
 aka = { path = "crates/aka" }
+subscriber-db = { path = "crates/subscriber-db" }
 
 # --- external ---
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }

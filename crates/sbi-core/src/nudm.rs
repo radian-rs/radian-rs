@@ -1,63 +1,20 @@
 //! Nudm_UEAuthentication — UDM/ARPF authentication-vector service (TS 29.503).
 //!
-//! Holds long-term subscriber credentials and generates 5G HE authentication
-//! vectors (RAND, AUTN, XRES*, K_AUSF) on request from the AUSF, using the `aka`
-//! crate (MILENAGE + TS 33.501 key derivation).
+//! The UDM here is a stateless front-end over a [`subscriber_db::SubscriberStore`]:
+//! it reads the next SQN and asks the store (the ARPF boundary) to generate a 5G HE
+//! authentication vector. **The long-term key K never reaches this module** — only
+//! the derived vector does.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use aka::SubscriberKey;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use subscriber_db::SubscriberStore;
 
 use crate::SbiError;
-
-/// In-memory subscriber database (ARPF). Maps SUPI → credentials + sequence number.
-#[derive(Clone, Default)]
-pub struct SubscriberDb(Arc<Mutex<HashMap<String, SubscriberState>>>);
-
-struct SubscriberState {
-    key: SubscriberKey,
-    sqn: [u8; 6],
-}
-
-impl SubscriberDb {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Provision a subscriber (SQN starts at zero).
-    pub fn insert(&self, supi: impl Into<String>, key: SubscriberKey) {
-        self.0
-            .lock()
-            .unwrap()
-            .insert(supi.into(), SubscriberState { key, sqn: [0u8; 6] });
-    }
-
-    /// Provision a subscriber from hex strings (K, OPc = 16 bytes; AMF = 2 bytes).
-    pub fn insert_hex(&self, supi: &str, k: &str, opc: &str, amf: &str) -> Result<(), String> {
-        self.insert(
-            supi,
-            SubscriberKey {
-                k: parse_n(k)?,
-                opc: parse_n(opc)?,
-                amf: parse_n(amf)?,
-            },
-        );
-        Ok(())
-    }
-}
-
-fn parse_n<const N: usize>(h: &str) -> Result<[u8; N], String> {
-    hex::decode(h)
-        .map_err(|e| e.to_string())?
-        .try_into()
-        .map_err(|_| format!("expected {N} bytes"))
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,32 +43,28 @@ pub struct Av5gHe {
     pub kausf: String,
 }
 
-/// Build the UDM router (Nudm_UEAuthentication_Get).
-pub fn router(db: SubscriberDb) -> Router {
+/// Build the UDM router (Nudm_UEAuthentication_Get) backed by a subscriber store.
+pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
     Router::new()
         .route(
             "/nudm-ueau/v1/{supi_or_suci}/security-information/generate-auth-data",
             post(generate_auth_data),
         )
-        .with_state(db)
+        .with_state(store)
 }
 
 async fn generate_auth_data(
-    State(db): State<SubscriberDb>,
+    State(store): State<Arc<dyn SubscriberStore>>,
     Path(supi_or_suci): Path<String>,
     Json(req): Json<AuthenticationInfoRequest>,
 ) -> Result<Json<AuthenticationInfoResult>, StatusCode> {
     // NOTE: SUCI deconcealment is out of scope; supiOrSuci is treated as the SUPI.
     let (mcc, mnc) = parse_snn(&req.serving_network_name).ok_or(StatusCode::BAD_REQUEST)?;
-
-    let av = {
-        let mut guard = db.0.lock().unwrap();
-        let sub = guard.get_mut(&supi_or_suci).ok_or(StatusCode::NOT_FOUND)?;
-        sub.sqn = increment_sqn(sub.sqn);
-        let rand = crate::random_rand();
-        aka::generate_5g_he_av(&sub.key, &sub.sqn, &rand, &mcc, &mnc)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
+    let sqn = store.next_sqn(&supi_or_suci).ok_or(StatusCode::NOT_FOUND)?;
+    let rand = crate::random_rand();
+    let av = store
+        .generate_he_av(&supi_or_suci, &sqn, &rand, &mcc, &mnc)
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(AuthenticationInfoResult {
         auth_type: "5G_AKA".to_string(),
@@ -124,17 +77,6 @@ async fn generate_auth_data(
         },
         supi: supi_or_suci,
     }))
-}
-
-fn increment_sqn(mut sqn: [u8; 6]) -> [u8; 6] {
-    for i in (0..6).rev() {
-        let (v, carry) = sqn[i].overflowing_add(1);
-        sqn[i] = v;
-        if !carry {
-            break;
-        }
-    }
-    sqn
 }
 
 /// Parse `5G:mnc<MNC3>.mcc<MCC3>.3gppnetwork.org` → (mcc, mnc).
