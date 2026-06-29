@@ -7,3 +7,5 @@ authors.workspace = true
 [dependencies]
 # NAS-5GS (TS 24.501) encoder/decoder — binary TLV, not ASN.1.
 oxirush-nas = "0.2"
+# NIA/NEA algorithms for the NAS security envelope (TS 33.501 §8.2).
+oxirush-security = "0.1"

@@ -31,6 +31,7 @@ pub struct PendingAuth {
 pub struct AuthOutcome {
     pub success: bool,
     pub kseaf: Option<String>,
+    pub supi: Option<String>,
 }
 
 /// AMF/SEAF authentication helper: knows the NRF and the serving network.
@@ -89,6 +90,7 @@ impl AmfAuth {
             return Ok(AuthOutcome {
                 success: false,
                 kseaf: None,
+                supi: None,
             });
         };
         // SEAF check — reject without troubling the AUSF if HRES* mismatches.
@@ -96,6 +98,7 @@ impl AmfAuth {
             return Ok(AuthOutcome {
                 success: false,
                 kseaf: None,
+                supi: None,
             });
         }
 
@@ -105,6 +108,7 @@ impl AmfAuth {
         Ok(AuthOutcome {
             success: conf.auth_result == "AUTHENTICATION_SUCCESS",
             kseaf: conf.kseaf,
+            supi: conf.supi,
         })
     }
 

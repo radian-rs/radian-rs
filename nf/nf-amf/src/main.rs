@@ -1,16 +1,17 @@
-//! AMF — Access and Mobility Management Function: **N2 + authentication slice**.
+//! AMF — Access and Mobility Management Function: **full registration slice**.
 //!
-//! Terminates N2 (NGAP/SCTP, TS 38.413) and drives UE registration into 5G-AKA,
-//! joining the N2 (binary) and SBI (JSON) planes:
+//! Terminates N2 (NGAP/SCTP, TS 38.413) and drives a UE through a complete
+//! registration, joining the N2 (binary) and SBI (JSON) planes:
 //!
-//! * `InitialUEMessage` → identify the UE from the RegistrationRequest SUCI (or ask
-//!   for identity), then discover the AUSF via the NRF, run `Nausf` to get a
-//!   challenge, and send a NAS **Authentication Request** over N2.
-//! * `UplinkNASTransport` → an **Authentication Response** is verified (SEAF HRES*
-//!   check) and confirmed with the AUSF; on success the AMF holds K_SEAF.
+//! 1. `InitialUEMessage` → identify from the RegistrationRequest SUCI (or ask).
+//! 2. Discover the AUSF via NRF, run `Nausf` 5G-AKA, send a NAS Authentication
+//!    Request; on the Authentication Response, confirm RES* → K_SEAF.
+//! 3. Derive K_AMF + NAS keys, send an integrity-protected **Security Mode Command**;
+//!    on **Security Mode Complete**, send a protected **Registration Accept** (5G-GUTI).
+//! 4. On **Registration Complete**, the UE is **REGISTERED**.
 //!
-//! Per-UE context is keyed by AMF-UE-NGAP-ID, held per SCTP association. Security
-//! Mode Command and Registration Accept are the next steps (TODO).
+//! Per-UE context (keyed by AMF-UE-NGAP-ID) holds the NAS security context once
+//! established. After that, uplink NAS is verified/deciphered before dispatch.
 
 mod auth;
 
@@ -20,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
-use nas::{Nas5gmmMessage, Nas5gsMessage, Suci};
+use nas::{Nas5gmmMessage, Nas5gmmMessageType, Nas5gsMessage, Suci};
 use ngap::{
     InitialUEMessage, InitialUEMessageProtocolIEs_EntryValue, InitiatingMessage,
     InitiatingMessageValue, NGAP_PDU, UplinkNASTransport, UplinkNASTransportProtocolIEs_EntryValue,
@@ -41,16 +42,25 @@ const PLMN_MNC: &str = "70";
 /// NRF the AMF uses to discover the AUSF.
 const NRF_BASE: &str = "http://127.0.0.1:8000";
 
+// NAS security parameters the AMF selects.
+const NAS_NEA: u8 = 2; // 128-NEA2 (AES-CTR)
+const NAS_NIA: u8 = 2; // 128-NIA2 (AES-CMAC)
+const NGKSI: u8 = 0;
+const ABBA: [u8; 2] = [0x00, 0x00];
+/// Replayed UE security capabilities (advertises EA0-2 / IA0-2).
+const UE_SEC_CAP: [u8; 2] = [0xE0, 0xE0];
+
 /// Allocator for AMF-UE-NGAP-IDs (one per UE the AMF takes context of).
 static NEXT_AMF_UE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Where a UE is in the (partial) registration flow.
+/// Where a UE is in the registration flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegState {
     IdentityRequested,
     Identified,
     Authenticating,
-    Authenticated,
+    SecurityMode,
+    Registered,
 }
 
 /// Per-UE context held by the AMF, keyed by AMF-UE-NGAP-ID.
@@ -60,14 +70,13 @@ struct UeContext {
     state: RegState,
     suci: Option<String>,
     auth: Option<auth::PendingAuth>,
-    kseaf: Option<String>,
+    /// NAS security context, present once the Security Mode Command is sent.
+    sec: Option<nas::NasSecurityContext>,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
 enum InitialUeOutcome {
-    /// Send this Identity Request downlink (no usable identity yet).
     NeedIdentity(NGAP_PDU),
-    /// UE is identified — start authentication for this SUPI.
     Identified { ran_ue_id: u32, supi: String },
 }
 
@@ -148,7 +157,9 @@ async fn handle_ngap(
                 }
             }
             InitiatingMessageValue::Id_UplinkNASTransport(msg) => {
-                on_uplink_nas(ues, amf_auth, msg).await;
+                if let Some((dl, label)) = on_uplink_nas(ues, amf_auth, msg).await {
+                    send_or_log(conn, &dl, label).await;
+                }
             }
             _ => info!("unhandled initiating message: {}", pdu.procedure_name()),
         },
@@ -169,32 +180,20 @@ fn on_initial_ue(
 
     match suci {
         Some(supi) => {
-            ues.insert(
-                amf_ue_id,
-                UeContext {
-                    ran_ue_id,
-                    state: RegState::Identified,
-                    suci: Some(supi.clone()),
-                    auth: None,
-                    kseaf: None,
-                },
-            );
+            ues.insert(amf_ue_id, UeContext::new(ran_ue_id, RegState::Identified, Some(supi.clone())));
             Some(InitialUeOutcome::Identified { ran_ue_id, supi })
         }
         None => {
-            ues.insert(
-                amf_ue_id,
-                UeContext {
-                    ran_ue_id,
-                    state: RegState::IdentityRequested,
-                    suci: None,
-                    auth: None,
-                    kseaf: None,
-                },
-            );
+            ues.insert(amf_ue_id, UeContext::new(ran_ue_id, RegState::IdentityRequested, None));
             let dl = ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, nas::identity_request_suci());
             Some(InitialUeOutcome::NeedIdentity(dl))
         }
+    }
+}
+
+impl UeContext {
+    fn new(ran_ue_id: u32, state: RegState, suci: Option<String>) -> Self {
+        Self { ran_ue_id, state, suci, auth: None, sec: None }
     }
 }
 
@@ -221,63 +220,134 @@ async fn start_authentication(
     }
 }
 
-/// Correlate an uplink NAS message to its UE and, if it's an Authentication
-/// Response, complete authentication. Returns `true` if the UE was known.
+/// Correlate an uplink NAS message to its UE, verify/decipher it if a security
+/// context exists, and dispatch by 5GMM message type. Returns a downlink to send.
 async fn on_uplink_nas(
     ues: &mut HashMap<u64, UeContext>,
     amf_auth: &auth::AmfAuth,
     msg: &UplinkNASTransport,
-) -> bool {
+) -> Option<(NGAP_PDU, &'static str)> {
     let Some(amf_ue_id) = uplink_amf_ue_id(msg) else {
         warn!("UplinkNASTransport without AMF-UE-NGAP-ID");
-        return false;
+        return None;
     };
     if !ues.contains_key(&amf_ue_id) {
         warn!("uplink NAS for unknown UE {amf_ue_id}");
-        return false;
+        return None;
     }
-    let Some(nas_msg) = uplink_nas_pdu(msg).and_then(|b| nas::decode_nas_5gs_message(b).ok()) else {
-        warn!("UE {amf_ue_id}: undecodable uplink NAS-PDU");
-        return true;
+    let Some(raw) = uplink_nas_pdu(msg) else {
+        warn!("UE {amf_ue_id}: UplinkNASTransport without NAS-PDU");
+        return None;
     };
 
-    match nas::res_star_from_authentication_response(&nas_msg).map(<[u8]>::to_vec) {
-        Some(res_star) => complete_authentication(ues, amf_auth, amf_ue_id, &res_star).await,
-        None => info!("UE {amf_ue_id}: uplink NAS {nas_msg}"),
+    // After the Security Mode Command, uplink NAS is integrity-protected/ciphered.
+    let has_sec = ues.get(&amf_ue_id).is_some_and(|c| c.sec.is_some());
+    let nas_msg = if has_sec {
+        ues.get_mut(&amf_ue_id)
+            .and_then(|c| c.sec.as_mut())
+            .and_then(|s| s.unprotect(raw, 0))
+    } else {
+        nas::decode_nas_5gs_message(raw).ok()
+    };
+    let Some(nas_msg) = nas_msg else {
+        warn!("UE {amf_ue_id}: could not verify/decode uplink NAS");
+        return None;
+    };
+
+    match nas::gmm_message_type(&nas_msg) {
+        Some(Nas5gmmMessageType::AuthenticationResponse) => {
+            let res_star = nas::res_star_from_authentication_response(&nas_msg)?.to_vec();
+            complete_authentication(ues, amf_auth, amf_ue_id, &res_star).await
+        }
+        Some(Nas5gmmMessageType::SecurityModeComplete) => on_security_mode_complete(ues, amf_ue_id),
+        Some(Nas5gmmMessageType::RegistrationComplete) => {
+            if let Some(ctx) = ues.get_mut(&amf_ue_id) {
+                ctx.state = RegState::Registered;
+                info!(
+                    "UE {amf_ue_id} REGISTERED (suci={:?}, ran_ue_id={}, state={:?})",
+                    ctx.suci, ctx.ran_ue_id, ctx.state
+                );
+            }
+            None
+        }
+        _ => {
+            info!("UE {amf_ue_id}: uplink NAS {nas_msg}");
+            None
+        }
     }
-    true
 }
 
-/// Verify the UE's RES* with the AUSF and record K_SEAF on success.
+/// Confirm the UE's RES* with the AUSF, derive the NAS security context, and return
+/// the protected Security Mode Command downlink.
 async fn complete_authentication(
     ues: &mut HashMap<u64, UeContext>,
     amf_auth: &auth::AmfAuth,
     amf_ue_id: u64,
     res_star: &[u8],
-) {
+) -> Option<(NGAP_PDU, &'static str)> {
     let Some(pending) = ues.get_mut(&amf_ue_id).and_then(|c| c.auth.take()) else {
         warn!("UE {amf_ue_id}: Authentication Response with no pending authentication");
-        return;
+        return None;
+    };
+    let outcome = match amf_auth.finish(&pending, res_star).await {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("UE {amf_ue_id}: authentication confirm failed: {e}");
+            return None;
+        }
+    };
+    if !outcome.success {
+        warn!("UE {amf_ue_id}: authentication failed (RES* rejected)");
+        return None;
+    }
+    let (Some(kseaf), Some(supi)) = (outcome.kseaf, outcome.supi) else {
+        warn!("UE {amf_ue_id}: authenticated but AUSF returned no K_SEAF/SUPI");
+        return None;
     };
 
-    match amf_auth.finish(&pending, res_star).await {
-        Ok(outcome) if outcome.success => {
-            if let Some(ctx) = ues.get_mut(&amf_ue_id) {
-                ctx.state = RegState::Authenticated;
-                ctx.kseaf = outcome.kseaf;
-                info!(
-                    "UE {amf_ue_id} authenticated (ran_ue_id={}, suci={:?}, state={:?}, kseaf_set={}); \
-                     registration would proceed to Security Mode (TODO)",
-                    ctx.ran_ue_id,
-                    ctx.suci,
-                    ctx.state,
-                    ctx.kseaf.is_some(),
-                );
-            }
-        }
-        Ok(_) => warn!("UE {amf_ue_id}: authentication failed (RES* rejected)"),
-        Err(e) => warn!("UE {amf_ue_id}: authentication confirm failed: {e}"),
-    }
+    info!("UE {amf_ue_id} authenticated ({supi}); establishing NAS security");
+    let Some((sec, smc_bytes)) = establish_security(&kseaf, &supi) else {
+        warn!("UE {amf_ue_id}: failed to derive NAS security context");
+        return None;
+    };
+    let ctx = ues.get_mut(&amf_ue_id)?;
+    ctx.sec = Some(sec);
+    ctx.state = RegState::SecurityMode;
+    let ran_ue_id = ctx.ran_ue_id;
+    Some((
+        ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, smc_bytes),
+        "DownlinkNASTransport (SecurityModeCommand)",
+    ))
+}
+
+/// Derive K_AMF + NAS keys from K_SEAF and build the protected Security Mode Command.
+fn establish_security(kseaf_hex: &str, supi: &str) -> Option<(nas::NasSecurityContext, Vec<u8>)> {
+    let kseaf: [u8; 32] = hex::decode(kseaf_hex).ok()?.try_into().ok()?;
+    let kamf = aka::kamf(&kseaf, supi, &ABBA);
+    let keys = aka::nas_keys(&kamf, NAS_NEA, NAS_NIA);
+    let mut sec = nas::NasSecurityContext::new(keys.knas_int, keys.knas_enc, NAS_NIA, NAS_NEA);
+    let smc = nas::security_mode_command(NAS_NEA, NAS_NIA, NGKSI, &UE_SEC_CAP);
+    let bytes = sec.protect(&smc, nas::sht::INTEGRITY_NEW_CONTEXT, 1);
+    Some((sec, bytes))
+}
+
+/// On Security Mode Complete, build the protected Registration Accept (assigning a
+/// 5G-GUTI) to send to the UE.
+fn on_security_mode_complete(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_ue_id: u64,
+) -> Option<(NGAP_PDU, &'static str)> {
+    let ctx = ues.get_mut(&amf_ue_id)?;
+    let ran_ue_id = ctx.ran_ue_id;
+    let tmsi = amf_ue_id as u32;
+    let sec = ctx.sec.as_mut()?;
+    let accept = nas::registration_accept(PLMN_MCC, PLMN_MNC, tmsi);
+    let bytes = sec.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1);
+    info!("UE {amf_ue_id}: SecurityModeComplete — sending Registration Accept");
+    Some((
+        ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
+        "DownlinkNASTransport (RegistrationAccept)",
+    ))
 }
 
 /// Extract the SUCI (if any) from a decoded NAS RegistrationRequest.
@@ -412,8 +482,7 @@ mod tests {
     fn registration_with_suci_is_identified() {
         let mut ues = HashMap::new();
         let pdu = initial_ue_message(7);
-        let outcome = on_initial_ue(&mut ues, as_initial_ue(&pdu), 100);
-        match outcome {
+        match on_initial_ue(&mut ues, as_initial_ue(&pdu), 100) {
             Some(InitialUeOutcome::Identified { ran_ue_id, supi }) => {
                 assert_eq!(ran_ue_id, 7);
                 assert!(supi.contains("999-70"), "unexpected SUPI: {supi}");
@@ -426,7 +495,6 @@ mod tests {
     #[test]
     fn unidentified_initial_ue_needs_identity() {
         let mut ues = HashMap::new();
-        // NAS that is not a RegistrationRequest → no SUCI → ask for identity.
         let pdu = ngap::initial_ue_message_with_nas(8, nas::identity_request_suci());
         match on_initial_ue(&mut ues, as_initial_ue(&pdu), 200) {
             Some(InitialUeOutcome::NeedIdentity(dl)) => {
@@ -437,23 +505,22 @@ mod tests {
         assert_eq!(ues.get(&200).unwrap().state, RegState::IdentityRequested);
     }
 
-    #[tokio::test]
-    async fn uplink_nas_correlates_to_known_ue_only() {
+    #[test]
+    fn uplink_correlates_by_amf_ue_id() {
         let mut ues = HashMap::new();
         on_initial_ue(&mut ues, as_initial_ue(&initial_ue_message(7)), 100);
-        // NRF base is unused: a RegistrationRequest uplink isn't an Auth Response.
-        let amf_auth = auth::AmfAuth::new("http://127.0.0.1:1", "999", "70");
-
         let known = ngap::uplink_nas_transport(100, 7, registration_request());
-        assert!(on_uplink_nas(&mut ues, &amf_auth, as_uplink(&known)).await);
-
+        assert_eq!(uplink_amf_ue_id(as_uplink(&known)), Some(100));
+        assert!(ues.contains_key(&100));
         let unknown = ngap::uplink_nas_transport(999, 7, registration_request());
-        assert!(!on_uplink_nas(&mut ues, &amf_auth, as_uplink(&unknown)).await);
+        assert_eq!(uplink_amf_ue_id(as_uplink(&unknown)), Some(999));
+        assert!(!ues.contains_key(&999));
     }
 
-    /// The payoff: discover AUSF via NRF, run 5G-AKA, confirm RES* → K_SEAF.
+    /// The payoff: authenticate, then complete registration with NAS security —
+    /// SMC ⇄ SMC Complete, Registration Accept ⇄ Registration Complete.
     #[tokio::test]
-    async fn authenticated_registration_over_sbi() {
+    async fn full_registration_completes() {
         use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService, NrfClient, NrfStore};
 
         let supi = "imsi-999700000000001";
@@ -479,7 +546,6 @@ mod tests {
             sbi_core::run_on(ausf_l, sbi_core::nausf::router(ausf_state)).await.unwrap()
         });
 
-        // Register the AUSF (with its service endpoint) in the NRF.
         let mut profile = NfProfile::new("ausf-1", "AUSF", ausf_addr.ip().to_string());
         profile.nf_services = Some(vec![NfService {
             service_instance_id: "nausf-auth-1".into(),
@@ -492,20 +558,45 @@ mod tests {
         }]);
         NrfClient::new(format!("http://{nrf_addr}")).register(&profile).await.unwrap();
 
-        // AMF: discover AUSF via NRF, begin authentication → NAS Authentication Request.
+        // ── Authentication ──
         let amf_auth = auth::AmfAuth::new(format!("http://{nrf_addr}"), "999", "70");
-        let (pending, nas_req) = amf_auth.begin(supi).await.expect("begin authentication");
-
-        // UE: parse the challenge, compute RES*, build the Authentication Response.
-        let (rand, autn) = nas::parse_authentication_request(&nas_req).expect("parse challenge");
+        let (pending, nas_req) = amf_auth.begin(supi).await.unwrap();
+        let (rand, autn) = nas::parse_authentication_request(&nas_req).unwrap();
         let res_star = aka::ue_compute_res_star(&sub, &rand, &autn, "999", "70").unwrap();
         let nas_resp = nas::authentication_response(&res_star);
-        let decoded = nas::decode_nas_5gs_message(&nas_resp).unwrap();
-        let res = nas::res_star_from_authentication_response(&decoded).unwrap();
+        let res = nas::res_star_from_authentication_response(
+            &nas::decode_nas_5gs_message(&nas_resp).unwrap(),
+        )
+        .unwrap()
+        .to_vec();
+        let outcome = amf_auth.finish(&pending, &res).await.unwrap();
+        assert!(outcome.success);
+        let kseaf_hex = outcome.kseaf.unwrap();
 
-        // AMF: SEAF-verify + confirm with the AUSF.
-        let outcome = amf_auth.finish(&pending, res).await.expect("finish authentication");
-        assert!(outcome.success, "authentication should succeed");
-        assert!(outcome.kseaf.is_some(), "K_SEAF derived");
+        // ── AMF derives NAS security + Security Mode Command ──
+        let (mut amf_sec, smc_bytes) = establish_security(&kseaf_hex, supi).expect("establish security");
+
+        // ── UE derives the same NAS keys and verifies the SMC ──
+        let kseaf: [u8; 32] = hex::decode(&kseaf_hex).unwrap().try_into().unwrap();
+        let kamf = aka::kamf(&kseaf, supi, &ABBA);
+        let keys = aka::nas_keys(&kamf, NAS_NEA, NAS_NIA);
+        let mut ue_sec = nas::NasSecurityContext::new(keys.knas_int, keys.knas_enc, NAS_NIA, NAS_NEA);
+        let smc = ue_sec.unprotect(&smc_bytes, 1).expect("UE verifies SMC");
+        assert_eq!(nas::gmm_message_type(&smc), Some(nas::Nas5gmmMessageType::SecurityModeCommand));
+
+        // ── UE → Security Mode Complete; AMF verifies ──
+        let up = ue_sec.protect(&nas::security_mode_complete(), nas::sht::INTEGRITY_CIPHERED, 0);
+        let got = amf_sec.unprotect(&up, 0).expect("AMF verifies SMC Complete");
+        assert_eq!(nas::gmm_message_type(&got), Some(nas::Nas5gmmMessageType::SecurityModeComplete));
+
+        // ── AMF → Registration Accept (protected); UE decodes ──
+        let dl = amf_sec.protect(&nas::registration_accept("999", "70", 1), nas::sht::INTEGRITY_CIPHERED, 1);
+        let accept = ue_sec.unprotect(&dl, 1).expect("UE decodes Registration Accept");
+        assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::RegistrationAccept));
+
+        // ── UE → Registration Complete; AMF verifies ──
+        let up = ue_sec.protect(&nas::registration_complete(), nas::sht::INTEGRITY_CIPHERED, 0);
+        let got = amf_sec.unprotect(&up, 0).expect("AMF verifies Registration Complete");
+        assert_eq!(nas::gmm_message_type(&got), Some(nas::Nas5gmmMessageType::RegistrationComplete));
     }
 }
