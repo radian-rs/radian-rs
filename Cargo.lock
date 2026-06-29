@@ -1353,12 +1353,16 @@ name = "nf-smf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "common",
  "nas",
  "ngap",
  "pfcp",
  "sbi-core",
+ "serde",
+ "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

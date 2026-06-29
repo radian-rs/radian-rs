@@ -250,6 +250,53 @@ pub fn handle_n4(data: &[u8], node_ip: Ipv4Addr, state: &mut UpfState) -> Option
     }
 }
 
+/// The outcome of a Session Establishment, as the SMF reads it from the UPF response.
+pub struct EstablishedSession {
+    /// UP-SEID — addresses this session in later Session Modification/Deletion.
+    pub up_seid: u64,
+    /// The UPF-allocated N3 F-TEID (carried to the gNB in the N2 SM info).
+    pub n3_teid: u32,
+    pub n3_addr: Ipv4Addr,
+}
+
+/// SMF: parse a Session Establishment Response — the UP F-SEID and the UPF-allocated
+/// N3 F-TEID (the Created PDR).
+pub fn parse_session_establishment_response(data: &[u8]) -> Option<EstablishedSession> {
+    let msg = rs_pfcp::message::parse(data).ok()?;
+    if msg.msg_type() != MsgType::SessionEstablishmentResponse {
+        return None;
+    }
+    let up_seid = u64::from(
+        msg.ies(IeType::Fseid)
+            .next()
+            .and_then(|ie| Fseid::unmarshal(&ie.payload).ok())?
+            .seid,
+    );
+    let f_teid = msg
+        .ies(IeType::CreatedPdr)
+        .next()
+        .and_then(|ie| CreatedPdr::unmarshal(&ie.payload).ok())?
+        .f_teid;
+    Some(EstablishedSession {
+        up_seid,
+        n3_teid: u32::from(f_teid.teid),
+        n3_addr: f_teid.ipv4_address?,
+    })
+}
+
+/// Whether a PFCP response carries an accepted Cause (value 1 = success, TS 29.244).
+pub fn response_accepted(data: &[u8]) -> bool {
+    rs_pfcp::message::parse(data)
+        .ok()
+        .and_then(|m| {
+            m.ies(IeType::Cause)
+                .next()
+                .and_then(|ie| ie.payload.first().copied())
+        })
+        .map(|v| v == 1)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
