@@ -86,6 +86,30 @@ pub fn kseaf(kausf: &[u8; 32], mcc: &str, mnc: &str) -> [u8; 32] {
     derive_kseaf(kausf, serving_network_name(mcc, mnc).as_bytes())
 }
 
+/// 128-bit NAS keys derived from K_AMF (TS 33.501 Annex A.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NasKeys {
+    pub knas_int: [u8; 16],
+    pub knas_enc: [u8; 16],
+}
+
+/// AMF: derive K_AMF from K_SEAF (TS 33.501 Annex A.7). `supi` may carry the
+/// `imsi-` prefix (stripped); `abba` is typically `[0x00, 0x00]`.
+pub fn kamf(kseaf: &[u8; 32], supi: &str, abba: &[u8]) -> [u8; 32] {
+    let digits = supi.strip_prefix("imsi-").unwrap_or(supi);
+    oxirush_security::derive_kamf(kseaf, digits, abba)
+}
+
+/// AMF/UE: derive the 128-bit NAS integrity/ciphering keys (TS 33.501 Annex A.8).
+/// `nea`/`nia` are the algorithm identifiers (e.g. 2 for 128-NEA2 / 128-NIA2).
+pub fn nas_keys(kamf: &[u8; 32], nea: u8, nia: u8) -> NasKeys {
+    use oxirush_security::{derive_nas_key, extract_128};
+    NasKeys {
+        knas_enc: extract_128(&derive_nas_key(kamf, 0x01, nea)),
+        knas_int: extract_128(&derive_nas_key(kamf, 0x02, nia)),
+    }
+}
+
 /// UE side: verify AUTN and compute RES* (TS 33.501). Used by tests / a UE simulator.
 pub fn ue_compute_res_star(
     sub: &SubscriberKey,

@@ -74,6 +74,181 @@ pub fn res_star_from_authentication_response(msg: &Nas5gsMessage) -> Option<&[u8
     }
 }
 
+/// Build a 5GMM **Security Mode Command** (TS 24.501 §8.2.25) selecting the NAS
+/// algorithms (`nea`/`nia` identifiers), key set, and replayed UE capabilities.
+pub fn security_mode_command(nea: u8, nia: u8, ngksi: u8, replayed_ue_sec_cap: &[u8]) -> Nas5gsMessage {
+    let smc = messages::NasSecurityModeCommand::new(
+        NasSecurityAlgorithms::new((nea << 4) | (nia & 0x0F)),
+        NasKeySetIdentifier::new(ngksi),
+        NasUeSecurityCapability::new(replayed_ue_sec_cap.to_vec()),
+    );
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::SecurityModeCommand,
+        Nas5gmmMessage::SecurityModeCommand(smc),
+    )
+}
+
+/// Build a 5GMM **Security Mode Complete** (TS 24.501 §8.2.26). UE side / tests.
+pub fn security_mode_complete() -> Nas5gsMessage {
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::SecurityModeComplete,
+        Nas5gmmMessage::SecurityModeComplete(messages::NasSecurityModeComplete::new()),
+    )
+}
+
+/// Build a 5GMM **Registration Accept** (TS 24.501 §8.2.7) assigning a 5G-GUTI.
+pub fn registration_accept(mcc: &str, mnc: &str, tmsi: u32) -> Nas5gsMessage {
+    let guti = NasFGsMobileIdentity::from_guti(&Guti {
+        mcc: mcc_digits(mcc),
+        mnc: mnc_digits(mnc),
+        amf_region_id: 0x01,
+        amf_set_id: 0x001,
+        amf_pointer: 0x00,
+        tmsi,
+    });
+    let accept = messages::NasRegistrationAccept::new(NasFGsRegistrationResult::new(vec![0x01]))
+        .set_fg_guti(guti);
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::RegistrationAccept,
+        Nas5gmmMessage::RegistrationAccept(accept),
+    )
+}
+
+/// Build a 5GMM **Registration Complete** (TS 24.501 §8.2.8). UE side / tests.
+pub fn registration_complete() -> Nas5gsMessage {
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::RegistrationComplete,
+        Nas5gmmMessage::RegistrationComplete(messages::NasRegistrationComplete::new()),
+    )
+}
+
+/// The 5GMM message type of a decoded NAS message, if it is a 5GMM message.
+pub fn gmm_message_type(msg: &Nas5gsMessage) -> Option<Nas5gmmMessageType> {
+    if let Nas5gsMessage::Gmm(hdr, _) = msg {
+        Some(hdr.message_type)
+    } else {
+        None
+    }
+}
+
+fn mcc_digits(mcc: &str) -> [u8; 3] {
+    let b = mcc.as_bytes();
+    [b[0] - b'0', b[1] - b'0', b[2] - b'0']
+}
+
+fn mnc_digits(mnc: &str) -> [u8; 3] {
+    let b = mnc.as_bytes();
+    if mnc.len() == 2 {
+        [b[0] - b'0', b[1] - b'0', 0x0F]
+    } else {
+        [b[0] - b'0', b[1] - b'0', b[2] - b'0']
+    }
+}
+
+/// NAS security header types (TS 24.501 §9.1.1).
+pub mod sht {
+    pub const INTEGRITY: u8 = 0x01;
+    pub const INTEGRITY_CIPHERED: u8 = 0x02;
+    pub const INTEGRITY_NEW_CONTEXT: u8 = 0x03;
+    pub const INTEGRITY_CIPHERED_NEW_CONTEXT: u8 = 0x04;
+}
+
+const NAS_BEARER: u8 = 1; // TS 33.501 §6.4.3.1: NAS bearer is always 1.
+const EPD_5GMM: u8 = 0x7e;
+
+/// NAS security context (TS 33.501 §8.2 / TS 24.501 §9.1.1): the keys, algorithms,
+/// and per-direction NAS COUNT used to integrity-protect and cipher NAS messages.
+///
+/// One context per peer protects its downlink and unprotects its uplink (AMF) or
+/// vice-versa (UE). `direction`: 0 = uplink, 1 = downlink.
+#[derive(Debug, Clone)]
+pub struct NasSecurityContext {
+    pub knas_int: [u8; 16],
+    pub knas_enc: [u8; 16],
+    pub nia: u8,
+    pub nea: u8,
+    pub ul_count: u32,
+    pub dl_count: u32,
+}
+
+impl NasSecurityContext {
+    pub fn new(knas_int: [u8; 16], knas_enc: [u8; 16], nia: u8, nea: u8) -> Self {
+        Self {
+            knas_int,
+            knas_enc,
+            nia,
+            nea,
+            ul_count: 0,
+            dl_count: 0,
+        }
+    }
+
+    /// Wrap a NAS message in the security envelope `[EPD | SHT | MAC(4) | SN | payload]`.
+    pub fn protect(&mut self, inner: &Nas5gsMessage, sht: u8, direction: u8) -> Vec<u8> {
+        let mut payload = encode_nas_5gs_message(inner).expect("encode inner NAS message");
+        let count = if direction == 0 {
+            &mut self.ul_count
+        } else {
+            &mut self.dl_count
+        };
+        let c = *count;
+        *count += 1;
+        let sn = (c & 0xff) as u8;
+
+        if matches!(sht, sht::INTEGRITY_CIPHERED | sht::INTEGRITY_CIPHERED_NEW_CONTEXT) {
+            oxirush_security::nas_cipher(&self.knas_enc, c, NAS_BEARER, direction, &mut payload, self.nea);
+        }
+
+        let mut mac_input = Vec::with_capacity(1 + payload.len());
+        mac_input.push(sn);
+        mac_input.extend_from_slice(&payload);
+        let mac = oxirush_security::nas_mac(&self.knas_int, c, NAS_BEARER, direction, &mac_input, self.nia);
+
+        let mut out = Vec::with_capacity(7 + payload.len());
+        out.push(EPD_5GMM);
+        out.push(sht);
+        out.extend_from_slice(&mac.to_be_bytes());
+        out.push(sn);
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// Verify the MAC of a protected NAS message, decipher if needed, and decode it.
+    /// Returns `None` on MAC failure or malformed input.
+    pub fn unprotect(&mut self, data: &[u8], direction: u8) -> Option<Nas5gsMessage> {
+        if data.len() < 7 {
+            return None;
+        }
+        let sht = data[1];
+        let recv_mac = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+        let sn = data[6];
+        let mut payload = data[7..].to_vec();
+
+        let count = if direction == 0 {
+            &mut self.ul_count
+        } else {
+            &mut self.dl_count
+        };
+        // Align the COUNT's low byte with the received SN (no overflow handling yet).
+        let c = (*count & !0xff) | sn as u32;
+
+        let mut mac_input = Vec::with_capacity(1 + payload.len());
+        mac_input.push(sn);
+        mac_input.extend_from_slice(&payload);
+        if oxirush_security::nas_mac(&self.knas_int, c, NAS_BEARER, direction, &mac_input, self.nia)
+            != recv_mac
+        {
+            return None;
+        }
+        *count = c + 1;
+
+        if matches!(sht, sht::INTEGRITY_CIPHERED | sht::INTEGRITY_CIPHERED_NEW_CONTEXT) {
+            oxirush_security::nas_cipher(&self.knas_enc, c, NAS_BEARER, direction, &mut payload, self.nea);
+        }
+        decode_nas_5gs_message(&payload).ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +269,47 @@ mod tests {
         let bytes = authentication_response(&res_star);
         let msg = decode_nas_5gs_message(&bytes).expect("decode");
         assert_eq!(res_star_from_authentication_response(&msg), Some(&res_star[..]));
+    }
+
+    #[test]
+    fn registration_accept_builds_and_decodes() {
+        let msg = registration_accept("999", "70", 0x01020304);
+        let bytes = encode_nas_5gs_message(&msg).unwrap();
+        let back = decode_nas_5gs_message(&bytes).unwrap();
+        assert_eq!(
+            gmm_message_type(&back),
+            Some(Nas5gmmMessageType::RegistrationAccept)
+        );
+    }
+
+    #[test]
+    fn nas_security_protect_unprotect() {
+        // AMF and UE share keys/algorithms (NIA2 / NEA2); each has its own context.
+        let (ki, ke) = ([0x11u8; 16], [0x22u8; 16]);
+        let mut amf = NasSecurityContext::new(ki, ke, 2, 2);
+        let mut ue = NasSecurityContext::new(ki, ke, 2, 2);
+
+        // Integrity-protected (new context) Security Mode Command, downlink.
+        let smc = security_mode_command(2, 2, 0, &[0xE0, 0xE0]);
+        let protected = amf.protect(&smc, sht::INTEGRITY_NEW_CONTEXT, 1);
+        let decoded = ue.unprotect(&protected, 1).expect("UE verifies + decodes SMC");
+        assert_eq!(
+            gmm_message_type(&decoded),
+            Some(Nas5gmmMessageType::SecurityModeCommand)
+        );
+
+        // Integrity-protected + ciphered Registration Accept, downlink.
+        let accept = registration_accept("999", "70", 0xDEAD_BEEF);
+        let protected = amf.protect(&accept, sht::INTEGRITY_CIPHERED, 1);
+        let decoded = ue.unprotect(&protected, 1).expect("UE verifies + deciphers Accept");
+        assert_eq!(
+            gmm_message_type(&decoded),
+            Some(Nas5gmmMessageType::RegistrationAccept)
+        );
+
+        // A tampered MAC is rejected.
+        let mut bad = amf.protect(&security_mode_complete(), sht::INTEGRITY, 1);
+        bad[2] ^= 0xff;
+        assert!(ue.unprotect(&bad, 1).is_none());
     }
 }
