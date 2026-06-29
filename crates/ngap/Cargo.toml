@@ -9,3 +9,7 @@ authors.workspace = true
 oxirush-ngap = "0.3"
 # Required at the call site of oxirush-ngap's `build_ngap!` macro.
 paste = "1"
+# APER codec + bitstrings, to (de)serialize the N2 SM-info *Transfer* sub-PDUs and
+# build TransportLayerAddress. Versions match oxirush-ngap's.
+asn1-codecs = "0.7"
+bitvec = "1"
