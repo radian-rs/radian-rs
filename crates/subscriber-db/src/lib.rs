@@ -15,6 +15,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use aka::{AuthVector, SubscriberKey};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use redb::{Builder, Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 /// Subscriber subscription data + mutable authentication state.
@@ -100,6 +102,21 @@ fn parse_key(k: &str, opc: &str, amf: &str) -> Result<SubscriberKey, String> {
     })
 }
 
+/// Parse a 32-byte master key (KEK) from a 64-character hex string.
+pub fn parse_kek_hex(hex_str: &str) -> Result<[u8; 32], String> {
+    hex::decode(hex_str.trim())
+        .map_err(|e| e.to_string())?
+        .try_into()
+        .map_err(|_| "master key must be 32 bytes (64 hex chars)".to_string())
+}
+
+/// Generate a random ephemeral KEK (dev use when no master key is configured).
+pub fn random_kek() -> [u8; 32] {
+    let mut k = [0u8; 32];
+    getrandom::getrandom(&mut k).expect("getrandom KEK");
+    k
+}
+
 // ── In-memory backend (tests / dev) ──────────────────────────────────────────
 
 #[derive(Default)]
@@ -175,12 +192,18 @@ fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
 
 pub struct RedbStore {
     db: Database,
+    kek: [u8; 32],
 }
 
 impl RedbStore {
-    /// Open (creating if absent) a persistent subscriber store at `path`. A newly
-    /// created file is owner-only (mode 0600) so credentials aren't world-readable.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    /// Open (creating if absent) a persistent subscriber store at `path`, encrypting
+    /// records at rest (AES-256-GCM) with the 32-byte key-encryption key `kek`. A
+    /// newly created file is owner-only (mode 0600). `kek` is injected by the caller
+    /// — sourced from an HSM / KMS / env in production — and never persisted.
+    pub fn open(
+        path: impl AsRef<Path>,
+        kek: [u8; 32],
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = path.as_ref();
         let db = if path.exists() {
             Database::open(path)?
@@ -190,18 +213,45 @@ impl RedbStore {
         let w = db.begin_write()?;
         w.open_table(SUBSCRIBERS)?; // ensure the table exists
         w.commit()?;
-        Ok(Self { db })
+        Ok(Self { db, kek })
+    }
+
+    /// AEAD-encrypt a record, bound to `supi` (AAD). Layout: nonce(12) || ciphertext+tag.
+    fn encrypt(&self, supi: &str, plaintext: &[u8]) -> Vec<u8> {
+        let cipher = Aes256Gcm::new_from_slice(&self.kek).expect("32-byte KEK");
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes).expect("getrandom nonce");
+        let nonce = Nonce::from(nonce_bytes);
+        let ct = cipher
+            .encrypt(&nonce, Payload { msg: plaintext, aad: supi.as_bytes() })
+            .expect("AES-256-GCM encrypt");
+        let mut out = Vec::with_capacity(12 + ct.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ct);
+        out
+    }
+
+    /// Verify + decrypt a record (None on wrong KEK / tamper / wrong SUPI).
+    fn decrypt(&self, supi: &str, blob: &[u8]) -> Option<[u8; 40]> {
+        if blob.len() < 12 {
+            return None;
+        }
+        let (nonce_bytes, ct) = blob.split_at(12);
+        let nonce = Nonce::from(<[u8; 12]>::try_from(nonce_bytes).ok()?);
+        let cipher = Aes256Gcm::new_from_slice(&self.kek).ok()?;
+        let pt = cipher
+            .decrypt(&nonce, Payload { msg: ct, aad: supi.as_bytes() })
+            .ok()?;
+        pt.try_into().ok()
     }
 
     pub fn provision(&self, supi: &str, key: SubscriberKey) -> Result<(), redb::Error> {
-        // SECURITY: K/OPc are persisted in the clear (the file is at least mode 0600).
-        // Encryption-at-rest / an HSM belongs behind `ArpfKeyStore` so the key is never
-        // on disk in plaintext. TODO (tracked).
-        let bytes = Record { key, sqn: [0; 6] }.to_bytes();
+        // K/OPc are AEAD-encrypted at rest under the injected KEK, bound to the SUPI.
+        let blob = self.encrypt(supi, &Record { key, sqn: [0; 6] }.to_bytes());
         let w = self.db.begin_write()?;
         {
             let mut table = w.open_table(SUBSCRIBERS)?;
-            table.insert(supi, bytes.as_slice())?;
+            table.insert(supi, blob.as_slice())?;
         }
         w.commit()?;
         Ok(())
@@ -216,7 +266,8 @@ impl RedbStore {
         let r = self.db.begin_read().ok()?;
         let table = r.open_table(SUBSCRIBERS).ok()?;
         let guard = table.get(supi).ok()??;
-        Record::from_bytes(guard.value())
+        let plain = self.decrypt(supi, guard.value())?;
+        Record::from_bytes(&plain)
     }
 }
 
@@ -232,11 +283,12 @@ impl SubscriberDb for RedbStore {
             let mut table = w.open_table(SUBSCRIBERS).ok()?;
             let mut rec = {
                 let guard = table.get(supi).ok()??;
-                Record::from_bytes(guard.value())?
+                let plain = self.decrypt(supi, guard.value())?;
+                Record::from_bytes(&plain)?
             };
             increment_sqn(&mut rec.sqn);
-            let bytes = rec.to_bytes();
-            table.insert(supi, bytes.as_slice()).ok()?;
+            let blob = self.encrypt(supi, &rec.to_bytes());
+            table.insert(supi, blob.as_slice()).ok()?;
             sqn = rec.sqn;
         }
         w.commit().ok()?;
@@ -264,6 +316,7 @@ mod tests {
 
     const K: &str = "465b5ce8b199b49faa5f0a2ee238a6bc";
     const OPC: &str = "cd63cb71954a9f4e48a5994e37a02baf";
+    const KEK: [u8; 32] = [0x42; 32];
 
     #[test]
     fn in_memory_sqn_increments_and_av_generates() {
@@ -288,13 +341,13 @@ mod tests {
         let path = dir.path().join("sub.redb");
 
         {
-            let store = RedbStore::open(&path).unwrap();
+            let store = RedbStore::open(&path, KEK).unwrap();
             store.provision_hex("imsi-1", K, OPC, "8000").unwrap();
             assert_eq!(store.next_sqn("imsi-1"), Some([0, 0, 0, 0, 0, 1]));
         }
 
         // Reopen: the subscriber and the advanced SQN survive.
-        let store = RedbStore::open(&path).unwrap();
+        let store = RedbStore::open(&path, KEK).unwrap();
         assert!(store.exists("imsi-1"));
         assert_eq!(store.next_sqn("imsi-1"), Some([0, 0, 0, 0, 0, 2]));
         let av = store
@@ -306,7 +359,7 @@ mod tests {
     #[test]
     fn redb_unknown_subscriber_is_none() {
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbStore::open(dir.path().join("s.redb")).unwrap();
+        let store = RedbStore::open(dir.path().join("s.redb"), KEK).unwrap();
         assert!(!store.exists("imsi-missing"));
         assert_eq!(store.next_sqn("imsi-missing"), None);
         assert!(store
@@ -320,8 +373,41 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub.redb");
-        let _store = RedbStore::open(&path).unwrap();
+        let _store = RedbStore::open(&path, KEK).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "credential store must be owner-only, got {mode:o}");
+    }
+
+    #[test]
+    fn redb_wrong_kek_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub.redb");
+        RedbStore::open(&path, [0x11; 32])
+            .unwrap()
+            .provision_hex("imsi-1", K, OPC, "8000")
+            .unwrap();
+
+        // A store opened with a different KEK can't decrypt the record (GCM tag fails).
+        let other = RedbStore::open(&path, [0x22; 32]).unwrap();
+        assert!(!other.exists("imsi-1"));
+        assert_eq!(other.next_sqn("imsi-1"), None);
+        assert!(other
+            .generate_he_av("imsi-1", &[0; 6], &[0x11; 16], "999", "70")
+            .is_none());
+    }
+
+    #[test]
+    fn redb_key_is_not_plaintext_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub.redb");
+        let store = RedbStore::open(&path, KEK).unwrap();
+        store.provision_hex("imsi-1", K, OPC, "8000").unwrap();
+        let _ = store.next_sqn("imsi-1"); // force an encrypted write
+        drop(store);
+
+        let file = std::fs::read(&path).unwrap();
+        let contains = |needle: &[u8]| file.windows(needle.len()).any(|w| w == needle);
+        assert!(!contains(&hex::decode(K).unwrap()), "K must not be plaintext on disk");
+        assert!(!contains(&hex::decode(OPC).unwrap()), "OPc must not be plaintext on disk");
     }
 }
