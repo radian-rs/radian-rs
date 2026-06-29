@@ -20,3 +20,4 @@ sctp-rs = "0.3"
 
 [dev-dependencies]
 hex-literal = "0.4"
+subscriber-db.workspace = true

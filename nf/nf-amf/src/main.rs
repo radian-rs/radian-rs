@@ -533,11 +533,12 @@ mod tests {
             sbi_core::run_on(nrf_l, sbi_core::nnrf::router(NrfStore::default())).await.unwrap()
         });
 
-        let db = sbi_core::nudm::SubscriberDb::new();
-        db.insert(supi, sub.clone());
+        let udm_store = std::sync::Arc::new(subscriber_db::InMemoryStore::new());
+        udm_store.provision(supi, sub.clone());
+        let udm_store: std::sync::Arc<dyn subscriber_db::SubscriberStore> = udm_store;
         let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udm_addr = udm_l.local_addr().unwrap();
-        tokio::spawn(async move { sbi_core::run_on(udm_l, sbi_core::nudm::router(db)).await.unwrap() });
+        tokio::spawn(async move { sbi_core::run_on(udm_l, sbi_core::nudm::router(udm_store)).await.unwrap() });
 
         let ausf_state = sbi_core::nausf::AusfState::new(format!("http://{udm_addr}"));
         let ausf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -18,6 +18,7 @@ surface of the project and assesses build feasibility.
 | [07-registration-complete.md](07-registration-complete.md) | Complete registration: K_AMF, NAS security, Security Mode + Registration Accept |
 | [08-n4-pfcp.md](08-n4-pfcp.md) | User-plane start: N4 PFCP (SMF↔UPF) association + heartbeat via rs-pfcp |
 | [09-pfcp-session.md](09-pfcp-session.md) | PFCP Session Establishment: SMF provisions PDR/FAR, UPF allocates N3 F-TEID |
+| [10-subscriber-db.md](10-subscriber-db.md) | Subscription store: SubscriberDb/ArpfKeyStore traits + redb persistence (K isolated) |
 
 ## One-paragraph summary
 
