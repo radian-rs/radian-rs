@@ -1,0 +1,13 @@
+[package]
+name = "nf-upf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+common.workspace = true
+pfcp.workspace = true
+gtpu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

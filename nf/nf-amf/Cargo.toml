@@ -1,0 +1,13 @@
+[package]
+name = "nf-amf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+common.workspace = true
+sbi-core.workspace = true
+ngap.workspace = true
+nas.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

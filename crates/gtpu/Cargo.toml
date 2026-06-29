@@ -1,0 +1,9 @@
+[package]
+name = "gtpu"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
