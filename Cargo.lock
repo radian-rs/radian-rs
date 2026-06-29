@@ -1216,13 +1216,16 @@ dependencies = [
 name = "nf-amf"
 version = "0.1.0"
 dependencies = [
+ "aka",
  "anyhow",
  "common",
  "hex",
+ "hex-literal",
  "nas",
  "ngap",
  "sbi-core",
  "sctp-rs",
+ "thiserror",
  "tokio",
  "tracing",
 ]
