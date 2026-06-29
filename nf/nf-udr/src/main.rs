@@ -10,6 +10,6 @@ async fn main() -> anyhow::Result<()> {
 
     // TODO: implement Nudr_DataRepository (TS 29.504).
     let sbi: SocketAddr = "0.0.0.0:8005".parse()?;
-    sbi_core::serve(sbi).await?;
+    sbi_core::run(sbi, sbi_core::health_router()).await?;
     Ok(())
 }

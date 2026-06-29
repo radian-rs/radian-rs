@@ -15,6 +15,6 @@ async fn main() -> anyhow::Result<()> {
     // TODO: NAS-SM via `nas`; N2 SM info (PDUSessionResource*Transfer) via `ngap`.
     // TODO: implement Nsmf_PDUSession + Nsmf_EventExposure.
     let sbi: SocketAddr = "0.0.0.0:8002".parse()?;
-    sbi_core::serve(sbi).await?;
+    sbi_core::run(sbi, sbi_core::health_router()).await?;
     Ok(())
 }

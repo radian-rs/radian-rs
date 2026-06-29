@@ -8,8 +8,9 @@ async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("nrf");
 
-    // TODO: implement Nnrf_NFManagement + Nnrf_NFDiscovery (TS 29.510).
+    // Nnrf_NFManagement + Nnrf_NFDiscovery (TS 29.510) over the SBI.
+    let store = sbi_core::nnrf::NrfStore::default();
     let sbi: SocketAddr = "0.0.0.0:8000".parse()?;
-    sbi_core::serve(sbi).await?;
+    sbi_core::run(sbi, sbi_core::nnrf::router(store)).await?;
     Ok(())
 }
