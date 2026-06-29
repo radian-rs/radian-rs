@@ -16,6 +16,7 @@ surface of the project and assesses build feasibility.
 | [05-aka-authentication.md](05-aka-authentication.md) | 5G-AKA: AUSF + UDM + the `aka` crypto crate (Milenage, TS 33.501) |
 | [06-amf-auth-join.md](06-amf-auth-join.md) | AMF authentication: joins N2 + SBI — discover AUSF, run 5G-AKA, K_SEAF |
 | [07-registration-complete.md](07-registration-complete.md) | Complete registration: K_AMF, NAS security, Security Mode + Registration Accept |
+| [08-n4-pfcp.md](08-n4-pfcp.md) | User-plane start: N4 PFCP (SMF↔UPF) association + heartbeat via rs-pfcp |
 
 ## One-paragraph summary
 

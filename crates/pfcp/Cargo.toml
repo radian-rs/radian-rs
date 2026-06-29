@@ -5,5 +5,8 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
-bytes.workspace = true
-thiserror.workspace = true
+# PFCP (TS 29.244) codec — N4 between SMF and UPF.
+rs-pfcp = "0.3"
+
+[dev-dependencies]
+tokio.workspace = true
