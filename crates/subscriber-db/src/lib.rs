@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use aka::{AuthVector, SubscriberKey};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Builder, Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 /// Subscriber subscription data + mutable authentication state.
 pub trait SubscriberDb: Send + Sync {
@@ -159,14 +159,34 @@ impl ArpfKeyStore for InMemoryStore {
 
 const SUBSCRIBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("subscribers");
 
+/// Create a new file readable/writable only by the owner (mode 0600 on Unix) so the
+/// persisted credential store is never world-readable. The restrictive mode is set at
+/// creation (no chmod-after-create TOCTOU window).
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 pub struct RedbStore {
     db: Database,
 }
 
 impl RedbStore {
-    /// Open (creating if absent) a persistent subscriber store at `path`.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, redb::Error> {
-        let db = Database::create(path)?;
+    /// Open (creating if absent) a persistent subscriber store at `path`. A newly
+    /// created file is owner-only (mode 0600) so credentials aren't world-readable.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let path = path.as_ref();
+        let db = if path.exists() {
+            Database::open(path)?
+        } else {
+            Builder::new().create_file(create_private_file(path)?)?
+        };
         let w = db.begin_write()?;
         w.open_table(SUBSCRIBERS)?; // ensure the table exists
         w.commit()?;
@@ -174,6 +194,9 @@ impl RedbStore {
     }
 
     pub fn provision(&self, supi: &str, key: SubscriberKey) -> Result<(), redb::Error> {
+        // SECURITY: K/OPc are persisted in the clear (the file is at least mode 0600).
+        // Encryption-at-rest / an HSM belongs behind `ArpfKeyStore` so the key is never
+        // on disk in plaintext. TODO (tracked).
         let bytes = Record { key, sqn: [0; 6] }.to_bytes();
         let w = self.db.begin_write()?;
         {
@@ -278,5 +301,27 @@ mod tests {
             .generate_he_av("imsi-1", &[0, 0, 0, 0, 0, 2], &[0x11; 16], "999", "70")
             .expect("AV");
         assert_ne!(av.kausf, [0u8; 32]);
+    }
+
+    #[test]
+    fn redb_unknown_subscriber_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(dir.path().join("s.redb")).unwrap();
+        assert!(!store.exists("imsi-missing"));
+        assert_eq!(store.next_sqn("imsi-missing"), None);
+        assert!(store
+            .generate_he_av("imsi-missing", &[0; 6], &[0x11; 16], "999", "70")
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redb_credential_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub.redb");
+        let _store = RedbStore::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "credential store must be owner-only, got {mode:o}");
     }
 }

@@ -1,39 +1,58 @@
 //! UDM — Unified Data Management (Nudm, TS 29.503). SBI-only (JSON).
 //!
 //! Stateless front-end over a persistent subscriber store (`subscriber-db`, redb
-//! backend). Architecturally the data belongs in the UDR (Nudr) — relocating it
-//! behind `nf-udr` is a later slice.
+//! backend, owner-only file). Architecturally the data belongs in the UDR (Nudr) —
+//! relocating it behind `nf-udr` is a later slice.
+//!
+//! The demo subscriber uses a **public** test key (TS 35.208) and is provisioned
+//! only when `RADIANT_UDM_PROVISION_DEMO=1` — never auto-created — so a production
+//! build never ships a known-key (backdoor) account.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use subscriber_db::{RedbStore, SubscriberDb, SubscriberStore};
+use tracing::{info, warn};
 
 const DEMO_SUPI: &str = "imsi-999700000000001";
-const UDM_DB_PATH: &str = "radiant-udm.redb";
+const DEFAULT_DB_PATH: &str = "radiant-udm.redb";
+const DEMO_ENV: &str = "RADIANT_UDM_PROVISION_DEMO";
+const DB_ENV: &str = "RADIANT_UDM_DB";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("udm");
 
-    // Persistent subscriber store; provision a demo subscriber (TS 35.208 key) once.
-    let store = RedbStore::open(UDM_DB_PATH)
-        .map_err(|e| anyhow::anyhow!("open UDM store {UDM_DB_PATH}: {e}"))?;
-    if !store.exists(DEMO_SUPI) {
-        store
-            .provision_hex(
-                DEMO_SUPI,
-                "465b5ce8b199b49faa5f0a2ee238a6bc",
-                "cd63cb71954a9f4e48a5994e37a02baf",
-                "8000",
-            )
-            .map_err(|e| anyhow::anyhow!("provision demo subscriber: {e}"))?;
-        tracing::info!(supi = DEMO_SUPI, "provisioned demo subscriber");
+    let db_path = std::env::var(DB_ENV).unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
+    let store =
+        RedbStore::open(&db_path).map_err(|e| anyhow::anyhow!("open UDM store {db_path}: {e}"))?;
+
+    if demo_enabled() {
+        if !store.exists(DEMO_SUPI) {
+            store
+                .provision_hex(
+                    DEMO_SUPI,
+                    "465b5ce8b199b49faa5f0a2ee238a6bc",
+                    "cd63cb71954a9f4e48a5994e37a02baf",
+                    "8000",
+                )
+                .map_err(|e| anyhow::anyhow!("provision demo subscriber: {e}"))?;
+        }
+        warn!(
+            supi = DEMO_SUPI,
+            "DEMO subscriber enabled (PUBLIC TS 35.208 test key) — do NOT use in production"
+        );
+    } else {
+        info!("demo subscriber disabled (set {DEMO_ENV}=1 to provision the TS 35.208 test subscriber)");
     }
 
     let store: Arc<dyn SubscriberStore> = Arc::new(store);
     let sbi: SocketAddr = "0.0.0.0:8004".parse()?;
     sbi_core::run(sbi, sbi_core::nudm::router(store)).await?;
     Ok(())
+}
+
+fn demo_enabled() -> bool {
+    std::env::var(DEMO_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
