@@ -25,7 +25,9 @@ use anyhow::Context;
 use nas::{Nas5gmmMessage, Nas5gmmMessageType, Nas5gsMessage, Suci};
 use ngap::{
     InitialUEMessage, InitialUEMessageProtocolIEs_EntryValue, InitiatingMessage,
-    InitiatingMessageValue, NGAP_PDU, UplinkNASTransport, UplinkNASTransportProtocolIEs_EntryValue,
+    InitiatingMessageValue, NGAP_PDU, PDUSessionResourceSetupResponseProtocolIEs_EntryValue,
+    SuccessfulOutcome, SuccessfulOutcomeValue, UplinkNASTransport,
+    UplinkNASTransportProtocolIEs_EntryValue,
 };
 use sctp_rs::{
     ConnectedSocket, NotificationOrData, SendData, SendInfo, Socket, SocketToAssociation,
@@ -73,6 +75,8 @@ struct UeContext {
     auth: Option<auth::PendingAuth>,
     /// NAS security context, present once the Security Mode Command is sent.
     sec: Option<nas::NasSecurityContext>,
+    /// SM context ref of an in-progress PDU session, to address its UpdateSMContext.
+    sm_ref: Option<String>,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
@@ -171,8 +175,53 @@ async fn handle_ngap(
             }
             _ => info!("unhandled initiating message: {}", pdu.procedure_name()),
         },
+        NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+            value: SuccessfulOutcomeValue::Id_PDUSessionResourceSetup(_),
+            ..
+        }) => {
+            on_pdu_session_setup_response(ues, amf_smf, &pdu).await;
+        }
         _ => info!("unhandled PDU: {}", pdu.procedure_name()),
     }
+}
+
+/// Handle a gNB's `PDUSessionResourceSetupResponse`: extract the gNB DL N3 F-TEID and
+/// drive UpdateSMContext at the SMF (which runs the N4 Session Modification).
+async fn on_pdu_session_setup_response(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    pdu: &NGAP_PDU,
+) {
+    let Some((psi, gnb_teid, gnb_addr)) = ngap::gnb_fteid_from_setup_response(pdu) else {
+        warn!("PDUSessionResourceSetupResponse without a gNB F-TEID");
+        return;
+    };
+    let Some(amf_ue_id) = setup_response_amf_ue_id(pdu) else {
+        warn!("PDUSessionResourceSetupResponse without AMF-UE-NGAP-ID");
+        return;
+    };
+    let Some(sm_ref) = ues.get(&amf_ue_id).and_then(|c| c.sm_ref.clone()) else {
+        warn!("UE {amf_ue_id}: setup response but no SM context is tracked");
+        return;
+    };
+    match amf_smf.update_sm_context(&sm_ref, gnb_teid, gnb_addr).await {
+        Ok(()) => info!("UE {amf_ue_id}: PDU session {psi} downlink installed (gNB F-TEID {gnb_teid:#x})"),
+        Err(e) => warn!("UE {amf_ue_id}: UpdateSMContext failed: {e}"),
+    }
+}
+
+/// Extract the AMF-UE-NGAP-ID from a `PDUSessionResourceSetupResponse`.
+fn setup_response_amf_ue_id(pdu: &NGAP_PDU) -> Option<u64> {
+    let NGAP_PDU::SuccessfulOutcome(so) = pdu else {
+        return None;
+    };
+    let SuccessfulOutcomeValue::Id_PDUSessionResourceSetup(resp) = &so.value else {
+        return None;
+    };
+    resp.protocol_i_es.0.iter().find_map(|e| match &e.value {
+        PDUSessionResourceSetupResponseProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(id) => Some(id.0),
+        _ => None,
+    })
 }
 
 /// Identify the UE and create its context. Returns what to do next.
@@ -201,7 +250,7 @@ fn on_initial_ue(
 
 impl UeContext {
     fn new(ran_ue_id: u32, state: RegState, suci: Option<String>) -> Self {
-        Self { ran_ue_id, state, suci, auth: None, sec: None }
+        Self { ran_ue_id, state, suci, auth: None, sec: None, sm_ref: None }
     }
 }
 
@@ -280,20 +329,37 @@ async fn on_uplink_nas(
             None
         }
         Some(Nas5gmmMessageType::UlNasTransport) => {
-            // A UE PDU session request. Relay it to the SMF (Nsmf CreateSMContext); the
-            // N1 SM container is opaque to the AMF (TS 29.502 multipart is a later slice).
-            let supi = ues.get(&amf_ue_id).and_then(|c| c.suci.clone());
-            match (supi, nas::sm_container_from_ul_nas_transport(&nas_msg)) {
-                (Some(supi), Some((psi, _sm_container))) => {
-                    match amf_smf.create_sm_context(&supi, psi, "internet").await {
-                        Ok(()) => info!("UE {amf_ue_id}: PDU session {psi} SM context created via SMF"),
-                        Err(e) => warn!("UE {amf_ue_id}: PDU session {psi} CreateSMContext failed: {e}"),
+            // A UE PDU session request: CreateSMContext at the SMF (N4 establishment),
+            // then send the N2 PDU Session Resource Setup to the gNB with the UPF's N3
+            // F-TEID. The N1 SM container is opaque to the AMF (TS 29.502 multipart later).
+            let Some((psi, _container)) = nas::sm_container_from_ul_nas_transport(&nas_msg) else {
+                warn!("UE {amf_ue_id}: UL NAS Transport without an SM container");
+                return None;
+            };
+            let Some((supi, ran_ue_id)) =
+                ues.get(&amf_ue_id).and_then(|c| Some((c.suci.clone()?, c.ran_ue_id)))
+            else {
+                warn!("UE {amf_ue_id}: UL NAS Transport before SUPI is known");
+                return None;
+            };
+            match amf_smf.create_sm_context(&supi, psi, "internet").await {
+                Ok(created) => {
+                    if let Some(ctx) = ues.get_mut(&amf_ue_id) {
+                        ctx.sm_ref = Some(created.sm_ref);
                     }
+                    // The SMF-provided N1 SM Accept isn't modeled yet; send a stub container.
+                    let nas_accept = vec![0x2e, psi, 0x00, 0xc2];
+                    let setup = ngap::pdu_session_resource_setup_request(
+                        amf_ue_id, ran_ue_id, psi, 1, created.up_n3_teid, created.up_n3_addr, nas_accept,
+                    );
+                    info!("UE {amf_ue_id}: PDU session {psi} SM context created; sending N2 setup");
+                    Some((setup, "PDUSessionResourceSetupRequest"))
                 }
-                (None, _) => warn!("UE {amf_ue_id}: UL NAS Transport before SUPI is known"),
-                (_, None) => warn!("UE {amf_ue_id}: UL NAS Transport without an SM container"),
+                Err(e) => {
+                    warn!("UE {amf_ue_id}: PDU session {psi} CreateSMContext failed: {e}");
+                    None
+                }
             }
-            None
         }
         _ => {
             info!("UE {amf_ue_id}: uplink NAS {nas_msg}");

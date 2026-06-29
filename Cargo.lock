@@ -1405,6 +1405,8 @@ dependencies = [
 name = "ngap"
 version = "0.1.0"
 dependencies = [
+ "asn1-codecs",
+ "bitvec",
  "oxirush-ngap",
  "paste",
 ]

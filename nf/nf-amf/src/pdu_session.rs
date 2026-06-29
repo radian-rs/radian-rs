@@ -6,7 +6,17 @@
 //! will (a later slice) place in the N2 SM info of a PDU Session Resource Setup to the
 //! gNB. The SM container is relayed opaquely (TS 29.502 multipart is a later slice).
 
+use std::net::Ipv4Addr;
+
 use sbi_core::nnrf::NrfClient;
+
+/// The UPF's N3 F-TEID returned by CreateSMContext — for the N2 PDU Session Resource
+/// Setup the AMF sends to the gNB.
+pub struct SmContextCreated {
+    pub sm_ref: String,
+    pub up_n3_teid: u32,
+    pub up_n3_addr: Ipv4Addr,
+}
 
 /// The AMF's client toward the SMF's `Nsmf_PDUSession` service.
 pub struct AmfSmf {
@@ -18,13 +28,13 @@ impl AmfSmf {
         Self { nrf: NrfClient::new(nrf_base.into()) }
     }
 
-    /// Discover the SMF and create an SM context for a UE's PDU session.
+    /// Discover the SMF and create an SM context; returns the UPF N3 F-TEID.
     pub async fn create_sm_context(
         &self,
         supi: &str,
         pdu_session_id: u8,
         dnn: &str,
-    ) -> Result<(), String> {
+    ) -> Result<SmContextCreated, String> {
         let smf_base = self.discover_smf().await?;
         let resp = sbi_core::h2c_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts"))
@@ -38,6 +48,41 @@ impl AmfSmf {
             .map_err(|e| format!("Nsmf CreateSMContext request failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Nsmf CreateSMContext returned {}", resp.status()));
+        }
+        let body: serde_json::Value =
+            resp.json().await.map_err(|e| format!("CreateSMContext body: {e}"))?;
+        let field = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+        let sm_ref = field("smContextRef").ok_or("response missing smContextRef")?;
+        let teid_hex = field("upN3Teid").ok_or("response missing upN3Teid")?;
+        let up_n3_teid =
+            u32::from_str_radix(&teid_hex, 16).map_err(|e| format!("bad upN3Teid: {e}"))?;
+        let up_n3_addr = field("upN3Addr")
+            .ok_or("response missing upN3Addr")?
+            .parse()
+            .map_err(|_| "bad upN3Addr")?;
+        Ok(SmContextCreated { sm_ref, up_n3_teid, up_n3_addr })
+    }
+
+    /// Update the SM context with the gNB's DL N3 F-TEID (from the N2 setup response),
+    /// driving the SMF's N4 Session Modification (the downlink path).
+    pub async fn update_sm_context(
+        &self,
+        sm_ref: &str,
+        gnb_teid: u32,
+        gnb_addr: Ipv4Addr,
+    ) -> Result<(), String> {
+        let smf_base = self.discover_smf().await?;
+        let resp = sbi_core::h2c_client()
+            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
+            .json(&serde_json::json!({
+                "gnbN3Teid": format!("{gnb_teid:08x}"),
+                "gnbN3Addr": gnb_addr.to_string(),
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Nsmf UpdateSMContext request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Nsmf UpdateSMContext returned {}", resp.status()));
         }
         Ok(())
     }
@@ -82,9 +127,14 @@ mod tests {
                 })),
             )
         }
+        async fn mock_modify() -> StatusCode {
+            StatusCode::OK
+        }
         let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let smf_addr = smf_l.local_addr().unwrap();
-        let smf_router = Router::new().route("/nsmf-pdusession/v1/sm-contexts", post(mock_create));
+        let smf_router = Router::new()
+            .route("/nsmf-pdusession/v1/sm-contexts", post(mock_create))
+            .route("/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify", post(mock_modify));
         tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
 
         // NRF with the mock SMF registered.
@@ -107,9 +157,16 @@ mod tests {
         NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
 
         let amf_smf = AmfSmf::new(nrf_base);
-        amf_smf
+        let created = amf_smf
             .create_sm_context("imsi-999700000000001", 5, "internet")
             .await
             .expect("AMF creates SM context via discovered SMF");
+        assert_eq!(created.up_n3_teid, 1, "UPF N3 F-TEID parsed from the response");
+
+        // The gNB F-TEID (from N2 setup) drives UpdateSMContext.
+        amf_smf
+            .update_sm_context(&created.sm_ref, 0x5678, Ipv4Addr::new(10, 0, 0, 9))
+            .await
+            .expect("AMF updates SM context with the gNB F-TEID");
     }
 }
