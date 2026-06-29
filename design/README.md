@@ -22,6 +22,7 @@ surface of the project and assesses build feasibility.
 | [11-gtpu-datapath.md](11-gtpu-datapath.md) | GTP-U datapath: N3 uplink decap, UPF serves N4 + N3, TEID-to-session routing |
 | [12-credential-hardening.md](12-credential-hardening.md) | Credential store hardening: gate demo subscriber, redb file 0600 (PR #11 review) |
 | [13-encryption-at-rest.md](13-encryption-at-rest.md) | Encryption-at-rest: AES-256-GCM for K/OPc, KEK-injected (HSM seam) |
+| [14-pfcp-session-modification.md](14-pfcp-session-modification.md) | PFCP Session Modification: install downlink Outer Header Creation (gNB F-TEID) |
 
 ## One-paragraph summary
 

@@ -130,4 +130,41 @@ mod tests {
             other => panic!("expected G-PDU, got {other:?}"),
         }
     }
+
+    /// Ties N4 Session Modification to the N3 downlink: after the SMF installs the
+    /// gNB's F-TEID, the UPF encapsulates a downlink packet toward that TEID.
+    #[test]
+    fn downlink_path_encaps_to_gnb_teid() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = pfcp::UpfState::new();
+        pfcp::handle_n4(
+            &pfcp::session_establishment_request(0xCAFE, 1, node_ip),
+            node_ip,
+            &mut state,
+        )
+        .expect("session established");
+        let up_seid = 1; // first allocation
+
+        // SMF installs the gNB downlink F-TEID via Session Modification.
+        let gnb_ip = Ipv4Addr::new(10, 0, 0, 9);
+        pfcp::handle_n4(
+            &pfcp::session_modification_request(up_seid, 2, 1, 0x5678, gnb_ip),
+            node_ip,
+            &mut state,
+        )
+        .expect("session modified");
+
+        let (gnb_teid, _ip) = state.downlink_for(up_seid).expect("downlink installed");
+        assert_eq!(gnb_teid, 0x5678);
+
+        // A downlink IP packet is encapsulated toward the gNB's TEID.
+        let inner = b"downlink-ip-packet";
+        match gtpu::parse(&gtpu::encap(gnb_teid, inner)) {
+            Some(gtpu::N3Message::GPdu { teid, payload }) => {
+                assert_eq!(teid, 0x5678);
+                assert_eq!(payload, inner);
+            }
+            other => panic!("expected downlink G-PDU, got {other:?}"),
+        }
+    }
 }

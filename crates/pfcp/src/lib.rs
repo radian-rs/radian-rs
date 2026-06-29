@@ -26,23 +26,37 @@ use rs_pfcp::ie::fseid::Fseid;
 use rs_pfcp::ie::pdi::PdiBuilder;
 use rs_pfcp::ie::pdr_id::PdrId;
 use rs_pfcp::ie::precedence::Precedence;
+use rs_pfcp::ie::apply_action::ApplyAction;
+use rs_pfcp::ie::outer_header_creation::OuterHeaderCreation;
+use rs_pfcp::ie::update_far::UpdateFar;
+use rs_pfcp::ie::update_forwarding_parameters::UpdateForwardingParameters;
 use rs_pfcp::message::association_setup_request::AssociationSetupRequestBuilder;
 use rs_pfcp::message::association_setup_response::AssociationSetupResponseBuilder;
 use rs_pfcp::message::heartbeat_request::HeartbeatRequestBuilder;
 use rs_pfcp::message::heartbeat_response::HeartbeatResponseBuilder;
 use rs_pfcp::message::session_establishment_request::SessionEstablishmentRequestBuilder;
 use rs_pfcp::message::session_establishment_response::SessionEstablishmentResponseBuilder;
+use rs_pfcp::message::session_modification_request::SessionModificationRequestBuilder;
+use rs_pfcp::message::session_modification_response::SessionModificationResponseBuilder;
 use rs_pfcp::message::Message;
 
 /// Default N4 PFCP UDP port (TS 29.244).
 pub const N4_PORT: u16 = 8805;
 
+/// One PFCP session's UPF state: the uplink N3 F-TEID and — once the SMF runs a
+/// Session Modification after N2 setup — the gNB downlink target `(TEID, IP)` for
+/// GTP-U Outer Header Creation.
+struct Session {
+    n3_teid: u32,
+    downlink: Option<(u32, Ipv4Addr)>,
+}
+
 /// Minimal UPF state: the N3 F-TEID and UP-SEID allocators plus a session table
-/// (UP-SEID → N3 TEID). The TEIDs are consumed by the GTP-U datapath in a later slice.
+/// (UP-SEID → [`Session`]).
 pub struct UpfState {
     next_teid: u32,
     next_seid: u64,
-    sessions: HashMap<u64, u32>,
+    sessions: HashMap<u64, Session>,
 }
 
 impl Default for UpfState {
@@ -68,7 +82,13 @@ impl UpfState {
     /// Whether any session owns this N3 TEID (used by the GTP-U datapath to route
     /// an uplink G-PDU to a known session).
     pub fn knows_teid(&self, teid: u32) -> bool {
-        self.sessions.values().any(|&t| t == teid)
+        self.sessions.values().any(|s| s.n3_teid == teid)
+    }
+
+    /// The gNB downlink target `(TEID, IP)` for a session, once a Session Modification
+    /// has installed it. The GTP-U datapath uses it to encapsulate downlink packets.
+    pub fn downlink_for(&self, up_seid: u64) -> Option<(u32, Ipv4Addr)> {
+        self.sessions.get(&up_seid).and_then(|s| s.downlink)
     }
 
     /// Allocate a UP-SEID + N3 TEID for a new session and record it.
@@ -77,8 +97,20 @@ impl UpfState {
         let teid = self.next_teid;
         self.next_seid += 1;
         self.next_teid += 1;
-        self.sessions.insert(up_seid, teid);
+        self.sessions
+            .insert(up_seid, Session { n3_teid: teid, downlink: None });
         (up_seid, teid)
+    }
+
+    /// Install the gNB downlink target for a session (from a Session Modification).
+    fn set_downlink(&mut self, up_seid: u64, gnb_teid: u32, gnb_ip: Ipv4Addr) -> bool {
+        match self.sessions.get_mut(&up_seid) {
+            Some(s) => {
+                s.downlink = Some((gnb_teid, gnb_ip));
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -127,6 +159,30 @@ pub fn session_establishment_request(cp_seid: u64, seq: u32, smf_ip: Ipv4Addr) -
         .marshal()
 }
 
+/// SMF: build a PFCP Session Modification Request that installs the downlink path —
+/// an Update FAR carrying Outer Header Creation (GTP-U/IPv4) to the gNB's N3 F-TEID
+/// (learned from the N2 PDU Session Resource Setup Response). Addressed by UP-SEID.
+pub fn session_modification_request(
+    up_seid: u64,
+    seq: u32,
+    far_id: u32,
+    gnb_teid: u32,
+    gnb_ip: Ipv4Addr,
+) -> Vec<u8> {
+    let mut params = UpdateForwardingParameters::new();
+    params.outer_header_creation = Some(OuterHeaderCreation::gtpu_ipv4(gnb_teid, gnb_ip));
+    let update_far = UpdateFar::builder(FarId::new(far_id))
+        .apply_action(ApplyAction::FORW)
+        .update_forwarding_parameters(params)
+        .build()
+        .expect("build Update FAR");
+
+    SessionModificationRequestBuilder::new(up_seid, seq)
+        .update_fars(vec![update_far.to_ie()])
+        .build()
+        .marshal()
+}
+
 /// UPF: handle an inbound N4 message, returning the response to send (if any).
 pub fn handle_n4(data: &[u8], node_ip: Ipv4Addr, state: &mut UpfState) -> Option<Vec<u8>> {
     let msg = rs_pfcp::message::parse(data).ok()?;
@@ -168,7 +224,28 @@ pub fn handle_n4(data: &[u8], node_ip: Ipv4Addr, state: &mut UpfState) -> Option
                 .marshal(),
             )
         }
-        // Session modification/deletion and others arrive in later slices.
+        MsgType::SessionModificationRequest => {
+            // Addressed by UP-SEID (the header SEID the UPF handed out at establishment).
+            let up_seid = u64::from(msg.seid()?);
+            // Install the gNB downlink target from the Update FAR's Outer Header Creation.
+            if let Some((gnb_teid, gnb_ip)) = msg
+                .ies(IeType::UpdateFar)
+                .next()
+                .and_then(|ie| UpdateFar::unmarshal(&ie.payload).ok())
+                .and_then(|uf| uf.update_forwarding_parameters)
+                .and_then(|ufp| ufp.outer_header_creation)
+                .and_then(|ohc| Some((u32::from(ohc.teid?), ohc.ipv4_address?)))
+            {
+                state.set_downlink(up_seid, gnb_teid, gnb_ip);
+            }
+            Some(
+                SessionModificationResponseBuilder::new(up_seid, seq)
+                    .cause_accepted()
+                    .build()
+                    .marshal(),
+            )
+        }
+        // Session deletion and others arrive in later slices.
         _ => None,
     }
 }
@@ -189,6 +266,33 @@ mod tests {
         assert_eq!(parsed.msg_type(), MsgType::SessionEstablishmentResponse);
         assert_eq!(parsed.ies(IeType::CreatedPdr).count(), 1, "Created PDR with allocated F-TEID");
         assert_eq!(parsed.ies(IeType::Fseid).count(), 1, "UP F-SEID returned");
+    }
+
+    #[test]
+    fn session_modification_installs_downlink() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip), node_ip, &mut state)
+            .expect("establish");
+        let up_seid = 1; // first allocation
+        assert_eq!(state.downlink_for(up_seid), None, "no downlink before modification");
+
+        // SMF installs the gNB's downlink F-TEID via Session Modification.
+        let gnb_ip = Ipv4Addr::new(10, 0, 0, 9);
+        let resp = handle_n4(
+            &session_modification_request(up_seid, 2, 1, 0x5678, gnb_ip),
+            node_ip,
+            &mut state,
+        )
+        .expect("modification response");
+
+        let parsed = rs_pfcp::message::parse(&resp).unwrap();
+        assert_eq!(parsed.msg_type(), MsgType::SessionModificationResponse);
+        assert_eq!(
+            state.downlink_for(up_seid),
+            Some((0x5678, gnb_ip)),
+            "UPF now knows the gNB downlink target"
+        );
     }
 
     /// Full N4 round-trip over real UDP: associate, heartbeat, establish a session.
