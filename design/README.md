@@ -23,6 +23,7 @@ surface of the project and assesses build feasibility.
 | [12-credential-hardening.md](12-credential-hardening.md) | Credential store hardening: gate demo subscriber, redb file 0600 (PR #11 review) |
 | [13-encryption-at-rest.md](13-encryption-at-rest.md) | Encryption-at-rest: AES-256-GCM for K/OPc, KEK-injected (HSM seam) |
 | [14-pfcp-session-modification.md](14-pfcp-session-modification.md) | PFCP Session Modification: install downlink Outer Header Creation (gNB F-TEID) |
+| [15-smf-pdu-session.md](15-smf-pdu-session.md) | SMF as a real NF: Nsmf_PDUSession (Create/Update SMContext) drives N4 establishment + modification |
 
 ## One-paragraph summary
 
