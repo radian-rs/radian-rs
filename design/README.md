@@ -21,6 +21,7 @@ surface of the project and assesses build feasibility.
 | [10-subscriber-db.md](10-subscriber-db.md) | Subscription store: SubscriberDb/ArpfKeyStore traits + redb persistence (K isolated) |
 | [11-gtpu-datapath.md](11-gtpu-datapath.md) | GTP-U datapath: N3 uplink decap, UPF serves N4 + N3, TEID-to-session routing |
 | [12-credential-hardening.md](12-credential-hardening.md) | Credential store hardening: gate demo subscriber, redb file 0600 (PR #11 review) |
+| [13-encryption-at-rest.md](13-encryption-at-rest.md) | Encryption-at-rest: AES-256-GCM for K/OPc, KEK-injected (HSM seam) |
 
 ## One-paragraph summary
 

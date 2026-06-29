@@ -18,6 +18,7 @@ const DEMO_SUPI: &str = "imsi-999700000000001";
 const DEFAULT_DB_PATH: &str = "radiant-udm.redb";
 const DEMO_ENV: &str = "RADIANT_UDM_PROVISION_DEMO";
 const DB_ENV: &str = "RADIANT_UDM_DB";
+const KEK_ENV: &str = "RADIANT_UDM_MASTER_KEY";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,8 +26,8 @@ async fn main() -> anyhow::Result<()> {
     common::banner("udm");
 
     let db_path = std::env::var(DB_ENV).unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
-    let store =
-        RedbStore::open(&db_path).map_err(|e| anyhow::anyhow!("open UDM store {db_path}: {e}"))?;
+    let store = RedbStore::open(&db_path, master_key()?)
+        .map_err(|e| anyhow::anyhow!("open UDM store {db_path}: {e}"))?;
 
     if demo_enabled() {
         if !store.exists(DEMO_SUPI) {
@@ -55,4 +56,19 @@ async fn main() -> anyhow::Result<()> {
 
 fn demo_enabled() -> bool {
     std::env::var(DEMO_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// The credential-store master key (KEK). From `RADIANT_UDM_MASTER_KEY` (64 hex
+/// chars), else an ephemeral key (persisted records become unreadable after restart).
+/// In production this should come from an HSM / KMS.
+fn master_key() -> anyhow::Result<[u8; 32]> {
+    match std::env::var(KEK_ENV) {
+        Ok(hex) => {
+            subscriber_db::parse_kek_hex(&hex).map_err(|e| anyhow::anyhow!("{KEK_ENV}: {e}"))
+        }
+        Err(_) => {
+            warn!("{KEK_ENV} not set — using an EPHEMERAL master key; persisted credentials become unreadable after restart. Set {KEK_ENV} (64 hex chars) for persistence.");
+            Ok(subscriber_db::random_kek())
+        }
+    }
 }
