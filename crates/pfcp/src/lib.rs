@@ -65,6 +65,12 @@ impl UpfState {
         self.sessions.len()
     }
 
+    /// Whether any session owns this N3 TEID (used by the GTP-U datapath to route
+    /// an uplink G-PDU to a known session).
+    pub fn knows_teid(&self, teid: u32) -> bool {
+        self.sessions.values().any(|&t| t == teid)
+    }
+
     /// Allocate a UP-SEID + N3 TEID for a new session and record it.
     fn establish(&mut self) -> (u64, u32) {
         let up_seid = self.next_seid;
