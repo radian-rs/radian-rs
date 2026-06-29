@@ -24,6 +24,7 @@ surface of the project and assesses build feasibility.
 | [13-encryption-at-rest.md](13-encryption-at-rest.md) | Encryption-at-rest: AES-256-GCM for K/OPc, KEK-injected (HSM seam) |
 | [14-pfcp-session-modification.md](14-pfcp-session-modification.md) | PFCP Session Modification: install downlink Outer Header Creation (gNB F-TEID) |
 | [15-smf-pdu-session.md](15-smf-pdu-session.md) | SMF as a real NF: Nsmf_PDUSession (Create/Update SMContext) drives N4 establishment + modification |
+| [16-amf-pdu-session-leg.md](16-amf-pdu-session-leg.md) | AMF leg: UE NAS-SM → discover SMF (NRF) → CreateSMContext; SMF NRF registration; PR#16 review fixes |
 
 ## One-paragraph summary
 

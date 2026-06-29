@@ -13,6 +13,9 @@ use pdu_session::SmfState;
 
 const UPF_N4_ENV: &str = "RADIANT_SMF_UPF_N4";
 const DEFAULT_UPF_N4: &str = "127.0.0.1:8805";
+const NRF_ENV: &str = "RADIANT_SMF_NRF";
+const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
+const SBI_PORT: u16 = 8002;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -28,7 +31,14 @@ async fn main() -> anyhow::Result<()> {
     smf.associate().await?;
     tracing::info!(%upf_n4, "PFCP association established with UPF");
 
-    let sbi: SocketAddr = "0.0.0.0:8002".parse()?;
+    // Register with the NRF so the AMF can discover the Nsmf_PDUSession service.
+    let nrf_base = std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string());
+    match pdu_session::register_with_nrf(&nrf_base, smf_ip, SBI_PORT).await {
+        Ok(()) => tracing::info!(%nrf_base, "registered SMF with NRF"),
+        Err(e) => tracing::warn!("NRF registration failed (continuing without discovery): {e}"),
+    }
+
+    let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     sbi_core::run(sbi, pdu_session::router(smf)).await?;
     Ok(())
 }

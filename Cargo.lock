@@ -1305,6 +1305,7 @@ version = "0.1.0"
 dependencies = [
  "aka",
  "anyhow",
+ "axum",
  "common",
  "hex",
  "hex-literal",
@@ -1312,6 +1313,7 @@ dependencies = [
  "ngap",
  "sbi-core",
  "sctp-rs",
+ "serde_json",
  "subscriber-db",
  "thiserror 2.0.18",
  "tokio",

@@ -14,6 +14,7 @@
 //! established. After that, uplink NAS is verified/deciphered before dispatch.
 
 mod auth;
+mod pdu_session;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -86,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
     common::banner("amf");
 
     let amf_auth = Arc::new(auth::AmfAuth::new(NRF_BASE, PLMN_MCC, PLMN_MNC));
+    let amf_smf = Arc::new(pdu_session::AmfSmf::new(NRF_BASE));
 
     let addr: SocketAddr = format!("0.0.0.0:{N2_PORT}").parse()?;
     let socket = Socket::new_v4(SocketToAssociation::OneToOne).context("create SCTP socket")?;
@@ -97,8 +99,9 @@ async fn main() -> anyhow::Result<()> {
         let (conn, peer) = listener.accept().await.context("accept SCTP association")?;
         info!(%peer, "gNB associated");
         let amf_auth = amf_auth.clone();
+        let amf_smf = amf_smf.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_gnb(conn, amf_auth).await {
+            if let Err(e) = serve_gnb(conn, amf_auth, amf_smf).await {
                 warn!("gNB session ended: {e:#}");
             }
         });
@@ -106,7 +109,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Receive loop for one gNB SCTP association, owning that association's UE contexts.
-async fn serve_gnb(conn: ConnectedSocket, amf_auth: Arc<auth::AmfAuth>) -> anyhow::Result<()> {
+async fn serve_gnb(
+    conn: ConnectedSocket,
+    amf_auth: Arc<auth::AmfAuth>,
+    amf_smf: Arc<pdu_session::AmfSmf>,
+) -> anyhow::Result<()> {
     let mut ues: HashMap<u64, UeContext> = HashMap::new();
     loop {
         match conn.sctp_recv().await? {
@@ -116,7 +123,7 @@ async fn serve_gnb(conn: ConnectedSocket, amf_auth: Arc<auth::AmfAuth>) -> anyho
                     info!("gNB association closed");
                     return Ok(());
                 }
-                handle_ngap(&conn, &mut ues, &amf_auth, &data.payload).await;
+                handle_ngap(&conn, &mut ues, &amf_auth, &amf_smf, &data.payload).await;
             }
         }
     }
@@ -127,6 +134,7 @@ async fn handle_ngap(
     conn: &ConnectedSocket,
     ues: &mut HashMap<u64, UeContext>,
     amf_auth: &auth::AmfAuth,
+    amf_smf: &pdu_session::AmfSmf,
     bytes: &[u8],
 ) {
     let pdu = match NGAP_PDU::decode(bytes) {
@@ -157,7 +165,7 @@ async fn handle_ngap(
                 }
             }
             InitiatingMessageValue::Id_UplinkNASTransport(msg) => {
-                if let Some((dl, label)) = on_uplink_nas(ues, amf_auth, msg).await {
+                if let Some((dl, label)) = on_uplink_nas(ues, amf_auth, amf_smf, msg).await {
                     send_or_log(conn, &dl, label).await;
                 }
             }
@@ -225,6 +233,7 @@ async fn start_authentication(
 async fn on_uplink_nas(
     ues: &mut HashMap<u64, UeContext>,
     amf_auth: &auth::AmfAuth,
+    amf_smf: &pdu_session::AmfSmf,
     msg: &UplinkNASTransport,
 ) -> Option<(NGAP_PDU, &'static str)> {
     let Some(amf_ue_id) = uplink_amf_ue_id(msg) else {
@@ -267,6 +276,22 @@ async fn on_uplink_nas(
                     "UE {amf_ue_id} REGISTERED (suci={:?}, ran_ue_id={}, state={:?})",
                     ctx.suci, ctx.ran_ue_id, ctx.state
                 );
+            }
+            None
+        }
+        Some(Nas5gmmMessageType::UlNasTransport) => {
+            // A UE PDU session request. Relay it to the SMF (Nsmf CreateSMContext); the
+            // N1 SM container is opaque to the AMF (TS 29.502 multipart is a later slice).
+            let supi = ues.get(&amf_ue_id).and_then(|c| c.suci.clone());
+            match (supi, nas::sm_container_from_ul_nas_transport(&nas_msg)) {
+                (Some(supi), Some((psi, _sm_container))) => {
+                    match amf_smf.create_sm_context(&supi, psi, "internet").await {
+                        Ok(()) => info!("UE {amf_ue_id}: PDU session {psi} SM context created via SMF"),
+                        Err(e) => warn!("UE {amf_ue_id}: PDU session {psi} CreateSMContext failed: {e}"),
+                    }
+                }
+                (None, _) => warn!("UE {amf_ue_id}: UL NAS Transport before SUPI is known"),
+                (_, None) => warn!("UE {amf_ue_id}: UL NAS Transport without an SM container"),
             }
             None
         }
