@@ -10,6 +10,6 @@ async fn main() -> anyhow::Result<()> {
 
     // TODO: implement Nausf_UEAuthentication (TS 29.509).
     let sbi: SocketAddr = "0.0.0.0:8003".parse()?;
-    sbi_core::serve(sbi).await?;
+    sbi_core::run(sbi, sbi_core::health_router()).await?;
     Ok(())
 }

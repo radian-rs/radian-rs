@@ -10,6 +10,6 @@ async fn main() -> anyhow::Result<()> {
 
     // TODO: implement Nudm_SDM / _UEContextManagement / _UEAuthentication (TS 29.503).
     let sbi: SocketAddr = "0.0.0.0:8004".parse()?;
-    sbi_core::serve(sbi).await?;
+    sbi_core::run(sbi, sbi_core::health_router()).await?;
     Ok(())
 }

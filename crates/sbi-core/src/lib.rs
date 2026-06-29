@@ -1,18 +1,24 @@
 //! Service-Based Interface (SBI) runtime shared by all 5GC network functions.
 //!
-//! The SBI is HTTP/2 + JSON, defined by 3GPP OpenAPI (TS 29.5xx). This crate will
-//! host the HTTP/2 stack, the generated OpenAPI models, and `multipart/related`
-//! handling for the opaque binary parts the SBI tunnels:
-//! `application/vnd.3gpp.5gnas` (NAS) and `application/vnd.3gpp.ngap` (NGAP).
+//! SBI is HTTP/2 + JSON, defined by 3GPP OpenAPI (TS 29.5xx). This crate provides
+//! the HTTP/2 (cleartext **h2c**) server runner ([`run`]), an h2c JSON client
+//! ([`h2c_client`]), the RFC 7807 [`ProblemDetails`] error body, and the NRF
+//! service ([`nnrf`]). Transport is `axum`/`hyper` (server) and `reqwest` (client),
+//! both speaking HTTP/2 with prior knowledge — no TLS, matching a typical
+//! intra-core SBI deployment.
 
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
+pub mod nnrf;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SbiError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("http: {0}")]
+    Http(#[from] reqwest::Error),
 }
 
 /// RFC 7807 `ProblemDetails`, the SBI error body (TS 29.500).
@@ -30,22 +36,35 @@ pub struct ProblemDetails {
     pub cause: Option<String>,
 }
 
-/// A 5GC network function exposing one or more SBI services.
-pub trait NfService: Send + Sync {
-    /// Service name as registered in the NRF, e.g. `"namf-comm"`.
-    fn service_name(&self) -> &'static str;
+/// Bind `addr` and serve an SBI router over HTTP/2 (h2c) + HTTP/1.1.
+pub async fn run(addr: SocketAddr, app: axum::Router) -> Result<(), SbiError> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "SBI HTTP/2 listener up");
+    run_on(listener, app).await
 }
 
-/// Placeholder SBI server bootstrap.
-///
-/// TODO: replace the raw TCP accept loop with an HTTP/2 stack (hyper/h2 or axum),
-/// route generated OpenAPI handlers (TS 29.5xx), and decode `multipart/related`
-/// bodies carrying `vnd.3gpp.5gnas` / `vnd.3gpp.ngap` parts.
-pub async fn serve(addr: SocketAddr) -> Result<(), SbiError> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "SBI listener bound (placeholder; HTTP/2 stack TODO)");
-    loop {
-        let (_stream, peer) = listener.accept().await?;
-        tracing::debug!(%peer, "accepted SBI connection (no handler yet)");
-    }
+/// Serve an SBI router on an already-bound listener (lets callers pick the port,
+/// e.g. an ephemeral `127.0.0.1:0` in tests).
+pub async fn run_on(listener: tokio::net::TcpListener, app: axum::Router) -> Result<(), SbiError> {
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// A root/health router — a real (otherwise empty) HTTP/2 SBI endpoint, used by
+/// NFs whose service handlers aren't implemented yet.
+pub fn health_router() -> axum::Router {
+    axum::Router::new().route("/", axum::routing::get(|| async { "radiant-rs SBI" }))
+}
+
+/// Build an HTTP/2-prior-knowledge (cleartext h2c) JSON client for SBI calls.
+pub fn h2c_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .expect("build h2c reqwest client")
+}
+
+/// Generate a fresh NF instance ID (UUIDv4, per TS 29.571 `NfInstanceId`).
+pub fn new_nf_instance_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }

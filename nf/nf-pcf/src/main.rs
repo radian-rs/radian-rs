@@ -10,6 +10,6 @@ async fn main() -> anyhow::Result<()> {
 
     // TODO: implement Npcf_AMPolicyControl / _SMPolicyControl / _PolicyAuthorization.
     let sbi: SocketAddr = "0.0.0.0:8006".parse()?;
-    sbi_core::serve(sbi).await?;
+    sbi_core::run(sbi, sbi_core::health_router()).await?;
     Ok(())
 }
