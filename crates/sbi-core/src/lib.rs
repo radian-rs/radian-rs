@@ -11,7 +11,9 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
+pub mod nausf;
 pub mod nnrf;
+pub mod nudm;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SbiError {
@@ -67,4 +69,11 @@ pub fn h2c_client() -> reqwest::Client {
 /// Generate a fresh NF instance ID (UUIDv4, per TS 29.571 `NfInstanceId`).
 pub fn new_nf_instance_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Generate a random 128-bit RAND challenge (UDM authentication).
+pub fn random_rand() -> [u8; 16] {
+    let mut r = [0u8; 16];
+    getrandom::getrandom(&mut r).expect("getrandom RAND");
+    r
 }
