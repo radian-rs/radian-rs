@@ -9,11 +9,14 @@ common.workspace = true
 sbi-core.workspace = true
 ngap.workspace = true
 nas.workspace = true
+aka.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
+hex = "0.4"
 # Async SCTP (kernel stack) for the N2 transport (TS 38.412).
 sctp-rs = "0.3"
 
 [dev-dependencies]
-hex = "0.4"
+hex-literal = "0.4"
