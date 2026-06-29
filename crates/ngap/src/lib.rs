@@ -51,6 +51,17 @@ pub fn initial_ue_message_with_nas(ran_ue_id: u32, nas: Vec<u8>) -> NGAP_PDU {
     )
 }
 
+/// Build a `DownlinkNASTransport` (TS 38.413 §9.2.5.3) carrying a NAS PDU from the
+/// AMF to the UE, addressed by the AMF-UE-NGAP-ID / RAN-UE-NGAP-ID pair.
+pub fn downlink_nas_transport(amf_ue_id: u64, ran_ue_id: u32, nas: Vec<u8>) -> NGAP_PDU {
+    build_ngap!(InitiatingMessage, DownlinkNASTransport,
+        IGNORE, DownlinkNASTransport,
+        REJECT AMF_UE_NGAP_ID(amf_ue_id),
+        REJECT RAN_UE_NGAP_ID(ran_ue_id),
+        REJECT NAS_PDU(nas),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +74,14 @@ mod tests {
         assert_eq!(pdu, back);
         assert_eq!(back.procedure_name(), "NGSetup");
         assert!(matches!(back, NGAP_PDU::SuccessfulOutcome(_)));
+    }
+
+    #[test]
+    fn downlink_nas_transport_roundtrips() {
+        let pdu = downlink_nas_transport(1, 2, vec![0x7e, 0x00, 0x5b, 0x01]);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(pdu, back);
+        assert_eq!(back.procedure_name(), "DownlinkNASTransport");
+        assert!(back.is_initiating());
     }
 }
