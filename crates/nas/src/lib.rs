@@ -9,3 +9,15 @@
 //! [`decode_nas_5gs_message`] / [`encode_nas_5gs_message`].
 
 pub use oxirush_nas::*;
+
+/// Build and encode a 5GMM **Identity Request** asking the UE for its SUCI
+/// (TS 24.501 §8.2.20). The AMF can send this standalone — no AUSF/UDM needed.
+pub fn identity_request_suci() -> Vec<u8> {
+    let msg = Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::IdentityRequest,
+        Nas5gmmMessage::IdentityRequest(messages::NasIdentityRequest::new(
+            NasFGsIdentityType::from_identity_type(MobileIdentityType::Suci),
+        )),
+    );
+    encode_nas_5gs_message(&msg).expect("encode 5GMM IdentityRequest")
+}
