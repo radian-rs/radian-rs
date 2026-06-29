@@ -1,0 +1,14 @@
+[package]
+name = "aka"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+# MILENAGE f1-f5 (TS 35.205/206) and 5G key derivation (TS 33.501 Annex A).
+milenage = "0.3.1"
+oxirush-security = "0.1.0"
+thiserror.workspace = true
+
+[dev-dependencies]
+hex-literal = "0.4"

@@ -8,8 +8,16 @@ async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("udm");
 
-    // TODO: implement Nudm_SDM / _UEContextManagement / _UEAuthentication (TS 29.503).
+    // Nudm_UEAuthentication (TS 29.503) with a demo subscriber (TS 35.208 test key).
+    let db = sbi_core::nudm::SubscriberDb::new();
+    db.insert_hex(
+        "imsi-999700000000001",
+        "465b5ce8b199b49faa5f0a2ee238a6bc",
+        "cd63cb71954a9f4e48a5994e37a02baf",
+        "8000",
+    )
+    .expect("provision demo subscriber");
     let sbi: SocketAddr = "0.0.0.0:8004".parse()?;
-    sbi_core::run(sbi, sbi_core::health_router()).await?;
+    sbi_core::run(sbi, sbi_core::nudm::router(db)).await?;
     Ok(())
 }

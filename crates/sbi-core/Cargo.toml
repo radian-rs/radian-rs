@@ -12,3 +12,9 @@ thiserror.workspace = true
 axum = "0.8.9"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "http2", "query"] }
 uuid = { version = "1.23.4", features = ["v4"] }
+aka.workspace = true
+hex = "0.4"
+getrandom = "0.2"
+
+[dev-dependencies]
+hex-literal = "0.4"

@@ -4,6 +4,15 @@
 //! The NRF is the registry every other NF depends on. This module provides the
 //! data model, an in-memory NRF [`router`] (server side), and an [`NrfClient`]
 //! that other NFs use to register themselves and discover peers.
+//!
+//! # Security (intentionally absent — see `design/04`)
+//!
+//! These endpoints are **unauthenticated**: any client can register, deregister,
+//! or discover NFs, which permits NF impersonation and deregistration DoS. This is
+//! a deliberate, temporary state for the cleartext-h2c development phase. The real
+//! fix is the TS 33.501 model — mutual TLS between NFs plus OAuth2 access tokens
+//! with the NRF as token endpoint — tracked as the "SBI security hardening" slice.
+//! Do not deploy this NRF on an untrusted network.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
