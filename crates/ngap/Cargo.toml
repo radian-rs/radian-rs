@@ -5,5 +5,7 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
-bytes.workspace = true
-thiserror.workspace = true
+# NGAP (TS 38.413) APER codec, auto-generated from 3GPP ASN.1.
+oxirush-ngap = "0.3"
+# Required at the call site of oxirush-ngap's `build_ngap!` macro.
+paste = "1"

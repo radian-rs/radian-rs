@@ -5,5 +5,5 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
-bytes.workspace = true
-thiserror.workspace = true
+# NAS-5GS (TS 24.501) encoder/decoder — binary TLV, not ASN.1.
+oxirush-nas = "0.2"
