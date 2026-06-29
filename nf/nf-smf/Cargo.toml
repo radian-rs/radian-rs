@@ -1,0 +1,14 @@
+[package]
+name = "nf-smf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+common.workspace = true
+sbi-core.workspace = true
+ngap.workspace = true
+nas.workspace = true
+pfcp.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

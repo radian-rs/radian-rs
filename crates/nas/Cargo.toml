@@ -1,0 +1,9 @@
+[package]
+name = "nas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
