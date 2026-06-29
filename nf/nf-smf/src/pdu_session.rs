@@ -65,24 +65,34 @@ impl SmfState {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Send one PFCP request and await its response (2s timeout).
-    async fn transact(&self, req: &[u8]) -> Option<Vec<u8>> {
+    /// Send one PFCP request and await *its* response — correlated by sequence number
+    /// (PFCP responses echo the request's), discarding any stale/mismatched datagram
+    /// (e.g. a late response to a previously timed-out request). 2s overall.
+    async fn transact(&self, req: &[u8], expect_seq: u32) -> Option<Vec<u8>> {
         let sock = self.sock.lock().await;
         sock.send(req).await.ok()?;
-        let mut buf = vec![0u8; 2048];
-        let n = tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf))
-            .await
-            .ok()?
-            .ok()?;
-        buf.truncate(n);
-        Some(buf)
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut buf = vec![0u8; 2048];
+                let n = sock.recv(&mut buf).await.ok()?;
+                buf.truncate(n);
+                if pfcp::sequence_of(&buf) == Some(expect_seq) {
+                    return Some(buf);
+                }
+                // Sequence mismatch — not the response to this request; drop it.
+            }
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// PFCP Association Setup toward the UPF — required before any session.
     pub async fn associate(&self) -> anyhow::Result<()> {
-        let req = pfcp::association_setup_request(self.smf_ip, self.next_seq());
+        let seq = self.next_seq();
+        let req = pfcp::association_setup_request(self.smf_ip, seq);
         let resp = self
-            .transact(&req)
+            .transact(&req, seq)
             .await
             .ok_or_else(|| anyhow::anyhow!("no PFCP association response from UPF"))?;
         anyhow::ensure!(pfcp::response_accepted(&resp), "UPF rejected PFCP association");
@@ -133,8 +143,9 @@ async fn create_sm_context(
     Json(req): Json<SmContextCreateData>,
 ) -> Result<(StatusCode, Json<SmContextCreatedData>), StatusCode> {
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
-    let est_req = pfcp::session_establishment_request(cp_seid, smf.next_seq(), smf.smf_ip);
-    let resp = smf.transact(&est_req).await.ok_or(StatusCode::BAD_GATEWAY)?;
+    let seq = smf.next_seq();
+    let est_req = pfcp::session_establishment_request(cp_seid, seq, smf.smf_ip);
+    let resp = smf.transact(&est_req, seq).await.ok_or(StatusCode::BAD_GATEWAY)?;
     let est = pfcp::parse_session_establishment_response(&resp).ok_or(StatusCode::BAD_GATEWAY)?;
 
     let sm_ref = smf.next_ref.fetch_add(1, Ordering::Relaxed).to_string();
@@ -142,8 +153,9 @@ async fn create_sm_context(
         sm_ref.clone(),
         SmContext { up_seid: est.up_seid, n3_teid: est.n3_teid, gnb: None },
     );
+    // SUPI is a permanent subscriber identifier (PII): log only a masked form.
     tracing::info!(
-        supi = %req.supi,
+        supi = %masked_supi(&req.supi),
         pdu_session_id = req.pdu_session_id,
         dnn = %req.dnn,
         up_seid = est.up_seid,
@@ -170,6 +182,13 @@ async fn update_sm_context(
         Ok(t) => t,
         Err(_) => return StatusCode::BAD_REQUEST,
     };
+    // Defense-in-depth on the downlink sink: reject an obviously bogus gNB target. The
+    // real protection is SBI authorization (only the AMF may call Nsmf) — OAuth2 is
+    // deferred (TS 33.501), same posture as the rest of SBI; the gNB F-TEID legitimately
+    // comes from the AMF (which learned it from the N2 PDU Session Resource Setup).
+    if !valid_gnb_target(gnb_teid, req.gnb_n3_addr) {
+        return StatusCode::BAD_REQUEST;
+    }
     let up_seid = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
@@ -178,8 +197,9 @@ async fn update_sm_context(
         }
     };
 
-    let mod_req = pfcp::session_modification_request(up_seid, smf.next_seq(), FAR_ID, gnb_teid, req.gnb_n3_addr);
-    let resp = match smf.transact(&mod_req).await {
+    let seq = smf.next_seq();
+    let mod_req = pfcp::session_modification_request(up_seid, seq, FAR_ID, gnb_teid, req.gnb_n3_addr);
+    let resp = match smf.transact(&mod_req, seq).await {
         Some(r) => r,
         None => return StatusCode::BAD_GATEWAY,
     };
@@ -194,9 +214,55 @@ async fn update_sm_context(
     StatusCode::OK
 }
 
+/// Whether a gNB downlink target is plausibly routable (not a zero TEID, nor an
+/// unspecified / broadcast / multicast address).
+fn valid_gnb_target(teid: u32, ip: Ipv4Addr) -> bool {
+    teid != 0 && !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast()
+}
+
+/// Mask a SUPI for logs — keep the scheme + a short prefix, redact the rest (PII).
+fn masked_supi(supi: &str) -> String {
+    match supi.split_once('-') {
+        Some((scheme, rest)) if rest.len() > 5 => format!("{scheme}-{}***", &rest[..5]),
+        _ => "***".to_string(),
+    }
+}
+
+/// Register this SMF's `nsmf-pdusession` service with the NRF so the AMF can discover it.
+pub async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> anyhow::Result<()> {
+    use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService, NrfClient};
+    let mut profile = NfProfile::new(sbi_core::new_nf_instance_id(), "SMF", ip.to_string());
+    profile.nf_services = Some(vec![NfService {
+        service_instance_id: "nsmf-pdusession-1".into(),
+        service_name: "nsmf-pdusession".into(),
+        scheme: "http".into(),
+        ip_end_points: vec![IpEndPoint {
+            ipv4_address: Some(ip.to_string()),
+            port: Some(sbi_port),
+        }],
+    }]);
+    NrfClient::new(nrf_base.to_string()).register(&profile).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_bogus_gnb_targets() {
+        assert!(valid_gnb_target(0x5678, Ipv4Addr::new(10, 0, 0, 9)));
+        assert!(!valid_gnb_target(0, Ipv4Addr::new(10, 0, 0, 9)), "zero TEID");
+        assert!(!valid_gnb_target(0x5678, Ipv4Addr::UNSPECIFIED), "0.0.0.0");
+        assert!(!valid_gnb_target(0x5678, Ipv4Addr::BROADCAST), "255.255.255.255");
+        assert!(!valid_gnb_target(0x5678, Ipv4Addr::new(224, 0, 0, 1)), "multicast");
+    }
+
+    #[test]
+    fn masks_supi_for_logging() {
+        assert_eq!(masked_supi("imsi-999700000000001"), "imsi-99970***");
+        assert_eq!(masked_supi("garbage"), "***");
+    }
 
     /// Full Nsmf → N4 spine: an in-process UPF, the SMF as PFCP client + SBI server,
     /// driven over HTTP. CreateSMContext establishes the session (UPF allocates the
@@ -265,5 +331,20 @@ mod tests {
             Some((0x5678, Ipv4Addr::new(10, 0, 0, 9))),
             "N4 modification installed the gNB downlink target"
         );
+    }
+
+    #[tokio::test]
+    async fn smf_registers_and_is_discoverable() {
+        use sbi_core::nnrf::NrfClient;
+        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nrf_addr = nrf_l.local_addr().unwrap();
+        let store = sbi_core::nnrf::NrfStore::default();
+        tokio::spawn(async move { sbi_core::run_on(nrf_l, sbi_core::nnrf::router(store)).await.unwrap() });
+        let nrf_base = format!("http://{nrf_addr}");
+
+        register_with_nrf(&nrf_base, Ipv4Addr::new(127, 0, 0, 1), 8002).await.unwrap();
+
+        let found = NrfClient::new(nrf_base).discover("SMF", "AMF").await.unwrap();
+        assert_eq!(found.len(), 1, "SMF is discoverable via the NRF after registration");
     }
 }

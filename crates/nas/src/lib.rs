@@ -122,6 +122,31 @@ pub fn registration_complete() -> Nas5gsMessage {
     )
 }
 
+/// Build and encode a 5GMM **UL NAS Transport** (TS 24.501 §8.2.10) carrying an N1 SM
+/// container (a 5GSM message) for `pdu_session_id`. UE side / tests — the AMF relays
+/// the container to the SMF transparently.
+pub fn ul_nas_transport_sm(pdu_session_id: u8, sm_container: Vec<u8>) -> Vec<u8> {
+    let transport = messages::NasUlNasTransport::new(
+        NasPayloadContainerType::new(0x01), // N1 SM information
+        NasPayloadContainer::new(sm_container),
+    )
+    .set_pdu_session_id(NasPduSessionIdentity2::new(pdu_session_id));
+    let msg = Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::UlNasTransport,
+        Nas5gmmMessage::UlNasTransport(transport),
+    );
+    encode_nas_5gs_message(&msg).expect("encode UlNasTransport")
+}
+
+/// Extract `(pdu_session_id, N1 SM container)` from a decoded 5GMM UL NAS Transport.
+pub fn sm_container_from_ul_nas_transport(msg: &Nas5gsMessage) -> Option<(u8, Vec<u8>)> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::UlNasTransport(transport)) = msg else {
+        return None;
+    };
+    let psi = transport.pdu_session_id.as_ref()?.value;
+    Some((psi, transport.payload_container.value.clone()))
+}
+
 /// The 5GMM message type of a decoded NAS message, if it is a 5GMM message.
 pub fn gmm_message_type(msg: &Nas5gsMessage) -> Option<Nas5gmmMessageType> {
     if let Nas5gsMessage::Gmm(hdr, _) = msg {
@@ -252,6 +277,16 @@ impl NasSecurityContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ul_nas_transport_round_trips() {
+        // A minimal 5GSM PDU Session Establishment Request as the opaque N1 SM container.
+        let container = vec![0x2e, 0x01, 0x01, 0xc1];
+        let bytes = ul_nas_transport_sm(5, container.clone());
+        let msg = decode_nas_5gs_message(&bytes).expect("decode");
+        assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::UlNasTransport));
+        assert_eq!(sm_container_from_ul_nas_transport(&msg), Some((5, container)));
+    }
 
     #[test]
     fn authentication_request_roundtrips() {

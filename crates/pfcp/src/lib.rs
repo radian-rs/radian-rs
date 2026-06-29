@@ -284,6 +284,12 @@ pub fn parse_session_establishment_response(data: &[u8]) -> Option<EstablishedSe
     })
 }
 
+/// A PFCP message's sequence number (responses echo the request's), for correlating
+/// a received response to the request that produced it.
+pub fn sequence_of(data: &[u8]) -> Option<u32> {
+    Some(u32::from(rs_pfcp::message::parse(data).ok()?.sequence()))
+}
+
 /// Whether a PFCP response carries an accepted Cause (value 1 = success, TS 29.244).
 pub fn response_accepted(data: &[u8]) -> bool {
     rs_pfcp::message::parse(data)
