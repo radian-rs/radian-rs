@@ -22,8 +22,15 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 
-/// FAR id shared by the uplink Create FAR (establishment) and the downlink Update FAR.
-const FAR_ID: u32 = 1;
+/// FAR id the downlink Update FAR targets. Establishment provisions FAR 2 (downlink,
+/// forward to Access); the Session Modification points it at the gNB with Outer Header
+/// Creation. (FAR 1 is the uplink FAR, forward to Core.)
+const FAR_ID: u32 = 2;
+
+/// The SMF allocates UE IPv4 addresses from this /16. `.1` is the UPF's N6 gateway
+/// (see nf-upf), so UEs start at `.2`. In a real deployment this is DNN/slice-scoped and
+/// coordinated with the UPF's N6 subnet; here one pool suffices.
+const UE_IP_POOL_START: u32 = 0x0A2D_0002; // 10.45.0.2
 
 /// Per-PDU-session SMF state.
 struct SmContext {
@@ -31,6 +38,8 @@ struct SmContext {
     up_seid: u64,
     /// UPF-allocated uplink N3 F-TEID.
     n3_teid: u32,
+    /// The UE's assigned IP (this session's PDU address).
+    ue_ip: Ipv4Addr,
     /// gNB downlink target, once `UpdateSMContext` installs it.
     gnb: Option<(u32, Ipv4Addr)>,
 }
@@ -43,6 +52,8 @@ pub struct SmfState {
     seq: AtomicU32,
     cp_seid: AtomicU64,
     next_ref: AtomicU64,
+    /// Next UE IPv4 address to hand out (as a host-order u32), from the pool above.
+    next_ue_ip: AtomicU32,
     contexts: Mutex<HashMap<String, SmContext>>,
 }
 
@@ -57,12 +68,18 @@ impl SmfState {
             seq: AtomicU32::new(1),
             cp_seid: AtomicU64::new(1),
             next_ref: AtomicU64::new(1),
+            next_ue_ip: AtomicU32::new(UE_IP_POOL_START),
             contexts: Mutex::new(HashMap::new()),
         })
     }
 
     fn next_seq(&self) -> u32 {
         self.seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Allocate the next UE IPv4 address from the pool.
+    fn alloc_ue_ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from(self.next_ue_ip.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Send one PFCP request and await *its* response — correlated by sequence number
@@ -116,6 +133,10 @@ struct SmContextCreatedData {
     /// The UPF's N3 F-TEID — carried to the gNB in the N2 SM info.
     up_n3_teid: String,
     up_n3_addr: Ipv4Addr,
+    /// The UE's assigned IPv4 address (its PDU session address). Delivered to the UE in
+    /// the NAS PDU Session Establishment Accept (a later NAS-SM slice); the UPF already
+    /// routes downlink traffic to it.
+    ue_ipv4_addr: Ipv4Addr,
 }
 
 #[derive(Deserialize)]
@@ -144,14 +165,17 @@ async fn create_sm_context(
 ) -> Result<(StatusCode, Json<SmContextCreatedData>), StatusCode> {
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
     let seq = smf.next_seq();
-    let est_req = pfcp::session_establishment_request(cp_seid, seq, smf.smf_ip);
+    // The SMF owns UE IP allocation; the address rides into the UPF's downlink PDR so it
+    // can route N6 traffic back to this session.
+    let ue_ip = smf.alloc_ue_ip();
+    let est_req = pfcp::session_establishment_request(cp_seid, seq, smf.smf_ip, ue_ip);
     let resp = smf.transact(&est_req, seq).await.ok_or(StatusCode::BAD_GATEWAY)?;
     let est = pfcp::parse_session_establishment_response(&resp).ok_or(StatusCode::BAD_GATEWAY)?;
 
     let sm_ref = smf.next_ref.fetch_add(1, Ordering::Relaxed).to_string();
     smf.contexts.lock().unwrap().insert(
         sm_ref.clone(),
-        SmContext { up_seid: est.up_seid, n3_teid: est.n3_teid, gnb: None },
+        SmContext { up_seid: est.up_seid, n3_teid: est.n3_teid, ue_ip, gnb: None },
     );
     // SUPI is a permanent subscriber identifier (PII): log only a masked form.
     tracing::info!(
@@ -160,6 +184,7 @@ async fn create_sm_context(
         dnn = %req.dnn,
         up_seid = est.up_seid,
         n3_teid = est.n3_teid,
+        %ue_ip,
         "created SM context; N4 session established"
     );
     Ok((
@@ -168,6 +193,7 @@ async fn create_sm_context(
             sm_context_ref: sm_ref,
             up_n3_teid: format!("{:08x}", est.n3_teid),
             up_n3_addr: est.n3_addr,
+            ue_ipv4_addr: ue_ip,
         }),
     ))
 }
@@ -209,7 +235,13 @@ async fn update_sm_context(
 
     if let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref) {
         c.gnb = Some((gnb_teid, req.gnb_n3_addr));
-        tracing::info!(%sm_ref, uplink_teid = c.n3_teid, gnb_teid, "updated SM context; N4 downlink installed");
+        tracing::info!(
+            %sm_ref,
+            ue_ip = %c.ue_ip,
+            uplink_teid = c.n3_teid,
+            gnb_teid,
+            "updated SM context; N4 downlink installed"
+        );
     }
     StatusCode::OK
 }
@@ -313,6 +345,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.up_n3_teid, "00000001", "UPF allocated the first N3 TEID");
+        assert_eq!(
+            created.ue_ipv4_addr,
+            Ipv4Addr::new(10, 45, 0, 2),
+            "SMF allocated a UE IP from the pool"
+        );
         assert_eq!(upf_state.lock().unwrap().session_count(), 1, "N4 session established");
 
         // AMF → SMF: UpdateSMContext with the gNB's downlink F-TEID (from N2 setup).
@@ -325,11 +362,17 @@ mod tests {
             .status();
         assert!(status.is_success(), "UpdateSMContext succeeded");
 
-        // The UPF now has the downlink installed for the session.
+        // The UPF now has the downlink installed for the session, reachable both by
+        // UP-SEID and — the N6 datapath's view — by routing on the UE's assigned IP.
         assert_eq!(
             upf_state.lock().unwrap().downlink_for(1),
             Some((0x5678, Ipv4Addr::new(10, 0, 0, 9))),
             "N4 modification installed the gNB downlink target"
+        );
+        assert_eq!(
+            upf_state.lock().unwrap().route_downlink(Ipv4Addr::new(10, 45, 0, 2)),
+            Some((0x5678, Ipv4Addr::new(10, 0, 0, 9))),
+            "UPF routes an N6 downlink packet to the gNB by the UE's assigned IP"
         );
     }
 

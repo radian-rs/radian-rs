@@ -8,6 +8,7 @@ authors.workspace = true
 common.workspace = true
 pfcp.workspace = true
 gtpu.workspace = true
+n6.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
