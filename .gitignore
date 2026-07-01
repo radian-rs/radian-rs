@@ -3,3 +3,5 @@
 Cargo.lock.bak
 # UDM persistent subscriber store
 *.redb
+# mdbook build output
+book/book/
