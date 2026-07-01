@@ -1,0 +1,24 @@
+[package]
+name = "bdd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+# Netns-based integration tests. Privileged (CAP_NET_ADMIN via sudo) and Linux-only, so
+# excluded from the quick `cargo test --workspace --exclude bdd` sweep; run explicitly with
+# `cargo test -p bdd` on a host where `sudo` is available.
+
+[dependencies]
+# The datapath test drives the real N4 (PFCP) and N3 (GTP-U) codecs against a live UPF.
+pfcp.workspace = true
+gtpu.workspace = true
+tokio = { workspace = true, features = ["process", "time"] }
+anyhow.workspace = true
+
+[dev-dependencies]
+cucumber = "0.23"
+futures = "0.3"
+
+[[test]]
+name = "cucumber"
+harness = false
