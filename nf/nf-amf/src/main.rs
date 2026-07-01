@@ -344,7 +344,7 @@ async fn on_uplink_nas(
             // A UE PDU session request: CreateSMContext at the SMF (N4 establishment),
             // then send the N2 PDU Session Resource Setup to the gNB with the UPF's N3
             // F-TEID. The N1 SM container is opaque to the AMF (TS 29.502 multipart later).
-            let Some((psi, _container)) = nas::sm_container_from_ul_nas_transport(&nas_msg) else {
+            let Some((psi, container)) = nas::sm_container_from_ul_nas_transport(&nas_msg) else {
                 warn!("UE {amf_ue_id}: UL NAS Transport without an SM container");
                 return None;
             };
@@ -356,15 +356,26 @@ async fn on_uplink_nas(
             };
             match amf_smf.create_sm_context(&supi, psi, "internet").await {
                 Ok(created) => {
-                    if let Some(ctx) = ues.get_mut(&amf_ue_id) {
-                        ctx.sm_ref = Some(created.sm_ref);
-                    }
-                    // The SMF-provided N1 SM Accept isn't modeled yet; send a stub container.
-                    let nas_accept = vec![0x2e, psi, 0x00, 0xc2];
+                    // Build the N1 PDU Session Establishment Accept (UE IP from the SMF,
+                    // echoing the request's PTI) and NAS-protect a DL NAS Transport carrying
+                    // it — the gNB relays that to the UE. The N2 SM info carries the UPF F-TEID.
+                    let pti = container.get(2).copied().unwrap_or(1);
+                    let accept = nas::pdu_session_establishment_accept(psi, pti, created.ue_ip, "internet");
+                    let dl = nas::dl_nas_transport_sm(psi, accept);
+                    let Some(ctx) = ues.get_mut(&amf_ue_id) else { return None };
+                    ctx.sm_ref = Some(created.sm_ref);
+                    let Some(sec) = ctx.sec.as_mut() else {
+                        warn!("UE {amf_ue_id}: PDU session before NAS security is established");
+                        return None;
+                    };
+                    let nas_accept = sec.protect(&dl, nas::sht::INTEGRITY_CIPHERED, 1);
                     let setup = ngap::pdu_session_resource_setup_request(
                         amf_ue_id, ran_ue_id, psi, 1, created.up_n3_teid, created.up_n3_addr, nas_accept,
                     );
-                    info!("UE {amf_ue_id}: PDU session {psi} SM context created; sending N2 setup");
+                    info!(
+                        "UE {amf_ue_id}: PDU session {psi} SM context created (UE IP {}); sending N2 setup",
+                        created.ue_ip
+                    );
                     Some((setup, "PDUSessionResourceSetupRequest"))
                 }
                 Err(e) => {
