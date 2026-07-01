@@ -147,6 +147,61 @@ pub fn sm_container_from_ul_nas_transport(msg: &Nas5gsMessage) -> Option<(u8, Ve
     Some((psi, transport.payload_container.value.clone()))
 }
 
+/// Deconceal a **SUCI** (TS 33.501 Annex C) to its **SUPI** in the `imsi-<MCC><MNC><MSIN>`
+/// form the UDM/UDR key subscribers under.
+///
+/// Only the **null protection scheme** (scheme 0) is supported: there the scheme output is
+/// the MSIN in BCD (low nibble first, `0xF` filler ignored). ECIES schemes (profiles A/B)
+/// need the home-network private key and are not implemented yet — for those the SUCI is
+/// returned in [canonical string form](suci_canonical_string) (which will not resolve to a
+/// subscriber, but stays inspectable) rather than a misleading partial IMSI.
+pub fn suci_to_supi(suci: &Suci) -> String {
+    if suci.protection_scheme != 0 {
+        return suci_canonical_string(suci);
+    }
+    let mut supi = String::from("imsi-");
+    // MCC/MNC are stored as one digit per byte (MNC may carry a 0xF filler for 2-digit MNCs).
+    for &d in suci.mcc.iter().chain(&suci.mnc) {
+        if d <= 9 {
+            supi.push((b'0' + d) as char);
+        }
+    }
+    // Null scheme: scheme output is the MSIN, BCD-packed (two digits per byte, low first).
+    for &byte in &suci.scheme_output {
+        for nibble in [byte & 0x0F, byte >> 4] {
+            if nibble <= 9 {
+                supi.push((b'0' + nibble) as char);
+            }
+        }
+    }
+    supi
+}
+
+/// The canonical SUCI string form `suci-<supi_fmt>-<MCC>-<MNC>-<RI>-<scheme>-<keyid>-<output>`
+/// (as free5GC/Open5GS render it) — used for logging and for unsupported protection schemes.
+pub fn suci_canonical_string(suci: &Suci) -> String {
+    fn digits(d: &[u8]) -> String {
+        d.iter().filter(|&&n| n <= 9).map(|n| char::from(b'0' + n)).collect()
+    }
+    fn hex_lower(bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    }
+    format!(
+        "suci-0-{}-{}-{}-{}-{}-{}",
+        digits(&suci.mcc),
+        digits(&suci.mnc),
+        hex_lower(&suci.routing_indicator),
+        suci.protection_scheme,
+        suci.home_nw_public_key_id,
+        hex_lower(&suci.scheme_output),
+    )
+}
+
 /// The 5GMM message type of a decoded NAS message, if it is a 5GMM message.
 pub fn gmm_message_type(msg: &Nas5gsMessage) -> Option<Nas5gmmMessageType> {
     if let Nas5gsMessage::Gmm(hdr, _) = msg {
@@ -277,6 +332,35 @@ impl NasSecurityContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_scheme_suci_deconceals_to_supi() {
+        // A null-scheme SUCI for imsi-999700000000001: MNC "70" carries a 0xF filler; the
+        // MSIN "0000000001" is BCD-packed low-nibble-first (last byte 0x10 = digits 0,1).
+        let suci = Suci {
+            mcc: [9, 9, 9],
+            mnc: [7, 0, 0x0F],
+            routing_indicator: vec![0xF0, 0xFF],
+            protection_scheme: 0,
+            home_nw_public_key_id: 0,
+            scheme_output: vec![0x00, 0x00, 0x00, 0x00, 0x10],
+        };
+        assert_eq!(suci_to_supi(&suci), "imsi-999700000000001");
+    }
+
+    #[test]
+    fn ecies_suci_falls_back_to_canonical_string() {
+        // A non-null (ECIES) scheme can't be deconcealed here → canonical SUCI string.
+        let suci = Suci {
+            mcc: [2, 0, 8],
+            mnc: [9, 3, 0x0F],
+            routing_indicator: vec![0x00, 0x00],
+            protection_scheme: 1,
+            home_nw_public_key_id: 1,
+            scheme_output: vec![0xDE, 0xAD],
+        };
+        assert_eq!(suci_to_supi(&suci), "suci-0-208-93-0000-1-1-dead");
+    }
 
     #[test]
     fn ul_nas_transport_round_trips() {

@@ -27,6 +27,7 @@ surface of the project and assesses build feasibility.
 | [16-amf-pdu-session-leg.md](16-amf-pdu-session-leg.md) | AMF leg: UE NAS-SM → discover SMF (NRF) → CreateSMContext; SMF NRF registration; PR#16 review fixes |
 | [17-n2-pdu-session-setup.md](17-n2-pdu-session-setup.md) | N2 PDU Session Resource Setup: N2 SM-info transfer-IEs, learn gNB F-TEID → UpdateSMContext |
 | [18-n6-forwarding.md](18-n6-forwarding.md) | N6 forwarding: SMF UE-IP allocation, UPF routes downlink by UE IP, real TUN datapath (N3↔N6) |
+| [19-suci-deconcealment-live-ue.md](19-suci-deconcealment-live-ue.md) | Live-UE registration: SUCI→SUPI null-scheme deconcealment + replay UE security capability (free-ran-ue interop) |
 
 ## One-paragraph summary
 

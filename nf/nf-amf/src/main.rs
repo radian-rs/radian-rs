@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
-use nas::{Nas5gmmMessage, Nas5gmmMessageType, Nas5gsMessage, Suci};
+use nas::{Nas5gmmMessage, Nas5gmmMessageType, Nas5gsMessage};
 use ngap::{
     InitialUEMessage, InitialUEMessageProtocolIEs_EntryValue, InitiatingMessage,
     InitiatingMessageValue, NGAP_PDU, PDUSessionResourceSetupResponseProtocolIEs_EntryValue,
@@ -75,6 +75,9 @@ struct UeContext {
     auth: Option<auth::PendingAuth>,
     /// NAS security context, present once the Security Mode Command is sent.
     sec: Option<nas::NasSecurityContext>,
+    /// The UE's advertised 5GS security capabilities `[EA, IA]`, replayed verbatim in the
+    /// Security Mode Command (TS 24.501 §8.2.25) so the UE can detect a bidding-down attack.
+    replayed_ue_sec_cap: Option<[u8; 2]>,
     /// SM context ref of an in-progress PDU session, to address its UpdateSMContext.
     sm_ref: Option<String>,
 }
@@ -231,13 +234,15 @@ fn on_initial_ue(
     amf_ue_id: u64,
 ) -> Option<InitialUeOutcome> {
     let ran_ue_id = initial_ue_ran_id(msg)?;
-    let suci = initial_ue_nas_pdu(msg)
+    let identity = initial_ue_nas_pdu(msg)
         .and_then(|b| nas::decode_nas_5gs_message(b).ok())
-        .and_then(registration_suci);
+        .and_then(registration_identity);
 
-    match suci {
-        Some(supi) => {
-            ues.insert(amf_ue_id, UeContext::new(ran_ue_id, RegState::Identified, Some(supi.clone())));
+    match identity {
+        Some((supi, ue_sec_cap)) => {
+            let mut ctx = UeContext::new(ran_ue_id, RegState::Identified, Some(supi.clone()));
+            ctx.replayed_ue_sec_cap = ue_sec_cap;
+            ues.insert(amf_ue_id, ctx);
             Some(InitialUeOutcome::Identified { ran_ue_id, supi })
         }
         None => {
@@ -250,7 +255,7 @@ fn on_initial_ue(
 
 impl UeContext {
     fn new(ran_ue_id: u32, state: RegState, suci: Option<String>) -> Self {
-        Self { ran_ue_id, state, suci, auth: None, sec: None, sm_ref: None }
+        Self { ran_ue_id, state, suci, auth: None, sec: None, replayed_ue_sec_cap: None, sm_ref: None }
     }
 }
 
@@ -397,7 +402,13 @@ async fn complete_authentication(
     };
 
     info!("UE {amf_ue_id} authenticated ({supi}); establishing NAS security");
-    let Some((sec, smc_bytes)) = establish_security(&kseaf, &supi) else {
+    // Replay the UE's own advertised capabilities (falling back to the AMF default if the
+    // UE didn't send them) so the Security Mode Command passes the UE's bidding-down check.
+    let replayed = ues
+        .get(&amf_ue_id)
+        .and_then(|c| c.replayed_ue_sec_cap)
+        .unwrap_or(UE_SEC_CAP);
+    let Some((sec, smc_bytes)) = establish_security(&kseaf, &supi, &replayed) else {
         warn!("UE {amf_ue_id}: failed to derive NAS security context");
         return None;
     };
@@ -411,13 +422,18 @@ async fn complete_authentication(
     ))
 }
 
-/// Derive K_AMF + NAS keys from K_SEAF and build the protected Security Mode Command.
-fn establish_security(kseaf_hex: &str, supi: &str) -> Option<(nas::NasSecurityContext, Vec<u8>)> {
+/// Derive K_AMF + NAS keys from K_SEAF and build the protected Security Mode Command,
+/// replaying `replayed_ue_sec_cap` (the UE's advertised capabilities) back to the UE.
+fn establish_security(
+    kseaf_hex: &str,
+    supi: &str,
+    replayed_ue_sec_cap: &[u8],
+) -> Option<(nas::NasSecurityContext, Vec<u8>)> {
     let kseaf: [u8; 32] = hex::decode(kseaf_hex).ok()?.try_into().ok()?;
     let kamf = aka::kamf(&kseaf, supi, &ABBA);
     let keys = aka::nas_keys(&kamf, NAS_NEA, NAS_NIA);
     let mut sec = nas::NasSecurityContext::new(keys.knas_int, keys.knas_enc, NAS_NIA, NAS_NEA);
-    let smc = nas::security_mode_command(NAS_NEA, NAS_NIA, NGKSI, &UE_SEC_CAP);
+    let smc = nas::security_mode_command(NAS_NEA, NAS_NIA, NGKSI, replayed_ue_sec_cap);
     let bytes = sec.protect(&smc, nas::sht::INTEGRITY_NEW_CONTEXT, 1);
     Some((sec, bytes))
 }
@@ -441,36 +457,19 @@ fn on_security_mode_complete(
     ))
 }
 
-/// Extract the SUCI (if any) from a decoded NAS RegistrationRequest.
-fn registration_suci(msg: Nas5gsMessage) -> Option<String> {
+/// From a decoded NAS RegistrationRequest, extract the identity the AMF needs: the
+/// **SUPI** (deconcealed from the SUCI, TS 33.501) and the UE's advertised 5GS security
+/// capabilities `[EA, IA]` (to replay in the Security Mode Command).
+fn registration_identity(msg: Nas5gsMessage) -> Option<(String, Option<[u8; 2]>)> {
     let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationRequest(reg)) = msg else {
         return None;
     };
-    reg.fgs_mobile_identity.as_suci().map(|s| suci_string(&s))
-}
-
-/// Render a parsed SUCI as the canonical `suci-0-<mcc>-<mnc>-...` text form.
-fn suci_string(s: &Suci) -> String {
-    fn digits(d: &[u8]) -> String {
-        d.iter().filter(|&&n| n <= 9).map(|n| char::from(b'0' + n)).collect()
-    }
-    fn hex_lower(bytes: &[u8]) -> String {
-        use std::fmt::Write;
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            let _ = write!(out, "{b:02x}");
-        }
-        out
-    }
-    format!(
-        "suci-0-{}-{}-{}-{}-{}-{}",
-        digits(&s.mcc),
-        digits(&s.mnc),
-        hex_lower(&s.routing_indicator),
-        s.protection_scheme,
-        s.home_nw_public_key_id,
-        hex_lower(&s.scheme_output),
-    )
+    let supi = reg.fgs_mobile_identity.as_suci().map(|s| nas::suci_to_supi(&s))?;
+    let ue_sec_cap = reg
+        .ue_security_capability
+        .as_ref()
+        .map(|c| [c.ea_byte(), c.ia_byte()]);
+    Some((supi, ue_sec_cap))
 }
 
 fn initial_ue_nas_pdu(msg: &InitialUEMessage) -> Option<&[u8]> {
@@ -576,7 +575,12 @@ mod tests {
         match on_initial_ue(&mut ues, as_initial_ue(&pdu), 100) {
             Some(InitialUeOutcome::Identified { ran_ue_id, supi }) => {
                 assert_eq!(ran_ue_id, 7);
-                assert!(supi.contains("999-70"), "unexpected SUPI: {supi}");
+                // The SUCI is deconcealed (null scheme) to an `imsi-<MCC><MNC>…` SUPI —
+                // the form the UDM keys on — not left as a `suci-…` string.
+                assert!(
+                    supi.starts_with("imsi-99970"),
+                    "SUCI should deconceal to an imsi- SUPI with MCC 999 / MNC 70, got: {supi}"
+                );
             }
             _ => panic!("expected Identified"),
         }
@@ -666,7 +670,8 @@ mod tests {
         let kseaf_hex = outcome.kseaf.unwrap();
 
         // ── AMF derives NAS security + Security Mode Command ──
-        let (mut amf_sec, smc_bytes) = establish_security(&kseaf_hex, supi).expect("establish security");
+        let (mut amf_sec, smc_bytes) =
+            establish_security(&kseaf_hex, supi, &UE_SEC_CAP).expect("establish security");
 
         // ── UE derives the same NAS keys and verifies the SMC ──
         let kseaf: [u8; 32] = hex::decode(&kseaf_hex).unwrap().try_into().unwrap();
