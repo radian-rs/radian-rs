@@ -1,0 +1,15 @@
+[package]
+name = "n6"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The N3 (GTP-U) and N4 (PFCP) crates: N6 forwarding bridges the two — decap an
+# uplink G-PDU to N6, and route an N6 downlink packet back through a PFCP session.
+gtpu = { path = "../gtpu" }
+pfcp = { path = "../pfcp" }
+tracing = "0.1"
+# The N6 data-network device is a real Linux TUN (privileged: needs CAP_NET_ADMIN at
+# runtime). Its `async` feature is tokio-native (wraps tokio's AsyncFd).
+tun = { version = "0.8.13", features = ["async"] }
