@@ -149,9 +149,84 @@ pub fn ul_nas_transport_sm(pdu_session_id: u8, sm_container: Vec<u8>) -> Vec<u8>
     encode_nas_5gs_message(&msg).expect("encode UlNasTransport")
 }
 
+/// Build a 5GSM **PDU Session Establishment Accept** (TS 24.501 §8.3.2) as the raw N1 SM
+/// container bytes. Hand-encoded to the exact TS 24.501 layout (so it interoperates with a
+/// free5GC UE regardless of codec quirks): SSC mode 1 + IPv4, one default *match-all* QoS
+/// rule, a Session-AMBR, the **PDU address** carrying the UE's assigned IPv4 (the field the UE
+/// reads to configure its stack), and the **S-NSSAI** + **DNN** (which the UE also reads).
+/// `pti` echoes the request's procedure transaction id; S-NSSAI is the default eMBB slice.
+pub fn pdu_session_establishment_accept(
+    pdu_session_id: u8,
+    pti: u8,
+    ue_ip: std::net::Ipv4Addr,
+    dnn: &str,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(48);
+    // 5GSM header: EPD, PDU session id, PTI, message type (0xC2 = Establishment Accept).
+    m.extend_from_slice(&[0x2e, pdu_session_id, pti, 0xc2]);
+    // Selected SSC mode (1, bits 5-7) + selected PDU session type (IPv4 = 1, bits 1-3).
+    m.push(0x11);
+    // Authorized QoS rules (LV-E, 2-byte length): one "create new" default (DQR) rule with a
+    // single bidirectional match-all packet filter, precedence 0xFF, QFI 1.
+    let qos_rules: [u8; 9] = [0x01, 0x00, 0x06, 0x31, 0x31, 0x01, 0x01, 0xff, 0x01];
+    m.extend_from_slice(&(qos_rules.len() as u16).to_be_bytes());
+    m.extend_from_slice(&qos_rules);
+    // Session-AMBR (LV, length 6): downlink unit+value then uplink unit+value.
+    m.push(6);
+    m.extend_from_slice(&[0x06, 0x00, 0x0a, 0x06, 0x00, 0x0a]);
+    // PDU address (IEI 0x29, length 5): PDU session type IPv4 (1) + the UE's IPv4 address.
+    m.push(0x29);
+    m.push(5);
+    m.push(0x01);
+    m.extend_from_slice(&ue_ip.octets());
+    // S-NSSAI (IEI 0x22): SST=1, SD=010203 (the default slice the RAN/UE are configured with).
+    m.extend_from_slice(&[0x22, 0x04, 0x01, 0x01, 0x02, 0x03]);
+    // DNN (IEI 0x25): RFC 1035 label form — a length-prefixed label per dot-separated part.
+    m.push(0x25);
+    let dnn_buf: Vec<u8> = rfc1035_labels(dnn);
+    m.push(dnn_buf.len() as u8);
+    m.extend_from_slice(&dnn_buf);
+    m
+}
+
+/// Encode a DNN as RFC 1035 labels (each dot-separated label prefixed by its length),
+/// as TS 24.501 §9.11.2.1A specifies.
+fn rfc1035_labels(dnn: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(dnn.len() + 2);
+    for label in dnn.split('.').filter(|l| !l.is_empty()) {
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out
+}
+
+/// Build a 5GMM **DL NAS Transport** (TS 24.501 §8.2.11) carrying an N1 SM container (a 5GSM
+/// message) down to the UE for `pdu_session_id`. The AMF NAS-protects this and hands it to the
+/// gNB in the N2 PDU Session Resource Setup, which relays it to the UE.
+pub fn dl_nas_transport_sm(pdu_session_id: u8, n1_sm_container: Vec<u8>) -> Nas5gsMessage {
+    let transport = messages::NasDlNasTransport::new(
+        NasPayloadContainerType::new(0x01), // N1 SM information
+        NasPayloadContainer::new(n1_sm_container),
+    )
+    .set_pdu_session_id(NasPduSessionIdentity2::new(pdu_session_id));
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::DlNasTransport,
+        Nas5gmmMessage::DlNasTransport(transport),
+    )
+}
+
 /// Extract `(pdu_session_id, N1 SM container)` from a decoded 5GMM UL NAS Transport.
 pub fn sm_container_from_ul_nas_transport(msg: &Nas5gsMessage) -> Option<(u8, Vec<u8>)> {
     let Nas5gsMessage::Gmm(_, Nas5gmmMessage::UlNasTransport(transport)) = msg else {
+        return None;
+    };
+    let psi = transport.pdu_session_id.as_ref()?.value;
+    Some((psi, transport.payload_container.value.clone()))
+}
+
+/// Extract `(pdu_session_id, N1 SM container)` from a decoded 5GMM DL NAS Transport.
+pub fn sm_container_from_dl_nas_transport(msg: &Nas5gsMessage) -> Option<(u8, Vec<u8>)> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::DlNasTransport(transport)) = msg else {
         return None;
     };
     let psi = transport.pdu_session_id.as_ref()?.value;
@@ -343,6 +418,21 @@ impl NasSecurityContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dl_nas_transport_carries_pdu_session_accept() {
+        let ue_ip = std::net::Ipv4Addr::new(10, 45, 0, 2);
+        let accept = pdu_session_establishment_accept(5, 1, ue_ip, "internet");
+        // A 5GSM Establishment Accept: header, the UE's IPv4 in the PDU address, and the DNN.
+        assert_eq!(&accept[..4], &[0x2e, 5, 1, 0xc2]);
+        assert!(accept.windows(7).any(|w| w == [0x29, 5, 0x01, 10, 45, 0, 2]), "PDU address = UE IPv4");
+        assert!(accept.ends_with(&[0x25, 0x09, 0x08, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't']), "DNN");
+
+        let bytes = encode_nas_5gs_message(&dl_nas_transport_sm(5, accept.clone())).expect("encode");
+        let msg = decode_nas_5gs_message(&bytes).expect("decode");
+        assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::DlNasTransport));
+        assert_eq!(sm_container_from_dl_nas_transport(&msg), Some((5, accept)));
+    }
 
     #[test]
     fn configuration_update_command_round_trips() {

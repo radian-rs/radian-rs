@@ -16,6 +16,8 @@ pub struct SmContextCreated {
     pub sm_ref: String,
     pub up_n3_teid: u32,
     pub up_n3_addr: Ipv4Addr,
+    /// The UE's assigned IPv4 address — placed in the N1 PDU Session Establishment Accept.
+    pub ue_ip: Ipv4Addr,
 }
 
 /// The AMF's client toward the SMF's `Nsmf_PDUSession` service.
@@ -60,7 +62,11 @@ impl AmfSmf {
             .ok_or("response missing upN3Addr")?
             .parse()
             .map_err(|_| "bad upN3Addr")?;
-        Ok(SmContextCreated { sm_ref, up_n3_teid, up_n3_addr })
+        let ue_ip = field("ueIpv4Addr")
+            .ok_or("response missing ueIpv4Addr")?
+            .parse()
+            .map_err(|_| "bad ueIpv4Addr")?;
+        Ok(SmContextCreated { sm_ref, up_n3_teid, up_n3_addr, ue_ip })
     }
 
     /// Update the SM context with the gNB's DL N3 F-TEID (from the N2 setup response),
@@ -123,7 +129,8 @@ mod tests {
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
-                    "smContextRef": "1", "upN3Teid": "00000001", "upN3Addr": "127.0.0.1"
+                    "smContextRef": "1", "upN3Teid": "00000001", "upN3Addr": "127.0.0.1",
+                    "ueIpv4Addr": "10.45.0.2"
                 })),
             )
         }

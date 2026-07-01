@@ -29,6 +29,7 @@ surface of the project and assesses build feasibility.
 | [18-n6-forwarding.md](18-n6-forwarding.md) | N6 forwarding: SMF UE-IP allocation, UPF routes downlink by UE IP, real TUN datapath (N3↔N6) |
 | [19-suci-deconcealment-live-ue.md](19-suci-deconcealment-live-ue.md) | Live-UE registration: SUCI→SUPI null-scheme deconcealment + replay UE security capability (free-ran-ue interop) |
 | [20-live-pdu-session-signaling.md](20-live-pdu-session-signaling.md) | Live PDU-session signaling: configurable UPF bind + post-registration Configuration Update Command |
+| [21-n1-sm-pdu-session-accept.md](21-n1-sm-pdu-session-accept.md) | N1 SM PDU Session Establishment Accept: real 5GSM accept (IP/QoS/AMBR/S-NSSAI/DNN) → live UE completes |
 
 ## One-paragraph summary
 
