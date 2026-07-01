@@ -1,0 +1,48 @@
+# free-ran-ue UE for the radiant e2e datapath test.
+# Runs in the UE namespace; credentials match the radiant UDM demo subscriber
+# (imsi-999700000000001, TS 35.208 test key). SQN 0 so the network's first SQN is fresh
+# (radiant has no AUTS/resync yet). Exactly one ciphering + one integrity algorithm.
+ue:
+  ranControlPlaneIp: "10.0.2.1"
+  ranDataPlaneIp: "10.0.2.1"
+  ranControlPlanePort: 31413
+  ranDataPlanePort: 31414
+
+  plmnId:
+    mcc: "999"
+    mnc: "70"
+  msin: "0000000001"
+
+  authenticationSubscription:
+    encPermanentKey: "465b5ce8b199b49faa5f0a2ee238a6bc"
+    encOpcKey: "cd63cb71954a9f4e48a5994e37a02baf"
+    authenticationManagementField: "8000"
+    sequenceNumber: "000000000000"
+
+  integrityAlgorithm:
+    nia0: false
+    nia1: false
+    nia2: true
+    nia3: false
+  cipheringAlgorithm:
+    nea0: false
+    nea1: false
+    nea2: true
+    nea3: false
+
+  pduSession:
+    dnn: "internet"
+    snssai:
+      sst: "1"
+      sd: "010203"
+
+  accessType: "3GPP_ACCESS"
+
+  nrdc:
+    enable: false
+
+  ueTunnelDevice: "ueTun"
+  ignoreSetupTunnel: false
+
+logger:
+  level: "info"

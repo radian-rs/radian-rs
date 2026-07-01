@@ -9,3 +9,4 @@ common.workspace = true
 sbi-core.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
