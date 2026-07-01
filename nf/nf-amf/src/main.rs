@@ -324,14 +324,21 @@ async fn on_uplink_nas(
         }
         Some(Nas5gmmMessageType::SecurityModeComplete) => on_security_mode_complete(ues, amf_ue_id),
         Some(Nas5gmmMessageType::RegistrationComplete) => {
-            if let Some(ctx) = ues.get_mut(&amf_ue_id) {
-                ctx.state = RegState::Registered;
-                info!(
-                    "UE {amf_ue_id} REGISTERED (suci={:?}, ran_ue_id={}, state={:?})",
-                    ctx.suci, ctx.ran_ue_id, ctx.state
-                );
-            }
-            None
+            let ctx = ues.get_mut(&amf_ue_id)?;
+            ctx.state = RegState::Registered;
+            info!(
+                "UE {amf_ue_id} REGISTERED (suci={:?}, ran_ue_id={}, state={:?})",
+                ctx.suci, ctx.ran_ue_id, ctx.state
+            );
+            // Follow registration with a Configuration Update Command — a compliant UE
+            // waits for it before initiating a PDU session (matches free5GC AMF behaviour).
+            let ran_ue_id = ctx.ran_ue_id;
+            let sec = ctx.sec.as_mut()?;
+            let cuc = sec.protect(&nas::configuration_update_command(), nas::sht::INTEGRITY_CIPHERED, 1);
+            Some((
+                ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
+                "DownlinkNASTransport (ConfigurationUpdateCommand)",
+            ))
         }
         Some(Nas5gmmMessageType::UlNasTransport) => {
             // A UE PDU session request: CreateSMContext at the SMF (N4 establishment),
