@@ -114,6 +114,17 @@ pub fn registration_accept(mcc: &str, mnc: &str, tmsi: u32) -> Nas5gsMessage {
     )
 }
 
+/// Build a minimal 5GMM **Configuration Update Command** (TS 24.501 §8.2.19). The AMF
+/// sends this after Registration Complete; a compliant UE waits for it before initiating
+/// a PDU session. All IEs are optional — none are included and no acknowledgement is
+/// requested, so the UE simply consumes it.
+pub fn configuration_update_command() -> Nas5gsMessage {
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::ConfigurationUpdateCommand,
+        Nas5gmmMessage::ConfigurationUpdateCommand(messages::NasConfigurationUpdateCommand::new()),
+    )
+}
+
 /// Build a 5GMM **Registration Complete** (TS 24.501 §8.2.8). UE side / tests.
 pub fn registration_complete() -> Nas5gsMessage {
     Nas5gsMessage::new_5gmm(
@@ -332,6 +343,13 @@ impl NasSecurityContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_update_command_round_trips() {
+        let bytes = encode_nas_5gs_message(&configuration_update_command()).expect("encode");
+        let msg = decode_nas_5gs_message(&bytes).expect("decode");
+        assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::ConfigurationUpdateCommand));
+    }
 
     #[test]
     fn null_scheme_suci_deconceals_to_supi() {

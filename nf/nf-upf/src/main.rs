@@ -28,7 +28,13 @@ use anyhow::Context;
 use n6::tun::N6Tun;
 use tracing::{info, trace, warn};
 
-const NODE_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+/// The UPF's N3/N4 address advertised to peers (the F-TEID address the gNB sends uplink
+/// G-PDUs to). From `RADIANT_UPF_N3_ADDR`, default loopback.
+const N3_ADDR_ENV: &str = "RADIANT_UPF_N3_ADDR";
+/// The local address the N3/N4 sockets bind to. From `RADIANT_UPF_BIND`, default all
+/// interfaces. Set to a specific loopback alias (e.g. 127.0.0.1) to coexist with a gNB
+/// that also uses GTP-U port 2152 on the same host (bind it to a different alias).
+const BIND_ENV: &str = "RADIANT_UPF_BIND";
 
 // N6 (data network) TUN configuration. The UPF's own address sits inside the UE IP pool
 // (10.45.0.0/16, allocated by the SMF — see nf-smf) so the kernel routes UE return traffic
@@ -47,15 +53,21 @@ async fn main() -> anyhow::Result<()> {
 
     let state: Upf = Arc::new(Mutex::new(pfcp::UpfState::new()));
 
-    let n4 = tokio::net::UdpSocket::bind(format!("0.0.0.0:{}", pfcp::N4_PORT))
+    let node_ip: Ipv4Addr = std::env::var(N3_ADDR_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(Ipv4Addr::LOCALHOST);
+    let bind = std::env::var(BIND_ENV).unwrap_or_else(|_| "0.0.0.0".to_string());
+
+    let n4 = tokio::net::UdpSocket::bind(format!("{bind}:{}", pfcp::N4_PORT))
         .await
         .context("bind N4 PFCP")?;
     let n3 = Arc::new(
-        tokio::net::UdpSocket::bind(format!("0.0.0.0:{}", gtpu::GTPU_PORT))
+        tokio::net::UdpSocket::bind(format!("{bind}:{}", gtpu::GTPU_PORT))
             .await
             .context("bind N3 GTP-U")?,
     );
-    info!(n4_port = pfcp::N4_PORT, n3_port = gtpu::GTPU_PORT, "UPF up: N4 (PFCP) + N3 (GTP-U)");
+    info!(%bind, %node_ip, n4_port = pfcp::N4_PORT, n3_port = gtpu::GTPU_PORT, "UPF up: N4 (PFCP) + N3 (GTP-U)");
 
     // N6 is the privileged edge: opening a TUN needs CAP_NET_ADMIN. Degrade gracefully.
     let tun = match N6Tun::open(N6_TUN_NAME, N6_UPF_ADDR, N6_NETMASK, N6_MTU) {
@@ -72,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let n4_task = tokio::spawn(serve_n4(n4, state.clone()));
+    let n4_task = tokio::spawn(serve_n4(n4, node_ip, state.clone()));
     let n3_task = tokio::spawn(serve_n3(n3.clone(), state.clone(), tun.clone()));
     // Downlink only runs when N6 is live: it reads packets from the data network.
     if let Some(tun) = tun {
@@ -83,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// N4: PFCP control plane (association, heartbeat, session establishment/modification).
-async fn serve_n4(socket: tokio::net::UdpSocket, state: Upf) {
+async fn serve_n4(socket: tokio::net::UdpSocket, node_ip: Ipv4Addr, state: Upf) {
     let mut buf = vec![0u8; 2048];
     loop {
         // Per-datagram errors must not tear down the UPF: log and keep serving.
@@ -96,7 +108,7 @@ async fn serve_n4(socket: tokio::net::UdpSocket, state: Upf) {
         };
         let resp = {
             let mut g = state.lock().unwrap();
-            pfcp::handle_n4(&buf[..n], NODE_IP, &mut g)
+            pfcp::handle_n4(&buf[..n], node_ip, &mut g)
         };
         match resp {
             Some(resp) => {
