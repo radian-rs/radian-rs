@@ -256,12 +256,64 @@ pub mod sm_cause {
     pub const REQUEST_REJECTED_UNSPECIFIED: u8 = 31;
 }
 
+/// GPRS Timer 3 (TS 24.008 §10.5.7.4a): one octet holding a 3-bit unit (bits 6-8)
+/// and a 5-bit multiple (bits 1-5). Carried as the **back-off timer value** IE
+/// (T3396) in 5GSM rejects — the UE must not re-request the same DNN until it
+/// expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GprsTimer3(u8);
+
+impl GprsTimer3 {
+    /// Encode a duration, choosing the finest unit whose 5-bit multiple fits and
+    /// rounding up — the UE backs off *at least* `secs`. Durations beyond the
+    /// encodable maximum (31 × 320 hours) clamp to it.
+    pub fn from_secs(secs: u32) -> Self {
+        // (unit bits, seconds per step): 2s, 30s, 1min, 10min, 1h, 10h, 320h.
+        const UNITS: [(u8, u32); 7] = [
+            (0b011, 2),
+            (0b100, 30),
+            (0b101, 60),
+            (0b000, 600),
+            (0b001, 3_600),
+            (0b010, 36_000),
+            (0b110, 1_152_000),
+        ];
+        for (unit, step) in UNITS {
+            let multiple = secs.div_ceil(step);
+            if multiple <= 31 {
+                return Self((unit << 5) | multiple as u8);
+            }
+        }
+        Self((0b110 << 5) | 31)
+    }
+
+    /// The timer-deactivated encoding (unit 0b111).
+    pub fn deactivated() -> Self {
+        Self(0b111_00000)
+    }
+
+    /// The raw value octet as it appears on the wire.
+    pub fn octet(self) -> u8 {
+        self.0
+    }
+}
+
 /// Build a 5GSM **PDU Session Establishment Reject** (TS 24.501 §8.3.3) as the raw
-/// N1 SM container bytes: the 5GSM header (message type 0xC3) followed by the
-/// mandatory 5GSM cause (V, one octet). `pti` echoes the request's procedure
-/// transaction id; pick `cause` from [`sm_cause`].
-pub fn pdu_session_establishment_reject(pdu_session_id: u8, pti: u8, cause: u8) -> Vec<u8> {
-    vec![0x2e, pdu_session_id, pti, 0xc3, cause]
+/// N1 SM container bytes: the 5GSM header (message type 0xC3), the mandatory 5GSM
+/// cause (V, one octet), and optionally the **back-off timer value** IE (IEI 0x37,
+/// TLV — starts T3396 in the UE). `pti` echoes the request's procedure transaction
+/// id; pick `cause` from [`sm_cause`].
+pub fn pdu_session_establishment_reject(
+    pdu_session_id: u8,
+    pti: u8,
+    cause: u8,
+    backoff: Option<GprsTimer3>,
+) -> Vec<u8> {
+    let mut m = vec![0x2e, pdu_session_id, pti, 0xc3, cause];
+    if let Some(t) = backoff {
+        m.extend_from_slice(&[0x37, 0x01, t.octet()]);
+    }
+    m
 }
 
 /// Encode a DNN as RFC 1035 labels (each dot-separated label prefixed by its length),
@@ -527,13 +579,35 @@ mod tests {
 
     #[test]
     fn dl_nas_transport_carries_pdu_session_reject() {
-        let reject = pdu_session_establishment_reject(5, 1, sm_cause::MISSING_OR_UNKNOWN_DNN);
+        let reject = pdu_session_establishment_reject(5, 1, sm_cause::MISSING_OR_UNKNOWN_DNN, None);
         // 5GSM header (0xC3 = Establishment Reject) + the mandatory cause octet.
         assert_eq!(reject, [0x2e, 5, 1, 0xc3, 27]);
 
-        let bytes = encode_nas_5gs_message(&dl_nas_transport_sm(5, reject.clone())).expect("encode");
+        // With a back-off: the T3396 IE (0x37, TLV) follows — 60s = 30 × 2s (unit 0b011).
+        let with_backoff = pdu_session_establishment_reject(
+            5,
+            1,
+            sm_cause::MISSING_OR_UNKNOWN_DNN,
+            Some(GprsTimer3::from_secs(60)),
+        );
+        assert_eq!(with_backoff, [0x2e, 5, 1, 0xc3, 27, 0x37, 0x01, 0b011_11110]);
+
+        let bytes = encode_nas_5gs_message(&dl_nas_transport_sm(5, with_backoff.clone())).expect("encode");
         let msg = decode_nas_5gs_message(&bytes).expect("decode");
-        assert_eq!(sm_container_from_dl_nas_transport(&msg), Some((5, reject)));
+        assert_eq!(sm_container_from_dl_nas_transport(&msg), Some((5, with_backoff)));
+    }
+
+    #[test]
+    fn gprs_timer3_unit_selection() {
+        // Finest fitting unit, rounded up.
+        assert_eq!(GprsTimer3::from_secs(60).octet(), 0b011_11110, "60s = 30 x 2s");
+        assert_eq!(GprsTimer3::from_secs(63).octet(), 0b100_00011, "63s rounds up to 3 x 30s");
+        assert_eq!(GprsTimer3::from_secs(300).octet(), 0b100_01010, "5min = 10 x 30s");
+        assert_eq!(GprsTimer3::from_secs(3_600).octet(), 0b000_00110, "1h = 6 x 10min");
+        assert_eq!(GprsTimer3::from_secs(86_400).octet(), 0b001_11000, "24h = 24 x 1h");
+        // Beyond the encodable range: clamp to 31 x 320h.
+        assert_eq!(GprsTimer3::from_secs(u32::MAX).octet(), 0b110_11111);
+        assert_eq!(GprsTimer3::deactivated().octet(), 0b111_00000);
     }
 
     #[test]
