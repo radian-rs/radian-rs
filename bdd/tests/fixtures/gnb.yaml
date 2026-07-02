@@ -1,4 +1,4 @@
-# free-ran-ue gNB for the radiant e2e datapath test.
+# free-ran-ue gNB for the radian e2e datapath test.
 # Runs in the RAN namespace; N2/N3 to the core (host 10.0.1.1), RAN planes open to the UE.
 gnb:
   amfN2Ip: "10.0.1.1"
@@ -20,7 +20,7 @@ gnb:
   gnbId: "000314"
   gnbName: "gNB"
 
-  # The gNB's broadcast PLMN; the radiant AMF does not enforce it against the UE.
+  # The gNB's broadcast PLMN; the radian AMF does not enforce it against the UE.
   plmnId:
     mcc: "208"
     mnc: "93"

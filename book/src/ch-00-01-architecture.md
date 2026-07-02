@@ -1,6 +1,6 @@
 # Architecture
 
-radiant-rs is a Cargo workspace. Reusable protocol logic lives in library
+radian-rs is a Cargo workspace. Reusable protocol logic lives in library
 **crates** under `crates/`; each network function is a thin binary under `nf/`
 that wires those crates to sockets.
 
@@ -52,7 +52,7 @@ N4 and forwarding over N3/N6. Every other NF speaks the Service-Based Interface.
 
 ## The SBI transport
 
-Service-Based Interfaces in radiant-rs run over **HTTP/2 cleartext (h2c)** with
+Service-Based Interfaces in radian-rs run over **HTTP/2 cleartext (h2c)** with
 JSON bodies. `crates/sbi-core` provides the server (`axum`) and the client
 (`reqwest` with HTTP/2 prior knowledge), plus the NRF, AUSF, and UDM service
 modules. JSON follows the 3GPP OpenAPI conventions (camelCase field names).
@@ -77,13 +77,13 @@ modules. JSON follows the 3GPP OpenAPI conventions (camelCase field names).
 | `subscriber-db` | subscription store: traits + in-memory and encrypted-redb backends |
 | `bdd` | netns-based integration tests |
 
-The design pattern throughout: a mature codec crate wrapped by a thin radiant
+The design pattern throughout: a mature codec crate wrapped by a thin radian
 crate that exposes exactly the messages the NFs need, so the NF binaries stay
 small and the protocol knowledge stays in one place.
 
 ## A note on process design
 
-Like the network it models, radiant-rs is many processes, not one. But each
+Like the network it models, radian-rs is many processes, not one. But each
 process is a single async binary that runs its own event loop over `tokio` —
 there is no per-NF thread soup or internal socket orchestration. Start the NFs
 you need, point them at each other (mostly through the NRF), and the core comes

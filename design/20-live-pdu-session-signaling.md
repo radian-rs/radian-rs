@@ -2,7 +2,7 @@
 
 > Built 2026-06-30 on branch `feat/upf-configurable-bind`. Two fixes that carry the
 > **free-ran-ue** simulator from REGISTERED through the **full PDU-session signaling chain**
-> against the live radiant core.
+> against the live radian core.
 
 Slice 19 got the live UE to REGISTERED. Driving it on to a PDU session surfaced two more
 gaps; both are fixed here, and the **entire PDU-session control plane now completes end to
@@ -13,7 +13,7 @@ end with a real free5GC gNB** — the only remaining step is the N1 SM *Accept* 
 
 GTP-U uses port 2152 on both ends, so a co-located UPF (`0.0.0.0:2152`) and gNB can't both
 bind it. The UPF's N3/N4 bind address and advertised N3 address are now env-configurable
-(`RADIANT_UPF_BIND`, `RADIANT_UPF_N3_ADDR`; defaults unchanged: bind `0.0.0.0`, advertise
+(`RADIAN_UPF_BIND`, `RADIAN_UPF_N3_ADDR`; defaults unchanged: bind `0.0.0.0`, advertise
 loopback). For the loopback test the UPF binds `127.0.0.1` and the gNB uses the `127.0.0.2`
 alias, so both keep port 2152.
 
@@ -27,7 +27,7 @@ DownlinkNASTransport) right after Registration Complete.
 
 ## What the live run proved
 
-With both fixes, the free-ran-ue UE ran the whole control plane against the radiant core:
+With both fixes, the free-ran-ue UE ran the whole control plane against the radian core:
 
 ```
 UE → AMF   UL NAS Transport (PDU Session Establishment Request)
@@ -49,7 +49,7 @@ consumed.
 - `cargo test` — green (48 workspace-wide, +1: `nas::configuration_update_command_round_trips`).
   `full_registration_completes` still passes. `cargo clippy` clean.
 - **Live interop:** free-ran-ue completes registration → Configuration Update → PDU session
-  signaling (SMF SM context + UPF N4 session + gNB N3 tunnel) against the radiant core.
+  signaling (SMF SM context + UPF N4 session + gNB N3 tunnel) against the radian core.
 
 ## Known limitations / next steps
 

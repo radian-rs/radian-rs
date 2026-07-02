@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn ng_setup_response_roundtrips() {
-        let pdu = ng_setup_response("radiant-amf", "999", "70");
+        let pdu = ng_setup_response("radian-amf", "999", "70");
         let bytes = pdu.encode().expect("APER encode");
         let back = NGAP_PDU::decode(&bytes).expect("APER decode");
         assert_eq!(pdu, back);

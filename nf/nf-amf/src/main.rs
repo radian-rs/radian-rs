@@ -39,7 +39,7 @@ const NGAP_PPID: u32 = 60;
 /// Default N2 SCTP port (TS 38.412).
 const N2_PORT: u16 = 38412;
 
-const AMF_NAME: &str = "radiant-amf";
+const AMF_NAME: &str = "radian-amf";
 const PLMN_MCC: &str = "999";
 const PLMN_MNC: &str = "70";
 /// DNN used when the UE's UL NAS Transport omits the requested-DNN IE (TS 23.501

@@ -10,9 +10,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Nnrf_NFManagement + Nnrf_NFDiscovery (TS 29.510) over the SBI. Registrations
     // are soft state: NFs heartbeat at the assigned interval or get evicted.
-    let store = match std::env::var("RADIANT_NRF_HEARTBEAT_SECS") {
+    let store = match std::env::var("RADIAN_NRF_HEARTBEAT_SECS") {
         Ok(v) => {
-            let secs: u64 = v.parse().map_err(|e| anyhow::anyhow!("RADIANT_NRF_HEARTBEAT_SECS: {e}"))?;
+            let secs: u64 = v.parse().map_err(|e| anyhow::anyhow!("RADIAN_NRF_HEARTBEAT_SECS: {e}"))?;
             sbi_core::nnrf::NrfStore::with_heartbeat_timer(std::time::Duration::from_secs(secs.max(1)))
         }
         Err(_) => sbi_core::nnrf::NrfStore::default(),

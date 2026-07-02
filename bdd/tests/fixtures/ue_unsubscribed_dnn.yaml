@@ -1,7 +1,7 @@
 # free-ran-ue UE requesting an UNSUBSCRIBED DNN (corporate) — the network must reject
 # the PDU session (5GSM cause #27). Same demo subscriber, so registration succeeds
 # (imsi-999700000000001, TS 35.208 test key). SQN 0 so the network's first SQN is fresh
-# (radiant has no AUTS/resync yet). Exactly one ciphering + one integrity algorithm.
+# (radian has no AUTS/resync yet). Exactly one ciphering + one integrity algorithm.
 ue:
   ranControlPlaneIp: "10.0.2.1"
   ranDataPlaneIp: "10.0.2.1"

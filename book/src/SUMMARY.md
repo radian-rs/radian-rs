@@ -1,6 +1,6 @@
-# radiant-rs 5G Core
+# radian-rs 5G Core
 
-[radiant-rs 5G Core](ch-00-00-introduction.md)
+[radian-rs 5G Core](ch-00-00-introduction.md)
 - [Architecture](ch-00-01-architecture.md)
 - [Building and Running](ch-00-02-building-and-running.md)
 

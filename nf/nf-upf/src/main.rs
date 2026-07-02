@@ -29,12 +29,12 @@ use n6::tun::N6Tun;
 use tracing::{info, trace, warn};
 
 /// The UPF's N3/N4 address advertised to peers (the F-TEID address the gNB sends uplink
-/// G-PDUs to). From `RADIANT_UPF_N3_ADDR`, default loopback.
-const N3_ADDR_ENV: &str = "RADIANT_UPF_N3_ADDR";
-/// The local address the N3/N4 sockets bind to. From `RADIANT_UPF_BIND`, default all
+/// G-PDUs to). From `RADIAN_UPF_N3_ADDR`, default loopback.
+const N3_ADDR_ENV: &str = "RADIAN_UPF_N3_ADDR";
+/// The local address the N3/N4 sockets bind to. From `RADIAN_UPF_BIND`, default all
 /// interfaces. Set to a specific loopback alias (e.g. 127.0.0.1) to coexist with a gNB
 /// that also uses GTP-U port 2152 on the same host (bind it to a different alias).
-const BIND_ENV: &str = "RADIANT_UPF_BIND";
+const BIND_ENV: &str = "RADIAN_UPF_BIND";
 
 // N6 (data network) TUN configuration. The UPF's own address sits inside the UE IP pool
 // (10.45.0.0/16, allocated by the SMF — see nf-smf) so the kernel routes UE return traffic

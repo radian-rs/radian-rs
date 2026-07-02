@@ -22,37 +22,37 @@ The `nf-udr` and `nf-pcf` binaries are scaffolding.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `RADIANT_UDM_PROVISION_DEMO` | unset | `1` provisions the TS 35.208 demo subscriber |
-| `RADIANT_UDM_DB` | `radiant-udm.redb` | path to the encrypted store |
-| `RADIANT_UDM_MASTER_KEY` | ephemeral (warns) | 64-hex KEK for encryption at rest |
+| `RADIAN_UDM_PROVISION_DEMO` | unset | `1` provisions the TS 35.208 demo subscriber |
+| `RADIAN_UDM_DB` | `radian-udm.redb` | path to the encrypted store |
+| `RADIAN_UDM_MASTER_KEY` | ephemeral (warns) | 64-hex KEK for encryption at rest |
 
 **SMF (`nf-smf`)**
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `RADIANT_SMF_UPF_N4` | `127.0.0.1:8805` | the UPF's N4 endpoint |
-| `RADIANT_SMF_NRF` | `http://127.0.0.1:8000` | the NRF base URL |
+| `RADIAN_SMF_UPF_N4` | `127.0.0.1:8805` | the UPF's N4 endpoint |
+| `RADIAN_SMF_NRF` | `http://127.0.0.1:8000` | the NRF base URL |
 
 **AUSF (`nf-ausf`)**
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `RADIANT_AUSF_NRF` | `http://127.0.0.1:8000` | the NRF base URL |
+| `RADIAN_AUSF_NRF` | `http://127.0.0.1:8000` | the NRF base URL |
 
 **UPF (`nf-upf`)**
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `RADIANT_UPF_BIND` | `0.0.0.0` | address to bind N3/N4 to |
-| `RADIANT_UPF_N3_ADDR` | `127.0.0.1` | N3 F-TEID address advertised to the gNB |
+| `RADIAN_UPF_BIND` | `0.0.0.0` | address to bind N3/N4 to |
+| `RADIAN_UPF_N3_ADDR` | `127.0.0.1` | N3 F-TEID address advertised to the gNB |
 
 **BDD suite (`bdd`)**
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `FREE_RAN_UE_BIN` | unset | path to the free-ran-ue binary (enables the `@sim` feature) |
-| `RADIANT_UPF_BIN` | `../target/debug/nf-upf` | UPF binary for the datapath feature |
-| `RADIANT_TARGET_DIR` | `../target/debug` | dir holding the `nf-*` binaries |
+| `RADIAN_UPF_BIN` | `../target/debug/nf-upf` | UPF binary for the datapath feature |
+| `RADIAN_TARGET_DIR` | `../target/debug` | dir holding the `nf-*` binaries |
 
 ## The demo subscriber
 

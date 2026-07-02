@@ -15,7 +15,7 @@ signaling chain runs UE → AMF → SMF → UPF.
   `Nsmf_PDUSession_CreateSMContext`. The N2 `UplinkNASTransport` dispatch gains a
   `UlNasTransport` arm: extract the UE's SUPI + PDU session id, relay to the SMF.
 - **`nf-smf`** — registers its `nsmf-pdusession` service with the NRF on startup
-  (`RADIANT_SMF_NRF`), so the AMF can discover it.
+  (`RADIAN_SMF_NRF`), so the AMF can discover it.
 - **PR #16 security review fixes** (`nf-smf`):
   - PFCP `transact` now **correlates responses by sequence number**, discarding stale
     datagrams (no state drift).

@@ -1,5 +1,5 @@
 [book]
-title = "radiant-rs"
+title = "radian-rs"
 authors = ["Kunihiro Ishiguro"]
 language = "en"
 src = "src"

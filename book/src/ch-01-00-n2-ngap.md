@@ -5,7 +5,7 @@
 relays NAS signalling to and from the UE, and manages PDU session resources on
 the radio side. NGAP is ASN.1, APER-encoded, and runs over **SCTP**.
 
-In radiant-rs the AMF (`nf-amf`) terminates N2. The `ngap` crate wraps
+In radian-rs the AMF (`nf-amf`) terminates N2. The `ngap` crate wraps
 `oxirush-ngap` and exposes exactly the messages the AMF and SMF build.
 
 ## The transport
@@ -39,7 +39,7 @@ The `ngap` crate builds the response with a single helper:
 pub fn ng_setup_response(amf_name: &str, mcc: &str, mnc: &str) -> NGAP_PDU
 ```
 
-radiant-rs's AMF accepts NG Setup from any gNB; it does not enforce the gNB's
+radian-rs's AMF accepts NG Setup from any gNB; it does not enforce the gNB's
 advertised PLMN against its own served PLMN. That is deliberate — it keeps the
 core interoperable with simulators and lab gNBs whose PLMN may differ from the
 subscriber's.
@@ -72,7 +72,7 @@ sub-PDUs (transfer-IEs) embedded as octet strings inside the NGAP message. The
 
 ## Codec compatibility
 
-radiant-rs's NGAP (via `oxirush-ngap`) is wire-compatible with the free5GC NGAP
+radian-rs's NGAP (via `oxirush-ngap`) is wire-compatible with the free5GC NGAP
 library used by [free-ran-ue](ch-04-00-free-ran-ue-interop.md): NG Setup,
 `InitialUEMessage`, the full downlink/uplink NAS transport exchange, and PDU
 Session Resource Setup all interoperate. That is the first thing the interop

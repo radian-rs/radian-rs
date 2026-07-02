@@ -48,7 +48,7 @@ After this, both tunnel endpoints exist and the UPF can forward.
 The **PDU Session Establishment Accept** is the 5GSM message the UE reads to
 configure its stack — it carries the **assigned IP** (the PDU address), the
 authorized **QoS rules**, the **session AMBR**, the **S-NSSAI**, and the **DNN**.
-radiant-rs builds it as a proper TS 24.501 message (`nas::pdu_session_establishment_accept`),
+radian-rs builds it as a proper TS 24.501 message (`nas::pdu_session_establishment_accept`),
 wraps it in a 5GMM **DL NAS Transport**, NAS-protects it, and places it as the
 NAS-PDU in the N2 setup. The gNB relays it to the UE, which then brings up its
 own tunnel interface with the assigned IP.

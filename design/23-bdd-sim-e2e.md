@@ -1,7 +1,7 @@
 # Simulator-driven end-to-end BDD feature
 
 > Built 2026-06-30 on branch `feat/bdd-sim-e2e`. A second `bdd/` feature that drives the
-> **whole stack** — the radiant core plus the free-ran-ue gNB/UE — from registration through
+> **whole stack** — the radian core plus the free-ran-ue gNB/UE — from registration through
 > a forwarded packet, automatically.
 
 Design/22 added a self-contained UPF-datapath BDD test. This slice adds the other half: an
@@ -12,7 +12,7 @@ manual end-to-end ping (design/21 follow-up) as a repeatable test.
 
 ```
  ┌───────────────────────┐  veth  ┌──────────────────────┐  veth  ┌──────────────┐
- │ host: radiant core     │10.0.1.1│ ns <tag>_ran: gNB    │10.0.2.1│ ns <tag>_ue  │
+ │ host: radian core     │10.0.1.1│ ns <tag>_ran: gNB    │10.0.2.1│ ns <tag>_ue  │
  │ NRF UDM AUSF SMF AMF    ├────────┤ 10.0.1.2             ├────────┤ UE 10.0.2.2  │
  │ UPF + N6 TUN 10.45.0.1  │        │                      │        │ ueTun0       │
  └───────────────────────┘        └──────────────────────┘        └──────────────┘
@@ -25,14 +25,14 @@ Each stage polls a readiness signal (SBI/SCTP ports, `n6upf0`, the gNB's control
 and — the PDU-session-complete signal — the UE's `ueTun0` appearing). A `Teardown topology`
 scenario stops everything and asserts the environment is clean.
 
-The UE (credentials matching the radiant UDM demo subscriber) registers via 5G-AKA, gets an
+The UE (credentials matching the radian UDM demo subscriber) registers via 5G-AKA, gets an
 IP on `ueTun0`, and the ping traverses UE → gNB → N3 → UPF → N6 → the host kernel and back —
 the full control **and** user plane, conformance-checked by an independent implementation.
 
 ## Supporting changes
 
 - **`nf-ausf` self-registers with the NRF** (mirrors the SMF) — the AMF can now discover the
-  AUSF without the manual registration the old runbook needed. `RADIANT_AUSF_NRF` overrides
+  AUSF without the manual registration the old runbook needed. `RADIAN_AUSF_NRF` overrides
   the NRF base.
 - **`bdd/src/netns.rs`** grew helpers: a namespace↔namespace veth, route add, host-process
   spawn (sudo or not), interface/port readiness polls, ns-scoped ping, and pattern kills.

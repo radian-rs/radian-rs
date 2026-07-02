@@ -1,7 +1,7 @@
 @serial
 @n6_datapath
 Feature: N6 user-plane datapath forwards a real packet
-  As a radiant-rs developer
+  As a radian-rs developer
   I want the UPF to forward a real IP packet between N3 (GTP-U) and N6 (a TUN)
   So that a signaled PDU session actually moves user traffic.
 

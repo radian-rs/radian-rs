@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use pdu_session::SmfState;
 
-const UPF_N4_ENV: &str = "RADIANT_SMF_UPF_N4";
+const UPF_N4_ENV: &str = "RADIAN_SMF_UPF_N4";
 const DEFAULT_UPF_N4: &str = "127.0.0.1:8805";
-const NRF_ENV: &str = "RADIANT_SMF_NRF";
+const NRF_ENV: &str = "RADIAN_SMF_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 const SBI_PORT: u16 = 8002;
 

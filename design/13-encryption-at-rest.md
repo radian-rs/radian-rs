@@ -14,7 +14,7 @@ the trait, and now never sits on disk in plaintext either.
   AAD** (so a blob can't be moved to another subscriber). `RedbStore::open(path, kek)`
   takes the 32-byte KEK; the KEK is never persisted. Reads/`next_sqn` decrypt, mutate,
   re-encrypt (new nonce). The whole record — including SQN — is integrity-protected.
-- **`nf-udm`** — sources the KEK from `RADIANT_UDM_MASTER_KEY` (64 hex chars); if
+- **`nf-udm`** — sources the KEK from `RADIAN_UDM_MASTER_KEY` (64 hex chars); if
   unset, generates an **ephemeral** key with a loud warning (persisted records become
   unreadable after restart — so there is never plaintext-at-rest, even in dev).
 - Helpers `subscriber_db::parse_kek_hex` / `random_kek`.
@@ -44,4 +44,4 @@ here too.
 - **In-memory store is plaintext in RAM** — unavoidable (K must be in RAM to compute
   vectors); at-rest encryption applies to the persistent backend only.
 - **Ephemeral-key default** trades dev convenience (no config) for losing persistence
-  across restarts; set `RADIANT_UDM_MASTER_KEY` for a stable store.
+  across restarts; set `RADIAN_UDM_MASTER_KEY` for a stable store.

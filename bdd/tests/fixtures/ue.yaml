@@ -1,7 +1,7 @@
-# free-ran-ue UE for the radiant e2e datapath test.
-# Runs in the UE namespace; credentials match the radiant UDM demo subscriber
+# free-ran-ue UE for the radian e2e datapath test.
+# Runs in the UE namespace; credentials match the radian UDM demo subscriber
 # (imsi-999700000000001, TS 35.208 test key). SQN 0 so the network's first SQN is fresh
-# (radiant has no AUTS/resync yet). Exactly one ciphering + one integrity algorithm.
+# (radian has no AUTS/resync yet). Exactly one ciphering + one integrity algorithm.
 ue:
   ranControlPlaneIp: "10.0.2.1"
   ranDataPlaneIp: "10.0.2.1"

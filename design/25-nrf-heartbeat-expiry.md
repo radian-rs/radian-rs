@@ -26,7 +26,7 @@ rebuilt by re-registration, so persistence would buy nothing.
   then spawns a task that heartbeats at the assigned interval and re-registers
   on failure/eviction. The **AUSF and SMF** now use it instead of a one-shot
   register.
-- **`nf-nrf`** — heartbeat interval overridable via `RADIANT_NRF_HEARTBEAT_SECS`.
+- **`nf-nrf`** — heartbeat interval overridable via `RADIAN_NRF_HEARTBEAT_SECS`.
 
 ## Verification
 

@@ -33,13 +33,13 @@ Postgres JSONB (or a document DB) when scale demands it.
   advances the SQN and derives the vector next to the credentials; only
   RAND/AUTN/XRES*/K_AUSF ever leave. Documented in the module; this seam is where
   TLS + HSM plug in later.
-- **`nf-udr`** — opens the persistent `RedbStore` (`RADIANT_UDR_DB`,
-  `RADIANT_UDR_MASTER_KEY`), owns the env-gated demo provisioning
-  (`RADIANT_UDR_PROVISION_DEMO=1`, TS 35.208 key + demo AM/SM documents for PLMN
+- **`nf-udr`** — opens the persistent `RedbStore` (`RADIAN_UDR_DB`,
+  `RADIAN_UDR_MASTER_KEY`), owns the env-gated demo provisioning
+  (`RADIAN_UDR_PROVISION_DEMO=1`, TS 35.208 key + demo AM/SM documents for PLMN
   99970), serves the Nudr router on :8005, registers with the NRF (`UDR`,
   `nudr-dr`) via `register_and_maintain` ([25](25-nrf-heartbeat-expiry.md)).
 - **`nf-udm`** — holds **no state and no KEK** anymore: a `UdrClient` front
-  (`RADIANT_UDM_UDR`, default `http://127.0.0.1:8005`) serving the unchanged Nudm
+  (`RADIAN_UDM_UDR`, default `http://127.0.0.1:8005`) serving the unchanged Nudm
   surface, now also NRF-registered (`UDM`, `nudm-ueau`). The AUSF and AMF needed
   **zero changes**.
 - **BDD** — `start_core` launches `nf-udr` (with the store envs, fresh

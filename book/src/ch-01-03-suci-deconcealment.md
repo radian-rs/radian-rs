@@ -15,7 +15,7 @@ first gap the [free-ran-ue interop](ch-04-00-free-ran-ue-interop.md) surfaced.
 
 ## The null scheme
 
-A SUCI carries a **protection scheme**. radiant-rs implements the **null scheme**
+A SUCI carries a **protection scheme**. radian-rs implements the **null scheme**
 (scheme 0), which is what a UE uses when no home-network public key is
 provisioned. For the null scheme the "scheme output" is simply the **MSIN** in
 BCD, and deconcealment is a direct decode:
@@ -40,7 +40,7 @@ UE is identified by its SUPI throughout authentication and session management.
 
 The **Profile A / Profile B (ECIES)** protection schemes conceal the MSIN with
 the home network's public key and require the operator's private key to
-deconceal. radiant-rs does not yet implement them; a non-null SUCI falls back to
+deconceal. radian-rs does not yet implement them; a non-null SUCI falls back to
 a canonical string form (`suci-0-…`) that is inspectable but will not resolve to
 a subscriber. Supporting ECIES is future work — the null scheme covers lab UEs
 and simulators, which is what the interop flow uses.

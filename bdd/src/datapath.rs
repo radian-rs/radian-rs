@@ -117,7 +117,7 @@ pub async fn ping_through_datapath(
     let mut buf = vec![0u8; 2048];
 
     for seq in 1..=3u16 {
-        let echo = icmp_echo_request(ue_ip, gw_ip, 0x1234, seq, b"radiant-datapath");
+        let echo = icmp_echo_request(ue_ip, gw_ip, 0x1234, seq, b"radian-datapath");
         gnb.send_to(&gtpu::encap(uplink_teid, &echo), upf_n3).await.context("send uplink G-PDU")?;
 
         // Drain replies for up to 1s; a matching echo reply means the round trip closed.

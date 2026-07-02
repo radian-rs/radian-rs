@@ -1,14 +1,14 @@
 # Subscriber Data (UDM) and Credentials
 
 The **UDM** holds subscriptions, and behind it sits the subscriber's long-term
-secret **K**. Everything about how radiant-rs stores that secret is shaped by one
+secret **K**. Everything about how radian-rs stores that secret is shaped by one
 rule: **K must never escape**. This chapter covers the store, the traits that
 enforce that boundary, and encryption at rest.
 
 ## The ARPF boundary
 
 The **ARPF** (Authentication credential Repository and Processing Function) is
-the only component allowed to touch K. In radiant-rs that boundary is a trait, not
+the only component allowed to touch K. In radian-rs that boundary is a trait, not
 a convention:
 
 - **`ArpfKeyStore::generate_he_av(...)`** takes a SUPI, SQN, RAND, and serving
@@ -49,10 +49,10 @@ bytes are not world-readable.
 
 ## Where the KEK comes from
 
-`nf-udm` sources the KEK from `RADIANT_UDM_MASTER_KEY` (64 hex characters):
+`nf-udm` sources the KEK from `RADIAN_UDM_MASTER_KEY` (64 hex characters):
 
 ```
-RADIANT_UDM_MASTER_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+RADIAN_UDM_MASTER_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 ```
 
 If it is unset, the UDM generates an **ephemeral** KEK and warns loudly —
@@ -64,13 +64,13 @@ Key rotation is not yet implemented.
 ## Provisioning
 
 The demo subscriber (a public TS 35.208 test key) is provisioned **only** when
-`RADIANT_UDM_PROVISION_DEMO=1`, so a production build never ships a known-key
+`RADIAN_UDM_PROVISION_DEMO=1`, so a production build never ships a known-key
 account. There is no general provisioning CLI yet; the demo subscriber is the one
 [Building and Running](ch-00-02-building-and-running.md) and the interop flow use.
 
 ## A note on layering
 
 Architecturally the subscription data belongs in the **UDR** (Nudr), with the UDM
-as a stateless front end. radiant-rs currently keeps the store directly behind the
+as a stateless front end. radian-rs currently keeps the store directly behind the
 UDM; relocating it behind `nf-udr` is future work. The trait boundary above is
 what makes that move safe — the ARPF contract does not change.

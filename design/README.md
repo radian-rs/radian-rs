@@ -1,6 +1,6 @@
-# radiant-rs — Design Notes
+# radian-rs — Design Notes
 
-`radiant-rs` is a greenfield Rust implementation of a 3GPP 5G/6G core (5GC).
+`radian-rs` is a greenfield Rust implementation of a 3GPP 5G/6G core (5GC).
 
 These notes capture the early architecture research that scopes the encoding/codec
 surface of the project and assesses build feasibility.
