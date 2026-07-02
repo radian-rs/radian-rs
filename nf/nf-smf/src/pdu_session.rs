@@ -47,6 +47,8 @@ struct SmContext {
 /// SMF runtime: a PFCP client toward one UPF plus the SM-context table.
 pub struct SmfState {
     smf_ip: Ipv4Addr,
+    /// NRF base URL — used to discover the UDM for Nudm_SDM subscription fetches.
+    nrf_base: String,
     /// Connected N4 socket. A mutex serializes PFCP request/response transactions.
     sock: tokio::sync::Mutex<UdpSocket>,
     seq: AtomicU32,
@@ -59,11 +61,16 @@ pub struct SmfState {
 
 impl SmfState {
     /// Bind an N4 client socket and connect it to the UPF's PFCP endpoint.
-    pub async fn connect(upf_n4: SocketAddr, smf_ip: Ipv4Addr) -> std::io::Result<Self> {
+    pub async fn connect(
+        upf_n4: SocketAddr,
+        smf_ip: Ipv4Addr,
+        nrf_base: impl Into<String>,
+    ) -> std::io::Result<Self> {
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
         sock.connect(upf_n4).await?;
         Ok(Self {
             smf_ip,
+            nrf_base: nrf_base.into(),
             sock: tokio::sync::Mutex::new(sock),
             seq: AtomicU32::new(1),
             cp_seid: AtomicU64::new(1),
@@ -117,6 +124,12 @@ impl SmfState {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct PlmnId {
+    mcc: String,
+    mnc: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SmContextCreateData {
@@ -124,6 +137,23 @@ struct SmContextCreateData {
     pdu_session_id: u8,
     #[serde(default)]
     dnn: String,
+    /// The serving PLMN (TS 29.502) — selects which provisioned dataset applies.
+    serving_network: Option<PlmnId>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Snssai {
+    sst: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sd: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionAmbrDto {
+    uplink: String,
+    downlink: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -137,6 +167,19 @@ struct SmContextCreatedData {
     /// the NAS PDU Session Establishment Accept (a later NAS-SM slice); the UPF already
     /// routes downlink traffic to it.
     ue_ipv4_addr: Ipv4Addr,
+    /// The subscribed slice serving this DNN (from the UDR sm-data) — the AMF puts it
+    /// in the N1 accept.
+    s_nssai: Snssai,
+    /// The subscribed session AMBR for this DNN (TS 29.571 BitRate strings), if
+    /// provisioned — likewise for the N1 accept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_ambr: Option<SessionAmbrDto>,
+}
+
+/// What the SMF needs out of the subscriber's session-management subscription.
+struct SessionSubscription {
+    snssai: Snssai,
+    ambr: Option<SessionAmbrDto>,
 }
 
 #[derive(Deserialize)]
@@ -158,11 +201,24 @@ pub fn router(state: Arc<SmfState>) -> Router {
         .with_state(state)
 }
 
-/// `Nsmf_PDUSession_CreateSMContext`: establish the N4 session, return the UPF N3 F-TEID.
+/// `Nsmf_PDUSession_CreateSMContext`: authorize the DNN against the subscriber's
+/// UDR-provisioned data (via Nudm_SDM), establish the N4 session, and return the
+/// UPF N3 F-TEID plus the subscribed S-NSSAI / session AMBR.
 async fn create_sm_context(
     State(smf): State<Arc<SmfState>>,
     Json(req): Json<SmContextCreateData>,
 ) -> Result<(StatusCode, Json<SmContextCreatedData>), StatusCode> {
+    if req.dnn.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let plmn = req
+        .serving_network
+        .as_ref()
+        .map(|p| format!("{}{}", p.mcc, p.mnc))
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    // Subscription check BEFORE touching the UPF: unsubscribed DNN → 403, no N4 state.
+    let sub = fetch_session_subscription(&smf.nrf_base, &req.supi, &plmn, &req.dnn).await?;
+
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
     let seq = smf.next_seq();
     // The SMF owns UE IP allocation; the address rides into the UPF's downlink PDR so it
@@ -182,6 +238,7 @@ async fn create_sm_context(
         supi = %masked_supi(&req.supi),
         pdu_session_id = req.pdu_session_id,
         dnn = %req.dnn,
+        snssai = ?sub.snssai,
         up_seid = est.up_seid,
         n3_teid = est.n3_teid,
         %ue_ip,
@@ -194,8 +251,107 @@ async fn create_sm_context(
             up_n3_teid: format!("{:08x}", est.n3_teid),
             up_n3_addr: est.n3_addr,
             ue_ipv4_addr: ue_ip,
+            s_nssai: sub.snssai,
+            session_ambr: sub.ambr,
         }),
     ))
+}
+
+/// Fetch and authorize the session-management subscription for (`supi`, `plmn`,
+/// `dnn`) via the NRF-discovered UDM (Nudm_SDM):
+/// - `smf-select-data` must list the DNN under a subscribed S-NSSAI (else `403`);
+/// - `sm-data` supplies the serving S-NSSAI and session AMBR for that DNN (else `403`).
+///
+/// Fails closed: a missing subscription is `403`, an unreachable NRF/UDM is `502`.
+async fn fetch_session_subscription(
+    nrf_base: &str,
+    supi: &str,
+    plmn: &str,
+    dnn: &str,
+) -> Result<SessionSubscription, StatusCode> {
+    let udm = discover_udm(nrf_base).await.map_err(|e| {
+        tracing::warn!("UDM discovery failed: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let sdm = sbi_core::nudm::NudmClient::new(udm);
+
+    let gateway = |e| {
+        tracing::warn!("Nudm_SDM fetch failed: {e}");
+        StatusCode::BAD_GATEWAY
+    };
+    let forbidden = |why: &str| {
+        tracing::warn!(supi = %masked_supi(supi), %dnn, "PDU session rejected: {why}");
+        StatusCode::FORBIDDEN
+    };
+
+    // SMF-selection data: which DNNs this subscriber may use, per subscribed S-NSSAI.
+    let select = sdm
+        .get_smf_select_data(supi, plmn)
+        .await
+        .map_err(gateway)?
+        .ok_or_else(|| forbidden("no smf-selection subscription data"))?;
+    let dnn_allowed = select
+        .get("subscribedSnssaiInfos")
+        .and_then(|v| v.as_object())
+        .is_some_and(|infos| {
+            infos.values().any(|info| {
+                info.get("dnnInfos")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|dnns| {
+                        dnns.iter().any(|d| d.get("dnn").and_then(|v| v.as_str()) == Some(dnn))
+                    })
+            })
+        });
+    if !dnn_allowed {
+        return Err(forbidden("DNN not in smf-selection subscription data"));
+    }
+
+    // SM data: session parameters (S-NSSAI, AMBR) for the DNN's configuration.
+    let sm_data = sdm
+        .get_sm_data(supi, plmn)
+        .await
+        .map_err(gateway)?
+        .ok_or_else(|| forbidden("no session-management subscription data"))?;
+    let entry = sm_data
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| {
+            e.get("dnnConfigurations")
+                .and_then(|v| v.as_object())
+                .is_some_and(|c| c.contains_key(dnn))
+        })
+        .ok_or_else(|| forbidden("DNN has no configuration in sm-data"))?;
+
+    let snssai = entry
+        .get("singleNssai")
+        .and_then(|v| serde_json::from_value::<Snssai>(v.clone()).ok())
+        .ok_or_else(|| forbidden("sm-data entry has no singleNssai"))?;
+    let ambr = entry
+        .get("dnnConfigurations")
+        .and_then(|c| c.get(dnn))
+        .and_then(|c| c.get("sessionAmbr"))
+        .and_then(|v| serde_json::from_value::<SessionAmbrDto>(v.clone()).ok());
+    Ok(SessionSubscription { snssai, ambr })
+}
+
+/// Discover the UDM's Nudm service endpoint via the NRF.
+async fn discover_udm(nrf_base: &str) -> Result<String, String> {
+    let profile = sbi_core::nnrf::NrfClient::new(nrf_base.to_string())
+        .discover("UDM", "SMF")
+        .await
+        .map_err(|e| format!("NRF discovery failed: {e}"))?
+        .into_iter()
+        .next()
+        .ok_or("no UDM registered with the NRF")?;
+    let endpoint = profile
+        .nf_services
+        .and_then(|s| s.into_iter().next())
+        .and_then(|svc| svc.ip_end_points.into_iter().next())
+        .ok_or("UDM profile has no service endpoint")?;
+    let ip = endpoint.ipv4_address.ok_or("UDM endpoint missing IP")?;
+    let port = endpoint.port.ok_or("UDM endpoint missing port")?;
+    Ok(format!("http://{ip}:{port}"))
 }
 
 /// `Nsmf_PDUSession_UpdateSMContext`: install the downlink path with the gNB's F-TEID.
@@ -297,9 +453,72 @@ mod tests {
         assert_eq!(masked_supi("garbage"), "***");
     }
 
+    /// Spin an NRF + UDR (in-memory, provisioned) + UDM chain; returns the NRF base
+    /// the SMF should use. The demo subscriber may use DNN "internet" on slice
+    /// sst=1/sd=010203 with a 1/2 Gbps session AMBR.
+    async fn spin_subscription_backend(supi: &str, plmn: &str) -> String {
+        use subscriber_db::{DataSet, ProvisionedDataStore, SubscriberStore};
+
+        let store = Arc::new(subscriber_db::InMemoryStore::new());
+        store
+            .put_provisioned(
+                DataSet::SmfSelection,
+                supi,
+                plmn,
+                &serde_json::json!({
+                    "subscribedSnssaiInfos": {
+                        "1-010203": { "dnnInfos": [ { "dnn": "internet" } ] }
+                    }
+                }),
+            )
+            .unwrap();
+        store
+            .put_provisioned(
+                DataSet::Sm,
+                supi,
+                plmn,
+                &serde_json::json!([{
+                    "singleNssai": { "sst": 1, "sd": "010203" },
+                    "dnnConfigurations": {
+                        "internet": { "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" } }
+                    }
+                }]),
+            )
+            .unwrap();
+        let store: Arc<dyn SubscriberStore> = store;
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(udr_l, sbi_core::nudr::router(store)).await.unwrap() });
+
+        let udr = Arc::new(sbi_core::nudr::UdrClient::new(format!("http://{udr_addr}")));
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(udm_l, sbi_core::nudm::router(udr)).await.unwrap() });
+
+        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nrf_addr = nrf_l.local_addr().unwrap();
+        let nrf_store = sbi_core::nnrf::NrfStore::default();
+        tokio::spawn(async move { sbi_core::run_on(nrf_l, sbi_core::nnrf::router(nrf_store)).await.unwrap() });
+        let nrf_base = format!("http://{nrf_addr}");
+
+        let mut profile = sbi_core::nnrf::NfProfile::new("udm-1", "UDM", udm_addr.ip().to_string());
+        profile.nf_services = Some(vec![sbi_core::nnrf::NfService {
+            service_instance_id: "nudm-1".into(),
+            service_name: "nudm-sdm".into(),
+            scheme: "http".into(),
+            ip_end_points: vec![sbi_core::nnrf::IpEndPoint {
+                ipv4_address: Some(udm_addr.ip().to_string()),
+                port: Some(udm_addr.port()),
+            }],
+        }]);
+        sbi_core::nnrf::NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
+        nrf_base
+    }
+
     /// Full Nsmf → N4 spine: an in-process UPF, the SMF as PFCP client + SBI server,
-    /// driven over HTTP. CreateSMContext establishes the session (UPF allocates the
-    /// uplink TEID); UpdateSMContext installs the gNB downlink target on the UPF.
+    /// driven over HTTP — with the subscription checked against a real UDR/UDM chain.
+    /// CreateSMContext authorizes the DNN and establishes the session (UPF allocates
+    /// the uplink TEID); UpdateSMContext installs the gNB downlink target on the UPF.
     #[tokio::test]
     async fn pdu_session_create_then_update_drives_n4() {
         let upf_ip = Ipv4Addr::new(127, 0, 0, 1);
@@ -325,8 +544,11 @@ mod tests {
             });
         }
 
+        let nrf_base = spin_subscription_backend("imsi-999700000000001", "99970").await;
+
         // SMF: connect, associate, serve Nsmf.
-        let smf = Arc::new(SmfState::connect(upf_addr, Ipv4Addr::new(127, 0, 0, 1)).await.unwrap());
+        let smf =
+            Arc::new(SmfState::connect(upf_addr, Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap());
         smf.associate().await.unwrap();
         let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let smf_addr = smf_listener.local_addr().unwrap();
@@ -338,7 +560,10 @@ mod tests {
         // AMF → SMF: CreateSMContext.
         let created: SmContextCreatedData = client
             .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
-            .json(&serde_json::json!({"supi":"imsi-999700000000001","pduSessionId":5,"dnn":"internet"}))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" }
+            }))
             .send()
             .await
             .unwrap()
@@ -346,6 +571,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.up_n3_teid, "00000001", "UPF allocated the first N3 TEID");
+        // The subscribed slice + AMBR ride back for the AMF's N1 accept.
+        assert_eq!(created.s_nssai.sst, 1);
+        assert_eq!(created.s_nssai.sd.as_deref(), Some("010203"));
+        let ambr = created.session_ambr.as_ref().expect("subscribed session AMBR");
+        assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("1 Gbps", "2 Gbps"));
         assert_eq!(
             created.ue_ipv4_addr,
             Ipv4Addr::new(10, 45, 0, 2),
@@ -375,6 +605,72 @@ mod tests {
             Some((0x5678, Ipv4Addr::new(10, 0, 0, 9))),
             "UPF routes an N6 downlink packet to the gNB by the UE's assigned IP"
         );
+    }
+
+    /// An unsubscribed DNN is rejected with 403 *before* any N4 state is created.
+    #[tokio::test]
+    async fn unsubscribed_dnn_is_rejected_without_n4_state() {
+        let upf_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let upf_state = Arc::new(Mutex::new(pfcp::UpfState::new()));
+        let upf_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upf_addr = upf_sock.local_addr().unwrap();
+        {
+            let upf_state = upf_state.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let (n, peer) = upf_sock.recv_from(&mut buf).await.unwrap();
+                    let resp = {
+                        let mut s = upf_state.lock().unwrap();
+                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s)
+                    };
+                    if let Some(resp) = resp {
+                        upf_sock.send_to(&resp, peer).await.unwrap();
+                    }
+                }
+            });
+        }
+
+        let nrf_base = spin_subscription_backend("imsi-999700000000001", "99970").await;
+        let smf =
+            Arc::new(SmfState::connect(upf_addr, Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap());
+        smf.associate().await.unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+        let post = |body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!("{base}/nsmf-pdusession/v1/sm-contexts");
+            async move { client.post(url).json(&body).send().await.unwrap().status() }
+        };
+
+        // DNN not in the subscription → 403.
+        let status = post(serde_json::json!({
+            "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "corporate",
+            "servingNetwork": { "mcc": "999", "mnc": "70" }
+        }))
+        .await;
+        assert_eq!(status.as_u16(), 403);
+
+        // Unknown subscriber → 403 (no smf-selection data at all).
+        let status = post(serde_json::json!({
+            "supi": "imsi-999700000000099", "pduSessionId": 5, "dnn": "internet",
+            "servingNetwork": { "mcc": "999", "mnc": "70" }
+        }))
+        .await;
+        assert_eq!(status.as_u16(), 403);
+
+        // Missing serving network → 400.
+        let status = post(serde_json::json!({
+            "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet"
+        }))
+        .await;
+        assert_eq!(status.as_u16(), 400);
+
+        assert_eq!(upf_state.lock().unwrap().session_count(), 0, "no N4 session was created");
     }
 
     #[tokio::test]

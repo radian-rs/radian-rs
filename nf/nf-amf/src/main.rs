@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
     common::banner("amf");
 
     let amf_auth = Arc::new(auth::AmfAuth::new(NRF_BASE, PLMN_MCC, PLMN_MNC));
-    let amf_smf = Arc::new(pdu_session::AmfSmf::new(NRF_BASE));
+    let amf_smf = Arc::new(pdu_session::AmfSmf::new(NRF_BASE, PLMN_MCC, PLMN_MNC));
 
     let addr: SocketAddr = format!("0.0.0.0:{N2_PORT}").parse()?;
     let socket = Socket::new_v4(SocketToAssociation::OneToOne).context("create SCTP socket")?;
@@ -360,7 +360,17 @@ async fn on_uplink_nas(
                     // echoing the request's PTI) and NAS-protect a DL NAS Transport carrying
                     // it — the gNB relays that to the UE. The N2 SM info carries the UPF F-TEID.
                     let pti = container.get(2).copied().unwrap_or(1);
-                    let accept = nas::pdu_session_establishment_accept(psi, pti, created.ue_ip, "internet");
+                    // S-NSSAI and session AMBR come from the subscriber's UDR sm-data
+                    // (looked up by the SMF during CreateSMContext).
+                    let accept = nas::pdu_session_establishment_accept(
+                        psi,
+                        pti,
+                        created.ue_ip,
+                        "internet",
+                        created.snssai_sst,
+                        created.snssai_sd,
+                        created.ambr,
+                    );
                     let dl = nas::dl_nas_transport_sm(psi, accept);
                     let Some(ctx) = ues.get_mut(&amf_ue_id) else { return None };
                     ctx.sm_ref = Some(created.sm_ref);

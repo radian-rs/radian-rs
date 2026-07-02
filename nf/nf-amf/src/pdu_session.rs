@@ -11,26 +11,37 @@ use std::net::Ipv4Addr;
 use sbi_core::nnrf::NrfClient;
 
 /// The UPF's N3 F-TEID returned by CreateSMContext — for the N2 PDU Session Resource
-/// Setup the AMF sends to the gNB.
+/// Setup the AMF sends to the gNB — plus the subscribed session parameters the AMF
+/// places in the N1 PDU Session Establishment Accept.
 pub struct SmContextCreated {
     pub sm_ref: String,
     pub up_n3_teid: u32,
     pub up_n3_addr: Ipv4Addr,
     /// The UE's assigned IPv4 address — placed in the N1 PDU Session Establishment Accept.
     pub ue_ip: Ipv4Addr,
+    /// The subscribed slice (from the SMF's UDR sm-data lookup): SST + optional SD bytes.
+    pub snssai_sst: u8,
+    pub snssai_sd: Option<[u8; 3]>,
+    /// The subscribed session AMBR, already in NAS wire form (falls back to the
+    /// pre-subscription default when the SMF didn't supply one).
+    pub ambr: nas::SessionAmbr,
 }
 
 /// The AMF's client toward the SMF's `Nsmf_PDUSession` service.
 pub struct AmfSmf {
     nrf: NrfClient,
+    /// The serving PLMN this AMF passes in CreateSMContext (TS 29.502 `servingNetwork`).
+    mcc: String,
+    mnc: String,
 }
 
 impl AmfSmf {
-    pub fn new(nrf_base: impl Into<String>) -> Self {
-        Self { nrf: NrfClient::new(nrf_base.into()) }
+    pub fn new(nrf_base: impl Into<String>, mcc: impl Into<String>, mnc: impl Into<String>) -> Self {
+        Self { nrf: NrfClient::new(nrf_base.into()), mcc: mcc.into(), mnc: mnc.into() }
     }
 
-    /// Discover the SMF and create an SM context; returns the UPF N3 F-TEID.
+    /// Discover the SMF and create an SM context; returns the UPF N3 F-TEID and the
+    /// subscribed session parameters.
     pub async fn create_sm_context(
         &self,
         supi: &str,
@@ -44,6 +55,7 @@ impl AmfSmf {
                 "supi": supi,
                 "pduSessionId": pdu_session_id,
                 "dnn": dnn,
+                "servingNetwork": { "mcc": self.mcc, "mnc": self.mnc },
             }))
             .send()
             .await
@@ -66,7 +78,28 @@ impl AmfSmf {
             .ok_or("response missing ueIpv4Addr")?
             .parse()
             .map_err(|_| "bad ueIpv4Addr")?;
-        Ok(SmContextCreated { sm_ref, up_n3_teid, up_n3_addr, ue_ip })
+
+        // Subscribed session parameters for the N1 accept. Tolerate their absence
+        // (defaults match the pre-subscription behaviour) so an older SMF still works.
+        let snssai_sst = body
+            .pointer("/sNssai/sst")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u8::try_from(v).ok())
+            .unwrap_or(1);
+        let snssai_sd = body
+            .pointer("/sNssai/sd")
+            .and_then(|v| v.as_str())
+            .and_then(|sd| hex::decode(sd).ok())
+            .and_then(|b| <[u8; 3]>::try_from(b).ok());
+        let ambr = body
+            .get("sessionAmbr")
+            .and_then(|a| {
+                let ul = a.get("uplink")?.as_str()?;
+                let dl = a.get("downlink")?.as_str()?;
+                nas::session_ambr_from_bitrates(ul, dl)
+            })
+            .unwrap_or(nas::SessionAmbr::TEN_MBPS);
+        Ok(SmContextCreated { sm_ref, up_n3_teid, up_n3_addr, ue_ip, snssai_sst, snssai_sd, ambr })
     }
 
     /// Update the SM context with the gNB's DL N3 F-TEID (from the N2 setup response),
@@ -125,12 +158,17 @@ mod tests {
     #[tokio::test]
     async fn amf_discovers_smf_and_creates_sm_context() {
         // Mock SMF: an Nsmf endpoint returning a CreateSMContext success.
-        async fn mock_create() -> (StatusCode, Json<serde_json::Value>) {
+        async fn mock_create(Json(req): Json<serde_json::Value>) -> (StatusCode, Json<serde_json::Value>) {
+            // The AMF must identify its serving PLMN (TS 29.502 servingNetwork).
+            assert_eq!(req.pointer("/servingNetwork/mcc").and_then(|v| v.as_str()), Some("999"));
+            assert_eq!(req.pointer("/servingNetwork/mnc").and_then(|v| v.as_str()), Some("70"));
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
                     "smContextRef": "1", "upN3Teid": "00000001", "upN3Addr": "127.0.0.1",
-                    "ueIpv4Addr": "10.45.0.2"
+                    "ueIpv4Addr": "10.45.0.2",
+                    "sNssai": { "sst": 1, "sd": "010203" },
+                    "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" }
                 })),
             )
         }
@@ -163,12 +201,18 @@ mod tests {
         }]);
         NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
 
-        let amf_smf = AmfSmf::new(nrf_base);
+        let amf_smf = AmfSmf::new(nrf_base, "999", "70");
         let created = amf_smf
             .create_sm_context("imsi-999700000000001", 5, "internet")
             .await
             .expect("AMF creates SM context via discovered SMF");
         assert_eq!(created.up_n3_teid, 1, "UPF N3 F-TEID parsed from the response");
+        // Subscribed session parameters parsed for the N1 accept.
+        assert_eq!((created.snssai_sst, created.snssai_sd), (1, Some([1, 2, 3])));
+        assert_eq!(
+            created.ambr,
+            nas::SessionAmbr { dl_unit: 0x0B, dl: 2, ul_unit: 0x0B, ul: 1 }
+        );
 
         // The gNB F-TEID (from N2 setup) drives UpdateSMContext.
         amf_smf
