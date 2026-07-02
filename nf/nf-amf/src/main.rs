@@ -45,6 +45,9 @@ const PLMN_MNC: &str = "70";
 /// DNN used when the UE's UL NAS Transport omits the requested-DNN IE (TS 23.501
 /// default-DNN selection, simplified to one network-wide default).
 const DEFAULT_DNN: &str = "internet";
+/// T3396 back-off sent with a subscription-refused PDU session reject (cause #27):
+/// retrying can't succeed until provisioning changes, so hold the UE off.
+const REJECT_BACKOFF_SECS: u32 = 600;
 /// NRF the AMF uses to discover the AUSF.
 const NRF_BASE: &str = "http://127.0.0.1:8000";
 
@@ -400,17 +403,24 @@ async fn on_uplink_nas(
                 Err(e) => {
                     // Answer the UE with a 5GSM PDU Session Establishment Reject instead
                     // of silence: subscription refusal → cause #27 (missing or unknown
-                    // DNN), anything else → #31 (request rejected, unspecified). Plain
-                    // DL NAS Transport — no N2 setup, since no session exists.
-                    let cause = match &e {
-                        pdu_session::CreateSmError::Forbidden => nas::sm_cause::MISSING_OR_UNKNOWN_DNN,
-                        pdu_session::CreateSmError::Other(_) => nas::sm_cause::REQUEST_REJECTED_UNSPECIFIED,
+                    // DNN) with a T3396 back-off (retrying can't help until provisioning
+                    // changes); anything else → #31 (request rejected, unspecified),
+                    // no back-off — a transient failure may clear. Plain DL NAS
+                    // Transport — no N2 setup, since no session exists.
+                    let (cause, backoff) = match &e {
+                        pdu_session::CreateSmError::Forbidden => (
+                            nas::sm_cause::MISSING_OR_UNKNOWN_DNN,
+                            Some(nas::GprsTimer3::from_secs(REJECT_BACKOFF_SECS)),
+                        ),
+                        pdu_session::CreateSmError::Other(_) => {
+                            (nas::sm_cause::REQUEST_REJECTED_UNSPECIFIED, None)
+                        }
                     };
                     warn!(
                         "UE {amf_ue_id}: PDU session {psi} (dnn={dnn}) CreateSMContext failed: {e}; \
-                         sending Establishment Reject (5GSM cause #{cause})"
+                         sending Establishment Reject (5GSM cause #{cause}, backoff={backoff:?})"
                     );
-                    let reject = nas::pdu_session_establishment_reject(psi, pti, cause);
+                    let reject = nas::pdu_session_establishment_reject(psi, pti, cause, backoff);
                     let dl = nas::dl_nas_transport_sm(psi, reject);
                     let Some(sec) = ues.get_mut(&amf_ue_id).and_then(|c| c.sec.as_mut()) else {
                         warn!("UE {amf_ue_id}: cannot NAS-protect the reject (no security context)");
