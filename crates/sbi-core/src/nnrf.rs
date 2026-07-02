@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -25,6 +26,9 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::SbiError;
+
+/// Heartbeat interval the NRF assigns to registering NFs (TS 29.510 `heartBeatTimer`).
+pub const DEFAULT_HEARTBEAT_TIMER: Duration = Duration::from_secs(10);
 
 fn default_registered() -> String {
     "REGISTERED".to_string()
@@ -93,16 +97,59 @@ pub struct SearchResult {
     pub nf_instances: Vec<NfProfile>,
 }
 
+/// A registered profile plus when we last heard from the NF.
+struct Entry {
+    profile: NfProfile,
+    last_seen: Instant,
+}
+
 /// In-memory NF registry shared by the NRF router handlers.
-#[derive(Clone, Default)]
-pub struct NrfStore(Arc<Mutex<HashMap<String, NfProfile>>>);
+///
+/// Registrations are **soft state**: an NF must heartbeat (PATCH) within twice the
+/// assigned `heartBeatTimer` or its profile is evicted — a crashed NF stops being
+/// discoverable instead of lingering forever. Eviction is lazy (on read/heartbeat);
+/// a heartbeat after eviction returns `404`, telling the NF to re-register.
+#[derive(Clone)]
+pub struct NrfStore {
+    entries: Arc<Mutex<HashMap<String, Entry>>>,
+    heartbeat_timer: Duration,
+}
+
+impl Default for NrfStore {
+    fn default() -> Self {
+        Self::with_heartbeat_timer(DEFAULT_HEARTBEAT_TIMER)
+    }
+}
 
 impl NrfStore {
+    /// A registry that assigns `heartbeat_timer` and evicts after 2× that interval.
+    pub fn with_heartbeat_timer(heartbeat_timer: Duration) -> Self {
+        Self { entries: Arc::new(Mutex::new(HashMap::new())), heartbeat_timer }
+    }
+
     pub fn len(&self) -> usize {
-        self.0.lock().unwrap().len()
+        let mut g = self.entries.lock().unwrap();
+        self.purge_stale(&mut g);
+        g.len()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// One missed heartbeat is tolerated; a second means the NF is gone.
+    fn ttl(&self) -> Duration {
+        2 * self.heartbeat_timer
+    }
+
+    fn purge_stale(&self, entries: &mut HashMap<String, Entry>) {
+        let ttl = self.ttl();
+        entries.retain(|id, e| {
+            let alive = e.last_seen.elapsed() <= ttl;
+            if !alive {
+                tracing::info!(nf = %id, nf_type = %e.profile.nf_type, "evicting stale NF (heartbeat expired)");
+            }
+            alive
+        });
     }
 }
 
@@ -126,25 +173,39 @@ async fn register(
     Json(mut profile): Json<NfProfile>,
 ) -> impl IntoResponse {
     profile.nf_instance_id = id.clone();
-    store.0.lock().unwrap().insert(id, profile.clone());
+    // The NRF assigns the heartbeat contract (TS 29.510): the NF must PATCH at
+    // this interval or be evicted. The wire field is whole seconds — never
+    // advertise 0 even if the store's timer is sub-second (tests).
+    profile.heart_beat_timer = Some(store.heartbeat_timer.as_secs().max(1) as u32);
+    store
+        .entries
+        .lock()
+        .unwrap()
+        .insert(id, Entry { profile: profile.clone(), last_seen: Instant::now() });
     (StatusCode::CREATED, Json(profile))
 }
 
 async fn heartbeat(State(store): State<NrfStore>, Path(id): Path<String>) -> StatusCode {
-    if store.0.lock().unwrap().contains_key(&id) {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
+    let mut g = store.entries.lock().unwrap();
+    store.purge_stale(&mut g);
+    match g.get_mut(&id) {
+        Some(e) => {
+            e.last_seen = Instant::now();
+            StatusCode::NO_CONTENT
+        }
+        None => StatusCode::NOT_FOUND,
     }
 }
 
 async fn deregister(State(store): State<NrfStore>, Path(id): Path<String>) -> StatusCode {
-    store.0.lock().unwrap().remove(&id);
+    store.entries.lock().unwrap().remove(&id);
     StatusCode::NO_CONTENT
 }
 
 async fn list(State(store): State<NrfStore>) -> Json<SearchResult> {
-    let nf_instances = store.0.lock().unwrap().values().cloned().collect();
+    let mut g = store.entries.lock().unwrap();
+    store.purge_stale(&mut g);
+    let nf_instances = g.values().map(|e| e.profile.clone()).collect();
     Json(SearchResult { nf_instances })
 }
 
@@ -163,13 +224,12 @@ async fn discover(
     State(store): State<NrfStore>,
     Query(q): Query<DiscoveryQuery>,
 ) -> Json<SearchResult> {
-    let nf_instances = store
-        .0
-        .lock()
-        .unwrap()
+    let mut g = store.entries.lock().unwrap();
+    store.purge_stale(&mut g);
+    let nf_instances = g
         .values()
-        .filter(|p| p.nf_type.eq_ignore_ascii_case(&q.target_nf_type))
-        .cloned()
+        .filter(|e| e.profile.nf_type.eq_ignore_ascii_case(&q.target_nf_type))
+        .map(|e| e.profile.clone())
         .collect();
     Json(SearchResult { nf_instances })
 }
@@ -245,6 +305,31 @@ impl NrfClient {
     }
 }
 
+/// Register `profile` with the NRF and keep the registration alive: spawns a
+/// background task that heartbeats at the NRF-assigned `heartBeatTimer` interval
+/// and re-registers if the NRF has evicted us (heartbeat → 404). Returns once the
+/// initial registration succeeds.
+pub async fn register_and_maintain(nrf_base: &str, profile: NfProfile) -> Result<(), SbiError> {
+    let client = NrfClient::new(nrf_base.to_string());
+    let registered = client.register(&profile).await?;
+    let period = Duration::from_secs(u64::from(
+        registered.heart_beat_timer.unwrap_or(DEFAULT_HEARTBEAT_TIMER.as_secs() as u32).max(1),
+    ));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(period).await;
+            if client.heartbeat(&profile.nf_instance_id).await.is_ok() {
+                continue;
+            }
+            match client.register(&profile).await {
+                Ok(_) => tracing::info!(nf = %profile.nf_instance_id, "re-registered with NRF after eviction"),
+                Err(e) => tracing::warn!(nf = %profile.nf_instance_id, "NRF heartbeat and re-register failed: {e}"),
+            }
+        }
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +372,62 @@ mod tests {
         let nrf = NrfClient::new(format!("http://{addr}"));
         // 404 → reqwest error_for_status → SbiError.
         assert!(nrf.heartbeat("never-registered").await.is_err());
+    }
+
+    async fn serve(store: NrfStore) -> NrfClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(listener, router(store)).await.unwrap() });
+        NrfClient::new(format!("http://{addr}"))
+    }
+
+    #[tokio::test]
+    async fn register_assigns_heartbeat_timer() {
+        let nrf = serve(NrfStore::with_heartbeat_timer(Duration::from_secs(7))).await;
+        let registered = nrf.register(&NfProfile::new("smf-1", "SMF", "127.0.0.1")).await.unwrap();
+        assert_eq!(registered.heart_beat_timer, Some(7));
+    }
+
+    #[tokio::test]
+    async fn stale_nf_is_evicted_and_heartbeat_404s() {
+        // 50ms heartbeat timer → eviction after 100ms of silence.
+        let nrf = serve(NrfStore::with_heartbeat_timer(Duration::from_millis(50))).await;
+        nrf.register(&NfProfile::new("ausf-1", "AUSF", "127.0.0.1")).await.unwrap();
+        assert_eq!(nrf.discover("AUSF", "AMF").await.unwrap().len(), 1);
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(nrf.discover("AUSF", "AMF").await.unwrap().is_empty(), "stale NF still discoverable");
+        // Post-eviction heartbeat → 404, the signal to re-register.
+        assert!(nrf.heartbeat("ausf-1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_keeps_nf_discoverable_past_ttl() {
+        let nrf = serve(NrfStore::with_heartbeat_timer(Duration::from_millis(50))).await;
+        nrf.register(&NfProfile::new("ausf-1", "AUSF", "127.0.0.1")).await.unwrap();
+        // Heartbeat every 40ms for 400ms — well past the 100ms TTL.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            nrf.heartbeat("ausf-1").await.unwrap();
+        }
+        assert_eq!(nrf.discover("AUSF", "AMF").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_and_maintain_survives_eviction() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The advertised heartBeatTimer is whole seconds, so the maintenance loop
+        // can't be tested faster than a 1s interval (TTL 2s).
+        let store = NrfStore::with_heartbeat_timer(Duration::from_secs(1));
+        tokio::spawn(async move { crate::run_on(listener, router(store)).await.unwrap() });
+
+        let base = format!("http://{addr}");
+        register_and_maintain(&base, NfProfile::new("smf-1", "SMF", "127.0.0.1")).await.unwrap();
+        // Past the 2s TTL the maintenance heartbeats (at ~1s, ~2s) must have kept
+        // the NF discoverable.
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        let found = NrfClient::new(base).discover("SMF", "AMF").await.unwrap();
+        assert_eq!(found.len(), 1);
     }
 }
