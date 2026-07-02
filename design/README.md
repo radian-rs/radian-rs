@@ -36,6 +36,7 @@ surface of the project and assesses build feasibility.
 | [25-nrf-heartbeat-expiry.md](25-nrf-heartbeat-expiry.md) | NRF soft state: heartbeat-TTL eviction, assigned heartBeatTimer, register_and_maintain loops in AUSF/SMF |
 | [26-udr-nudr-relocation.md](26-udr-nudr-relocation.md) | Subscriber store behind nf-udr over Nudr: SQN split from encrypted creds, AM/SM/SMF-selection JSON documents, stateless UDM (K never on the wire) |
 | [27-smf-subscription-data.md](27-smf-subscription-data.md) | SMF reads sm-data/smf-select-data via Nudm_SDM: DNN authorization (403, no N4), subscribed S-NSSAI + session AMBR drive the N1 accept |
+| [28-requested-dnn.md](28-requested-dnn.md) | UE-requested DNN: parse the UL NAS Transport 0x25 IE, drive CreateSMContext + N1 accept with it (default `internet` when omitted) |
 
 ## One-paragraph summary
 

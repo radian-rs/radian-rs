@@ -134,14 +134,17 @@ pub fn registration_complete() -> Nas5gsMessage {
 }
 
 /// Build and encode a 5GMM **UL NAS Transport** (TS 24.501 §8.2.10) carrying an N1 SM
-/// container (a 5GSM message) for `pdu_session_id`. UE side / tests — the AMF relays
-/// the container to the SMF transparently.
-pub fn ul_nas_transport_sm(pdu_session_id: u8, sm_container: Vec<u8>) -> Vec<u8> {
-    let transport = messages::NasUlNasTransport::new(
+/// container (a 5GSM message) for `pdu_session_id`, optionally with the UE's requested
+/// **DNN** IE. UE side / tests — the AMF relays the container to the SMF transparently.
+pub fn ul_nas_transport_sm(pdu_session_id: u8, sm_container: Vec<u8>, dnn: Option<&str>) -> Vec<u8> {
+    let mut transport = messages::NasUlNasTransport::new(
         NasPayloadContainerType::new(0x01), // N1 SM information
         NasPayloadContainer::new(sm_container),
     )
     .set_pdu_session_id(NasPduSessionIdentity2::new(pdu_session_id));
+    if let Some(dnn) = dnn {
+        transport = transport.set_dnn(NasDnn::from_string(dnn));
+    }
     let msg = Nas5gsMessage::new_5gmm(
         Nas5gmmMessageType::UlNasTransport,
         Nas5gmmMessage::UlNasTransport(transport),
@@ -278,6 +281,17 @@ pub fn sm_container_from_ul_nas_transport(msg: &Nas5gsMessage) -> Option<(u8, Ve
     };
     let psi = transport.pdu_session_id.as_ref()?.value;
     Some((psi, transport.payload_container.value.clone()))
+}
+
+/// Extract the UE's requested **DNN** from a decoded 5GMM UL NAS Transport
+/// (TS 24.501 §8.2.10, IEI 0x25), decoded from its RFC 1035 label form to a
+/// dot-separated string. `None` when the UE omitted the IE (the network then
+/// falls back to a default DNN).
+pub fn requested_dnn_from_ul_nas_transport(msg: &Nas5gsMessage) -> Option<String> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::UlNasTransport(transport)) = msg else {
+        return None;
+    };
+    transport.dnn.as_ref()?.as_string()
 }
 
 /// Extract `(pdu_session_id, N1 SM container)` from a decoded 5GMM DL NAS Transport.
@@ -550,10 +564,17 @@ mod tests {
     fn ul_nas_transport_round_trips() {
         // A minimal 5GSM PDU Session Establishment Request as the opaque N1 SM container.
         let container = vec![0x2e, 0x01, 0x01, 0xc1];
-        let bytes = ul_nas_transport_sm(5, container.clone());
+        let bytes = ul_nas_transport_sm(5, container.clone(), Some("ims.corp"));
         let msg = decode_nas_5gs_message(&bytes).expect("decode");
         assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::UlNasTransport));
         assert_eq!(sm_container_from_ul_nas_transport(&msg), Some((5, container)));
+        // The requested DNN rides in the transport's 0x25 IE (RFC 1035 labels).
+        assert_eq!(requested_dnn_from_ul_nas_transport(&msg).as_deref(), Some("ims.corp"));
+
+        // Without the IE, extraction yields None (network default applies).
+        let without = decode_nas_5gs_message(&ul_nas_transport_sm(5, vec![0x2e, 0x01, 0x01, 0xc1], None))
+            .expect("decode");
+        assert_eq!(requested_dnn_from_ul_nas_transport(&without), None);
     }
 
     #[test]
