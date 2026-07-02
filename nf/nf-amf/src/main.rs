@@ -42,6 +42,9 @@ const N2_PORT: u16 = 38412;
 const AMF_NAME: &str = "radiant-amf";
 const PLMN_MCC: &str = "999";
 const PLMN_MNC: &str = "70";
+/// DNN used when the UE's UL NAS Transport omits the requested-DNN IE (TS 23.501
+/// default-DNN selection, simplified to one network-wide default).
+const DEFAULT_DNN: &str = "internet";
 /// NRF the AMF uses to discover the AUSF.
 const NRF_BASE: &str = "http://127.0.0.1:8000";
 
@@ -354,19 +357,25 @@ async fn on_uplink_nas(
                 warn!("UE {amf_ue_id}: UL NAS Transport before SUPI is known");
                 return None;
             };
-            match amf_smf.create_sm_context(&supi, psi, "internet").await {
+            // The UE's requested DNN rides in the transport's optional 0x25 IE; a UE
+            // that omits it gets the network default. The SMF authorizes it against
+            // the subscription (design/27) — an unsubscribed DNN fails CreateSMContext.
+            let dnn = nas::requested_dnn_from_ul_nas_transport(&nas_msg)
+                .unwrap_or_else(|| DEFAULT_DNN.to_string());
+            match amf_smf.create_sm_context(&supi, psi, &dnn).await {
                 Ok(created) => {
                     // Build the N1 PDU Session Establishment Accept (UE IP from the SMF,
                     // echoing the request's PTI) and NAS-protect a DL NAS Transport carrying
                     // it — the gNB relays that to the UE. The N2 SM info carries the UPF F-TEID.
                     let pti = container.get(2).copied().unwrap_or(1);
                     // S-NSSAI and session AMBR come from the subscriber's UDR sm-data
-                    // (looked up by the SMF during CreateSMContext).
+                    // (looked up by the SMF during CreateSMContext); the DNN echoes
+                    // the UE's authorized request.
                     let accept = nas::pdu_session_establishment_accept(
                         psi,
                         pti,
                         created.ue_ip,
-                        "internet",
+                        &dnn,
                         created.snssai_sst,
                         created.snssai_sd,
                         created.ambr,
