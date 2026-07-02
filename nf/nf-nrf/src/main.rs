@@ -8,8 +8,15 @@ async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("nrf");
 
-    // Nnrf_NFManagement + Nnrf_NFDiscovery (TS 29.510) over the SBI.
-    let store = sbi_core::nnrf::NrfStore::default();
+    // Nnrf_NFManagement + Nnrf_NFDiscovery (TS 29.510) over the SBI. Registrations
+    // are soft state: NFs heartbeat at the assigned interval or get evicted.
+    let store = match std::env::var("RADIANT_NRF_HEARTBEAT_SECS") {
+        Ok(v) => {
+            let secs: u64 = v.parse().map_err(|e| anyhow::anyhow!("RADIANT_NRF_HEARTBEAT_SECS: {e}"))?;
+            sbi_core::nnrf::NrfStore::with_heartbeat_timer(std::time::Duration::from_secs(secs.max(1)))
+        }
+        Err(_) => sbi_core::nnrf::NrfStore::default(),
+    };
     let sbi: SocketAddr = "0.0.0.0:8000".parse()?;
     sbi_core::run(sbi, sbi_core::nnrf::router(store)).await?;
     Ok(())

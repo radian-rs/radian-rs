@@ -33,6 +33,7 @@ surface of the project and assesses build feasibility.
 | [22-bdd-datapath.md](22-bdd-datapath.md) | Netns datapath BDD test: cucumber `bdd/` crate drives PFCP+GTP-U through a real UPF+N6 TUN, verifies an ICMP round trip |
 | [23-bdd-sim-e2e.md](23-bdd-sim-e2e.md) | Simulator-driven e2e BDD (`@sim`): free-ran-ue gNB/UE + full core → registration → PDU session → ping; AUSF self-registers |
 | [24-db-subscriber-nf.md](24-db-subscriber-nf.md) | DB design study: subscriber (UDR) vs NF-profile (NRF) storage — RDB vs NoSQL vs embedded, staged path (redb → Postgres+JSONB; NRF stays DB-less) |
+| [25-nrf-heartbeat-expiry.md](25-nrf-heartbeat-expiry.md) | NRF soft state: heartbeat-TTL eviction, assigned heartBeatTimer, register_and_maintain loops in AUSF/SMF |
 
 ## One-paragraph summary
 

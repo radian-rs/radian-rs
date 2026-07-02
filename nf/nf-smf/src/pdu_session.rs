@@ -260,9 +260,10 @@ fn masked_supi(supi: &str) -> String {
     }
 }
 
-/// Register this SMF's `nsmf-pdusession` service with the NRF so the AMF can discover it.
+/// Register this SMF's `nsmf-pdusession` service with the NRF so the AMF can
+/// discover it, and keep it alive via the NRF-assigned heartbeat.
 pub async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> anyhow::Result<()> {
-    use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService, NrfClient};
+    use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService};
     let mut profile = NfProfile::new(sbi_core::new_nf_instance_id(), "SMF", ip.to_string());
     profile.nf_services = Some(vec![NfService {
         service_instance_id: "nsmf-pdusession-1".into(),
@@ -273,7 +274,7 @@ pub async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> a
             port: Some(sbi_port),
         }],
     }]);
-    NrfClient::new(nrf_base.to_string()).register(&profile).await?;
+    sbi_core::nnrf::register_and_maintain(nrf_base, profile).await?;
     Ok(())
 }
 

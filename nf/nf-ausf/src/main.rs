@@ -30,9 +30,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Register this AUSF's `nausf-auth` service with the NRF (mirrors the SMF's registration).
+/// Register this AUSF's `nausf-auth` service with the NRF (mirrors the SMF's
+/// registration) and keep it alive via the NRF-assigned heartbeat.
 async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> anyhow::Result<()> {
-    use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService, NrfClient};
+    use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService};
     let mut profile = NfProfile::new(sbi_core::new_nf_instance_id(), "AUSF", ip.to_string());
     profile.nf_services = Some(vec![NfService {
         service_instance_id: "nausf-auth-1".into(),
@@ -43,6 +44,6 @@ async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> anyho
             port: Some(sbi_port),
         }],
     }]);
-    NrfClient::new(nrf_base.to_string()).register(&profile).await?;
+    sbi_core::nnrf::register_and_maintain(nrf_base, profile).await?;
     Ok(())
 }
