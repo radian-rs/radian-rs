@@ -1,17 +1,20 @@
-//! Nudm_UEAuthentication — UDM authentication-vector service (TS 29.503).
+//! Nudm — UDM services (TS 29.503): `Nudm_UEAuthentication` (authentication
+//! vectors) and `Nudm_SDM` (subscriber data management, the SMF's view of
+//! sm-data / smf-select-data).
 //!
 //! The UDM here is a stateless front-end over the **UDR** (Nudr, design/24 step 1):
-//! it parses the serving network and asks the UDR — which co-hosts the ARPF — to
-//! derive a 5G HE authentication vector. **The long-term key K never reaches this
-//! module or the UDM↔UDR wire** — only the derived vector does.
+//! authentication asks the UDR — which co-hosts the ARPF — to derive a 5G HE
+//! vector (**the long-term key K never reaches this module or the UDM↔UDR wire**),
+//! and SDM proxies the provisioned-data documents verbatim.
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use subscriber_db::DataSet;
 
 use crate::nudr::UdrClient;
 use crate::SbiError;
@@ -43,14 +46,57 @@ pub struct Av5gHe {
     pub kausf: String,
 }
 
-/// Build the UDM router (Nudm_UEAuthentication_Get) backed by the UDR over Nudr.
+/// Build the UDM router (Nudm_UEAuthentication_Get + Nudm_SDM) backed by the UDR
+/// over Nudr.
 pub fn router(udr: Arc<UdrClient>) -> Router {
     Router::new()
         .route(
             "/nudm-ueau/v1/{supi_or_suci}/security-information/generate-auth-data",
             post(generate_auth_data),
         )
+        .route("/nudm-sdm/v2/{supi}/sm-data", get(sdm_sm_data))
+        .route("/nudm-sdm/v2/{supi}/smf-select-data", get(sdm_smf_select_data))
         .with_state(udr)
+}
+
+/// `Nudm_SDM` query: the serving PLMN selects which provisioned dataset applies
+/// (TS 29.503 `plmn-id`; we take the concatenated MCC+MNC form, e.g. `99970`).
+#[derive(Debug, Deserialize)]
+struct SdmQuery {
+    #[serde(rename = "plmn-id")]
+    plmn_id: String,
+}
+
+async fn sdm_sm_data(
+    State(udr): State<Arc<UdrClient>>,
+    Path(supi): Path<String>,
+    Query(q): Query<SdmQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    sdm_fetch(udr, DataSet::Sm, supi, q.plmn_id).await
+}
+
+async fn sdm_smf_select_data(
+    State(udr): State<Arc<UdrClient>>,
+    Path(supi): Path<String>,
+    Query(q): Query<SdmQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    sdm_fetch(udr, DataSet::SmfSelection, supi, q.plmn_id).await
+}
+
+async fn sdm_fetch(
+    udr: Arc<UdrClient>,
+    ds: DataSet,
+    supi: String,
+    plmn: String,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    udr.get_provisioned(ds, &supi, &plmn)
+        .await
+        .map_err(|e| {
+            tracing::warn!("UDR provisioned-data fetch failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn generate_auth_data(
@@ -125,5 +171,41 @@ impl NudmClient {
             .await?
             .error_for_status()?;
         Ok(resp.json().await?)
+    }
+
+    /// Nudm_SDM — Session Management Subscription data. `Ok(None)` if not provisioned.
+    pub async fn get_sm_data(
+        &self,
+        supi: &str,
+        plmn: &str,
+    ) -> Result<Option<serde_json::Value>, SbiError> {
+        self.sdm_get("sm-data", supi, plmn).await
+    }
+
+    /// Nudm_SDM — SMF selection subscription data. `Ok(None)` if not provisioned.
+    pub async fn get_smf_select_data(
+        &self,
+        supi: &str,
+        plmn: &str,
+    ) -> Result<Option<serde_json::Value>, SbiError> {
+        self.sdm_get("smf-select-data", supi, plmn).await
+    }
+
+    async fn sdm_get(
+        &self,
+        resource: &str,
+        supi: &str,
+        plmn: &str,
+    ) -> Result<Option<serde_json::Value>, SbiError> {
+        let resp = self
+            .http
+            .get(format!("{}/nudm-sdm/v2/{}/{}", self.base, supi, resource))
+            .query(&[("plmn-id", plmn)])
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
     }
 }

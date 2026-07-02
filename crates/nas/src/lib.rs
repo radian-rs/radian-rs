@@ -149,17 +149,59 @@ pub fn ul_nas_transport_sm(pdu_session_id: u8, sm_container: Vec<u8>) -> Vec<u8>
     encode_nas_5gs_message(&msg).expect("encode UlNasTransport")
 }
 
+/// A Session-AMBR in TS 24.501 §9.11.4.14 wire form: a unit octet plus a 16-bit
+/// multiple, per direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAmbr {
+    pub dl_unit: u8,
+    pub dl: u16,
+    pub ul_unit: u8,
+    pub ul: u16,
+}
+
+impl SessionAmbr {
+    /// The pre-subscription default this stack used: 10 Mbps each way.
+    pub const TEN_MBPS: SessionAmbr =
+        SessionAmbr { dl_unit: 0x06, dl: 10, ul_unit: 0x06, ul: 10 };
+}
+
+/// Convert TS 29.571 `BitRate` strings (as provisioned in the UDR sm-data, e.g.
+/// `"2 Gbps"`) to the NAS Session-AMBR encoding. Integer values only; `None` if
+/// either string doesn't parse or overflows the 16-bit multiple.
+pub fn session_ambr_from_bitrates(uplink: &str, downlink: &str) -> Option<SessionAmbr> {
+    fn one(s: &str) -> Option<(u8, u16)> {
+        let (value, unit) = s.trim().split_once(' ')?;
+        let value: u16 = value.parse().ok()?;
+        // TS 24.501 Table 9.11.4.14.1 (the 1× steps; finer multiples unused here).
+        let unit = match unit {
+            "Kbps" => 0x01,
+            "Mbps" => 0x06,
+            "Gbps" => 0x0B,
+            "Tbps" => 0x10,
+            _ => return None,
+        };
+        Some((unit, value))
+    }
+    let (ul_unit, ul) = one(uplink)?;
+    let (dl_unit, dl) = one(downlink)?;
+    Some(SessionAmbr { dl_unit, dl, ul_unit, ul })
+}
+
 /// Build a 5GSM **PDU Session Establishment Accept** (TS 24.501 §8.3.2) as the raw N1 SM
 /// container bytes. Hand-encoded to the exact TS 24.501 layout (so it interoperates with a
 /// free5GC UE regardless of codec quirks): SSC mode 1 + IPv4, one default *match-all* QoS
-/// rule, a Session-AMBR, the **PDU address** carrying the UE's assigned IPv4 (the field the UE
-/// reads to configure its stack), and the **S-NSSAI** + **DNN** (which the UE also reads).
-/// `pti` echoes the request's procedure transaction id; S-NSSAI is the default eMBB slice.
+/// rule, the subscribed **Session-AMBR**, the **PDU address** carrying the UE's assigned
+/// IPv4 (the field the UE reads to configure its stack), and the subscribed **S-NSSAI** +
+/// **DNN** (which the UE also reads). `pti` echoes the request's procedure transaction id;
+/// S-NSSAI/AMBR come from the subscriber's UDR sm-data (design/27).
 pub fn pdu_session_establishment_accept(
     pdu_session_id: u8,
     pti: u8,
     ue_ip: std::net::Ipv4Addr,
     dnn: &str,
+    snssai_sst: u8,
+    snssai_sd: Option<[u8; 3]>,
+    ambr: SessionAmbr,
 ) -> Vec<u8> {
     let mut m = Vec::with_capacity(48);
     // 5GSM header: EPD, PDU session id, PTI, message type (0xC2 = Establishment Accept).
@@ -173,14 +215,28 @@ pub fn pdu_session_establishment_accept(
     m.extend_from_slice(&qos_rules);
     // Session-AMBR (LV, length 6): downlink unit+value then uplink unit+value.
     m.push(6);
-    m.extend_from_slice(&[0x06, 0x00, 0x0a, 0x06, 0x00, 0x0a]);
+    m.push(ambr.dl_unit);
+    m.extend_from_slice(&ambr.dl.to_be_bytes());
+    m.push(ambr.ul_unit);
+    m.extend_from_slice(&ambr.ul.to_be_bytes());
     // PDU address (IEI 0x29, length 5): PDU session type IPv4 (1) + the UE's IPv4 address.
     m.push(0x29);
     m.push(5);
     m.push(0x01);
     m.extend_from_slice(&ue_ip.octets());
-    // S-NSSAI (IEI 0x22): SST=1, SD=010203 (the default slice the RAN/UE are configured with).
-    m.extend_from_slice(&[0x22, 0x04, 0x01, 0x01, 0x02, 0x03]);
+    // S-NSSAI (IEI 0x22): SST, plus the SD when the slice has one.
+    m.push(0x22);
+    match snssai_sd {
+        Some(sd) => {
+            m.push(4);
+            m.push(snssai_sst);
+            m.extend_from_slice(&sd);
+        }
+        None => {
+            m.push(1);
+            m.push(snssai_sst);
+        }
+    }
     // DNN (IEI 0x25): RFC 1035 label form — a length-prefixed label per dot-separated part.
     m.push(0x25);
     let dnn_buf: Vec<u8> = rfc1035_labels(dnn);
@@ -422,16 +478,36 @@ mod tests {
     #[test]
     fn dl_nas_transport_carries_pdu_session_accept() {
         let ue_ip = std::net::Ipv4Addr::new(10, 45, 0, 2);
-        let accept = pdu_session_establishment_accept(5, 1, ue_ip, "internet");
+        let ambr = session_ambr_from_bitrates("1 Gbps", "2 Gbps").expect("bitrates parse");
+        let accept =
+            pdu_session_establishment_accept(5, 1, ue_ip, "internet", 1, Some([1, 2, 3]), ambr);
         // A 5GSM Establishment Accept: header, the UE's IPv4 in the PDU address, and the DNN.
         assert_eq!(&accept[..4], &[0x2e, 5, 1, 0xc2]);
         assert!(accept.windows(7).any(|w| w == [0x29, 5, 0x01, 10, 45, 0, 2]), "PDU address = UE IPv4");
         assert!(accept.ends_with(&[0x25, 0x09, 0x08, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't']), "DNN");
+        // Subscribed values on the wire: AMBR DL 2 Gbps then UL 1 Gbps; S-NSSAI sst=1 sd=010203.
+        assert!(accept.windows(7).any(|w| w == [6, 0x0B, 0, 2, 0x0B, 0, 1]), "Session-AMBR");
+        assert!(accept.windows(6).any(|w| w == [0x22, 0x04, 0x01, 1, 2, 3]), "S-NSSAI");
 
         let bytes = encode_nas_5gs_message(&dl_nas_transport_sm(5, accept.clone())).expect("encode");
         let msg = decode_nas_5gs_message(&bytes).expect("decode");
         assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::DlNasTransport));
         assert_eq!(sm_container_from_dl_nas_transport(&msg), Some((5, accept)));
+    }
+
+    #[test]
+    fn session_ambr_bitrate_parsing() {
+        assert_eq!(
+            session_ambr_from_bitrates("1 Gbps", "2 Gbps"),
+            Some(SessionAmbr { dl_unit: 0x0B, dl: 2, ul_unit: 0x0B, ul: 1 })
+        );
+        assert_eq!(
+            session_ambr_from_bitrates("500 Kbps", "10 Mbps"),
+            Some(SessionAmbr { dl_unit: 0x06, dl: 10, ul_unit: 0x01, ul: 500 })
+        );
+        assert_eq!(session_ambr_from_bitrates("0.5 Gbps", "1 Gbps"), None, "fractions unsupported");
+        assert_eq!(session_ambr_from_bitrates("fast", "1 Gbps"), None);
+        assert_eq!(session_ambr_from_bitrates("1 Gbps", "999999 Gbps"), None, "u16 overflow");
     }
 
     #[test]

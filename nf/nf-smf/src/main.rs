@@ -26,13 +26,14 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| DEFAULT_UPF_N4.to_string())
         .parse()?;
     let smf_ip = Ipv4Addr::new(127, 0, 0, 1); // TODO: real N4 source address / config
+    let nrf_base = std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string());
 
-    let smf = Arc::new(SmfState::connect(upf_n4, smf_ip).await?);
+    // The NRF base is also how the SMF finds the UDM for Nudm_SDM subscription checks.
+    let smf = Arc::new(SmfState::connect(upf_n4, smf_ip, nrf_base.clone()).await?);
     smf.associate().await?;
     tracing::info!(%upf_n4, "PFCP association established with UPF");
 
     // Register with the NRF so the AMF can discover the Nsmf_PDUSession service.
-    let nrf_base = std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string());
     match pdu_session::register_with_nrf(&nrf_base, smf_ip, SBI_PORT).await {
         Ok(()) => tracing::info!(%nrf_base, "registered SMF with NRF"),
         Err(e) => tracing::warn!("NRF registration failed (continuing without discovery): {e}"),

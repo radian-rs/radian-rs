@@ -83,9 +83,17 @@ fn provision_demo(store: &RedbStore) -> anyhow::Result<()> {
             }
         }
     }]);
+    // Which DNNs the subscriber may use per subscribed S-NSSAI — the SMF's
+    // authorization gate for CreateSMContext.
+    let smf_sel = serde_json::json!({
+        "subscribedSnssaiInfos": {
+            "1-010203": { "dnnInfos": [ { "dnn": "internet" } ] }
+        }
+    });
     store
         .put_provisioned(DataSet::Am, DEMO_SUPI, DEMO_PLMN, &am)
         .and_then(|()| store.put_provisioned(DataSet::Sm, DEMO_SUPI, DEMO_PLMN, &sm))
+        .and_then(|()| store.put_provisioned(DataSet::SmfSelection, DEMO_SUPI, DEMO_PLMN, &smf_sel))
         .map_err(|e| anyhow::anyhow!("provision demo documents: {e}"))
 }
 
