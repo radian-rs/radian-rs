@@ -7,7 +7,6 @@ authors.workspace = true
 [dependencies]
 common.workspace = true
 sbi-core.workspace = true
-subscriber-db.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true

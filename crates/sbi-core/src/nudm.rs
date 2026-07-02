@@ -1,9 +1,9 @@
-//! Nudm_UEAuthentication — UDM/ARPF authentication-vector service (TS 29.503).
+//! Nudm_UEAuthentication — UDM authentication-vector service (TS 29.503).
 //!
-//! The UDM here is a stateless front-end over a [`subscriber_db::SubscriberStore`]:
-//! it reads the next SQN and asks the store (the ARPF boundary) to generate a 5G HE
-//! authentication vector. **The long-term key K never reaches this module** — only
-//! the derived vector does.
+//! The UDM here is a stateless front-end over the **UDR** (Nudr, design/24 step 1):
+//! it parses the serving network and asks the UDR — which co-hosts the ARPF — to
+//! derive a 5G HE authentication vector. **The long-term key K never reaches this
+//! module or the UDM↔UDR wire** — only the derived vector does.
 
 use std::sync::Arc;
 
@@ -12,8 +12,8 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use subscriber_db::SubscriberStore;
 
+use crate::nudr::UdrClient;
 use crate::SbiError;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -43,37 +43,40 @@ pub struct Av5gHe {
     pub kausf: String,
 }
 
-/// Build the UDM router (Nudm_UEAuthentication_Get) backed by a subscriber store.
-pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
+/// Build the UDM router (Nudm_UEAuthentication_Get) backed by the UDR over Nudr.
+pub fn router(udr: Arc<UdrClient>) -> Router {
     Router::new()
         .route(
             "/nudm-ueau/v1/{supi_or_suci}/security-information/generate-auth-data",
             post(generate_auth_data),
         )
-        .with_state(store)
+        .with_state(udr)
 }
 
 async fn generate_auth_data(
-    State(store): State<Arc<dyn SubscriberStore>>,
+    State(udr): State<Arc<UdrClient>>,
     Path(supi_or_suci): Path<String>,
     Json(req): Json<AuthenticationInfoRequest>,
 ) -> Result<Json<AuthenticationInfoResult>, StatusCode> {
     // NOTE: SUCI deconcealment is out of scope; supiOrSuci is treated as the SUPI.
     let (mcc, mnc) = parse_snn(&req.serving_network_name).ok_or(StatusCode::BAD_REQUEST)?;
-    let sqn = store.next_sqn(&supi_or_suci).ok_or(StatusCode::NOT_FOUND)?;
-    let rand = crate::random_rand();
-    let av = store
-        .generate_he_av(&supi_or_suci, &sqn, &rand, &mcc, &mnc)
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let av = udr
+        .generate_av(&supi_or_suci, &mcc, &mnc)
+        .await
+        .map_err(|e| {
+            tracing::warn!("UDR generate-av failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(AuthenticationInfoResult {
         auth_type: "5G_AKA".to_string(),
         authentication_vector: Av5gHe {
             av_type: "5G_HE_AKA".to_string(),
-            rand: hex::encode(av.rand),
-            xres_star: hex::encode(av.xres_star),
-            autn: hex::encode(av.autn),
-            kausf: hex::encode(av.kausf),
+            rand: av.rand,
+            xres_star: av.xres_star,
+            autn: av.autn,
+            kausf: av.kausf,
         },
         supi: supi_or_suci,
     }))

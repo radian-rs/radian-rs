@@ -1,74 +1,55 @@
 //! UDM — Unified Data Management (Nudm, TS 29.503). SBI-only (JSON).
 //!
-//! Stateless front-end over a persistent subscriber store (`subscriber-db`, redb
-//! backend, owner-only file). Architecturally the data belongs in the UDR (Nudr) —
-//! relocating it behind `nf-udr` is a later slice.
-//!
-//! The demo subscriber uses a **public** test key (TS 35.208) and is provisioned
-//! only when `RADIANT_UDM_PROVISION_DEMO=1` — never auto-created — so a production
-//! build never ships a known-key (backdoor) account.
+//! Stateless front-end over the **UDR** (Nudr, design/24 step 1): the subscriber
+//! store lives behind `nf-udr`; this NF holds no persistent state and never sees
+//! the long-term key K — only derived authentication vectors cross the UDM↔UDR
+//! wire (`sbi_core::nudr`).
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use subscriber_db::{RedbStore, SubscriberDb, SubscriberStore};
 use tracing::{info, warn};
 
-const DEMO_SUPI: &str = "imsi-999700000000001";
-const DEFAULT_DB_PATH: &str = "radiant-udm.redb";
-const DEMO_ENV: &str = "RADIANT_UDM_PROVISION_DEMO";
-const DB_ENV: &str = "RADIANT_UDM_DB";
-const KEK_ENV: &str = "RADIANT_UDM_MASTER_KEY";
+const SBI_PORT: u16 = 8004;
+/// UDR the UDM fronts. Override with `RADIANT_UDM_UDR`.
+const UDR_ENV: &str = "RADIANT_UDM_UDR";
+const DEFAULT_UDR: &str = "http://127.0.0.1:8005";
+const NRF_ENV: &str = "RADIANT_UDM_NRF";
+const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("udm");
 
-    let db_path = std::env::var(DB_ENV).unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
-    let store = RedbStore::open(&db_path, master_key()?)
-        .map_err(|e| anyhow::anyhow!("open UDM store {db_path}: {e}"))?;
+    let udr_base = std::env::var(UDR_ENV).unwrap_or_else(|_| DEFAULT_UDR.to_string());
+    info!(%udr_base, "UDM fronting UDR over Nudr");
+    let udr = Arc::new(sbi_core::nudr::UdrClient::new(udr_base));
 
-    if demo_enabled() {
-        if !store.exists(DEMO_SUPI) {
-            store
-                .provision_hex(
-                    DEMO_SUPI,
-                    "465b5ce8b199b49faa5f0a2ee238a6bc",
-                    "cd63cb71954a9f4e48a5994e37a02baf",
-                    "8000",
-                )
-                .map_err(|e| anyhow::anyhow!("provision demo subscriber: {e}"))?;
-        }
-        warn!(
-            supi = DEMO_SUPI,
-            "DEMO subscriber enabled (PUBLIC TS 35.208 test key) — do NOT use in production"
-        );
-    } else {
-        info!("demo subscriber disabled (set {DEMO_ENV}=1 to provision the TS 35.208 test subscriber)");
+    // Register with the NRF so the AUSF can discover the Nudm service.
+    let nrf_base = std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string());
+    match register_with_nrf(&nrf_base, Ipv4Addr::LOCALHOST, SBI_PORT).await {
+        Ok(()) => info!(%nrf_base, "registered UDM with NRF"),
+        Err(e) => warn!("NRF registration failed (continuing without discovery): {e}"),
     }
 
-    let store: Arc<dyn SubscriberStore> = Arc::new(store);
-    let sbi: SocketAddr = "0.0.0.0:8004".parse()?;
-    sbi_core::run(sbi, sbi_core::nudm::router(store)).await?;
+    let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
+    sbi_core::run(sbi, sbi_core::nudm::router(udr)).await?;
     Ok(())
 }
 
-fn demo_enabled() -> bool {
-    std::env::var(DEMO_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-}
-
-/// The credential-store master key (KEK). From `RADIANT_UDM_MASTER_KEY` (64 hex
-/// chars), else an ephemeral key (persisted records become unreadable after restart).
-/// In production this should come from an HSM / KMS.
-fn master_key() -> anyhow::Result<[u8; 32]> {
-    match std::env::var(KEK_ENV) {
-        Ok(hex) => {
-            subscriber_db::parse_kek_hex(&hex).map_err(|e| anyhow::anyhow!("{KEK_ENV}: {e}"))
-        }
-        Err(_) => {
-            warn!("{KEK_ENV} not set — using an EPHEMERAL master key; persisted credentials become unreadable after restart. Set {KEK_ENV} (64 hex chars) for persistence.");
-            Ok(subscriber_db::random_kek())
-        }
-    }
+async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> anyhow::Result<()> {
+    use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService};
+    let mut profile = NfProfile::new(sbi_core::new_nf_instance_id(), "UDM", ip.to_string());
+    profile.nf_services = Some(vec![NfService {
+        service_instance_id: "nudm-ueau-1".into(),
+        service_name: "nudm-ueau".into(),
+        scheme: "http".into(),
+        ip_end_points: vec![IpEndPoint {
+            ipv4_address: Some(ip.to_string()),
+            port: Some(sbi_port),
+        }],
+    }]);
+    sbi_core::nnrf::register_and_maintain(nrf_base, profile).await?;
+    Ok(())
 }

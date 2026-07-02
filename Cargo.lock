@@ -1775,7 +1775,6 @@ dependencies = [
  "anyhow",
  "common",
  "sbi-core",
- "subscriber-db",
  "tokio",
  "tracing",
 ]
@@ -1787,7 +1786,10 @@ dependencies = [
  "anyhow",
  "common",
  "sbi-core",
+ "serde_json",
+ "subscriber-db",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2354,6 +2356,7 @@ dependencies = [
  "hex-literal",
  "reqwest",
  "serde",
+ "serde_json",
  "subscriber-db",
  "thiserror 2.0.18",
  "tokio",
@@ -2611,6 +2614,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "redb",
+ "serde_json",
  "tempfile",
 ]
 

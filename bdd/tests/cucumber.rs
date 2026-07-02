@@ -24,7 +24,7 @@ const UE_NS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2); // UE end of the RAN↔UE
 const N3_PORT: u16 = 2152;
 const N4_PORT: u16 = 8805;
 const GNB_TEID: u32 = 0x1001; // datapath feature: the downlink F-TEID we install and expect
-const UDM_KEK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+const UDR_KEK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
 #[derive(Debug, Default, CucumberWorld)]
 struct World {
@@ -205,16 +205,18 @@ async fn setup_ran_ue(world: &mut World) {
 #[when("I start the radiant core")]
 async fn start_core(world: &mut World) {
     let nrf = "http://127.0.0.1:8000";
-    let db = format!("/tmp/{}_udm.redb", world.feature_tag);
+    let db = format!("/tmp/{}_udr.redb", world.feature_tag);
     let _ = std::fs::remove_file(&db);
 
-    // NRF first — the AUSF and SMF register with it on startup.
+    // NRF first — the UDR, UDM, AUSF and SMF register with it on startup.
     world.procs.push(spawn_core(false, &[], "nrf").await);
     assert!(wait_until(5, || netns::host_port_listening(8000, "tcp")).await, "NRF SBI not up");
 
+    // UDR owns the subscriber store; the UDM is a stateless Nudr front-end.
     world.procs.push(
-        spawn_core(false, &[("RADIANT_UDM_PROVISION_DEMO", "1"), ("RADIANT_UDM_DB", &db), ("RADIANT_UDM_MASTER_KEY", UDM_KEK)], "udm").await,
+        spawn_core(false, &[("RADIANT_UDR_PROVISION_DEMO", "1"), ("RADIANT_UDR_DB", &db), ("RADIANT_UDR_MASTER_KEY", UDR_KEK)], "udr").await,
     );
+    world.procs.push(spawn_core(false, &[], "udm").await);
     world.procs.push(spawn_core(false, &[("RADIANT_AUSF_NRF", nrf)], "ausf").await);
     // UPF needs CAP_NET_ADMIN for its N6 TUN → run under sudo; advertise the host N3 address.
     world.procs.push(spawn_core(true, &[("RADIANT_UPF_N3_ADDR", &HOST_IP.to_string())], "upf").await);
