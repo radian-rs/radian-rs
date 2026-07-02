@@ -12,6 +12,8 @@ hex = "0.4"
 # AEAD encryption-at-rest for persisted credentials (K/OPc).
 aes-gcm = "0.11"
 getrandom = "0.2"
+# Provisioned subscription data is stored as TS 29.505-shaped JSON documents.
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

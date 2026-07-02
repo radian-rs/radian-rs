@@ -1,14 +1,19 @@
-//! Subscription store — the UDM/ARPF persistence seam.
+//! Subscription store — the UDR persistence seam (design/24, step 1).
 //!
-//! Two concerns are split behind traits:
+//! Data is partitioned by class, each behind its own trait:
 //! - [`SubscriberDb`]: subscriber existence + the mutable sequence number (SQN).
+//!   The SQN lives **outside** the encrypted credential blob so the per-auth hot
+//!   path never re-encrypts the long-term keys.
 //! - [`ArpfKeyStore`]: the long-term credential boundary (K/OPc). **K never crosses
 //!   this trait** — only the derived authentication vector leaves. Back it with an
 //!   HSM or vault in production; here we provide in-memory (tests) and redb (persistent).
+//! - [`ProvisionedDataStore`]: provisioned subscription data (AM/SM/SMF-selection)
+//!   as TS 29.505-shaped JSON documents keyed by (SUPI, serving PLMN) — the layout
+//!   that ports mechanically to Postgres JSONB or a document store later.
 //!
-//! Architecture note: per TS 23.501 / 29.504 this data belongs in the **UDR** (Nudr)
-//! with the UDM as a stateless front-end; relocating it behind `nf-udr` is a later
-//! slice. Persisted credentials are not yet encrypted at rest (TODO: HSM / KMS).
+//! This store is hosted by `nf-udr` and consumed over Nudr (`sbi_core::nudr`);
+//! only credentials (K/OPc/AMF) are encrypted at rest (AES-256-GCM under an
+//! injected KEK). SQN and profile documents are not secret.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -42,40 +47,54 @@ pub trait ArpfKeyStore: Send + Sync {
     ) -> Option<AuthVector>;
 }
 
-/// Combined store the UDM holds as `Arc<dyn SubscriberStore>`.
-pub trait SubscriberStore: SubscriberDb + ArpfKeyStore {}
-impl<T: SubscriberDb + ArpfKeyStore + ?Sized> SubscriberStore for T {}
-
-/// One subscriber's authentication record (40-byte fixed layout on disk).
-#[derive(Clone)]
-struct Record {
-    key: SubscriberKey,
-    sqn: [u8; 6],
+/// A provisioned-data document family (TS 29.505 `provisioned-data` resources).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DataSet {
+    /// Access-and-mobility data: subscribed S-NSSAIs, UE-AMBR, …
+    Am,
+    /// Session-management data: per-DNN QoS, session AMBR, SSC modes, …
+    Sm,
+    /// SMF selection subscription data.
+    SmfSelection,
 }
 
-impl Record {
-    fn to_bytes(&self) -> [u8; 40] {
-        let mut b = [0u8; 40];
-        b[0..16].copy_from_slice(&self.key.k);
-        b[16..32].copy_from_slice(&self.key.opc);
-        b[32..34].copy_from_slice(&self.key.amf);
-        b[34..40].copy_from_slice(&self.sqn);
-        b
-    }
+/// Provisioned subscription data as JSON documents keyed by (SUPI, serving PLMN).
+pub trait ProvisionedDataStore: Send + Sync {
+    /// Fetch a provisioned document. `None` if not provisioned.
+    fn get_provisioned(&self, ds: DataSet, supi: &str, plmn: &str) -> Option<serde_json::Value>;
+    /// Store (create or replace) a provisioned document.
+    fn put_provisioned(
+        &self,
+        ds: DataSet,
+        supi: &str,
+        plmn: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), String>;
+}
 
-    fn from_bytes(b: &[u8]) -> Option<Self> {
-        if b.len() != 40 {
-            return None;
-        }
-        Some(Record {
-            key: SubscriberKey {
-                k: b[0..16].try_into().ok()?,
-                opc: b[16..32].try_into().ok()?,
-                amf: b[32..34].try_into().ok()?,
-            },
-            sqn: b[34..40].try_into().ok()?,
-        })
+/// Combined store the UDR holds as `Arc<dyn SubscriberStore>`.
+pub trait SubscriberStore: SubscriberDb + ArpfKeyStore + ProvisionedDataStore {}
+impl<T: SubscriberDb + ArpfKeyStore + ProvisionedDataStore + ?Sized> SubscriberStore for T {}
+
+/// Long-term credentials only (34-byte fixed layout: K ‖ OPc ‖ AMF). The mutable
+/// SQN is deliberately **not** here — see the module docs.
+fn key_to_bytes(key: &SubscriberKey) -> [u8; 34] {
+    let mut b = [0u8; 34];
+    b[0..16].copy_from_slice(&key.k);
+    b[16..32].copy_from_slice(&key.opc);
+    b[32..34].copy_from_slice(&key.amf);
+    b
+}
+
+fn key_from_bytes(b: &[u8]) -> Option<SubscriberKey> {
+    if b.len() != 34 {
+        return None;
     }
+    Some(SubscriberKey {
+        k: b[0..16].try_into().ok()?,
+        opc: b[16..32].try_into().ok()?,
+        amf: b[32..34].try_into().ok()?,
+    })
 }
 
 fn increment_sqn(sqn: &mut [u8; 6]) {
@@ -120,8 +139,15 @@ pub fn random_kek() -> [u8; 32] {
 // ── In-memory backend (tests / dev) ──────────────────────────────────────────
 
 #[derive(Default)]
+struct InMemoryInner {
+    credentials: HashMap<String, SubscriberKey>,
+    sqn: HashMap<String, [u8; 6]>,
+    docs: HashMap<(DataSet, String, String), serde_json::Value>,
+}
+
+#[derive(Default)]
 pub struct InMemoryStore {
-    subscribers: Mutex<HashMap<String, Record>>,
+    inner: Mutex<InMemoryInner>,
 }
 
 impl InMemoryStore {
@@ -131,10 +157,10 @@ impl InMemoryStore {
 
     /// Provision a subscriber (SQN starts at zero).
     pub fn provision(&self, supi: impl Into<String>, key: SubscriberKey) {
-        self.subscribers
-            .lock()
-            .unwrap()
-            .insert(supi.into(), Record { key, sqn: [0; 6] });
+        let supi = supi.into();
+        let mut g = self.inner.lock().unwrap();
+        g.sqn.insert(supi.clone(), [0; 6]);
+        g.credentials.insert(supi, key);
     }
 
     /// Provision from hex strings (K, OPc = 16 bytes; AMF = 2 bytes).
@@ -146,14 +172,17 @@ impl InMemoryStore {
 
 impl SubscriberDb for InMemoryStore {
     fn exists(&self, supi: &str) -> bool {
-        self.subscribers.lock().unwrap().contains_key(supi)
+        self.inner.lock().unwrap().credentials.contains_key(supi)
     }
 
     fn next_sqn(&self, supi: &str) -> Option<[u8; 6]> {
-        let mut g = self.subscribers.lock().unwrap();
-        let rec = g.get_mut(supi)?;
-        increment_sqn(&mut rec.sqn);
-        Some(rec.sqn)
+        let mut g = self.inner.lock().unwrap();
+        if !g.credentials.contains_key(supi) {
+            return None;
+        }
+        let sqn = g.sqn.get_mut(supi)?;
+        increment_sqn(sqn);
+        Some(*sqn)
     }
 }
 
@@ -166,15 +195,52 @@ impl ArpfKeyStore for InMemoryStore {
         mcc: &str,
         mnc: &str,
     ) -> Option<AuthVector> {
-        let g = self.subscribers.lock().unwrap();
-        let rec = g.get(supi)?;
-        aka::generate_5g_he_av(&rec.key, sqn, rand, mcc, mnc).ok()
+        let g = self.inner.lock().unwrap();
+        let key = g.credentials.get(supi)?;
+        aka::generate_5g_he_av(key, sqn, rand, mcc, mnc).ok()
+    }
+}
+
+impl ProvisionedDataStore for InMemoryStore {
+    fn get_provisioned(&self, ds: DataSet, supi: &str, plmn: &str) -> Option<serde_json::Value> {
+        self.inner.lock().unwrap().docs.get(&(ds, supi.to_string(), plmn.to_string())).cloned()
+    }
+
+    fn put_provisioned(
+        &self,
+        ds: DataSet,
+        supi: &str,
+        plmn: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .docs
+            .insert((ds, supi.to_string(), plmn.to_string()), doc.clone());
+        Ok(())
     }
 }
 
 // ── redb backend (persistent) ────────────────────────────────────────────────
 
-const SUBSCRIBERS: TableDefinition<&str, &[u8]> = TableDefinition::new("subscribers");
+/// AEAD(K ‖ OPc ‖ AMF) under the KEK — the cold ARPF partition.
+const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credentials");
+/// Plaintext 6-byte SQN — the hot per-auth counter (not secret).
+const AUTH_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("auth_state");
+/// Provisioned-data documents, keyed (SUPI, serving PLMN), JSON values.
+const AM_DATA: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("am_data");
+const SM_DATA: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("sm_data");
+const SMF_SELECTION: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("smf_selection");
+
+fn doc_table(ds: DataSet) -> TableDefinition<'static, (&'static str, &'static str), &'static [u8]> {
+    match ds {
+        DataSet::Am => AM_DATA,
+        DataSet::Sm => SM_DATA,
+        DataSet::SmfSelection => SMF_SELECTION,
+    }
+}
 
 /// Create a new file readable/writable only by the owner (mode 0600 on Unix) so the
 /// persisted credential store is never world-readable. The restrictive mode is set at
@@ -197,9 +263,13 @@ pub struct RedbStore {
 
 impl RedbStore {
     /// Open (creating if absent) a persistent subscriber store at `path`, encrypting
-    /// records at rest (AES-256-GCM) with the 32-byte key-encryption key `kek`. A
-    /// newly created file is owner-only (mode 0600). `kek` is injected by the caller
-    /// — sourced from an HSM / KMS / env in production — and never persisted.
+    /// credential records at rest (AES-256-GCM) with the 32-byte key-encryption key
+    /// `kek`. A newly created file is owner-only (mode 0600). `kek` is injected by
+    /// the caller — sourced from an HSM / KMS / env in production — and never
+    /// persisted.
+    ///
+    /// Note: pre-doc-24 stores (single `subscribers` table, SQN inside the blob)
+    /// are not migrated — dev-only data; re-provision instead.
     pub fn open(
         path: impl AsRef<Path>,
         kek: [u8; 32],
@@ -211,7 +281,11 @@ impl RedbStore {
             Builder::new().create_file(create_private_file(path)?)?
         };
         let w = db.begin_write()?;
-        w.open_table(SUBSCRIBERS)?; // ensure the table exists
+        w.open_table(CREDENTIALS)?; // ensure the tables exist
+        w.open_table(AUTH_STATE)?;
+        w.open_table(AM_DATA)?;
+        w.open_table(SM_DATA)?;
+        w.open_table(SMF_SELECTION)?;
         w.commit()?;
         Ok(Self { db, kek })
     }
@@ -232,26 +306,26 @@ impl RedbStore {
     }
 
     /// Verify + decrypt a record (None on wrong KEK / tamper / wrong SUPI).
-    fn decrypt(&self, supi: &str, blob: &[u8]) -> Option<[u8; 40]> {
+    fn decrypt(&self, supi: &str, blob: &[u8]) -> Option<Vec<u8>> {
         if blob.len() < 12 {
             return None;
         }
         let (nonce_bytes, ct) = blob.split_at(12);
         let nonce = Nonce::from(<[u8; 12]>::try_from(nonce_bytes).ok()?);
         let cipher = Aes256Gcm::new_from_slice(&self.kek).ok()?;
-        let pt = cipher
-            .decrypt(&nonce, Payload { msg: ct, aad: supi.as_bytes() })
-            .ok()?;
-        pt.try_into().ok()
+        cipher.decrypt(&nonce, Payload { msg: ct, aad: supi.as_bytes() }).ok()
     }
 
     pub fn provision(&self, supi: &str, key: SubscriberKey) -> Result<(), redb::Error> {
-        // K/OPc are AEAD-encrypted at rest under the injected KEK, bound to the SUPI.
-        let blob = self.encrypt(supi, &Record { key, sqn: [0; 6] }.to_bytes());
+        // K/OPc/AMF are AEAD-encrypted at rest under the injected KEK, bound to the
+        // SUPI; the SQN starts at zero in its own plaintext table.
+        let blob = self.encrypt(supi, &key_to_bytes(&key));
         let w = self.db.begin_write()?;
         {
-            let mut table = w.open_table(SUBSCRIBERS)?;
-            table.insert(supi, blob.as_slice())?;
+            let mut creds = w.open_table(CREDENTIALS)?;
+            creds.insert(supi, blob.as_slice())?;
+            let mut sqn = w.open_table(AUTH_STATE)?;
+            sqn.insert(supi, [0u8; 6].as_slice())?;
         }
         w.commit()?;
         Ok(())
@@ -262,34 +336,37 @@ impl RedbStore {
             .map_err(|e| e.to_string())
     }
 
-    fn read_record(&self, supi: &str) -> Option<Record> {
+    fn read_key(&self, supi: &str) -> Option<SubscriberKey> {
         let r = self.db.begin_read().ok()?;
-        let table = r.open_table(SUBSCRIBERS).ok()?;
+        let table = r.open_table(CREDENTIALS).ok()?;
         let guard = table.get(supi).ok()??;
         let plain = self.decrypt(supi, guard.value())?;
-        Record::from_bytes(&plain)
+        key_from_bytes(&plain)
     }
 }
 
 impl SubscriberDb for RedbStore {
     fn exists(&self, supi: &str) -> bool {
-        self.read_record(supi).is_some()
+        self.read_key(supi).is_some()
     }
 
     fn next_sqn(&self, supi: &str) -> Option<[u8; 6]> {
+        // A subscriber is only usable if its credentials decrypt under our KEK —
+        // don't advance SQNs for records we can't authenticate against.
+        if !self.exists(supi) {
+            return None;
+        }
         let w = self.db.begin_write().ok()?;
         let sqn;
         {
-            let mut table = w.open_table(SUBSCRIBERS).ok()?;
-            let mut rec = {
+            let mut table = w.open_table(AUTH_STATE).ok()?;
+            let mut cur: [u8; 6] = {
                 let guard = table.get(supi).ok()??;
-                let plain = self.decrypt(supi, guard.value())?;
-                Record::from_bytes(&plain)?
+                guard.value().try_into().ok()?
             };
-            increment_sqn(&mut rec.sqn);
-            let blob = self.encrypt(supi, &rec.to_bytes());
-            table.insert(supi, blob.as_slice()).ok()?;
-            sqn = rec.sqn;
+            increment_sqn(&mut cur);
+            table.insert(supi, cur.as_slice()).ok()?;
+            sqn = cur;
         }
         w.commit().ok()?;
         Some(sqn)
@@ -305,14 +382,40 @@ impl ArpfKeyStore for RedbStore {
         mcc: &str,
         mnc: &str,
     ) -> Option<AuthVector> {
-        let rec = self.read_record(supi)?;
-        aka::generate_5g_he_av(&rec.key, sqn, rand, mcc, mnc).ok()
+        let key = self.read_key(supi)?;
+        aka::generate_5g_he_av(&key, sqn, rand, mcc, mnc).ok()
+    }
+}
+
+impl ProvisionedDataStore for RedbStore {
+    fn get_provisioned(&self, ds: DataSet, supi: &str, plmn: &str) -> Option<serde_json::Value> {
+        let r = self.db.begin_read().ok()?;
+        let table = r.open_table(doc_table(ds)).ok()?;
+        let guard = table.get((supi, plmn)).ok()??;
+        serde_json::from_slice(guard.value()).ok()
+    }
+
+    fn put_provisioned(
+        &self,
+        ds: DataSet,
+        supi: &str,
+        plmn: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), String> {
+        let bytes = serde_json::to_vec(doc).map_err(|e| e.to_string())?;
+        let w = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = w.open_table(doc_table(ds)).map_err(|e| e.to_string())?;
+            table.insert((supi, plmn), bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        w.commit().map_err(|e| e.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const K: &str = "465b5ce8b199b49faa5f0a2ee238a6bc";
     const OPC: &str = "cd63cb71954a9f4e48a5994e37a02baf";
@@ -336,6 +439,17 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_provisioned_docs_roundtrip() {
+        let store = InMemoryStore::new();
+        let doc = json!({"nssai": {"defaultSingleNssais": [{"sst": 1, "sd": "010203"}]}});
+        store.put_provisioned(DataSet::Am, "imsi-1", "99970", &doc).unwrap();
+        assert_eq!(store.get_provisioned(DataSet::Am, "imsi-1", "99970"), Some(doc));
+        // Distinct per data set and per serving PLMN.
+        assert!(store.get_provisioned(DataSet::Sm, "imsi-1", "99970").is_none());
+        assert!(store.get_provisioned(DataSet::Am, "imsi-1", "00101").is_none());
+    }
+
+    #[test]
     fn redb_persists_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub.redb");
@@ -354,6 +468,25 @@ mod tests {
             .generate_he_av("imsi-1", &[0, 0, 0, 0, 0, 2], &[0x11; 16], "999", "70")
             .expect("AV");
         assert_ne!(av.kausf, [0u8; 32]);
+    }
+
+    #[test]
+    fn redb_provisioned_docs_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub.redb");
+        let sm = json!([{
+            "singleNssai": {"sst": 1, "sd": "010203"},
+            "dnnConfigurations": {"internet": {"pduSessionTypes": {"defaultSessionType": "IPV4"}}}
+        }]);
+
+        {
+            let store = RedbStore::open(&path, KEK).unwrap();
+            store.put_provisioned(DataSet::Sm, "imsi-1", "99970", &sm).unwrap();
+        }
+
+        let store = RedbStore::open(&path, KEK).unwrap();
+        assert_eq!(store.get_provisioned(DataSet::Sm, "imsi-1", "99970"), Some(sm));
+        assert!(store.get_provisioned(DataSet::SmfSelection, "imsi-1", "99970").is_none());
     }
 
     #[test]
@@ -387,7 +520,8 @@ mod tests {
             .provision_hex("imsi-1", K, OPC, "8000")
             .unwrap();
 
-        // A store opened with a different KEK can't decrypt the record (GCM tag fails).
+        // A store opened with a different KEK can't decrypt the credentials (GCM tag
+        // fails) — and must not advance SQNs for a subscriber it can't authenticate.
         let other = RedbStore::open(&path, [0x22; 32]).unwrap();
         assert!(!other.exists("imsi-1"));
         assert_eq!(other.next_sqn("imsi-1"), None);
@@ -402,7 +536,7 @@ mod tests {
         let path = dir.path().join("sub.redb");
         let store = RedbStore::open(&path, KEK).unwrap();
         store.provision_hex("imsi-1", K, OPC, "8000").unwrap();
-        let _ = store.next_sqn("imsi-1"); // force an encrypted write
+        let _ = store.next_sqn("imsi-1"); // SQN writes must not leak key material either
         drop(store);
 
         let file = std::fs::read(&path).unwrap();

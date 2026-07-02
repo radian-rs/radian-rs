@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub mod nausf;
 pub mod nnrf;
 pub mod nudm;
+pub mod nudr;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SbiError {

@@ -639,19 +639,25 @@ mod tests {
         let supi = "imsi-999700000000001";
         let sub = test_subscriber();
 
-        // Spin NRF, UDM (with the subscriber), and AUSF (pointed at the UDM).
+        // Spin NRF, UDR (with the subscriber), UDM (fronting the UDR), and AUSF
+        // (pointed at the UDM).
         let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let nrf_addr = nrf_l.local_addr().unwrap();
         tokio::spawn(async move {
             sbi_core::run_on(nrf_l, sbi_core::nnrf::router(NrfStore::default())).await.unwrap()
         });
 
-        let udm_store = std::sync::Arc::new(subscriber_db::InMemoryStore::new());
-        udm_store.provision(supi, sub.clone());
-        let udm_store: std::sync::Arc<dyn subscriber_db::SubscriberStore> = udm_store;
+        let udr_store = std::sync::Arc::new(subscriber_db::InMemoryStore::new());
+        udr_store.provision(supi, sub.clone());
+        let udr_store: std::sync::Arc<dyn subscriber_db::SubscriberStore> = udr_store;
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(udr_l, sbi_core::nudr::router(udr_store)).await.unwrap() });
+
+        let udr_client = std::sync::Arc::new(sbi_core::nudr::UdrClient::new(format!("http://{udr_addr}")));
         let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udm_addr = udm_l.local_addr().unwrap();
-        tokio::spawn(async move { sbi_core::run_on(udm_l, sbi_core::nudm::router(udm_store)).await.unwrap() });
+        tokio::spawn(async move { sbi_core::run_on(udm_l, sbi_core::nudm::router(udr_client)).await.unwrap() });
 
         let ausf_state = sbi_core::nausf::AusfState::new(format!("http://{udm_addr}"));
         let ausf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -243,14 +243,19 @@ mod tests {
         }
     }
 
-    /// Spin a UDM + AUSF and return (ausf_base, udm provisioned with `supi`).
+    /// Spin a UDR + UDM + AUSF chain and return (ausf_base, udr provisioned with `supi`).
     async fn spin(supi: &str, sub: aka::SubscriberKey) -> String {
         let store = Arc::new(InMemoryStore::new());
         store.provision(supi, sub);
         let store: Arc<dyn SubscriberStore> = store;
+        let udr = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udr, crate::nudr::router(store)).await.unwrap() });
+
+        let udr_client = Arc::new(crate::nudr::UdrClient::new(format!("http://{udr_addr}")));
         let udm = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udm_addr = udm.local_addr().unwrap();
-        tokio::spawn(async move { crate::run_on(udm, crate::nudm::router(store)).await.unwrap() });
+        tokio::spawn(async move { crate::run_on(udm, crate::nudm::router(udr_client)).await.unwrap() });
 
         let ausf = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ausf_addr = ausf.local_addr().unwrap();
