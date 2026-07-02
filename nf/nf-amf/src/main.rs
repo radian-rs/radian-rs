@@ -360,13 +360,15 @@ async fn on_uplink_nas(
                 warn!("UE {amf_ue_id}: UL NAS Transport before SUPI is known");
                 return None;
             };
-            // The UE's requested DNN rides in the transport's optional 0x25 IE; a UE
-            // that omits it gets the network default. The SMF authorizes it against
-            // the subscription (design/27) — an unsubscribed DNN fails CreateSMContext.
+            // The UE's requested DNN (0x25 IE) and S-NSSAI (0x22 IE) ride in the
+            // transport; omitted → network default DNN / subscribed default slice.
+            // The SMF authorizes the (slice, DNN) pair against the subscription
+            // (design/27, design/31) — a denied pair fails CreateSMContext.
             let dnn = nas::requested_dnn_from_ul_nas_transport(&nas_msg)
                 .unwrap_or_else(|| DEFAULT_DNN.to_string());
+            let snssai = nas::requested_snssai_from_ul_nas_transport(&nas_msg);
             let pti = container.get(2).copied().unwrap_or(1);
-            match amf_smf.create_sm_context(&supi, psi, &dnn).await {
+            match amf_smf.create_sm_context(&supi, psi, &dnn, snssai).await {
                 Ok(created) => {
                     // Build the N1 PDU Session Establishment Accept (UE IP from the SMF,
                     // echoing the request's PTI) and NAS-protect a DL NAS Transport carrying
@@ -403,13 +405,19 @@ async fn on_uplink_nas(
                 Err(e) => {
                     // Answer the UE with a 5GSM PDU Session Establishment Reject instead
                     // of silence: subscription refusal → cause #27 (missing or unknown
-                    // DNN) with a T3396 back-off (retrying can't help until provisioning
-                    // changes); anything else → #31 (request rejected, unspecified),
-                    // no back-off — a transient failure may clear. Plain DL NAS
-                    // Transport — no N2 setup, since no session exists.
+                    // DNN), or #70 (missing or unknown DNN in a slice) when the UE
+                    // requested a specific S-NSSAI — both with a T3396 back-off
+                    // (retrying can't help until provisioning changes); anything else
+                    // → #31 (request rejected, unspecified), no back-off — a transient
+                    // failure may clear. Plain DL NAS Transport — no N2 setup, since
+                    // no session exists.
                     let (cause, backoff) = match &e {
                         pdu_session::CreateSmError::Forbidden => (
-                            nas::sm_cause::MISSING_OR_UNKNOWN_DNN,
+                            if snssai.is_some() {
+                                nas::sm_cause::MISSING_OR_UNKNOWN_DNN_IN_SLICE
+                            } else {
+                                nas::sm_cause::MISSING_OR_UNKNOWN_DNN
+                            },
                             Some(nas::GprsTimer3::from_secs(REJECT_BACKOFF_SECS)),
                         ),
                         pdu_session::CreateSmError::Other(_) => {

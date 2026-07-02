@@ -139,6 +139,9 @@ struct SmContextCreateData {
     dnn: String,
     /// The serving PLMN (TS 29.502) — selects which provisioned dataset applies.
     serving_network: Option<PlmnId>,
+    /// The UE's requested slice (TS 29.502 `sNssai`). Absent → the subscribed
+    /// slice serving the DNN is used.
+    s_nssai: Option<Snssai>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -147,6 +150,26 @@ struct Snssai {
     sst: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     sd: Option<String>,
+}
+
+impl Snssai {
+    /// The `subscribedSnssaiInfos` map key this stack provisions: `sst` or `sst-sd`.
+    fn key(&self) -> String {
+        match &self.sd {
+            Some(sd) => format!("{}-{}", self.sst, sd.to_lowercase()),
+            None => self.sst.to_string(),
+        }
+    }
+
+    /// Slice equality with case-insensitive SD (SDs are hex strings).
+    fn matches(&self, other: &Snssai) -> bool {
+        self.sst == other.sst
+            && match (&self.sd, &other.sd) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -201,23 +224,48 @@ pub fn router(state: Arc<SmfState>) -> Router {
         .with_state(state)
 }
 
-/// `Nsmf_PDUSession_CreateSMContext`: authorize the DNN against the subscriber's
-/// UDR-provisioned data (via Nudm_SDM), establish the N4 session, and return the
-/// UPF N3 F-TEID plus the subscribed S-NSSAI / session AMBR.
+/// An SBI error response: status + RFC 7807 ProblemDetails with a TS 29.502-style
+/// application cause (e.g. `DNN_DENIED`, `SNSSAI_DENIED`).
+type SbiProblem = (StatusCode, Json<sbi_core::ProblemDetails>);
+
+fn problem(status: StatusCode, cause: &str, detail: &str) -> SbiProblem {
+    (
+        status,
+        Json(sbi_core::ProblemDetails {
+            status: Some(status.as_u16()),
+            cause: Some(cause.to_string()),
+            detail: Some(detail.to_string()),
+            ..Default::default()
+        }),
+    )
+}
+
+/// `Nsmf_PDUSession_CreateSMContext`: authorize the (requested S-NSSAI, DNN) pair
+/// against the subscriber's UDR-provisioned data (via Nudm_SDM), establish the N4
+/// session, and return the UPF N3 F-TEID plus the serving S-NSSAI / session AMBR.
 async fn create_sm_context(
     State(smf): State<Arc<SmfState>>,
     Json(req): Json<SmContextCreateData>,
-) -> Result<(StatusCode, Json<SmContextCreatedData>), StatusCode> {
+) -> Result<(StatusCode, Json<SmContextCreatedData>), SbiProblem> {
     if req.dnn.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(problem(StatusCode::BAD_REQUEST, "MANDATORY_IE_MISSING", "dnn is required"));
     }
     let plmn = req
         .serving_network
         .as_ref()
         .map(|p| format!("{}{}", p.mcc, p.mnc))
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    // Subscription check BEFORE touching the UPF: unsubscribed DNN → 403, no N4 state.
-    let sub = fetch_session_subscription(&smf.nrf_base, &req.supi, &plmn, &req.dnn).await?;
+        .ok_or_else(|| {
+            problem(StatusCode::BAD_REQUEST, "MANDATORY_IE_MISSING", "servingNetwork is required")
+        })?;
+    // Subscription check BEFORE touching the UPF: a denied (slice, DNN) → 403, no N4 state.
+    let sub = fetch_session_subscription(
+        &smf.nrf_base,
+        &req.supi,
+        &plmn,
+        &req.dnn,
+        req.s_nssai.as_ref(),
+    )
+    .await?;
 
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
     let seq = smf.next_seq();
@@ -225,8 +273,12 @@ async fn create_sm_context(
     // can route N6 traffic back to this session.
     let ue_ip = smf.alloc_ue_ip();
     let est_req = pfcp::session_establishment_request(cp_seid, seq, smf.smf_ip, ue_ip);
-    let resp = smf.transact(&est_req, seq).await.ok_or(StatusCode::BAD_GATEWAY)?;
-    let est = pfcp::parse_session_establishment_response(&resp).ok_or(StatusCode::BAD_GATEWAY)?;
+    let resp = smf.transact(&est_req, seq).await.ok_or_else(|| {
+        problem(StatusCode::BAD_GATEWAY, "UPF_NOT_RESPONDING", "no PFCP response from the UPF")
+    })?;
+    let est = pfcp::parse_session_establishment_response(&resp).ok_or_else(|| {
+        problem(StatusCode::BAD_GATEWAY, "UPF_NOT_RESPONDING", "PFCP establishment rejected")
+    })?;
 
     let sm_ref = smf.next_ref.fetch_add(1, Ordering::Relaxed).to_string();
     smf.contexts.lock().unwrap().insert(
@@ -257,10 +309,21 @@ async fn create_sm_context(
     ))
 }
 
+/// Whether one smf-select `subscribedSnssaiInfos` entry's `dnnInfos` contains `dnn`.
+fn dnn_in_info(info: &serde_json::Value, dnn: &str) -> bool {
+    info.get("dnnInfos")
+        .and_then(|v| v.as_array())
+        .is_some_and(|dnns| dnns.iter().any(|d| d.get("dnn").and_then(|v| v.as_str()) == Some(dnn)))
+}
+
 /// Fetch and authorize the session-management subscription for (`supi`, `plmn`,
-/// `dnn`) via the NRF-discovered UDM (Nudm_SDM):
-/// - `smf-select-data` must list the DNN under a subscribed S-NSSAI (else `403`);
-/// - `sm-data` supplies the serving S-NSSAI and session AMBR for that DNN (else `403`).
+/// `dnn`, optionally the UE's `requested` S-NSSAI) via the NRF-discovered UDM
+/// (Nudm_SDM):
+/// - `smf-select-data` must allow the pair: with a requested slice, that slice's
+///   entry must exist (else `403 SNSSAI_DENIED`) and list the DNN (else
+///   `403 DNN_DENIED`); without one, any subscribed slice listing the DNN counts.
+/// - `sm-data` supplies the serving S-NSSAI and session AMBR: with a requested
+///   slice, its own entry is used; without one, the first entry configuring the DNN.
 ///
 /// Fails closed: a missing subscription is `403`, an unreachable NRF/UDM is `502`.
 async fn fetch_session_subscription(
@@ -268,20 +331,21 @@ async fn fetch_session_subscription(
     supi: &str,
     plmn: &str,
     dnn: &str,
-) -> Result<SessionSubscription, StatusCode> {
+    requested: Option<&Snssai>,
+) -> Result<SessionSubscription, SbiProblem> {
     let udm = discover_udm(nrf_base).await.map_err(|e| {
         tracing::warn!("UDM discovery failed: {e}");
-        StatusCode::BAD_GATEWAY
+        problem(StatusCode::BAD_GATEWAY, "UDM_UNREACHABLE", "UDM discovery failed")
     })?;
     let sdm = sbi_core::nudm::NudmClient::new(udm);
 
     let gateway = |e| {
         tracing::warn!("Nudm_SDM fetch failed: {e}");
-        StatusCode::BAD_GATEWAY
+        problem(StatusCode::BAD_GATEWAY, "UDM_UNREACHABLE", "Nudm_SDM fetch failed")
     };
-    let forbidden = |why: &str| {
-        tracing::warn!(supi = %masked_supi(supi), %dnn, "PDU session rejected: {why}");
-        StatusCode::FORBIDDEN
+    let denied = |cause: &str, why: &str| {
+        tracing::warn!(supi = %masked_supi(supi), %dnn, snssai = ?requested, "PDU session rejected ({cause}): {why}");
+        problem(StatusCode::FORBIDDEN, cause, why)
     };
 
     // SMF-selection data: which DNNs this subscriber may use, per subscribed S-NSSAI.
@@ -289,48 +353,61 @@ async fn fetch_session_subscription(
         .get_smf_select_data(supi, plmn)
         .await
         .map_err(gateway)?
-        .ok_or_else(|| forbidden("no smf-selection subscription data"))?;
-    let dnn_allowed = select
-        .get("subscribedSnssaiInfos")
-        .and_then(|v| v.as_object())
-        .is_some_and(|infos| {
-            infos.values().any(|info| {
-                info.get("dnnInfos")
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|dnns| {
-                        dnns.iter().any(|d| d.get("dnn").and_then(|v| v.as_str()) == Some(dnn))
-                    })
-            })
-        });
-    if !dnn_allowed {
-        return Err(forbidden("DNN not in smf-selection subscription data"));
+        .ok_or_else(|| denied("DNN_DENIED", "no smf-selection subscription data"))?;
+    let infos = select.get("subscribedSnssaiInfos").and_then(|v| v.as_object());
+    match requested {
+        Some(slice) => {
+            let info = infos
+                .and_then(|m| m.get(&slice.key()))
+                .ok_or_else(|| denied("SNSSAI_DENIED", "requested S-NSSAI is not subscribed"))?;
+            if !dnn_in_info(info, dnn) {
+                return Err(denied("DNN_DENIED", "DNN not allowed in the requested slice"));
+            }
+        }
+        None => {
+            let allowed = infos.is_some_and(|m| m.values().any(|info| dnn_in_info(info, dnn)));
+            if !allowed {
+                return Err(denied("DNN_DENIED", "DNN not in smf-selection subscription data"));
+            }
+        }
     }
 
-    // SM data: session parameters (S-NSSAI, AMBR) for the DNN's configuration.
+    // SM data: session parameters (S-NSSAI, AMBR) for the slice's DNN configuration.
     let sm_data = sdm
         .get_sm_data(supi, plmn)
         .await
         .map_err(gateway)?
-        .ok_or_else(|| forbidden("no session-management subscription data"))?;
-    let entry = sm_data
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|e| {
-            e.get("dnnConfigurations")
-                .and_then(|v| v.as_object())
-                .is_some_and(|c| c.contains_key(dnn))
-        })
-        .ok_or_else(|| forbidden("DNN has no configuration in sm-data"))?;
-
-    let snssai = entry
-        .get("singleNssai")
-        .and_then(|v| serde_json::from_value::<Snssai>(v.clone()).ok())
-        .ok_or_else(|| forbidden("sm-data entry has no singleNssai"))?;
-    let ambr = entry
+        .ok_or_else(|| denied("DNN_DENIED", "no session-management subscription data"))?;
+    let entry_snssai = |e: &serde_json::Value| {
+        e.get("singleNssai").and_then(|v| serde_json::from_value::<Snssai>(v.clone()).ok())
+    };
+    let entry = match requested {
+        Some(slice) => sm_data
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| entry_snssai(e).is_some_and(|s| s.matches(slice)))
+            .ok_or_else(|| denied("SNSSAI_DENIED", "requested S-NSSAI has no sm-data"))?,
+        None => sm_data
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| {
+                e.get("dnnConfigurations")
+                    .and_then(|v| v.as_object())
+                    .is_some_and(|c| c.contains_key(dnn))
+            })
+            .ok_or_else(|| denied("DNN_DENIED", "DNN has no configuration in sm-data"))?,
+    };
+    let dnn_config = entry
         .get("dnnConfigurations")
         .and_then(|c| c.get(dnn))
-        .and_then(|c| c.get("sessionAmbr"))
+        .ok_or_else(|| denied("DNN_DENIED", "DNN has no configuration in the serving slice"))?;
+
+    let snssai = entry_snssai(entry)
+        .ok_or_else(|| denied("DNN_DENIED", "sm-data entry has no singleNssai"))?;
+    let ambr = dnn_config
+        .get("sessionAmbr")
         .and_then(|v| serde_json::from_value::<SessionAmbrDto>(v.clone()).ok());
     Ok(SessionSubscription { snssai, ambr })
 }
@@ -557,12 +634,13 @@ mod tests {
         let client = sbi_core::h2c_client();
         let base = format!("http://{smf_addr}");
 
-        // AMF → SMF: CreateSMContext.
+        // AMF → SMF: CreateSMContext, with the UE's requested slice.
         let created: SmContextCreatedData = client
             .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
             .json(&serde_json::json!({
                 "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
-                "servingNetwork": { "mcc": "999", "mnc": "70" }
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
             }))
             .send()
             .await
@@ -571,7 +649,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.up_n3_teid, "00000001", "UPF allocated the first N3 TEID");
-        // The subscribed slice + AMBR ride back for the AMF's N1 accept.
+        // The serving slice (== validated requested slice) + AMBR ride back for the
+        // AMF's N1 accept.
         assert_eq!(created.s_nssai.sst, 1);
         assert_eq!(created.s_nssai.sd.as_deref(), Some("010203"));
         let ambr = created.session_ambr.as_ref().expect("subscribed session AMBR");
@@ -641,34 +720,62 @@ mod tests {
 
         let client = sbi_core::h2c_client();
         let base = format!("http://{smf_addr}");
+        // POST and return (status, ProblemDetails cause).
         let post = |body: serde_json::Value| {
             let client = client.clone();
             let url = format!("{base}/nsmf-pdusession/v1/sm-contexts");
-            async move { client.post(url).json(&body).send().await.unwrap().status() }
+            async move {
+                let resp = client.post(url).json(&body).send().await.unwrap();
+                let status = resp.status().as_u16();
+                let cause = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|b| b.get("cause").and_then(|c| c.as_str()).map(str::to_owned));
+                (status, cause)
+            }
         };
 
-        // DNN not in the subscription → 403.
-        let status = post(serde_json::json!({
+        // DNN not in the subscription (no slice requested) → 403 DNN_DENIED.
+        let (status, cause) = post(serde_json::json!({
             "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "corporate",
             "servingNetwork": { "mcc": "999", "mnc": "70" }
         }))
         .await;
-        assert_eq!(status.as_u16(), 403);
+        assert_eq!((status, cause.as_deref()), (403, Some("DNN_DENIED")));
+
+        // Requested slice not subscribed → 403 SNSSAI_DENIED.
+        let (status, cause) = post(serde_json::json!({
+            "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+            "servingNetwork": { "mcc": "999", "mnc": "70" },
+            "sNssai": { "sst": 2, "sd": "010203" }
+        }))
+        .await;
+        assert_eq!((status, cause.as_deref()), (403, Some("SNSSAI_DENIED")));
+
+        // Subscribed slice, but the DNN isn't allowed in it → 403 DNN_DENIED.
+        let (status, cause) = post(serde_json::json!({
+            "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "corporate",
+            "servingNetwork": { "mcc": "999", "mnc": "70" },
+            "sNssai": { "sst": 1, "sd": "010203" }
+        }))
+        .await;
+        assert_eq!((status, cause.as_deref()), (403, Some("DNN_DENIED")));
 
         // Unknown subscriber → 403 (no smf-selection data at all).
-        let status = post(serde_json::json!({
+        let (status, _) = post(serde_json::json!({
             "supi": "imsi-999700000000099", "pduSessionId": 5, "dnn": "internet",
             "servingNetwork": { "mcc": "999", "mnc": "70" }
         }))
         .await;
-        assert_eq!(status.as_u16(), 403);
+        assert_eq!(status, 403);
 
         // Missing serving network → 400.
-        let status = post(serde_json::json!({
+        let (status, cause) = post(serde_json::json!({
             "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet"
         }))
         .await;
-        assert_eq!(status.as_u16(), 400);
+        assert_eq!((status, cause.as_deref()), (400, Some("MANDATORY_IE_MISSING")));
 
         assert_eq!(upf_state.lock().unwrap().session_count(), 0, "no N4 session was created");
     }
