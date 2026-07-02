@@ -7,7 +7,7 @@ Function).
 
 ## SBI transport
 
-radiant-rs's SBI is **HTTP/2 cleartext (h2c)** with JSON bodies. `crates/sbi-core`
+radian-rs's SBI is **HTTP/2 cleartext (h2c)** with JSON bodies. `crates/sbi-core`
 provides both ends:
 
 - a server built on `axum`, exposed via `sbi_core::run(addr, router)`;
@@ -59,8 +59,8 @@ it does `discover("SMF", "AMF")`, using whatever endpoint the NRF returns.
 The NRF base each NF uses is configurable:
 
 ```
-RADIANT_SMF_NRF=http://127.0.0.1:8000     # SMF
-RADIANT_AUSF_NRF=http://127.0.0.1:8000    # AUSF
+RADIAN_SMF_NRF=http://127.0.0.1:8000     # SMF
+RADIAN_AUSF_NRF=http://127.0.0.1:8000    # AUSF
 ```
 
 The AMF's NRF base is fixed at `http://127.0.0.1:8000`.

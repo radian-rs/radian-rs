@@ -11,10 +11,10 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 const SBI_PORT: u16 = 8004;
-/// UDR the UDM fronts. Override with `RADIANT_UDM_UDR`.
-const UDR_ENV: &str = "RADIANT_UDM_UDR";
+/// UDR the UDM fronts. Override with `RADIAN_UDM_UDR`.
+const UDR_ENV: &str = "RADIAN_UDM_UDR";
 const DEFAULT_UDR: &str = "http://127.0.0.1:8005";
-const NRF_ENV: &str = "RADIANT_UDM_NRF";
+const NRF_ENV: &str = "RADIAN_UDM_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 
 #[tokio::main]

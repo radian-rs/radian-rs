@@ -1,4 +1,4 @@
-# radiant-rs
+# radian-rs
 
 A greenfield Rust implementation of a 3GPP 5G/6G core (5GC).
 

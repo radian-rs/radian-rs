@@ -2,7 +2,7 @@
 
 **N6** is the UPF's link to the **data network** (the DN — the internet, or a
 private network). It is where a *signalled* PDU session becomes a *forwarding*
-one: user packets actually leave the mobile network and come back. In radiant-rs
+one: user packets actually leave the mobile network and come back. In radian-rs
 the N6 interface is a real Linux **TUN** device, and the forwarding logic that
 bridges N3 (GTP-U) and N6 lives in the `n6` crate.
 

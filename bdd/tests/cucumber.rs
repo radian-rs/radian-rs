@@ -4,7 +4,7 @@
 //! Two features:
 //! - `n6_datapath` — self-contained: the test plays SMF+gNB against a live `nf-upf` in a
 //!   namespace and proves an ICMP echo round-trips N3↔N6.
-//! - `datapath_e2e` (`@sim`) — the whole stack: the radiant core plus the **free-ran-ue**
+//! - `datapath_e2e` (`@sim`) — the whole stack: the radian core plus the **free-ran-ue**
 //!   simulator (gNB + UE) register, establish a PDU session, and ping the data network.
 //!   Runs only when `FREE_RAN_UE_BIN` points at the simulator binary.
 
@@ -56,9 +56,9 @@ impl World {
     }
 }
 
-/// Path to a radiant NF binary (`nf-<name>`); `RADIANT_TARGET_DIR` overrides the dir.
-fn radiant_bin(name: &str) -> PathBuf {
-    if let Ok(dir) = std::env::var("RADIANT_TARGET_DIR") {
+/// Path to a radian NF binary (`nf-<name>`); `RADIAN_TARGET_DIR` overrides the dir.
+fn radian_bin(name: &str) -> PathBuf {
+    if let Ok(dir) = std::env::var("RADIAN_TARGET_DIR") {
         return PathBuf::from(dir).join(format!("nf-{name}"));
     }
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(format!("target/debug/nf-{name}"))
@@ -125,10 +125,10 @@ async fn setup_upf_namespace(world: &mut World) {
 
 #[when("I start the UPF with its N6 TUN")]
 async fn start_upf_in_ns(world: &mut World) {
-    let bin = radiant_bin("upf");
+    let bin = radian_bin("upf");
     assert!(bin.exists(), "nf-upf not found at {} — run `cargo build -p nf-upf`", bin.display());
     let ns = world.ns("upf");
-    netns::spawn_in_netns_env(&ns, &[("RADIANT_UPF_N3_ADDR", &NS_IP.to_string())], &bin.to_string_lossy(), &[])
+    netns::spawn_in_netns_env(&ns, &[("RADIAN_UPF_N3_ADDR", &NS_IP.to_string())], &bin.to_string_lossy(), &[])
         .await
         .expect("spawn nf-upf in namespace");
     let up = wait_until(5, || netns::iface_exists(&ns, "n6upf0")).await;
@@ -202,7 +202,7 @@ async fn setup_ran_ue(world: &mut World) {
     netns::add_route(&ue, "default", &["via", &RAN_UE_GW.to_string()]).await.expect("UE default route");
 }
 
-#[when("I start the radiant core")]
+#[when("I start the radian core")]
 async fn start_core(world: &mut World) {
     let nrf = "http://127.0.0.1:8000";
     let db = format!("/tmp/{}_udr.redb", world.feature_tag);
@@ -214,16 +214,16 @@ async fn start_core(world: &mut World) {
 
     // UDR owns the subscriber store; the UDM is a stateless Nudr front-end.
     world.procs.push(
-        spawn_core(false, &[("RADIANT_UDR_PROVISION_DEMO", "1"), ("RADIANT_UDR_DB", &db), ("RADIANT_UDR_MASTER_KEY", UDR_KEK)], "udr").await,
+        spawn_core(false, &[("RADIAN_UDR_PROVISION_DEMO", "1"), ("RADIAN_UDR_DB", &db), ("RADIAN_UDR_MASTER_KEY", UDR_KEK)], "udr").await,
     );
     world.procs.push(spawn_core(false, &[], "udm").await);
-    world.procs.push(spawn_core(false, &[("RADIANT_AUSF_NRF", nrf)], "ausf").await);
+    world.procs.push(spawn_core(false, &[("RADIAN_AUSF_NRF", nrf)], "ausf").await);
     // UPF needs CAP_NET_ADMIN for its N6 TUN → run under sudo; advertise the host N3 address.
-    world.procs.push(spawn_core(true, &[("RADIANT_UPF_N3_ADDR", &HOST_IP.to_string())], "upf").await);
+    world.procs.push(spawn_core(true, &[("RADIAN_UPF_N3_ADDR", &HOST_IP.to_string())], "upf").await);
     assert!(wait_until(6, || netns::host_iface_exists("n6upf0")).await, "UPF N6 TUN did not come up");
 
     world.procs.push(
-        spawn_core(false, &[("RADIANT_SMF_UPF_N4", "127.0.0.1:8805"), ("RADIANT_SMF_NRF", nrf)], "smf").await,
+        spawn_core(false, &[("RADIAN_SMF_UPF_N4", "127.0.0.1:8805"), ("RADIAN_SMF_NRF", nrf)], "smf").await,
     );
     world.procs.push(spawn_core(false, &[], "amf").await);
     let ready = wait_until(6, || async {
@@ -232,12 +232,12 @@ async fn start_core(world: &mut World) {
             && netns::host_port_listening(38412, "sctp").await // AMF N2
     })
     .await;
-    assert!(ready, "radiant core did not become ready");
+    assert!(ready, "radian core did not become ready");
 }
 
-/// Spawn one radiant NF in the host namespace (under sudo when `root`), tracking it.
+/// Spawn one radian NF in the host namespace (under sudo when `root`), tracking it.
 async fn spawn_core(root: bool, env: &[(&str, &str)], name: &str) -> tokio::process::Child {
-    let bin = radiant_bin(name);
+    let bin = radian_bin(name);
     assert!(bin.exists(), "nf-{name} not found at {} — run `cargo build`", bin.display());
     netns::spawn_host_env(root, env, &bin.to_string_lossy(), &[]).await.unwrap_or_else(|e| panic!("spawn nf-{name}: {e}"))
 }
@@ -331,7 +331,7 @@ async fn ue_gets_no_pdu_session(world: &mut World) {
 async fn stop_sim_and_core(world: &mut World) {
     netns::kill_netns_procs(&world.ns("ue")).await.expect("kill UE");
     netns::kill_netns_procs(&world.ns("ran")).await.expect("kill gNB");
-    netns::kill_host_procs("target/debug/nf-").await.expect("kill radiant core"); // also removes n6upf0
+    netns::kill_host_procs("target/debug/nf-").await.expect("kill radian core"); // also removes n6upf0
 }
 
 #[when("I delete the RAN and UE namespaces")]

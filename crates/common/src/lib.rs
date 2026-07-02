@@ -1,4 +1,4 @@
-//! Shared types and bootstrap helpers for radiant-rs network functions.
+//! Shared types and bootstrap helpers for radian-rs network functions.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +12,7 @@ pub fn init_tracing() {
 
 /// Log a startup banner for a network function.
 pub fn banner(nf: &str) {
-    tracing::info!(nf, "radiant-rs network function starting (scaffold)");
+    tracing::info!(nf, "radian-rs network function starting (scaffold)");
 }
 
 /// SUPI — Subscription Permanent Identifier, e.g. `imsi-001010000000001`.

@@ -6,7 +6,7 @@
 //! (design/24 step 1, deviation documented in `sbi_core::nudr`).
 //!
 //! The demo subscriber uses a **public** test key (TS 35.208) and is provisioned
-//! only when `RADIANT_UDR_PROVISION_DEMO=1` — never auto-created — so a production
+//! only when `RADIAN_UDR_PROVISION_DEMO=1` — never auto-created — so a production
 //! build never ships a known-key (backdoor) account.
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -18,11 +18,11 @@ use tracing::{info, warn};
 const SBI_PORT: u16 = 8005;
 const DEMO_SUPI: &str = "imsi-999700000000001";
 const DEMO_PLMN: &str = "99970";
-const DEFAULT_DB_PATH: &str = "radiant-udr.redb";
-const DEMO_ENV: &str = "RADIANT_UDR_PROVISION_DEMO";
-const DB_ENV: &str = "RADIANT_UDR_DB";
-const KEK_ENV: &str = "RADIANT_UDR_MASTER_KEY";
-const NRF_ENV: &str = "RADIANT_UDR_NRF";
+const DEFAULT_DB_PATH: &str = "radian-udr.redb";
+const DEMO_ENV: &str = "RADIAN_UDR_PROVISION_DEMO";
+const DB_ENV: &str = "RADIAN_UDR_DB";
+const KEK_ENV: &str = "RADIAN_UDR_MASTER_KEY";
+const NRF_ENV: &str = "RADIAN_UDR_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 
 #[tokio::main]
@@ -117,7 +117,7 @@ fn demo_enabled() -> bool {
     std::env::var(DEMO_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
-/// The credential-store master key (KEK). From `RADIANT_UDR_MASTER_KEY` (64 hex
+/// The credential-store master key (KEK). From `RADIAN_UDR_MASTER_KEY` (64 hex
 /// chars), else an ephemeral key (persisted records become unreadable after restart).
 /// In production this should come from an HSM / KMS.
 fn master_key() -> anyhow::Result<[u8; 32]> {

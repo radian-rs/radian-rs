@@ -21,7 +21,7 @@ leaks namespaces, veths, TUN devices, or processes into the next.
 ## Feature 1: the datapath (self-contained)
 
 `n6_datapath.feature` needs **no external simulator**. The test process itself
-plays the SMF and the gNB, using radiant-rs's own `pfcp` and `gtpu` crates:
+plays the SMF and the gNB, using radian-rs's own `pfcp` and `gtpu` crates:
 
 ```
  ┌──────────────────────────┐   veth   ┌───────────────────────────────┐
@@ -41,7 +41,7 @@ anywhere with root.
 
 ## Feature 2: end-to-end with the simulator (`@sim`)
 
-`datapath_e2e.feature` drives the **whole stack** — the radiant core plus the
+`datapath_e2e.feature` drives the **whole stack** — the radian core plus the
 free-ran-ue gNB and UE — reproducing the
 [interop walkthrough](ch-04-00-free-ran-ue-interop.md) automatically. It sets up
 the RAN and UE namespaces, starts the six core NFs, runs the simulator's gNB and

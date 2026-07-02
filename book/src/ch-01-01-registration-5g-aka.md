@@ -1,7 +1,7 @@
 # Registration and 5G-AKA
 
 Registration is how a UE attaches to the network and proves who it is. In
-radiant-rs it joins two planes — the binary **N2/N1** signalling the AMF speaks
+radian-rs it joins two planes — the binary **N2/N1** signalling the AMF speaks
 to the gNB and UE, and the JSON **SBI** the AMF speaks to the AUSF and UDM — into
 a single flow that ends with the UE **REGISTERED** and holding a NAS security
 context.
@@ -73,7 +73,7 @@ sets, so a UE and the core derive identical keys.
 The UDM's store keeps a per-subscriber **sequence number** and hands out the next
 value for each authentication. The UE checks that the network's SQN is fresh. If
 the UE's stored SQN is ahead of the network's, real 5G-AKA recovers with a
-resynchronisation (AUTS); radiant-rs does **not** yet implement AUTS/resync, so a
+resynchronisation (AUTS); radian-rs does **not** yet implement AUTS/resync, so a
 test UE should start from an SQN at or below the network's next value.
 
 ## Discovery, not configuration

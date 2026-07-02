@@ -11,7 +11,7 @@ N4 datapath. It's the first leg of the PDU-session call flow.
 
 - **`nf-smf`** — SBI server (`:8002`) + PFCP client (one connected N4 socket,
   transactions serialized by a mutex):
-  - on startup, **PFCP Association** with the UPF (`RADIANT_SMF_UPF_N4`, default
+  - on startup, **PFCP Association** with the UPF (`RADIAN_SMF_UPF_N4`, default
     `127.0.0.1:8805`).
   - **`CreateSMContext`** → N4 **Session Establishment** → returns the UPF-allocated
     **N3 F-TEID** (which the AMF will put in the N2 SM info for the gNB) + a

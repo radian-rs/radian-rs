@@ -3,7 +3,7 @@
 > Built 2026-06-30 on branch `feat/live-ue-suci-deconceal`. The two AMF fixes that let a
 > real free5GC-based UE (the **free-ran-ue** simulator) complete registration end to end.
 
-Slices 2–7 built a full registration that passed with radiant-rs's *own* in-process test UE.
+Slices 2–7 built a full registration that passed with radian-rs's *own* in-process test UE.
 Pointing a real external simulator ([free-ran-ue](https://github.com/free-ran-ue/free-ran-ue))
 at the AMF surfaced two gaps that the self-test never exercised. Both are fixed here; the
 live UE now reaches **REGISTERED**.
@@ -48,7 +48,7 @@ across NG Setup, InitialUEMessage, and the full DL/UL NAS transport exchange.
 - `cargo test` — green (47 workspace-wide, +2). New: `nas::null_scheme_suci_deconceals_to_supi`,
   `nas::ecies_suci_falls_back_to_canonical_string`. `full_registration_completes` still passes
   (the self-test UE uses null-scheme SUCI + NEA2/NIA2, so it exercises both fixes).
-- **Live interop:** free-ran-ue UE `imsi-999700000000001` registers against the radiant core
+- **Live interop:** free-ran-ue UE `imsi-999700000000001` registers against the radian core
   (NRF+UDM+AUSF+AMF) over loopback SCTP/GTP-U. See the interop harness notes in memory.
 
 ## Known limitations / next steps

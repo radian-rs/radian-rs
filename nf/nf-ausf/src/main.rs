@@ -4,8 +4,8 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 const SBI_PORT: u16 = 8003;
-/// NRF the AUSF registers with so the AMF can discover it. Override with `RADIANT_AUSF_NRF`.
-const NRF_ENV: &str = "RADIANT_AUSF_NRF";
+/// NRF the AUSF registers with so the AMF can discover it. Override with `RADIAN_AUSF_NRF`.
+const NRF_ENV: &str = "RADIAN_AUSF_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 
 #[tokio::main]

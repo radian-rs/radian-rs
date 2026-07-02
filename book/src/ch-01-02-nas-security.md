@@ -14,7 +14,7 @@ keys from K_AMF and the selected algorithm identifiers:
 - **K_NASint** — integrity, used by **128-NIA2** (AES-CMAC).
 - **K_NASenc** — ciphering, used by **128-NEA2** (AES-CTR).
 
-radiant-rs selects **NIA2 / NEA2**. The `aka` crate provides `kamf` and
+radian-rs selects **NIA2 / NEA2**. The `aka` crate provides `kamf` and
 `nas_keys`; the `nas` crate holds the resulting `NasSecurityContext`, which
 protects and unprotects messages and tracks the uplink/downlink NAS counts.
 
@@ -31,7 +31,7 @@ The **Security Mode Command** carries the selected NAS algorithms, the key set
 identifier, and a **replay of the UE's advertised security capabilities**. That
 replay matters: the UE compares it against what it originally sent, and rejects
 the command if they differ — a bidding-down defence (TS 24.501 §8.2.25).
-radiant-rs therefore echoes the UE's *own* `ue_security_capability` from the
+radian-rs therefore echoes the UE's *own* `ue_security_capability` from the
 Registration Request, not a fixed value.
 
 The Security Mode Command is integrity-protected under a *new* security context
@@ -44,7 +44,7 @@ On **Security Mode Complete**, the AMF sends a protected **Registration Accept**
 that assigns the UE a **5G-GUTI** (a temporary identity so the SUCI need not be
 sent again). The UE answers with **Registration Complete**.
 
-radiant-rs then sends one more downlink — a **Configuration Update Command**. A
+radian-rs then sends one more downlink — a **Configuration Update Command**. A
 compliant UE waits for it after Registration Complete before it will start a PDU
 session, so the AMF issues a minimal one to unblock the UE.
 
@@ -68,7 +68,7 @@ context so replay and ordering are enforced.
 
 ## Algorithm negotiation
 
-radiant-rs currently fixes on **NIA2 / NEA2**. It does not yet negotiate the
+radian-rs currently fixes on **NIA2 / NEA2**. It does not yet negotiate the
 strongest common algorithm from the UE's advertised set — it selects NIA2/NEA2
 and replays the UE's capabilities for the bidding-down check. A UE that does not
 support NEA2/NIA2 would need that negotiation, which is future work.

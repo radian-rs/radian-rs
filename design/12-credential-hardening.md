@@ -9,7 +9,7 @@ store. This slice fixes the two cheap ones and documents the deferred one.
 
 | Finding | Fix |
 |---|---|
-| **Hard-coded demo subscriber** (nf-udm) — a known-key account was auto-provisioned, i.e. a backdoor in any deployment | The demo subscriber (a **public** TS 35.208 test key) is now provisioned **only** when `RADIANT_UDM_PROVISION_DEMO=1` — never by default. The DB path is also configurable (`RADIANT_UDM_DB`). A production build ships **no** known-key account. |
+| **Hard-coded demo subscriber** (nf-udm) — a known-key account was auto-provisioned, i.e. a backdoor in any deployment | The demo subscriber (a **public** TS 35.208 test key) is now provisioned **only** when `RADIAN_UDM_PROVISION_DEMO=1` — never by default. The DB path is also configurable (`RADIAN_UDM_DB`). A production build ships **no** known-key account. |
 | **Insecure file permissions** on the credential store | The redb file is created **mode 0600** (owner-only) at creation time via `OpenOptions.mode(0o600)` + `redb::Builder::create_file` — no chmod-after-create **TOCTOU** window. |
 | **Plaintext K/OPc at rest** | **Acknowledged, deferred.** Documented at the persistence site; the real fix is encryption-at-rest / an HSM **behind `ArpfKeyStore`** (the key never on disk in the clear). The seam already exists. |
 
@@ -20,7 +20,7 @@ store. This slice fixes the two cheap ones and documents the deferred one.
     unprovisioned subscriber (so with the demo OFF, the UDM returns **404** — no
     backdoor account).
   - `redb_credential_file_is_owner_only` — the persisted file is mode **0600**.
-- Behavior confirmed: with `RADIANT_UDM_PROVISION_DEMO` unset, the UDM logs
+- Behavior confirmed: with `RADIAN_UDM_PROVISION_DEMO` unset, the UDM logs
   "demo subscriber disabled" and an unprovisioned SUPI 404s; with it set, the demo
   subscriber is provisioned and authenticates.
 

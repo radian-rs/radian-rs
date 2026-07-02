@@ -72,13 +72,13 @@ collide. The UPF's bind and advertised addresses are configurable so they can si
 on distinct addresses:
 
 ```
-RADIANT_UPF_BIND=127.0.0.1      # bind N3/N4 here (default 0.0.0.0)
-RADIANT_UPF_N3_ADDR=10.0.1.1    # advertise this as the N3 F-TEID address
+RADIAN_UPF_BIND=127.0.0.1      # bind N3/N4 here (default 0.0.0.0)
+RADIAN_UPF_N3_ADDR=10.0.1.1    # advertise this as the N3 F-TEID address
 ```
 
 ## Security
 
 PFCP is **unauthenticated** (TS 29.244) and relies on a trusted/isolated N4
-network, or IPsec per TS 33.501 — which radiant-rs does not yet implement. The
+network, or IPsec per TS 33.501 — which radian-rs does not yet implement. The
 UPF's N4 handler logs and continues on a malformed datagram rather than failing
 open.

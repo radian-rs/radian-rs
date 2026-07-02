@@ -2,7 +2,7 @@
 
 > Built 2026-06-30 on branch `feat/n1-sm-accept`. The real N1 SM Accept that lets the
 > **free-ran-ue** UE finish its PDU session — parsing its IP/DNN/S-NSSAI and reaching the
-> operational "UE started" state against the live radiant core.
+> operational "UE started" state against the live radian core.
 
 Slice 20 completed the PDU-session *signaling* (SMF/N4/N2/gNB tunnel), but the AMF still
 handed the UE a **4-byte stub** N1 container — the UE crashed decoding it. This slice builds

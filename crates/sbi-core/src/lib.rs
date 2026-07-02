@@ -56,7 +56,7 @@ pub async fn run_on(listener: tokio::net::TcpListener, app: axum::Router) -> Res
 /// A root/health router — a real (otherwise empty) HTTP/2 SBI endpoint, used by
 /// NFs whose service handlers aren't implemented yet.
 pub fn health_router() -> axum::Router {
-    axum::Router::new().route("/", axum::routing::get(|| async { "radiant-rs SBI" }))
+    axum::Router::new().route("/", axum::routing::get(|| async { "radian-rs SBI" }))
 }
 
 /// Build an HTTP/2-prior-knowledge (cleartext h2c) JSON client for SBI calls.
