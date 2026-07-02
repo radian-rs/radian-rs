@@ -295,6 +295,38 @@ async fn e2e_topology_exists(world: &mut World) {
     assert!(netns::netns_exists(&world.ns("ran")).await, "RAN namespace is not up");
 }
 
+#[when("I stop the UE in the UE namespace")]
+async fn stop_ue(world: &mut World) {
+    let ue = world.ns("ue");
+    netns::kill_netns_procs(&ue).await.expect("kill UE");
+    // Its ueTun0 goes with it — a later "no tunnel" assertion must start clean.
+    let gone = wait_until(5, || async { !netns::iface_exists(&ue, "ueTun0").await }).await;
+    assert!(gone, "ueTun0 still present after stopping the UE");
+}
+
+#[when(regex = r#"^I start a UE requesting the unsubscribed DNN "([^"]+)"$"#)]
+async fn start_ue_unsubscribed_dnn(world: &mut World, _dnn: String) {
+    let sim = free_ran_ue_bin().expect("FREE_RAN_UE_BIN");
+    let ue = world.ns("ue");
+    // Same demo subscriber (registration succeeds) but pduSession.dnn = corporate.
+    let cfg = fixture("ue_unsubscribed_dnn.yaml");
+    world.procs.push(
+        netns::spawn_in_netns_env(&ue, &[], &sim.to_string_lossy(), &["ue", "-c", &cfg.to_string_lossy()])
+            .await
+            .expect("spawn UE (unsubscribed DNN)"),
+    );
+}
+
+#[then("the UE does not get a PDU session")]
+async fn ue_gets_no_pdu_session(world: &mut World) {
+    let ue = world.ns("ue");
+    // The SMF refuses the DNN (403) and the AMF answers with a 5GSM Establishment
+    // Reject — so ueTun0 must never appear. 8s is well past the happy-path
+    // registration + PDU-session bring-up time.
+    let appeared = wait_until(8, || netns::iface_exists(&ue, "ueTun0")).await;
+    assert!(!appeared, "ueTun0 appeared — the unsubscribed DNN was not rejected");
+}
+
 #[when("I stop the simulator and core")]
 async fn stop_sim_and_core(world: &mut World) {
     netns::kill_netns_procs(&world.ns("ue")).await.expect("kill UE");

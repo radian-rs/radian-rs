@@ -248,6 +248,22 @@ pub fn pdu_session_establishment_accept(
     m
 }
 
+/// 5GSM cause values (TS 24.501 §9.11.4.2) this stack emits.
+pub mod sm_cause {
+    /// #27 — the requested DNN is not subscribed / unknown.
+    pub const MISSING_OR_UNKNOWN_DNN: u8 = 27;
+    /// #31 — request rejected, unspecified (internal / upstream failure).
+    pub const REQUEST_REJECTED_UNSPECIFIED: u8 = 31;
+}
+
+/// Build a 5GSM **PDU Session Establishment Reject** (TS 24.501 §8.3.3) as the raw
+/// N1 SM container bytes: the 5GSM header (message type 0xC3) followed by the
+/// mandatory 5GSM cause (V, one octet). `pti` echoes the request's procedure
+/// transaction id; pick `cause` from [`sm_cause`].
+pub fn pdu_session_establishment_reject(pdu_session_id: u8, pti: u8, cause: u8) -> Vec<u8> {
+    vec![0x2e, pdu_session_id, pti, 0xc3, cause]
+}
+
 /// Encode a DNN as RFC 1035 labels (each dot-separated label prefixed by its length),
 /// as TS 24.501 §9.11.2.1A specifies.
 fn rfc1035_labels(dnn: &str) -> Vec<u8> {
@@ -507,6 +523,17 @@ mod tests {
         let msg = decode_nas_5gs_message(&bytes).expect("decode");
         assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::DlNasTransport));
         assert_eq!(sm_container_from_dl_nas_transport(&msg), Some((5, accept)));
+    }
+
+    #[test]
+    fn dl_nas_transport_carries_pdu_session_reject() {
+        let reject = pdu_session_establishment_reject(5, 1, sm_cause::MISSING_OR_UNKNOWN_DNN);
+        // 5GSM header (0xC3 = Establishment Reject) + the mandatory cause octet.
+        assert_eq!(reject, [0x2e, 5, 1, 0xc3, 27]);
+
+        let bytes = encode_nas_5gs_message(&dl_nas_transport_sm(5, reject.clone())).expect("encode");
+        let msg = decode_nas_5gs_message(&bytes).expect("decode");
+        assert_eq!(sm_container_from_dl_nas_transport(&msg), Some((5, reject)));
     }
 
     #[test]

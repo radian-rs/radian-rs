@@ -362,12 +362,12 @@ async fn on_uplink_nas(
             // the subscription (design/27) — an unsubscribed DNN fails CreateSMContext.
             let dnn = nas::requested_dnn_from_ul_nas_transport(&nas_msg)
                 .unwrap_or_else(|| DEFAULT_DNN.to_string());
+            let pti = container.get(2).copied().unwrap_or(1);
             match amf_smf.create_sm_context(&supi, psi, &dnn).await {
                 Ok(created) => {
                     // Build the N1 PDU Session Establishment Accept (UE IP from the SMF,
                     // echoing the request's PTI) and NAS-protect a DL NAS Transport carrying
                     // it — the gNB relays that to the UE. The N2 SM info carries the UPF F-TEID.
-                    let pti = container.get(2).copied().unwrap_or(1);
                     // S-NSSAI and session AMBR come from the subscriber's UDR sm-data
                     // (looked up by the SMF during CreateSMContext); the DNN echoes
                     // the UE's authorized request.
@@ -398,8 +398,29 @@ async fn on_uplink_nas(
                     Some((setup, "PDUSessionResourceSetupRequest"))
                 }
                 Err(e) => {
-                    warn!("UE {amf_ue_id}: PDU session {psi} CreateSMContext failed: {e}");
-                    None
+                    // Answer the UE with a 5GSM PDU Session Establishment Reject instead
+                    // of silence: subscription refusal → cause #27 (missing or unknown
+                    // DNN), anything else → #31 (request rejected, unspecified). Plain
+                    // DL NAS Transport — no N2 setup, since no session exists.
+                    let cause = match &e {
+                        pdu_session::CreateSmError::Forbidden => nas::sm_cause::MISSING_OR_UNKNOWN_DNN,
+                        pdu_session::CreateSmError::Other(_) => nas::sm_cause::REQUEST_REJECTED_UNSPECIFIED,
+                    };
+                    warn!(
+                        "UE {amf_ue_id}: PDU session {psi} (dnn={dnn}) CreateSMContext failed: {e}; \
+                         sending Establishment Reject (5GSM cause #{cause})"
+                    );
+                    let reject = nas::pdu_session_establishment_reject(psi, pti, cause);
+                    let dl = nas::dl_nas_transport_sm(psi, reject);
+                    let Some(sec) = ues.get_mut(&amf_ue_id).and_then(|c| c.sec.as_mut()) else {
+                        warn!("UE {amf_ue_id}: cannot NAS-protect the reject (no security context)");
+                        return None;
+                    };
+                    let protected = sec.protect(&dl, nas::sht::INTEGRITY_CIPHERED, 1);
+                    Some((
+                        ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, protected),
+                        "DownlinkNASTransport (PDUSessionEstablishmentReject)",
+                    ))
                 }
             }
         }

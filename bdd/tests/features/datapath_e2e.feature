@@ -29,6 +29,12 @@ Feature: End-to-end datapath with the free-ran-ue simulator
     And I start the UE in the UE namespace
     Then the UE can ping the data network gateway "10.45.0.1"
 
+  Scenario: A UE requesting an unsubscribed DNN is rejected
+    Given the e2e topology exists
+    When I stop the UE in the UE namespace
+    And I start a UE requesting the unsubscribed DNN "corporate"
+    Then the UE does not get a PDU session
+
   Scenario: Teardown topology
     Given the e2e topology exists
     When I stop the simulator and core

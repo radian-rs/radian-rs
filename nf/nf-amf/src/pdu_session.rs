@@ -13,6 +13,7 @@ use sbi_core::nnrf::NrfClient;
 /// The UPF's N3 F-TEID returned by CreateSMContext — for the N2 PDU Session Resource
 /// Setup the AMF sends to the gNB — plus the subscribed session parameters the AMF
 /// places in the N1 PDU Session Establishment Accept.
+#[derive(Debug)]
 pub struct SmContextCreated {
     pub sm_ref: String,
     pub up_n3_teid: u32,
@@ -25,6 +26,36 @@ pub struct SmContextCreated {
     /// The subscribed session AMBR, already in NAS wire form (falls back to the
     /// pre-subscription default when the SMF didn't supply one).
     pub ambr: nas::SessionAmbr,
+}
+
+/// Why CreateSMContext failed — drives which 5GSM cause the UE gets.
+#[derive(Debug)]
+pub enum CreateSmError {
+    /// The SMF refused the session (`403`): the DNN is not in the subscription.
+    Forbidden,
+    /// Anything else (discovery, transport, upstream failure).
+    Other(String),
+}
+
+impl std::fmt::Display for CreateSmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CreateSmError::Forbidden => write!(f, "SMF refused: DNN not subscribed"),
+            CreateSmError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<String> for CreateSmError {
+    fn from(e: String) -> Self {
+        CreateSmError::Other(e)
+    }
+}
+
+impl From<&str> for CreateSmError {
+    fn from(e: &str) -> Self {
+        CreateSmError::Other(e.to_string())
+    }
 }
 
 /// The AMF's client toward the SMF's `Nsmf_PDUSession` service.
@@ -41,13 +72,14 @@ impl AmfSmf {
     }
 
     /// Discover the SMF and create an SM context; returns the UPF N3 F-TEID and the
-    /// subscribed session parameters.
+    /// subscribed session parameters. `Forbidden` when the SMF refused the DNN
+    /// (subscription check) — the caller turns that into a 5GSM reject, cause #27.
     pub async fn create_sm_context(
         &self,
         supi: &str,
         pdu_session_id: u8,
         dnn: &str,
-    ) -> Result<SmContextCreated, String> {
+    ) -> Result<SmContextCreated, CreateSmError> {
         let smf_base = self.discover_smf().await?;
         let resp = sbi_core::h2c_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts"))
@@ -60,8 +92,11 @@ impl AmfSmf {
             .send()
             .await
             .map_err(|e| format!("Nsmf CreateSMContext request failed: {e}"))?;
+        if resp.status().as_u16() == 403 {
+            return Err(CreateSmError::Forbidden);
+        }
         if !resp.status().is_success() {
-            return Err(format!("Nsmf CreateSMContext returned {}", resp.status()));
+            return Err(format!("Nsmf CreateSMContext returned {}", resp.status()).into());
         }
         let body: serde_json::Value =
             resp.json().await.map_err(|e| format!("CreateSMContext body: {e}"))?;
@@ -162,6 +197,10 @@ mod tests {
             // The AMF must identify its serving PLMN (TS 29.502 servingNetwork).
             assert_eq!(req.pointer("/servingNetwork/mcc").and_then(|v| v.as_str()), Some("999"));
             assert_eq!(req.pointer("/servingNetwork/mnc").and_then(|v| v.as_str()), Some("70"));
+            // The subscription gate: only "internet" is subscribed (mirrors the SMF's 403).
+            if req.get("dnn").and_then(|v| v.as_str()) != Some("internet") {
+                return (StatusCode::FORBIDDEN, Json(serde_json::json!({})));
+            }
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
@@ -219,5 +258,13 @@ mod tests {
             .update_sm_context(&created.sm_ref, 0x5678, Ipv4Addr::new(10, 0, 0, 9))
             .await
             .expect("AMF updates SM context with the gNB F-TEID");
+
+        // An SMF 403 (unsubscribed DNN) surfaces as the typed Forbidden error —
+        // the signal for the AMF to send a 5GSM reject with cause #27.
+        let err = amf_smf
+            .create_sm_context("imsi-999700000000001", 5, "corporate")
+            .await
+            .expect_err("unsubscribed DNN must be refused");
+        assert!(matches!(err, CreateSmError::Forbidden), "got {err:?}");
     }
 }
