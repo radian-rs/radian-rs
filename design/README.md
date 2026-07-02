@@ -39,6 +39,7 @@ surface of the project and assesses build feasibility.
 | [28-requested-dnn.md](28-requested-dnn.md) | UE-requested DNN: parse the UL NAS Transport 0x25 IE, drive CreateSMContext + N1 accept with it (default `internet` when omitted) |
 | [29-pdu-session-reject.md](29-pdu-session-reject.md) | 5GSM PDU Session Establishment Reject: SMF 403 → cause #27 (else #31), NAS-protected DL NAS Transport; negative BDD scenario |
 | [30-reject-backoff-timer.md](30-reject-backoff-timer.md) | T3396 back-off IE on the reject: GprsTimer3 encoding (finest-fitting unit, round up), 600s on cause #27, none on #31 |
+| [31-requested-snssai.md](31-requested-snssai.md) | UE-requested S-NSSAI: parse the 0x22 IE, slice-keyed subscription validation (403 SNSSAI_DENIED/DNN_DENIED ProblemDetails), 5GSM cause #70 |
 
 ## One-paragraph summary
 

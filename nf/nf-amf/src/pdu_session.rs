@@ -72,23 +72,34 @@ impl AmfSmf {
     }
 
     /// Discover the SMF and create an SM context; returns the UPF N3 F-TEID and the
-    /// subscribed session parameters. `Forbidden` when the SMF refused the DNN
-    /// (subscription check) — the caller turns that into a 5GSM reject, cause #27.
+    /// serving session parameters. `snssai` is the UE's requested slice, forwarded
+    /// as TS 29.502 `sNssai`. `Forbidden` when the SMF refused the (slice, DNN)
+    /// pair — the caller turns that into a 5GSM reject (cause #27, or #70 when a
+    /// slice was requested).
     pub async fn create_sm_context(
         &self,
         supi: &str,
         pdu_session_id: u8,
         dnn: &str,
+        snssai: Option<(u8, Option<[u8; 3]>)>,
     ) -> Result<SmContextCreated, CreateSmError> {
         let smf_base = self.discover_smf().await?;
+        let mut body = serde_json::json!({
+            "supi": supi,
+            "pduSessionId": pdu_session_id,
+            "dnn": dnn,
+            "servingNetwork": { "mcc": self.mcc, "mnc": self.mnc },
+        });
+        if let Some((sst, sd)) = snssai {
+            let mut slice = serde_json::json!({ "sst": sst });
+            if let Some(sd) = sd {
+                slice["sd"] = serde_json::Value::String(hex::encode(sd));
+            }
+            body["sNssai"] = slice;
+        }
         let resp = sbi_core::h2c_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts"))
-            .json(&serde_json::json!({
-                "supi": supi,
-                "pduSessionId": pdu_session_id,
-                "dnn": dnn,
-                "servingNetwork": { "mcc": self.mcc, "mnc": self.mnc },
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| format!("Nsmf CreateSMContext request failed: {e}"))?;
@@ -194,9 +205,12 @@ mod tests {
     async fn amf_discovers_smf_and_creates_sm_context() {
         // Mock SMF: an Nsmf endpoint returning a CreateSMContext success.
         async fn mock_create(Json(req): Json<serde_json::Value>) -> (StatusCode, Json<serde_json::Value>) {
-            // The AMF must identify its serving PLMN (TS 29.502 servingNetwork).
+            // The AMF must identify its serving PLMN (TS 29.502 servingNetwork) and
+            // forward the UE's requested slice (sNssai).
             assert_eq!(req.pointer("/servingNetwork/mcc").and_then(|v| v.as_str()), Some("999"));
             assert_eq!(req.pointer("/servingNetwork/mnc").and_then(|v| v.as_str()), Some("70"));
+            assert_eq!(req.pointer("/sNssai/sst").and_then(|v| v.as_u64()), Some(1));
+            assert_eq!(req.pointer("/sNssai/sd").and_then(|v| v.as_str()), Some("010203"));
             // The subscription gate: only "internet" is subscribed (mirrors the SMF's 403).
             if req.get("dnn").and_then(|v| v.as_str()) != Some("internet") {
                 return (StatusCode::FORBIDDEN, Json(serde_json::json!({})));
@@ -241,8 +255,9 @@ mod tests {
         NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
 
         let amf_smf = AmfSmf::new(nrf_base, "999", "70");
+        let requested = Some((1, Some([1, 2, 3])));
         let created = amf_smf
-            .create_sm_context("imsi-999700000000001", 5, "internet")
+            .create_sm_context("imsi-999700000000001", 5, "internet", requested)
             .await
             .expect("AMF creates SM context via discovered SMF");
         assert_eq!(created.up_n3_teid, 1, "UPF N3 F-TEID parsed from the response");
@@ -259,10 +274,10 @@ mod tests {
             .await
             .expect("AMF updates SM context with the gNB F-TEID");
 
-        // An SMF 403 (unsubscribed DNN) surfaces as the typed Forbidden error —
-        // the signal for the AMF to send a 5GSM reject with cause #27.
+        // An SMF 403 (denied pair) surfaces as the typed Forbidden error — the
+        // signal for the AMF to send a 5GSM reject (#27, or #70 with a slice).
         let err = amf_smf
-            .create_sm_context("imsi-999700000000001", 5, "corporate")
+            .create_sm_context("imsi-999700000000001", 5, "corporate", requested)
             .await
             .expect_err("unsubscribed DNN must be refused");
         assert!(matches!(err, CreateSmError::Forbidden), "got {err:?}");
