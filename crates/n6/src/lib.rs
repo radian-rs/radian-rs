@@ -74,6 +74,9 @@ pub fn uplink<'a>(state: &mut UpfState, teid: u32, inner: &'a [u8], now_nanos: u
 pub enum Downlink {
     /// Send this G-PDU toward the gNB at `gnb_ip` on N3.
     ToN3 { gnb_ip: Ipv4Addr, gpdu: Vec<u8> },
+    /// The owning session is **CM-IDLE**: the packet was buffered and a Downlink
+    /// Data Report raised (paging trigger) — nothing to send now.
+    Buffered,
     /// No session owns the destination UE IP, or its downlink isn't installed yet — drop.
     NoRoute,
     /// The packet is not IPv4 (only IPv4 PDU sessions are supported) — drop.
@@ -90,7 +93,9 @@ pub fn downlink(state: &mut UpfState, pkt: &[u8], now_nanos: u64) -> Downlink {
         return Downlink::NotIpv4;
     };
     let Some((gnb_teid, gnb_ip)) = state.route_downlink(dst) else {
-        return Downlink::NoRoute;
+        // No installed tunnel: a CM-IDLE (buffering) session holds the packet and
+        // triggers paging; otherwise there's no route.
+        return if state.buffer_downlink(dst, pkt) { Downlink::Buffered } else { Downlink::NoRoute };
     };
     if !state.admit_downlink(dst, now_nanos, pkt) {
         return Downlink::RateLimited;

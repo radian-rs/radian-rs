@@ -122,6 +122,9 @@ enum UeCmd {
     T3522Expiry(u64),
     /// Push a mid-session PDU-session QoS change to the RAN/UE (from the SMF).
     ModifyPolicy(Box<ModifyPolicy>),
+    /// Page a CM-IDLE UE by 5G-TMSI (downlink data arrived — the SMF asked the AMF
+    /// to page). Broadcast to every gNB association; each sends an NGAP Paging.
+    Page(u32),
 }
 
 /// A network-initiated PDU-session modification for one UE — the parsed QoS the
@@ -211,6 +214,16 @@ static GUTI_DIRECTORY: LazyLock<Mutex<HashMap<u32, String>>> =
 /// association ending), so a UE can resume on any gNB.
 static RETAINED: LazyLock<Mutex<HashMap<u32, UeContext>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Command channels into every live gNB association — how the SBI paging surface
+/// reaches the N2 tasks. Each `serve_gnb` registers its channel; closed ones are
+/// swept when paging broadcasts. NGAP **Paging** is non-UE-associated, so it goes
+/// to all gNBs (a real AMF filters by the UE's registration-area TAI list).
+static GNB_LINKS: LazyLock<Mutex<Vec<UnboundedSender<UeCmd>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// The tracking-area code the AMF pages within (single-TA demo core).
+const AMF_TAC: [u8; 3] = [0x00, 0x00, 0x01];
 
 /// Arm T3522: after `secs`, post an expiry for this UE onto its association.
 fn arm_t3522(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64, secs: u64) {
@@ -348,6 +361,8 @@ async fn serve_gnb(
     let mut ues: HashMap<u64, UeContext> = HashMap::new();
     // The SBI callback surface reaches this association's UEs through this channel.
     let (dereg_tx, mut dereg_rx) = unbounded_channel::<UeCmd>();
+    // Register this association so the paging surface can reach its gNB.
+    GNB_LINKS.lock().unwrap().push(dereg_tx.clone());
     let result = loop {
         tokio::select! {
             received = conn.sctp_recv() => match received {
@@ -368,6 +383,11 @@ async fn serve_gnb(
                     }
                     UeCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, T3522_SECS),
                     UeCmd::ModifyPolicy(m) => on_network_modification(&mut ues, &m),
+                    // Page a CM-IDLE UE on this gNB (non-UE-associated NGAP Paging).
+                    UeCmd::Page(tmsi) => {
+                        info!("paging CM-IDLE UE (5G-TMSI {tmsi:#010x}) on this gNB");
+                        vec![(ngap::paging(tmsi, PLMN_MCC, PLMN_MNC, &AMF_TAC), "Paging")]
+                    }
                 };
                 for (dl, label) in downlinks {
                     send_or_log(&conn, &dl, label).await;
@@ -461,11 +481,39 @@ fn namf_callback_router() -> axum::Router {
         }
     }
 
+    /// `Namf_Communication_N1N2MessageTransfer` (TS 29.518, simplified) — the SMF
+    /// asks the AMF to page a UE for which downlink data arrived at the UPF. The AMF
+    /// resolves the SUPI to its retained CM-IDLE 5G-TMSI and broadcasts an NGAP
+    /// Paging to every gNB. `202` if paged; `404` if the UE isn't CM-IDLE / unknown.
+    async fn page_ue(
+        axum::extract::Path(supi): axum::extract::Path<String>,
+    ) -> axum::http::StatusCode {
+        let tmsi = RETAINED
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, c)| c.suci.as_deref() == Some(supi.as_str()))
+            .map(|(tmsi, _)| *tmsi);
+        let Some(tmsi) = tmsi else {
+            warn!(%supi, "paging requested but the UE is not CM-IDLE / unknown");
+            return axum::http::StatusCode::NOT_FOUND;
+        };
+        // Broadcast to every live gNB association (sweeping any that have closed).
+        let mut links = GNB_LINKS.lock().unwrap();
+        links.retain(|tx| tx.send(UeCmd::Page(tmsi)).is_ok());
+        info!(%supi, gnbs = links.len(), "paging CM-IDLE UE (downlink data)");
+        axum::http::StatusCode::ACCEPTED
+    }
+
     axum::Router::new()
         .route("/namf-callback/v1/{supi}/dereg-notify", axum::routing::post(dereg_notify))
         .route(
             "/namf-comm/v1/ue-contexts/{supi}/modify",
             axum::routing::post(modify_policy),
+        )
+        .route(
+            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages",
+            axum::routing::post(page_ue),
         )
 }
 
@@ -2011,6 +2059,53 @@ mod tests {
 
         // A release request for an unknown UE produces no command.
         assert!(on_ue_context_release_request(&mut ues, &amf_smf, &ngap::ue_context_release_request(99, 1, 20)).await.is_none());
+    }
+
+    /// Network-initiated paging: the SMF's N1N2 message transfer (downlink data)
+    /// resolves the SUPI to its retained CM-IDLE 5G-TMSI and broadcasts a Page
+    /// command to the gNB associations, which each build an NGAP Paging.
+    #[tokio::test]
+    async fn downlink_data_pages_a_cm_idle_ue() {
+        let supi = "imsi-999700000000101";
+        let tmsi = 0x0000_0101u32;
+
+        // A retained CM-IDLE context for the UE.
+        let mut ctx = UeContext::new(0, RegState::Registered, Some(supi.into()));
+        ctx.cm_state = CmState::Idle;
+        ctx.guti_tmsi = Some(tmsi);
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+
+        // A mock gNB association link registered in GNB_LINKS.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        GNB_LINKS.lock().unwrap().push(tx);
+
+        // The SMF calls the AMF's N1N2 paging surface.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(listener, namf_callback_router()).await.unwrap() });
+        let client = sbi_core::h2c_client();
+        let status = client
+            .post(format!("http://{addr}/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 202, "paging accepted");
+        // The gNB link received a Page for this TMSI.
+        assert!(matches!(rx.recv().await, Some(UeCmd::Page(t)) if t == tmsi));
+
+        // Paging an unknown (not CM-IDLE) UE → 404.
+        let status = client
+            .post(format!("http://{addr}/namf-comm/v1/ue-contexts/imsi-000/n1-n2-messages"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 404);
+
+        RETAINED.lock().unwrap().remove(&tmsi);
     }
 
     /// Service Request resume: a CM-IDLE UE (retained by 5G-TMSI) comes back with a

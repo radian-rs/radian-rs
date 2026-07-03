@@ -317,7 +317,20 @@ struct Session {
     reported_dl: u64,
     /// A threshold crossing awaiting pickup by [`UpfState::take_due_report`].
     report_due: bool,
+    /// The downlink FAR is **buffering** (CM-IDLE, AN release): downlink packets are
+    /// held in `dl_buffer` and a Downlink Data Report is raised, instead of being
+    /// forwarded. Cleared when the tunnel is re-installed (Service Request resume).
+    buffering: bool,
+    /// Buffered downlink packets (bounded), flushed to the gNB on re-activation.
+    dl_buffer: std::collections::VecDeque<Vec<u8>>,
+    /// A first buffered packet awaiting a Downlink Data Report toward the SMF
+    /// (paging trigger), picked up by [`UpfState::take_dl_data_report`].
+    dl_data_report_due: bool,
 }
+
+/// Max downlink packets buffered per CM-IDLE session before dropping the oldest —
+/// enough to hold the trigger packet(s) until paging completes (TS 23.501 §5.6.11).
+const DL_BUFFER_CAP: usize = 64;
 
 impl Session {
     /// Admit `pkt` in the given direction: classify it to a GBR flow and police it
@@ -393,6 +406,10 @@ pub struct UpfState {
     next_teid: u32,
     next_seid: u64,
     sessions: HashMap<u64, Session>,
+    /// Buffered downlink packets to send on N3 after a re-activation, as
+    /// `(gNB TEID, gNB IP, inner IP packet)` — drained by
+    /// [`take_flush`](UpfState::take_flush) and GTP-U-encapsulated by the caller.
+    pending_flush: Vec<(u32, Ipv4Addr, Vec<u8>)>,
 }
 
 impl Default for UpfState {
@@ -408,6 +425,7 @@ impl UpfState {
             next_teid: 1,
             next_seid: 1,
             sessions: HashMap::new(),
+            pending_flush: Vec::new(),
         }
     }
 
@@ -517,6 +535,9 @@ impl UpfState {
                 reported_ul: 0,
                 reported_dl: 0,
                 report_due: false,
+                buffering: false,
+                dl_buffer: std::collections::VecDeque::new(),
+                dl_data_report_due: false,
             },
         );
         (up_seid, teid)
@@ -539,27 +560,73 @@ impl UpfState {
     }
 
     /// Install the gNB downlink target for a session (from a Session Modification).
+    /// Also stops buffering and **flushes** any downlink packets held while the UE
+    /// was CM-IDLE — encapsulated to the new tunnel — onto the pending-flush queue.
     fn set_downlink(&mut self, up_seid: u64, gnb_teid: u32, gnb_ip: Ipv4Addr) -> bool {
+        let Some(s) = self.sessions.get_mut(&up_seid) else {
+            return false;
+        };
+        s.downlink = Some((gnb_teid, gnb_ip));
+        s.buffering = false;
+        s.dl_data_report_due = false;
+        let flushed: Vec<(u32, Ipv4Addr, Vec<u8>)> =
+            s.dl_buffer.drain(..).map(|pkt| (gnb_teid, gnb_ip, pkt)).collect();
+        if !flushed.is_empty() {
+            self.pending_flush.extend(flushed);
+        }
+        true
+    }
+
+    /// Clear a session's gNB downlink target and **start buffering** (AN release /
+    /// UP deactivation): downlink packets are held (and a Downlink Data Report
+    /// raised on the first) instead of forwarded, until a Service Request
+    /// re-installs the tunnel.
+    fn clear_downlink(&mut self, up_seid: u64) -> bool {
         match self.sessions.get_mut(&up_seid) {
             Some(s) => {
-                s.downlink = Some((gnb_teid, gnb_ip));
+                s.downlink = None;
+                s.buffering = true;
                 true
             }
             None => false,
         }
     }
 
-    /// Clear a session's gNB downlink target (AN release / UP deactivation): the
-    /// UPF then has no route for downlink traffic to this UE, so it is dropped
-    /// until a Service Request re-installs the tunnel.
-    fn clear_downlink(&mut self, up_seid: u64) -> bool {
-        match self.sessions.get_mut(&up_seid) {
-            Some(s) => {
-                s.downlink = None;
-                true
-            }
-            None => false,
+    /// Buffer a downlink packet for a **CM-IDLE** session owning `dst` (the UE IP),
+    /// raising a Downlink Data Report on the first buffered packet. Returns whether
+    /// the packet was buffered (i.e. a buffering session owns `dst`).
+    pub fn buffer_downlink(&mut self, dst: Ipv4Addr, pkt: &[u8]) -> bool {
+        let Some(s) = self.sessions.values_mut().find(|s| s.ue_ip == Some(dst) && s.buffering) else {
+            return false;
+        };
+        if s.dl_buffer.is_empty() {
+            s.dl_data_report_due = true; // first arrival → notify the SMF (paging)
         }
+        if s.dl_buffer.len() >= DL_BUFFER_CAP {
+            s.dl_buffer.pop_front(); // bounded: drop the oldest
+        }
+        s.dl_buffer.push_back(pkt.to_vec());
+        true
+    }
+
+    /// Take one pending **Downlink Data Report** (a CM-IDLE session that just
+    /// received its first buffered packet), returning the SMF's F-SEID to address
+    /// the Session Report to. Consumed once per idle period.
+    pub fn take_dl_data_report(&mut self) -> Option<u64> {
+        let s = self.sessions.values_mut().find(|s| s.dl_data_report_due)?;
+        s.dl_data_report_due = false;
+        Some(s.cp_seid)
+    }
+
+    /// Drain the buffered downlink packets to send on N3 after re-activations, as
+    /// `(gNB TEID, gNB IP, inner IP packet)` — the caller GTP-U-encapsulates each.
+    pub fn take_flush(&mut self) -> Vec<(u32, Ipv4Addr, Vec<u8>)> {
+        std::mem::take(&mut self.pending_flush)
+    }
+
+    /// Whether a session owning `dst` is currently buffering (test/inspection).
+    pub fn is_buffering(&self, dst: Ipv4Addr) -> bool {
+        self.sessions.values().any(|s| s.ue_ip == Some(dst) && s.buffering)
     }
 
     /// Set/replace a session's AMBR (from a Create or Update QER), re-rating its
@@ -831,13 +898,15 @@ pub fn session_flow_modification_request(
 }
 
 /// SMF: build a PFCP Session Modification Request that **deactivates** the downlink
-/// user-plane connection (TS 23.502 §4.2.6 AN release) — an Update FAR that DROPs
-/// downlink and clears its Outer Header Creation, so the UPF stops forwarding to the
-/// (now released) gNB tunnel. The uplink path and the session itself are unchanged;
-/// a later Service Request re-activates via [`session_modification_request`].
+/// user-plane connection (TS 23.502 §4.2.6 AN release) — an Update FAR set to
+/// **BUFF**er downlink (and notify the CP on first arrival, `NOCP`), clearing its
+/// Outer Header Creation. The UPF then holds downlink for the CM-IDLE UE and raises
+/// a Downlink Data Report (paging trigger) instead of dropping it. The uplink path
+/// and the session persist; a Service Request re-activates via
+/// [`session_modification_request`], which flushes the buffer.
 pub fn session_deactivate_request(up_seid: u64, seq: u32, far_id: u32) -> Vec<u8> {
     let update_far = UpdateFar::builder(FarId::new(far_id))
-        .apply_action(ApplyAction::DROP)
+        .apply_action(ApplyAction::BUFF | ApplyAction::NOCP)
         .build()
         .expect("build deactivate Update FAR");
     SessionModificationRequestBuilder::new(up_seid, seq)
@@ -967,8 +1036,12 @@ pub fn handle_n4(
                     Some((gnb_teid, gnb_ip)) => {
                         state.set_downlink(up_seid, gnb_teid, gnb_ip);
                     }
-                    // No OHC + a DROP action → deactivate the downlink (AN release).
-                    None if uf.apply_action.is_some_and(|a| a.contains(ApplyAction::DROP)) => {
+                    // No OHC + a BUFF/DROP action → deactivate the downlink (AN
+                    // release): start buffering downlink for the CM-IDLE UE.
+                    None if uf.apply_action.is_some_and(|a| {
+                        a.contains(ApplyAction::BUFF) || a.contains(ApplyAction::DROP)
+                    }) =>
+                    {
                         state.clear_downlink(up_seid);
                     }
                     None => {}
@@ -1065,6 +1138,31 @@ fn usage_report_for(u: &UsageVolume, ur_seqn: u32, trigger: u8) -> UsageReport {
     );
     report.volume_measurement = Some(vm);
     report
+}
+
+/// UPF: build a Session Report Request carrying a **Downlink Data Report**
+/// (TS 29.244 §7.5.8) — downlink data arrived for a buffering (CM-IDLE) session,
+/// so the SMF should page the UE. The header SEID is the **SMF's** F-SEID.
+pub fn session_report_request_dldr(cp_seid: u64, seq: u32) -> Vec<u8> {
+    let report_type = ReportType::new().with_downlink_data_report(true);
+    SessionReportRequestBuilder::new(cp_seid, seq)
+        .report_type(Ie::new(IeType::ReportType, report_type.marshal()))
+        .build()
+        .marshal()
+}
+
+/// SMF: whether a Session Report Request is a **Downlink Data Report** (the paging
+/// trigger). Returns `(cp_seid, seq)`; `None` for other report types (e.g. usage).
+pub fn parse_dl_data_report(data: &[u8]) -> Option<(u64, u32)> {
+    let msg = rs_pfcp::message::parse(data).ok()?;
+    if msg.msg_type() != MsgType::SessionReportRequest {
+        return None;
+    }
+    let rt = msg.ies(IeType::ReportType).next()?;
+    if !ReportType::unmarshal(&rt.payload).ok()?.is_downlink_data_report() {
+        return None;
+    }
+    Some((u64::from(msg.seid()?), u32::from(msg.sequence())))
 }
 
 /// UPF: build a Session Report Request carrying a threshold-triggered usage report
@@ -1476,6 +1574,54 @@ mod tests {
             Some((4000, 3000, 1000)),
             "(total, uplink, downlink) bytes"
         );
+    }
+
+    #[test]
+    fn an_release_buffers_downlink_reports_and_flushes_on_resume() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[], None), node_ip, &mut state, 0)
+            .expect("establish");
+        let up_seid = 1u64;
+        let gnb = Ipv4Addr::new(10, 0, 0, 9);
+        handle_n4(&session_modification_request(up_seid, 2, 1, 0x5678, gnb), node_ip, &mut state, 0)
+            .expect("activate downlink");
+
+        // AN release → the session buffers downlink (not drops).
+        handle_n4(&session_deactivate_request(up_seid, 3, 1), node_ip, &mut state, 0).expect("deactivate");
+        assert!(state.is_buffering(UE_IP), "session buffering while CM-IDLE");
+        assert_eq!(state.route_downlink(UE_IP), None, "no tunnel while idle");
+
+        // Two downlink packets arrive → buffered; the first raises one DL data report.
+        assert!(state.buffer_downlink(UE_IP, &[1u8; 40]));
+        assert!(state.buffer_downlink(UE_IP, &[2u8; 40]));
+        assert_eq!(state.take_dl_data_report(), Some(0xCAFE), "report addressed by the SMF F-SEID");
+        assert_eq!(state.take_dl_data_report(), None, "only one report per idle period");
+        assert!(state.take_flush().is_empty(), "nothing to flush while still idle");
+        // A packet for an unknown UE isn't buffered.
+        assert!(!state.buffer_downlink(Ipv4Addr::new(10, 45, 0, 9), &[0u8; 40]));
+
+        // Service Request resume: re-installing the downlink flushes the buffer to
+        // the new gNB tunnel.
+        handle_n4(&session_modification_request(up_seid, 4, 1, 0x9ABC, gnb), node_ip, &mut state, 0)
+            .expect("re-activate");
+        assert!(!state.is_buffering(UE_IP), "no longer buffering after resume");
+        let flushed = state.take_flush();
+        assert_eq!(flushed.len(), 2, "both buffered packets flushed");
+        assert!(flushed.iter().all(|(teid, ip, _)| *teid == 0x9ABC && *ip == gnb), "to the new tunnel");
+    }
+
+    #[test]
+    fn dl_data_report_wire_round_trips() {
+        let req = session_report_request_dldr(0xBEEF, 9);
+        assert_eq!(parse_dl_data_report(&req), Some((0xBEEF, 9)));
+        // A usage report is NOT a downlink data report, and vice versa.
+        let usage = session_report_request(
+            &DueReport { cp_seid: 0xBEEF, usage: UsageVolume { urr_id: 1, total: 10, uplink: 10, downlink: 0 } },
+            9,
+        );
+        assert_eq!(parse_dl_data_report(&usage), None);
+        assert!(parse_session_report_request(&req).is_none());
     }
 
     #[test]

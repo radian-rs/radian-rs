@@ -127,23 +127,58 @@ pub fn parse_ue_context_release_command(pdu: &NGAP_PDU) -> Option<(u64, u32, Opt
 /// (TS 38.413 §9.2.5.1) — a CM-IDLE UE resuming with a Service Request identifies
 /// itself by 5G-S-TMSI, which the gNB relays from RRC. For tests / a gNB simulator.
 pub fn initial_ue_message_with_stmsi(ran_ue_id: u32, tmsi: u32, nas: Vec<u8>) -> NGAP_PDU {
-    // AMF Set ID is 10 bits, AMF Pointer 6 bits, 5G-TMSI 32 bits (4 octets).
-    let mut set_id = BitVec::<u8, Msb0>::from_slice(&[0x00, 0x40]);
-    set_id.truncate(10);
-    let mut pointer = BitVec::<u8, Msb0>::from_slice(&[0x00]);
-    pointer.truncate(6);
-    let s_tmsi = FiveG_S_TMSI {
-        amf_set_id: AMFSetID(set_id),
-        amf_pointer: AMFPointer(pointer),
-        five_g_tmsi: FiveG_TMSI(tmsi.to_be_bytes().to_vec()),
-        ie_extensions: None,
-    };
     build_ngap!(InitiatingMessage, InitialUEMessage,
         IGNORE, InitialUEMessage,
         REJECT RAN_UE_NGAP_ID(ran_ue_id),
         REJECT NAS_PDU(nas),
-        REJECT FiveG_S_TMSI(s_tmsi),
+        REJECT FiveG_S_TMSI(fiveg_s_tmsi(tmsi)),
     )
+}
+
+/// Build a 5G-S-TMSI IE from a 5G-TMSI (AMF Set ID 10 bits, AMF Pointer 6 bits,
+/// 5G-TMSI 32 bits). Set ID / pointer are fixed (single-AMF core).
+fn fiveg_s_tmsi(tmsi: u32) -> FiveG_S_TMSI {
+    let mut set_id = BitVec::<u8, Msb0>::from_slice(&[0x00, 0x40]);
+    set_id.truncate(10);
+    let mut pointer = BitVec::<u8, Msb0>::from_slice(&[0x00]);
+    pointer.truncate(6);
+    FiveG_S_TMSI {
+        amf_set_id: AMFSetID(set_id),
+        amf_pointer: AMFPointer(pointer),
+        five_g_tmsi: FiveG_TMSI(tmsi.to_be_bytes().to_vec()),
+        ie_extensions: None,
+    }
+}
+
+/// Build a `Paging` (TS 38.413 §9.2.5.4) — a **non-UE-associated** message the AMF
+/// broadcasts to gNBs to page a CM-IDLE UE by its 5G-S-TMSI, restricted to the
+/// tracking-area list. The UE answers with a Service Request.
+pub fn paging(tmsi: u32, mcc: &str, mnc: &str, tac: &[u8]) -> NGAP_PDU {
+    let tai_list = TAIListForPaging(vec![TAIListForPagingItem {
+        tai: helpers::tai(plmn(mcc, mnc), tac),
+        ie_extensions: None,
+    }]);
+    build_ngap!(InitiatingMessage, Paging,
+        IGNORE, Paging,
+        IGNORE UEPagingIdentity(UEPagingIdentity::FiveG_S_TMSI(fiveg_s_tmsi(tmsi))),
+        IGNORE TAIListForPaging(tai_list),
+    )
+}
+
+/// Extract the paged UE's **5G-TMSI** from a `Paging` message (gNB side / tests).
+pub fn tmsi_from_paging(pdu: &NGAP_PDU) -> Option<u32> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_Paging(paging) = value else {
+        return None;
+    };
+    paging.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        PagingProtocolIEs_EntryValue::Id_UEPagingIdentity(UEPagingIdentity::FiveG_S_TMSI(t)) => {
+            <[u8; 4]>::try_from(t.five_g_tmsi.0.as_slice()).ok().map(u32::from_be_bytes)
+        }
+        _ => None,
+    })
 }
 
 /// Extract the **5G-TMSI** (u32) from an `InitialUEMessage`'s 5G-S-TMSI IE, if
@@ -739,6 +774,18 @@ mod release_tests {
             unreachable!()
         };
         assert_eq!(fiveg_s_tmsi_from_initial_ue(&plain), None);
+    }
+
+    #[test]
+    fn paging_roundtrips() {
+        let pdu = paging(0x00A1_B2C3, "999", "70", &[0x00, 0x00, 0x01]);
+        let mut data = PerCodecData::new_aper();
+        pdu.aper_encode(&mut data).expect("APER encode");
+        let bytes = data.get_inner().expect("bytes");
+        let back = NGAP_PDU::decode(&bytes).expect("APER decode");
+        assert_eq!(tmsi_from_paging(&back), Some(0x00A1_B2C3));
+        // A non-Paging message has no paged TMSI.
+        assert_eq!(tmsi_from_paging(&initial_ue_message_with_nas(1, vec![1])), None);
     }
 
     #[test]
