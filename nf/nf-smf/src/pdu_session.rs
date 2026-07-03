@@ -32,6 +32,11 @@ const FAR_ID: u32 = 2;
 /// coordinated with the UPF's N6 subnet; here one pool suffices.
 const UE_IP_POOL_START: u32 = 0x0A2D_0002; // 10.45.0.2
 
+/// This SMF's stable NF instance id — the `smfInstanceId` in every UECM
+/// smf-registration.
+static SMF_INSTANCE_ID: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(sbi_core::new_nf_instance_id);
+
 /// Per-PDU-session SMF state.
 struct SmContext {
     /// UP-SEID — addresses the session toward the UPF.
@@ -42,6 +47,10 @@ struct SmContext {
     ue_ip: Ipv4Addr,
     /// gNB downlink target, once `UpdateSMContext` installs it.
     gnb: Option<(u32, Ipv4Addr)>,
+    /// Subscriber + session identity, for the UECM smf-registration teardown.
+    supi: String,
+    pdu_session_id: u8,
+    dnn: String,
 }
 
 /// SMF runtime: a PFCP client toward one UPF plus the SM-context table.
@@ -287,7 +296,23 @@ async fn create_sm_context(
     let sm_ref = smf.next_ref.fetch_add(1, Ordering::Relaxed).to_string();
     smf.contexts.lock().unwrap().insert(
         sm_ref.clone(),
-        SmContext { up_seid: est.up_seid, n3_teid: est.n3_teid, ue_ip, gnb: None },
+        SmContext {
+            up_seid: est.up_seid,
+            n3_teid: est.n3_teid,
+            ue_ip,
+            gnb: None,
+            supi: req.supi.clone(),
+            pdu_session_id: req.pdu_session_id,
+            dnn: req.dnn.clone(),
+        },
+    );
+    // Record this SMF as the serving SMF for the session (Nudm_UECM). Best-effort,
+    // off the establishment path — the session is up regardless.
+    spawn_uecm_register(
+        smf.nrf_base.clone(),
+        req.supi.clone(),
+        req.pdu_session_id,
+        req.dnn.clone(),
     );
     // SUPI is a permanent subscriber identifier (PII): log only a masked form.
     tracing::info!(
@@ -489,10 +514,10 @@ async fn release_sm_context(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<StatusCode, SbiProblem> {
-    let up_seid = {
+    let (up_seid, supi, psi) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
-            Some(c) => c.up_seid,
+            Some(c) => (c.up_seid, c.supi.clone(), c.pdu_session_id),
             None => {
                 return Err(problem(
                     StatusCode::NOT_FOUND,
@@ -513,8 +538,53 @@ async fn release_sm_context(
         tracing::warn!(%sm_ref, up_seid, "UPF did not accept the N4 deletion (already gone?)");
     }
     smf.contexts.lock().unwrap().remove(&sm_ref);
+    // Purge the serving-SMF registration (Nudm_UECM). Best-effort, off the path.
+    spawn_uecm_purge(smf.nrf_base.clone(), supi, psi);
     tracing::info!(%sm_ref, up_seid, "released SM context; N4 session deleted");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Register this SMF as the serving SMF for `(supi, pdu_session_id)` at the UDM
+/// (Nudm_UECM). Best-effort, spawned off the signaling path.
+fn spawn_uecm_register(nrf_base: String, supi: String, pdu_session_id: u8, dnn: String) {
+    tokio::spawn(async move {
+        let reg = sbi_core::nudm::SmfRegistration {
+            smf_instance_id: SMF_INSTANCE_ID.clone(),
+            pdu_session_id,
+            dnn,
+        };
+        match discover_udm(&nrf_base).await {
+            Ok(udm) => {
+                if let Err(e) =
+                    sbi_core::nudm::NudmClient::new(udm).uecm_register_smf(&supi, &reg).await
+                {
+                    tracing::warn!(psi = pdu_session_id, "UECM SMF registration failed: {e}");
+                } else {
+                    tracing::info!(psi = pdu_session_id, "UECM: registered as the serving SMF");
+                }
+            }
+            Err(e) => tracing::warn!("UECM SMF registration skipped (no UDM): {e}"),
+        }
+    });
+}
+
+/// Purge this SMF's serving-SMF registration for the PDU session. Best-effort.
+fn spawn_uecm_purge(nrf_base: String, supi: String, pdu_session_id: u8) {
+    tokio::spawn(async move {
+        match discover_udm(&nrf_base).await {
+            Ok(udm) => {
+                match sbi_core::nudm::NudmClient::new(udm)
+                    .uecm_deregister_smf(&supi, pdu_session_id)
+                    .await
+                {
+                    Ok(true) => tracing::info!(psi = pdu_session_id, "UECM: serving-SMF registration purged"),
+                    Ok(false) => {} // already gone (e.g. the subscriber was withdrawn)
+                    Err(e) => tracing::warn!(psi = pdu_session_id, "UECM SMF purge failed: {e}"),
+                }
+            }
+            Err(e) => tracing::warn!("UECM SMF purge skipped (no UDM): {e}"),
+        }
+    });
 }
 
 /// Whether a gNB downlink target is plausibly routable (not a zero TEID, nor an
@@ -571,7 +641,8 @@ mod tests {
     /// Spin an NRF + UDR (in-memory, provisioned) + UDM chain; returns the NRF base
     /// the SMF should use. The demo subscriber may use DNN "internet" on slice
     /// sst=1/sd=010203 with a 1/2 Gbps session AMBR.
-    async fn spin_subscription_backend(supi: &str, plmn: &str) -> String {
+    /// Returns (nrf_base, udr_base).
+    async fn spin_subscription_backend(supi: &str, plmn: &str) -> (String, String) {
         use subscriber_db::{DataSet, ProvisionedDataStore, SubscriberStore};
 
         let store = Arc::new(subscriber_db::InMemoryStore::new());
@@ -605,7 +676,8 @@ mod tests {
         let udr_addr = udr_l.local_addr().unwrap();
         tokio::spawn(async move { sbi_core::run_on(udr_l, sbi_core::nudr::router(store)).await.unwrap() });
 
-        let udr = Arc::new(sbi_core::nudr::UdrClient::new(format!("http://{udr_addr}")));
+        let udr_base = format!("http://{udr_addr}");
+        let udr = Arc::new(sbi_core::nudr::UdrClient::new(udr_base.clone()));
         let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udm_addr = udm_l.local_addr().unwrap();
         tokio::spawn(async move { sbi_core::run_on(udm_l, sbi_core::nudm::router(udr)).await.unwrap() });
@@ -627,7 +699,7 @@ mod tests {
             }],
         }]);
         sbi_core::nnrf::NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
-        nrf_base
+        (nrf_base, udr_base)
     }
 
     /// Full Nsmf → N4 spine: an in-process UPF, the SMF as PFCP client + SBI server,
@@ -659,7 +731,7 @@ mod tests {
             });
         }
 
-        let nrf_base = spin_subscription_backend("imsi-999700000000001", "99970").await;
+        let (nrf_base, udr_base) = spin_subscription_backend("imsi-999700000000001", "99970").await;
 
         // SMF: connect, associate, serve Nsmf.
         let smf =
@@ -687,6 +759,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.up_n3_teid, "00000001", "UPF allocated the first N3 TEID");
+        // The SMF recorded itself as the serving SMF for the session (Nudm_UECM).
+        // The registration is spawned off the create path — poll briefly.
+        let udr = sbi_core::nudr::UdrClient::new(udr_base);
+        let mut smf_reg = None;
+        for _ in 0..50 {
+            smf_reg = udr.get_smf_registration("imsi-999700000000001", 5).await.unwrap();
+            if smf_reg.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let reg = smf_reg.expect("serving-SMF registration recorded");
+        assert_eq!(reg.get("dnn").and_then(|v| v.as_str()), Some("internet"));
+        assert_eq!(reg.get("pduSessionId").and_then(|v| v.as_u64()), Some(5));
         // The serving slice (== validated requested slice) + AMBR ride back for the
         // AMF's N1 accept.
         assert_eq!(created.s_nssai.sst, 1);
@@ -735,6 +821,16 @@ mod tests {
             .status();
         assert_eq!(status.as_u16(), 204, "release succeeded");
         assert_eq!(upf_state.lock().unwrap().session_count(), 0, "N4 session deleted at the UPF");
+        // The serving-SMF registration is purged (spawned off the release path).
+        let mut gone = false;
+        for _ in 0..50 {
+            if udr.get_smf_registration("imsi-999700000000001", 5).await.unwrap().is_none() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(gone, "serving-SMF registration purged on release");
 
         // A second release of the same context → 404.
         let status = client
@@ -773,7 +869,7 @@ mod tests {
             });
         }
 
-        let nrf_base = spin_subscription_backend("imsi-999700000000001", "99970").await;
+        let (nrf_base, _udr_base) = spin_subscription_backend("imsi-999700000000001", "99970").await;
         let smf =
             Arc::new(SmfState::connect(upf_addr, Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap());
         smf.associate().await.unwrap();

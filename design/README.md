@@ -49,6 +49,7 @@ surface of the project and assesses build feasibility.
 | [38-network-dereg.md](38-network-dereg.md) | Network-initiated dereg: UDR DELETE → AMF callback (namf-callback :8001, UE_DIRECTORY) → Deregistration Request (UE terminated) + full teardown |
 | [39-t3522.md](39-t3522.md) | T3522: dereg accept-wait, 6s retransmissions (5 sends) then abort; DeregCmd channel, stale-expiry no-ops; live-traced vs free-ran-ue |
 | [40-uecm.md](40-uecm.md) | Nudm_UECM serving-AMF tracking: amf-3gpp-access context data in the UDR, withdrawal notifies the stored deregCallbackUri, purge on dereg |
+| [41-smf-uecm.md](41-smf-uecm.md) | SMF-side Nudm_UECM (smf-registrations per PDU session, register on create / purge on release) + config-derived AMF callback advertise address |
 
 ## One-paragraph summary
 

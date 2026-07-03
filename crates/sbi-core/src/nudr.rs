@@ -79,6 +79,10 @@ pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
             get(get_amf_reg).put(put_amf_reg).delete(delete_amf_reg),
         )
         .route(
+            "/nudr-dr/v2/subscription-data/{ue_id}/context-data/smf-registrations/{pdu_session_id}",
+            get(get_smf_reg).put(put_smf_reg).delete(delete_smf_reg),
+        )
+        .route(
             "/nudr-dr/v2/subscription-data/{ue_id}/{serving_plmn_id}/provisioned-data/am-data",
             get(get_am_data).put(put_am_data),
         )
@@ -188,6 +192,40 @@ async fn put_amf_reg(
 
 async fn delete_amf_reg(State(st): State<NudrState>, Path(ue_id): Path<String>) -> StatusCode {
     if st.store.remove_amf_registration(&ue_id) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+/// Context-data handlers (TS 29.505 `smf-registrations/{pduSessionId}`): the
+/// serving SMF's per-PDU-session registration, written by the UDM's Nudm_UECM front.
+async fn get_smf_reg(
+    State(st): State<NudrState>,
+    Path((ue_id, psi)): Path<(String, u8)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    st.store.get_smf_registration(&ue_id, psi).map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn put_smf_reg(
+    State(st): State<NudrState>,
+    Path((ue_id, psi)): Path<(String, u8)>,
+    Json(doc): Json<serde_json::Value>,
+) -> StatusCode {
+    match st.store.put_smf_registration(&ue_id, psi, &doc) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::warn!(supi = %ue_id, psi, "put smf-registrations failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn delete_smf_reg(
+    State(st): State<NudrState>,
+    Path((ue_id, psi)): Path<(String, u8)>,
+) -> StatusCode {
+    if st.store.remove_smf_registration(&ue_id, psi) {
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
@@ -369,6 +407,56 @@ impl UdrClient {
 
     fn amf_reg_url(&self, supi: &str) -> String {
         format!("{}/nudr-dr/v2/subscription-data/{}/context-data/amf-3gpp-access", self.base, supi)
+    }
+
+    /// Record the serving SMF for a PDU session (context data).
+    pub async fn put_smf_registration(
+        &self,
+        supi: &str,
+        pdu_session_id: u8,
+        doc: &serde_json::Value,
+    ) -> Result<(), SbiError> {
+        self.http
+            .put(self.smf_reg_url(supi, pdu_session_id))
+            .json(doc)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Fetch the serving SMF's registration for a PDU session. `Ok(None)` if absent.
+    pub async fn get_smf_registration(
+        &self,
+        supi: &str,
+        pdu_session_id: u8,
+    ) -> Result<Option<serde_json::Value>, SbiError> {
+        let resp = self.http.get(self.smf_reg_url(supi, pdu_session_id)).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    /// Purge a serving-SMF registration. `Ok(false)` if none was recorded.
+    pub async fn delete_smf_registration(
+        &self,
+        supi: &str,
+        pdu_session_id: u8,
+    ) -> Result<bool, SbiError> {
+        let resp = self.http.delete(self.smf_reg_url(supi, pdu_session_id)).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        resp.error_for_status()?;
+        Ok(true)
+    }
+
+    fn smf_reg_url(&self, supi: &str, pdu_session_id: u8) -> String {
+        format!(
+            "{}/nudr-dr/v2/subscription-data/{}/context-data/smf-registrations/{}",
+            self.base, supi, pdu_session_id
+        )
     }
 
     /// Store (create or replace) a provisioned-data document.
@@ -559,6 +647,45 @@ mod tests {
         // Nothing was stored.
         let udr = UdrClient::new(format!("http://{udr_addr}"));
         assert!(udr.get_amf_registration("imsi-1").await.unwrap().is_none());
+    }
+
+    /// SMF UECM register → per-session context data at the UDR; purge → gone.
+    #[tokio::test]
+    async fn smf_uecm_registration_roundtrips_through_udm_and_udr() {
+        let store: Arc<dyn SubscriberStore> = Arc::new(InMemoryStore::new());
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udr_l, router(store)).await.unwrap() });
+        let udr = UdrClient::new(format!("http://{udr_addr}"));
+
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        let udr_for_udm = Arc::new(UdrClient::new(format!("http://{udr_addr}")));
+        tokio::spawn(async move {
+            crate::run_on(udm_l, crate::nudm::router(udr_for_udm)).await.unwrap()
+        });
+        let sdm = crate::nudm::NudmClient::new(format!("http://{udm_addr}"));
+
+        assert!(udr.get_smf_registration("imsi-1", 5).await.unwrap().is_none());
+        sdm.uecm_register_smf(
+            "imsi-1",
+            &crate::nudm::SmfRegistration {
+                smf_instance_id: "smf-1".into(),
+                pdu_session_id: 5,
+                dnn: "internet".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let reg = udr.get_smf_registration("imsi-1", 5).await.unwrap().expect("stored");
+        assert_eq!(reg.get("smfInstanceId").and_then(|v| v.as_str()), Some("smf-1"));
+        assert_eq!(reg.get("dnn").and_then(|v| v.as_str()), Some("internet"));
+        // Keyed per session — a different PDU session is independent.
+        assert!(udr.get_smf_registration("imsi-1", 6).await.unwrap().is_none());
+
+        assert_eq!(sdm.uecm_deregister_smf("imsi-1", 5).await.unwrap(), true);
+        assert!(udr.get_smf_registration("imsi-1", 5).await.unwrap().is_none(), "purged");
+        assert_eq!(sdm.uecm_deregister_smf("imsi-1", 5).await.unwrap(), false, "re-purge 404s");
     }
 
     /// UECM register → readable context data; purge → gone (and 404 on re-purge).
