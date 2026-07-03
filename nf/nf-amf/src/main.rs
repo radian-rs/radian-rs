@@ -53,6 +53,8 @@ const REJECT_BACKOFF_SECS: u32 = 600;
 /// T3346 back-off sent with a #62 Registration Reject: re-registering can't
 /// succeed until the slice subscription changes.
 const REG_REJECT_BACKOFF_SECS: u32 = 600;
+/// UE-AMBR sent to the gNB when am-data carried none (fail-open) — 1 Gbps each way.
+const DEFAULT_UE_AMBR_BPS: (u64, u64) = (1_000_000_000, 1_000_000_000);
 /// NRF the AMF uses to discover the AUSF.
 const NRF_BASE: &str = "http://127.0.0.1:8000";
 
@@ -179,8 +181,12 @@ struct UeContext {
     /// The UE's advertised 5GS security capabilities `[EA, IA]`, replayed verbatim in the
     /// Security Mode Command (TS 24.501 §8.2.25) so the UE can detect a bidding-down attack.
     replayed_ue_sec_cap: Option<[u8; 2]>,
-    /// SM context ref of an in-progress PDU session, to address its UpdateSMContext.
-    sm_ref: Option<String>,
+    /// SM context refs of the UE's PDU sessions, keyed by PDU session id — one per
+    /// active session, addressing UpdateSMContext / ReleaseSMContext.
+    sm_refs: HashMap<u8, String>,
+    /// The subscribed UE-AMBR from am-data as `(downlink, uplink)` bits/sec, sent
+    /// to the gNB in the N2 PDU Session Resource Setup. `None` → a default is used.
+    ue_ambr: Option<(u64, u64)>,
     /// The allowed NSSAI granted at registration (from am-data). `None` = the fetch
     /// failed or hasn't happened — slice admission then falls back to the SMF's check.
     allowed_nssai: Option<Vec<(u8, Option<[u8; 3]>)>>,
@@ -341,10 +347,10 @@ async fn on_network_deregistration(
     }
     let ran_ue_id = ctx.ran_ue_id;
 
-    if let Some(sm_ref) = ctx.sm_ref.take() {
+    for (psi, sm_ref) in std::mem::take(&mut ctx.sm_refs) {
         match amf_smf.release_sm_context(&sm_ref).await {
-            Ok(()) => info!("UE {amf_ue_id}: released SM context {sm_ref} (network dereg)"),
-            Err(e) => warn!("UE {amf_ue_id}: SM context {sm_ref} release failed: {e}"),
+            Ok(()) => info!("UE {amf_ue_id}: released SM context {sm_ref} (psi {psi}, network dereg)"),
+            Err(e) => warn!("UE {amf_ue_id}: SM context {sm_ref} (psi {psi}) release failed: {e}"),
         }
     }
     // The UE stops being addressable for further withdrawals immediately.
@@ -497,8 +503,8 @@ async fn on_pdu_session_setup_response(
         warn!("PDUSessionResourceSetupResponse without AMF-UE-NGAP-ID");
         return;
     };
-    let Some(sm_ref) = ues.get(&amf_ue_id).and_then(|c| c.sm_ref.clone()) else {
-        warn!("UE {amf_ue_id}: setup response but no SM context is tracked");
+    let Some(sm_ref) = ues.get(&amf_ue_id).and_then(|c| c.sm_refs.get(&psi).cloned()) else {
+        warn!("UE {amf_ue_id}: setup response for PDU session {psi} but no SM context tracked");
         return;
     };
     match amf_smf.update_sm_context(&sm_ref, gnb_teid, gnb_addr).await {
@@ -560,7 +566,8 @@ impl UeContext {
             auth: None,
             sec: None,
             replayed_ue_sec_cap: None,
-            sm_ref: None,
+            sm_refs: HashMap::new(),
+            ue_ambr: None,
             allowed_nssai: None,
             requested_nssai: Vec::new(),
             dereg_attempts: None,
@@ -659,10 +666,10 @@ async fn on_deregistration(
 
     // Tear down an in-progress/active PDU session first — best effort: the UE is
     // leaving either way, so a release failure is logged, not fatal.
-    if let Some(sm_ref) = ctx.sm_ref.take() {
+    for (psi, sm_ref) in std::mem::take(&mut ctx.sm_refs) {
         match amf_smf.release_sm_context(&sm_ref).await {
-            Ok(()) => info!("UE {amf_ue_id}: released SM context {sm_ref} on deregistration"),
-            Err(e) => warn!("UE {amf_ue_id}: SM context {sm_ref} release failed: {e}"),
+            Ok(()) => info!("UE {amf_ue_id}: released SM context {sm_ref} (psi {psi}) on deregistration"),
+            Err(e) => warn!("UE {amf_ue_id}: SM context {sm_ref} (psi {psi}) release failed: {e}"),
         }
     }
 
@@ -820,14 +827,23 @@ async fn dispatch_uplink_nas(
                     );
                     let dl = nas::dl_nas_transport_sm(psi, accept);
                     let Some(ctx) = ues.get_mut(&amf_ue_id) else { return None };
-                    ctx.sm_ref = Some(created.sm_ref);
+                    ctx.sm_refs.insert(psi, created.sm_ref);
+                    let (ambr_dl, ambr_ul) = ctx.ue_ambr.unwrap_or(DEFAULT_UE_AMBR_BPS);
                     let Some(sec) = ctx.sec.as_mut() else {
                         warn!("UE {amf_ue_id}: PDU session before NAS security is established");
                         return None;
                     };
                     let nas_accept = sec.protect(&dl, nas::sht::INTEGRITY_CIPHERED, 1);
                     let setup = ngap::pdu_session_resource_setup_request(
-                        amf_ue_id, ran_ue_id, psi, 1, created.up_n3_teid, created.up_n3_addr, nas_accept,
+                        amf_ue_id,
+                        ran_ue_id,
+                        psi,
+                        1,
+                        created.up_n3_teid,
+                        created.up_n3_addr,
+                        ambr_dl,
+                        ambr_ul,
+                        nas_accept,
                     );
                     info!(
                         "UE {amf_ue_id}: PDU session {psi} SM context created (UE IP {}); sending N2 setup",
@@ -961,14 +977,15 @@ async fn on_security_mode_complete(
     let Some(supi) = ues.get(&amf_ue_id).map(|c| c.suci.clone()) else {
         return Vec::new();
     };
-    let subscribed = match &supi {
-        Some(supi) => fetch_subscribed_nssai(nrf_base, supi).await,
-        None => None,
+    let (subscribed, ue_ambr) = match &supi {
+        Some(supi) => fetch_am_data(nrf_base, supi).await,
+        None => (None, None),
     };
 
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
         return Vec::new();
     };
+    ctx.ue_ambr = ue_ambr;
     let ran_ue_id = ctx.ran_ue_id;
     let tmsi = amf_ue_id as u32;
     // Fail-open when the subscription is unreachable: no NSSAI IEs, and slice
@@ -1045,34 +1062,67 @@ fn compute_nssai(
     requested.iter().partition(|slice| subscribed.contains(slice))
 }
 
-/// Fetch the subscriber's subscribed NSSAI from am-data via the NRF-discovered UDM
-/// (Nudm_SDM): the subscribed default S-NSSAIs (`nssai.defaultSingleNssais`).
-/// `None` on any failure — registration proceeds without the IE (fail-open; the
-/// SMF's subscription check still gates session establishment).
-async fn fetch_subscribed_nssai(nrf_base: &str, supi: &str) -> Option<Vec<(u8, Option<[u8; 3]>)>> {
-    let udm =
-        discover_nf(nrf_base, "UDM").await.map_err(|e| warn!("UDM discovery failed: {e}")).ok()?;
-    let plmn = format!("{PLMN_MCC}{PLMN_MNC}");
-    let am = sbi_core::nudm::NudmClient::new(udm)
-        .get_am_data(supi, &plmn)
-        .await
-        .map_err(|e| warn!("Nudm_SDM am-data fetch failed: {e}"))
-        .ok()??;
+/// Convert a TS 29.571 `BitRate` string ("2 Gbps") to bits/sec (integer values).
+fn bitrate_to_bps(s: &str) -> Option<u64> {
+    let (value, unit) = s.trim().split_once(' ')?;
+    let value: u64 = value.parse().ok()?;
+    let mult: u64 = match unit {
+        "bps" => 1,
+        "Kbps" => 1_000,
+        "Mbps" => 1_000_000,
+        "Gbps" => 1_000_000_000,
+        "Tbps" => 1_000_000_000_000,
+        _ => return None,
+    };
+    value.checked_mul(mult)
+}
+
+/// Fetch the subscriber's am-data via the NRF-discovered UDM (Nudm_SDM) and
+/// extract what the AMF needs at registration: the subscribed default S-NSSAIs
+/// (`nssai.defaultSingleNssais`) and the UE-AMBR (`subscribedUeAmbr`). The NSSAI
+/// half keeps the fail-open contract — `None` (the first element) means "no
+/// am-data / no default NSSAI", so slice admission falls back to the SMF check;
+/// the UE-AMBR is independent (`None` → the AMF sends [`DEFAULT_UE_AMBR_BPS`]).
+async fn fetch_am_data(
+    nrf_base: &str,
+    supi: &str,
+) -> (Option<Vec<(u8, Option<[u8; 3]>)>>, Option<(u64, u64)>) {
+    let Ok(udm) = discover_nf(nrf_base, "UDM").await.map_err(|e| warn!("UDM discovery failed: {e}"))
+    else {
+        return (None, None);
+    };
+    let am = match sbi_core::nudm::NudmClient::new(udm).get_am_data(supi, &format!("{PLMN_MCC}{PLMN_MNC}")).await {
+        Ok(Some(am)) => am,
+        Ok(None) => return (None, None),
+        Err(e) => {
+            warn!("Nudm_SDM am-data fetch failed: {e}");
+            return (None, None);
+        }
+    };
     let slices: Vec<(u8, Option<[u8; 3]>)> = am
-        .pointer("/nssai/defaultSingleNssais")?
-        .as_array()?
-        .iter()
-        .filter_map(|s| {
-            let sst = u8::try_from(s.get("sst")?.as_u64()?).ok()?;
-            let sd = s
-                .get("sd")
-                .and_then(|v| v.as_str())
-                .and_then(|sd| hex::decode(sd).ok())
-                .and_then(|b| <[u8; 3]>::try_from(b).ok());
-            Some((sst, sd))
+        .pointer("/nssai/defaultSingleNssais")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    let sst = u8::try_from(s.get("sst")?.as_u64()?).ok()?;
+                    let sd = s
+                        .get("sd")
+                        .and_then(|v| v.as_str())
+                        .and_then(|sd| hex::decode(sd).ok())
+                        .and_then(|b| <[u8; 3]>::try_from(b).ok());
+                    Some((sst, sd))
+                })
+                .collect()
         })
-        .collect();
-    (!slices.is_empty()).then_some(slices)
+        .unwrap_or_default();
+    let nssai = (!slices.is_empty()).then_some(slices);
+    let ue_ambr = am.pointer("/subscribedUeAmbr").and_then(|a| {
+        let dl = bitrate_to_bps(a.get("downlink")?.as_str()?)?;
+        let ul = bitrate_to_bps(a.get("uplink")?.as_str()?)?;
+        Some((dl, ul))
+    });
+    (nssai, ue_ambr)
 }
 
 /// Discover an NF's first service endpoint via the NRF.
@@ -1177,6 +1227,16 @@ mod tests {
     }
 
     #[test]
+    fn bitrate_to_bps_parsing() {
+        assert_eq!(bitrate_to_bps("2 Gbps"), Some(2_000_000_000));
+        assert_eq!(bitrate_to_bps("500 Mbps"), Some(500_000_000));
+        assert_eq!(bitrate_to_bps("1 Tbps"), Some(1_000_000_000_000));
+        assert_eq!(bitrate_to_bps("100 bps"), Some(100));
+        assert_eq!(bitrate_to_bps("fast"), None);
+        assert_eq!(bitrate_to_bps("2Gbps"), None, "needs a space");
+    }
+
+    #[test]
     fn nssai_intersection() {
         let sub: Vec<(u8, Option<[u8; 3]>)> = vec![(1, Some([1, 2, 3])), (2, None)];
         // No request → the subscribed defaults, nothing rejected.
@@ -1244,22 +1304,23 @@ mod tests {
         NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
         let amf_smf = pdu_session::AmfSmf::new(nrf_base, "999", "70");
 
-        // A registered, secured UE with an active PDU session.
+        // A registered, secured UE with TWO active PDU sessions (psi 5 and 6).
         let (ki, ke) = ([0x11u8; 16], [0x22u8; 16]);
         let mut ctx = UeContext::new(7, RegState::Registered, Some("imsi-999700000000001".into()));
         ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
-        ctx.sm_ref = Some("1".into());
+        ctx.sm_refs.insert(5, "ctx-5".into());
+        ctx.sm_refs.insert(6, "ctx-6".into());
         let mut ues = HashMap::new();
         ues.insert(1u64, ctx);
 
-        // Normal deregistration → SM release + Accept + Release Command, context gone.
+        // Normal deregistration → both SM contexts released + Accept + Release Command.
         let dereg = nas::deregistration_request_from_ue(0x01, "999", "70", 1);
         let downlinks = on_deregistration(&mut ues, &amf_smf, 1, &dereg).await;
         assert_eq!(
             downlinks.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             ["DownlinkNASTransport (DeregistrationAccept)", "UEContextReleaseCommand"]
         );
-        assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 1, "SM context released at the SMF");
+        assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 2, "both SM contexts released at the SMF");
         assert!(!ues.contains_key(&1), "AMF context dropped");
         assert_eq!(
             ngap::parse_ue_context_release_command(&downlinks[1].0),
@@ -1286,7 +1347,7 @@ mod tests {
             "switch-off expects silence, only the RAN release goes out"
         );
         assert!(!ues.contains_key(&2));
-        assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 1, "no session, no extra release");
+        assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 2, "no session, no extra release");
     }
 
     /// A subscription-withdrawal callback reaches the UE's association; the
