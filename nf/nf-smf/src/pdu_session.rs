@@ -50,7 +50,6 @@ struct SmContext {
     /// Subscriber + session identity, for the UECM smf-registration teardown.
     supi: String,
     pdu_session_id: u8,
-    dnn: String,
 }
 
 /// SMF runtime: a PFCP client toward one UPF plus the SM-context table.
@@ -303,7 +302,6 @@ async fn create_sm_context(
             gnb: None,
             supi: req.supi.clone(),
             pdu_session_id: req.pdu_session_id,
-            dnn: req.dnn.clone(),
         },
     );
     // Record this SMF as the serving SMF for the session (Nudm_UECM). Best-effort,
@@ -605,7 +603,7 @@ fn masked_supi(supi: &str) -> String {
 /// discover it, and keep it alive via the NRF-assigned heartbeat.
 pub async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> anyhow::Result<()> {
     use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService};
-    let mut profile = NfProfile::new(sbi_core::new_nf_instance_id(), "SMF", ip.to_string());
+    let mut profile = NfProfile::new(SMF_INSTANCE_ID.clone(), "SMF", ip.to_string());
     profile.nf_services = Some(vec![NfService {
         service_instance_id: "nsmf-pdusession-1".into(),
         service_name: "nsmf-pdusession".into(),

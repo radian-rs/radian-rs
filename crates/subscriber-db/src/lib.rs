@@ -92,6 +92,11 @@ pub trait ProvisionedDataStore: Send + Sync {
     ) -> Result<(), String>;
     /// Purge a serving-SMF registration. Returns whether one existed.
     fn remove_smf_registration(&self, supi: &str, pdu_session_id: u8) -> bool;
+    /// Every serving-AMF registration as `(SUPI, document)` — for stale-eviction
+    /// sweeps that check each `amfInstanceId` against NF liveness.
+    fn list_amf_registrations(&self) -> Vec<(String, serde_json::Value)>;
+    /// Every serving-SMF registration as `((SUPI, PDU session id), document)`.
+    fn list_smf_registrations(&self) -> Vec<((String, u8), serde_json::Value)>;
 }
 
 /// Combined store the UDR holds as `Arc<dyn SubscriberStore>`.
@@ -269,6 +274,26 @@ impl ProvisionedDataStore for InMemoryStore {
 
     fn remove_smf_registration(&self, supi: &str, pdu_session_id: u8) -> bool {
         self.inner.lock().unwrap().smf_reg.remove(&(supi.to_string(), pdu_session_id)).is_some()
+    }
+
+    fn list_amf_registrations(&self) -> Vec<(String, serde_json::Value)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .amf_reg
+            .iter()
+            .map(|(supi, doc)| (supi.clone(), doc.clone()))
+            .collect()
+    }
+
+    fn list_smf_registrations(&self) -> Vec<((String, u8), serde_json::Value)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .smf_reg
+            .iter()
+            .map(|(k, doc)| (k.clone(), doc.clone()))
+            .collect()
     }
 
     fn put_provisioned(
@@ -583,6 +608,43 @@ impl ProvisionedDataStore for RedbStore {
         w.commit().is_ok() && existed
     }
 
+    fn list_amf_registrations(&self) -> Vec<(String, serde_json::Value)> {
+        let Ok(r) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(table) = r.open_table(AMF_3GPP_REG) else {
+            return Vec::new();
+        };
+        table
+            .iter()
+            .into_iter()
+            .flatten()
+            .filter_map(|kv| kv.ok())
+            .filter_map(|(k, v)| {
+                serde_json::from_slice(v.value()).ok().map(|doc| (k.value().to_string(), doc))
+            })
+            .collect()
+    }
+
+    fn list_smf_registrations(&self) -> Vec<((String, u8), serde_json::Value)> {
+        let Ok(r) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(table) = r.open_table(SMF_REG) else {
+            return Vec::new();
+        };
+        table
+            .iter()
+            .into_iter()
+            .flatten()
+            .filter_map(|kv| kv.ok())
+            .filter_map(|(k, v)| {
+                let (supi, psi) = k.value();
+                serde_json::from_slice(v.value()).ok().map(|doc| ((supi.to_string(), psi), doc))
+            })
+            .collect()
+    }
+
     fn put_provisioned(
         &self,
         ds: DataSet,
@@ -698,6 +760,30 @@ mod tests {
         mem.put_amf_registration("imsi-1", &reg).unwrap();
         assert_eq!(mem.get_amf_registration("imsi-1"), Some(reg));
         assert!(mem.remove_amf_registration("imsi-1"));
+    }
+
+    #[test]
+    fn list_registrations_enumerates_context_data() {
+        let mem = InMemoryStore::new();
+        mem.put_amf_registration("imsi-1", &json!({"amfInstanceId": "amf-1"})).unwrap();
+        mem.put_amf_registration("imsi-2", &json!({"amfInstanceId": "amf-2"})).unwrap();
+        mem.put_smf_registration("imsi-1", 5, &json!({"smfInstanceId": "smf-1"})).unwrap();
+
+        let mut amf = mem.list_amf_registrations();
+        amf.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(amf.len(), 2);
+        assert_eq!(amf[0].0, "imsi-1");
+        assert_eq!(amf[0].1.get("amfInstanceId").and_then(|v| v.as_str()), Some("amf-1"));
+
+        let smf = mem.list_smf_registrations();
+        assert_eq!(smf, vec![(("imsi-1".to_string(), 5), json!({"smfInstanceId": "smf-1"}))]);
+
+        // redb agrees.
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(dir.path().join("s.redb"), KEK).unwrap();
+        store.put_amf_registration("imsi-9", &json!({"amfInstanceId": "amf-9"})).unwrap();
+        assert_eq!(store.list_amf_registrations().len(), 1);
+        assert!(store.list_smf_registrations().is_empty());
     }
 
     #[test]
