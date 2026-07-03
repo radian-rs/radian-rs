@@ -62,13 +62,33 @@ const DEFAULT_UE_AMBR_BPS: (u64, u64) = (1_000_000_000, 1_000_000_000);
 const RAW_NRF_BASE: &str = "http://127.0.0.1:8000";
 static NRF_BASE: LazyLock<String> = LazyLock::new(|| sbi_core::sbi_base(RAW_NRF_BASE));
 
-// NAS security parameters the AMF selects.
-const NAS_NEA: u8 = 2; // 128-NEA2 (AES-CTR)
-const NAS_NIA: u8 = 2; // 128-NIA2 (AES-CMAC)
+// NAS security parameters.
 const NGKSI: u8 = 0;
 const ABBA: [u8; 2] = [0x00, 0x00];
-/// Replayed UE security capabilities (advertises EA0-2 / IA0-2).
+/// Replayed UE security capabilities (advertises EA0-2 / IA0-2). Used as the
+/// fallback when a Registration Request omitted the UE security capability IE.
 const UE_SEC_CAP: [u8; 2] = [0xE0, 0xE0];
+
+/// The AMF's NAS **ciphering** algorithms in preference order (TS 33.501 §6.7.1):
+/// 128-NEA2 (AES) ≻ 128-NEA1 (SNOW 3G) ≻ 128-NEA3 (ZUC) ≻ NEA0 (null, last resort).
+const NEA_PRIORITY: [u8; 4] = [2, 1, 3, 0];
+/// The AMF's NAS **integrity** algorithms in preference order. NIA0 (null) is
+/// never offered — integrity is mandatory outside unauthenticated emergency
+/// (TS 33.501 §5.5.2), so a UE supporting no real integrity algorithm is rejected.
+const NIA_PRIORITY: [u8; 3] = [2, 1, 3];
+
+/// Whether a UE security-capability byte advertises algorithm `id` (0..7). The
+/// byte is MSB-first: EA0/IA0 is bit 8 (`0x80`), EA1 bit 7, … (TS 24.501 §9.11.3.54).
+fn ue_supports_algo(cap: u8, id: u8) -> bool {
+    cap & (0x80u8 >> id) != 0
+}
+
+/// Select the highest-priority algorithm both the AMF (in `priority` order) and
+/// the UE (`cap` byte) support — NAS algorithm negotiation. `None` if there is
+/// no common algorithm.
+fn select_algo(cap: u8, priority: &[u8]) -> Option<u8> {
+    priority.iter().copied().find(|&id| ue_supports_algo(cap, id))
+}
 
 /// Allocator for AMF-UE-NGAP-IDs (one per UE the AMF takes context of).
 static NEXT_AMF_UE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1288,14 +1308,15 @@ async fn complete_authentication(
     };
 
     info!("UE {amf_ue_id} authenticated ({supi}); establishing NAS security");
-    // Replay the UE's own advertised capabilities (falling back to the AMF default if the
-    // UE didn't send them) so the Security Mode Command passes the UE's bidding-down check.
-    let replayed = ues
+    // Negotiate NAS algorithms from the UE's advertised capabilities (falling back
+    // to the AMF default if the UE didn't send them). The capabilities are also
+    // replayed in the Security Mode Command so the UE can detect a bidding-down.
+    let ue_sec_cap = ues
         .get(&amf_ue_id)
         .and_then(|c| c.replayed_ue_sec_cap)
         .unwrap_or(UE_SEC_CAP);
-    let Some((sec, smc_bytes)) = establish_security(&kseaf, &supi, &replayed) else {
-        warn!("UE {amf_ue_id}: failed to derive NAS security context");
+    let Some((sec, smc_bytes, _nea, _nia)) = establish_security(&kseaf, &supi, ue_sec_cap) else {
+        warn!("UE {amf_ue_id}: cannot establish NAS security (no common integrity algorithm?)");
         return None;
     };
     let ctx = ues.get_mut(&amf_ue_id)?;
@@ -1308,20 +1329,28 @@ async fn complete_authentication(
     ))
 }
 
-/// Derive K_AMF + NAS keys from K_SEAF and build the protected Security Mode Command,
-/// replaying `replayed_ue_sec_cap` (the UE's advertised capabilities) back to the UE.
+/// Negotiate NAS algorithms from `ue_sec_cap`, derive K_AMF + the NAS keys for the
+/// selected algorithms, and build the protected Security Mode Command (which
+/// announces the selection and replays the UE's capabilities for its bidding-down
+/// check). `None` when the UE supports no acceptable **integrity** algorithm
+/// (encryption falls back to NEA0/null). The NAS keys are algorithm-bound
+/// (TS 33.501 Annex A.8), so the UE derives matching keys from the announced
+/// algorithms.
 fn establish_security(
     kseaf_hex: &str,
     supi: &str,
-    replayed_ue_sec_cap: &[u8],
-) -> Option<(nas::NasSecurityContext, Vec<u8>)> {
+    ue_sec_cap: [u8; 2],
+) -> Option<(nas::NasSecurityContext, Vec<u8>, u8, u8)> {
+    let nea = select_algo(ue_sec_cap[0], &NEA_PRIORITY)?;
+    let nia = select_algo(ue_sec_cap[1], &NIA_PRIORITY)?;
     let kseaf: [u8; 32] = hex::decode(kseaf_hex).ok()?.try_into().ok()?;
     let kamf = aka::kamf(&kseaf, supi, &ABBA);
-    let keys = aka::nas_keys(&kamf, NAS_NEA, NAS_NIA);
-    let mut sec = nas::NasSecurityContext::new(keys.knas_int, keys.knas_enc, NAS_NIA, NAS_NEA);
-    let smc = nas::security_mode_command(NAS_NEA, NAS_NIA, NGKSI, replayed_ue_sec_cap);
+    let keys = aka::nas_keys(&kamf, nea, nia);
+    let mut sec = nas::NasSecurityContext::new(keys.knas_int, keys.knas_enc, nia, nea);
+    let smc = nas::security_mode_command(nea, nia, NGKSI, &ue_sec_cap);
     let bytes = sec.protect(&smc, nas::sht::INTEGRITY_NEW_CONTEXT, 1);
-    Some((sec, bytes))
+    info!(supi = %supi, "NAS security: selected NEA{nea} / NIA{nia}");
+    Some((sec, bytes, nea, nia))
 }
 
 /// On Security Mode Complete, fetch the subscriber's am-data, intersect it with
@@ -1605,6 +1634,11 @@ async fn send_ngap(conn: &ConnectedSocket, pdu: &NGAP_PDU) -> anyhow::Result<()>
 mod tests {
     use super::*;
     use hex_literal::hex;
+
+    // The test UE supports/derives keys with 128-NEA2 / 128-NIA2 — what the AMF
+    // negotiates from the default UE_SEC_CAP (EA2/IA2 are the top-priority bits set).
+    const NAS_NEA: u8 = 2;
+    const NAS_NIA: u8 = 2;
 
     const REG_REQUEST_HEX: &str = "7e004179000d0199f9070000000000000010022e08a020000000000000";
 
@@ -2270,6 +2304,70 @@ mod tests {
         assert!(!ues.contains_key(&700), "context dropped on abort");
     }
 
+    #[test]
+    fn algorithm_negotiation_picks_the_best_common() {
+        // UE_SEC_CAP (EA0-2/IA0-2) → the AMF's top preference, 128-NEA2/128-NIA2.
+        assert_eq!(select_algo(0xE0, &NEA_PRIORITY), Some(2));
+        assert_eq!(select_algo(0xE0, &NIA_PRIORITY), Some(2));
+
+        // A UE supporting only NEA1/NIA1 (bit 7 = 0x40) negotiates down to them.
+        assert_eq!(select_algo(0x40, &NEA_PRIORITY), Some(1));
+        assert_eq!(select_algo(0x40, &NIA_PRIORITY), Some(1));
+
+        // A UE offering only null ciphering (NEA0, bit 8 = 0x80) gets NEA0…
+        assert_eq!(select_algo(0x80, &NEA_PRIORITY), Some(0));
+        // …but null integrity is never selected (NIA0 not in the priority list).
+        assert_eq!(select_algo(0x80, &NIA_PRIORITY), None);
+
+        // NEA3/NIA3 only (bit 5 = 0x10) is still supported, below 2 and 1.
+        assert_eq!(select_algo(0x10, &NEA_PRIORITY), Some(3));
+        assert_eq!(select_algo(0x10, &NIA_PRIORITY), Some(3));
+
+        // The bit test itself: EA2 is 0x20, IA1 is 0x40.
+        assert!(ue_supports_algo(0x20, 2) && !ue_supports_algo(0x20, 1));
+    }
+
+    /// End-to-end negotiation: a UE that supports only 128-NEA1/128-NIA1 gets those
+    /// selected, and — because the NAS keys are algorithm-bound — a UE deriving keys
+    /// with the *negotiated* algorithms verifies the Security Mode Command. With the
+    /// old hardcoded NEA2/NIA2 this UE could never have completed security mode.
+    #[tokio::test]
+    async fn security_mode_uses_the_negotiated_algorithms() {
+        let supi = "imsi-999700000000071";
+        let sub = test_subscriber();
+        let nrf_base = spin_auth_backend(supi, sub.clone()).await;
+        let amf_auth = auth::AmfAuth::new(nrf_base, "999", "70");
+
+        // Authenticate to obtain K_SEAF.
+        let (pending, req) = amf_auth.begin(supi).await.unwrap();
+        let (rand, autn) = nas::parse_authentication_request(&req).unwrap();
+        let res_star = aka::ue_compute_res_star(&sub, &rand, &autn, "999", "70").unwrap();
+        let kseaf_hex = amf_auth.finish(&pending, &res_star).await.unwrap().kseaf.unwrap();
+
+        // The AMF negotiates against a UE advertising ONLY 128-NEA1/128-NIA1.
+        let ue_cap = [0x40u8, 0x40u8];
+        let (mut amf_sec, smc_bytes, nea, nia) =
+            establish_security(&kseaf_hex, supi, ue_cap).expect("establish security");
+        assert_eq!((nea, nia), (1, 1), "negotiated down to NEA1/NIA1");
+
+        // The UE derives NAS keys with the NEGOTIATED algorithms and verifies the SMC.
+        let kseaf: [u8; 32] = hex::decode(&kseaf_hex).unwrap().try_into().unwrap();
+        let keys = aka::nas_keys(&aka::kamf(&kseaf, supi, &ABBA), nea, nia);
+        let mut ue_sec = nas::NasSecurityContext::new(keys.knas_int, keys.knas_enc, nia, nea);
+        let smc = ue_sec.unprotect(&smc_bytes, 1).expect("UE verifies SMC under negotiated keys");
+        assert_eq!(nas::gmm_message_type(&smc), Some(nas::Nas5gmmMessageType::SecurityModeCommand));
+
+        // Keys derived with the WRONG (default NEA2/NIA2) algorithms cannot verify it —
+        // proving the selection actually bound the keys.
+        let wrong = aka::nas_keys(&aka::kamf(&kseaf, supi, &ABBA), 2, 2);
+        let mut wrong_sec = nas::NasSecurityContext::new(wrong.knas_int, wrong.knas_enc, 2, 2);
+        assert!(wrong_sec.unprotect(&smc_bytes, 1).is_none(), "NEA2/NIA2 keys reject the NEA1 SMC");
+
+        // SMC Complete round-trips under the negotiated context.
+        let up = ue_sec.protect(&nas::security_mode_complete(), nas::sht::INTEGRITY_CIPHERED, 0);
+        assert!(amf_sec.unprotect(&up, 0).is_some(), "AMF verifies SMC Complete");
+    }
+
     /// The payoff: authenticate, then complete registration with NAS security —
     /// SMC ⇄ SMC Complete, Registration Accept ⇄ Registration Complete.
     #[tokio::test]
@@ -2294,8 +2392,8 @@ mod tests {
         let kseaf_hex = outcome.kseaf.unwrap();
 
         // ── AMF derives NAS security + Security Mode Command ──
-        let (mut amf_sec, smc_bytes) =
-            establish_security(&kseaf_hex, supi, &UE_SEC_CAP).expect("establish security");
+        let (mut amf_sec, smc_bytes, _, _) =
+            establish_security(&kseaf_hex, supi, UE_SEC_CAP).expect("establish security");
 
         // ── UE derives the same NAS keys and verifies the SMC ──
         let kseaf: [u8; 32] = hex::decode(&kseaf_hex).unwrap().try_into().unwrap();
