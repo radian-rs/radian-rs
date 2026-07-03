@@ -183,7 +183,7 @@ impl AusfClient {
     pub fn new(base: impl Into<String>) -> Self {
         Self {
             base: base.into(),
-            http: crate::h2c_client(),
+            http: crate::sbi_client(),
         }
     }
 

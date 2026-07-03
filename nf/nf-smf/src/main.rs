@@ -24,11 +24,17 @@ async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("smf");
 
+    // Mutual TLS (design/57): with RADIAN_SBI_TLS_DIR set, dial every NF (NRF/UDM/AMF)
+    // over mTLS and serve Nsmf over mTLS; the NRF base is then https.
+    let tls = sbi_core::tls::TlsIdentity::from_env("smf")?;
+    sbi_core::configure_transport(tls.as_ref());
+
     let upf_n4: SocketAddr = std::env::var(UPF_N4_ENV)
         .unwrap_or_else(|_| DEFAULT_UPF_N4.to_string())
         .parse()?;
     let smf_ip = Ipv4Addr::new(127, 0, 0, 1); // TODO: real N4 source address / config
-    let nrf_base = std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string());
+    let nrf_base =
+        sbi_core::sbi_base(std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string()));
 
     // The NRF base is also how the SMF finds the UDM for Nudm_SDM subscription checks.
     let mut smf = SmfState::connect(upf_n4, smf_ip, nrf_base.clone()).await?;
@@ -49,6 +55,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
-    sbi_core::run(sbi, pdu_session::router(smf)).await?;
+    match &tls {
+        Some(id) => sbi_core::tls::run_tls(sbi, pdu_session::router(smf), id.server_config()?).await?,
+        None => sbi_core::run(sbi, pdu_session::router(smf)).await?,
+    }
     Ok(())
 }

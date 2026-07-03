@@ -29,6 +29,16 @@ pub struct TlsIdentity {
 }
 
 impl TlsIdentity {
+    /// Load this NF's mTLS identity from the shared `RADIAN_SBI_TLS_DIR` directory
+    /// (`<nf_name>.crt`, `<nf_name>.key`, `ca.crt`). Returns `Ok(None)` — cleartext
+    /// h2c — when the env var is unset, so callers can opt into mTLS uniformly.
+    pub fn from_env(nf_name: &str) -> Result<Option<Self>, SbiError> {
+        match std::env::var("RADIAN_SBI_TLS_DIR") {
+            Ok(dir) => Self::load(&dir, nf_name).map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Load an identity from `dir`: `<name>.crt` (chain), `<name>.key`, and
     /// `ca.crt` (the core CA trust root).
     pub fn load(dir: &str, name: &str) -> Result<Self, SbiError> {

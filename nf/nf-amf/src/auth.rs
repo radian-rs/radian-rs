@@ -121,14 +121,8 @@ impl AmfAuth {
             .into_iter()
             .next()
             .ok_or(AuthError::NoAusf)?;
-        let endpoint = profile
-            .nf_services
-            .and_then(|s| s.into_iter().next())
-            .and_then(|svc| svc.ip_end_points.into_iter().next())
-            .ok_or(AuthError::NoAusf)?;
-        let ip = endpoint.ipv4_address.ok_or(AuthError::NoAusf)?;
-        let port = endpoint.port.ok_or(AuthError::NoAusf)?;
-        Ok(format!("http://{ip}:{port}"))
+        // Dial the AUSF on the transport it advertises (`https` under mTLS).
+        profile.service_base().ok_or(AuthError::NoAusf)
     }
 }
 

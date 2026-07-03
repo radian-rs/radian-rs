@@ -607,14 +607,8 @@ async fn discover_endpoint(nrf_base: &str, nf_type: &str) -> Result<String, Stri
         .into_iter()
         .next()
         .ok_or_else(|| format!("no {nf_type} registered with the NRF"))?;
-    let endpoint = profile
-        .nf_services
-        .and_then(|s| s.into_iter().next())
-        .and_then(|svc| svc.ip_end_points.into_iter().next())
-        .ok_or_else(|| format!("{nf_type} profile has no service endpoint"))?;
-    let ip = endpoint.ipv4_address.ok_or_else(|| format!("{nf_type} endpoint missing IP"))?;
-    let port = endpoint.port.ok_or_else(|| format!("{nf_type} endpoint missing port"))?;
-    Ok(format!("http://{ip}:{port}"))
+    // Dial the peer on the transport it advertises (`https` under mTLS).
+    profile.service_base().ok_or_else(|| format!("{nf_type} profile has no service endpoint"))
 }
 
 /// Discover the UDM's Nudm service endpoint via the NRF.
@@ -874,7 +868,7 @@ fn spawn_amf_pdu_modify(
             "releasedQfis": released_qfis,
         });
         let url = format!("{amf}/namf-comm/v1/ue-contexts/{supi}/modify");
-        match sbi_core::h2c_client().post(url).json(&body).send().await {
+        match sbi_core::sbi_client().post(url).json(&body).send().await {
             Ok(r) if r.status().is_success() => {
                 tracing::info!(psi, "notified serving AMF of the mid-session QoS change")
             }
@@ -1038,7 +1032,7 @@ pub async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> a
     profile.nf_services = Some(vec![NfService {
         service_instance_id: "nsmf-pdusession-1".into(),
         service_name: "nsmf-pdusession".into(),
-        scheme: "http".into(),
+        scheme: sbi_core::sbi_scheme().into(),
         ip_end_points: vec![IpEndPoint {
             ipv4_address: Some(ip.to_string()),
             port: Some(sbi_port),

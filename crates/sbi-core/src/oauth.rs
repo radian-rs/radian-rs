@@ -350,7 +350,7 @@ pub struct JwksCache {
 
 impl JwksCache {
     pub fn new(nrf_base: impl Into<String>) -> Self {
-        Self { nrf_base: nrf_base.into(), http: crate::h2c_client(), cache: Mutex::new(None) }
+        Self { nrf_base: nrf_base.into(), http: crate::sbi_client(), cache: Mutex::new(None) }
     }
 
     /// The cached JWKS, fetching from the NRF on a miss (or when `force`d, e.g.
@@ -487,7 +487,7 @@ impl TokenSource {
         Self {
             nrf_base: nrf_base.into(),
             client_id: client_id.into(),
-            http: crate::h2c_client(),
+            http: crate::sbi_client(),
             cache: Mutex::new(std::collections::HashMap::new()),
         }
     }

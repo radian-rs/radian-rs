@@ -205,9 +205,9 @@ async fn notify_amf_deregistration(callback_uri: &str, supi: &str) -> Result<(),
     if !is_valid_callback_uri(callback_uri) {
         return Err("stored deregCallbackUri is not a valid http(s) URL".to_string());
     }
-    crate::ensure_crypto_provider();
-    let client = reqwest::Client::builder()
-        .http2_prior_knowledge()
+    // Dial on the process-wide SBI transport (mTLS when configured), but with
+    // redirects disabled so a stored callback can't bounce the request elsewhere.
+    let client = crate::sbi_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("build callback client: {e}"))?;
@@ -395,7 +395,7 @@ pub struct UdrClient {
 impl UdrClient {
     /// Target a UDR at `base_url`, e.g. `http://127.0.0.1:8005` (no access token).
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self { base: base_url.into(), http: crate::h2c_client(), tokens: None }
+        Self { base: base_url.into(), http: crate::sbi_client(), tokens: None }
     }
 
     /// Like [`new`], but obtains and attaches a `UDR` access token from the NRF
@@ -404,7 +404,7 @@ impl UdrClient {
         base_url: impl Into<String>,
         tokens: std::sync::Arc<crate::oauth::TokenSource>,
     ) -> Self {
-        Self { base: base_url.into(), http: crate::h2c_client(), tokens: Some(tokens) }
+        Self { base: base_url.into(), http: crate::sbi_client(), tokens: Some(tokens) }
     }
 
     /// Use a caller-supplied transport (e.g. an mTLS client from
