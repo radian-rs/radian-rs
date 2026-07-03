@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -191,6 +191,9 @@ struct Entry {
 pub struct NrfStore {
     entries: Arc<Mutex<HashMap<String, Entry>>>,
     heartbeat_timer: Duration,
+    /// SBI signing secret for the OAuth2 token endpoint (`None` = token endpoint
+    /// disabled / open SBI).
+    secret: Option<Vec<u8>>,
 }
 
 impl Default for NrfStore {
@@ -202,7 +205,14 @@ impl Default for NrfStore {
 impl NrfStore {
     /// A registry that assigns `heartbeat_timer` and evicts after 2× that interval.
     pub fn with_heartbeat_timer(heartbeat_timer: Duration) -> Self {
-        Self { entries: Arc::new(Mutex::new(HashMap::new())), heartbeat_timer }
+        Self { entries: Arc::new(Mutex::new(HashMap::new())), heartbeat_timer, secret: None }
+    }
+
+    /// Enable the OAuth2 token endpoint with this signing secret. In production
+    /// pass `oauth::sbi_secret()`; `None` leaves the endpoint disabled.
+    pub fn with_secret(mut self, secret: Option<Vec<u8>>) -> Self {
+        self.secret = secret;
+        self
     }
 
     pub fn len(&self) -> usize {
@@ -217,6 +227,14 @@ impl NrfStore {
     /// One missed heartbeat is tolerated; a second means the NF is gone.
     fn ttl(&self) -> Duration {
         2 * self.heartbeat_timer
+    }
+
+    /// Whether an NF instance id is currently registered (alive) — the NRF checks
+    /// this before issuing it an access token.
+    pub fn is_registered(&self, nf_instance_id: &str) -> bool {
+        let mut g = self.entries.lock().unwrap();
+        self.purge_stale(&mut g);
+        g.contains_key(nf_instance_id)
     }
 
     fn purge_stale(&self, entries: &mut HashMap<String, Entry>) {
@@ -240,7 +258,42 @@ pub fn router(store: NrfStore) -> Router {
         )
         .route("/nnrf-nfm/v1/nf-instances", get(list))
         .route("/nnrf-disc/v1/nf-instances", get(discover))
+        .route("/oauth2/token", post(access_token))
         .with_state(store)
+}
+
+// ── Nnrf_AccessToken (TS 29.510 §6.3) — the OAuth2 authorization server ────────
+
+/// `POST /oauth2/token` — issue an access token for a `client_credentials`
+/// request. Requires `RADIAN_SBI_SECRET` (else `404` — SBI security disabled) and
+/// that the requesting NF is registered. See [`crate::oauth`] for the trust model.
+async fn access_token(
+    State(store): State<NrfStore>,
+    Json(req): Json<crate::oauth::AccessTokenReq>,
+) -> Result<Json<crate::oauth::AccessTokenRsp>, (StatusCode, Json<crate::ProblemDetails>)> {
+    let problem = |status: StatusCode, cause: &str, detail: &str| {
+        (
+            status,
+            Json(crate::ProblemDetails {
+                status: Some(status.as_u16()),
+                cause: Some(cause.to_string()),
+                detail: Some(detail.to_string()),
+                ..Default::default()
+            }),
+        )
+    };
+    let Some(secret) = store.secret.clone() else {
+        return Err(problem(StatusCode::NOT_FOUND, "SERVICE_DISABLED", "SBI security is not enabled"));
+    };
+    if req.grant_type != "client_credentials" {
+        return Err(problem(StatusCode::BAD_REQUEST, "UNSUPPORTED_GRANT_TYPE", "expected client_credentials"));
+    }
+    // Only a registered NF may obtain a token (ties issuance to the registry).
+    if !store.is_registered(&req.nf_instance_id) {
+        return Err(problem(StatusCode::FORBIDDEN, "UNAUTHORIZED_CLIENT", "requesting NF is not registered"));
+    }
+    tracing::info!(client = %req.nf_instance_id, target = %req.target_nf_type, "issued SBI access token");
+    Ok(Json(crate::oauth::issue_token(&secret, "radian-nrf", &req)))
 }
 
 // ── Nnrf_NFManagement ────────────────────────────────────────────────────────

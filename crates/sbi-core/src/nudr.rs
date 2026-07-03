@@ -68,7 +68,7 @@ pub struct HeAv {
 /// we collapse UDR→UDM→AMF to UDR→AMF).
 pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
     let state = NudrState { store };
-    Router::new()
+    let router = Router::new()
         .route(
             "/nudr-dr/v2/subscription-data/{ue_id}/authentication-data/generate-av",
             post(generate_av),
@@ -94,7 +94,11 @@ pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
             "/nudr-dr/v2/subscription-data/{ue_id}/{serving_plmn_id}/provisioned-data/smf-selection-subscription-data",
             get(get_smf_sel).put(put_smf_sel),
         )
-        .with_state(state)
+        .with_state(state);
+    // SBI security: require a valid `UDR` access token when a secret is configured
+    // (open otherwise). The UDR holds subscriber data + the withdrawal that can
+    // trigger the AMF callback, so it is the first service protected (design/46).
+    crate::oauth::protect(router, "UDR", crate::oauth::sbi_secret())
 }
 
 /// Withdraw a subscription: remove everything stored for the SUPI, then notify
@@ -351,18 +355,40 @@ fn dataset_path(ds: DataSet) -> &'static str {
     }
 }
 
-/// Client the UDM (and later PCF) uses to reach the UDR over h2c.
+/// Client the UDM (and later PCF) uses to reach the UDR over h2c. When built with
+/// [`UdrClient::with_tokens`], it obtains an NRF-issued OAuth2 access token
+/// (audience `UDR`) and presents it on every request — required once the UDR is
+/// protected (SBI security enabled). Plain [`UdrClient::new`] sends no token
+/// (open SBI).
 pub struct UdrClient {
     base: String,
     http: reqwest::Client,
+    tokens: Option<std::sync::Arc<crate::oauth::TokenSource>>,
 }
 
 impl UdrClient {
-    /// Target a UDR at `base_url`, e.g. `http://127.0.0.1:8005`.
+    /// Target a UDR at `base_url`, e.g. `http://127.0.0.1:8005` (no access token).
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            base: base_url.into(),
-            http: crate::h2c_client(),
+        Self { base: base_url.into(), http: crate::h2c_client(), tokens: None }
+    }
+
+    /// Like [`new`], but obtains and attaches a `UDR` access token from the NRF
+    /// (via `tokens`) on every request.
+    pub fn with_tokens(
+        base_url: impl Into<String>,
+        tokens: std::sync::Arc<crate::oauth::TokenSource>,
+    ) -> Self {
+        Self { base: base_url.into(), http: crate::h2c_client(), tokens: Some(tokens) }
+    }
+
+    /// Attach a `UDR` Bearer token to a request when a token source is configured.
+    async fn bearer(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.tokens {
+            Some(ts) => match ts.token_for("UDR", "nudr-dr").await {
+                Some(tok) => rb.bearer_auth(tok),
+                None => rb,
+            },
+            None => rb,
         }
     }
 
@@ -379,9 +405,12 @@ impl UdrClient {
             self.base, supi
         );
         let resp = self
-            .http
-            .post(url)
-            .json(&GenerateAvRequest { mcc: mcc.to_string(), mnc: mnc.to_string() })
+            .bearer(
+                self.http
+                    .post(url)
+                    .json(&GenerateAvRequest { mcc: mcc.to_string(), mnc: mnc.to_string() }),
+            )
+            .await
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -397,7 +426,7 @@ impl UdrClient {
         supi: &str,
         plmn: &str,
     ) -> Result<Option<serde_json::Value>, SbiError> {
-        let resp = self.http.get(self.doc_url(ds, supi, plmn)).send().await?;
+        let resp = self.bearer(self.http.get(self.doc_url(ds, supi, plmn))).await.send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -408,8 +437,8 @@ impl UdrClient {
     /// if it existed, `Ok(false)` on 404.
     pub async fn delete_subscriber(&self, supi: &str) -> Result<bool, SbiError> {
         let resp = self
-            .http
-            .delete(format!("{}/nudr-dr/v2/subscription-data/{}", self.base, supi))
+            .bearer(self.http.delete(format!("{}/nudr-dr/v2/subscription-data/{}", self.base, supi)))
+            .await
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -424,7 +453,7 @@ impl UdrClient {
         &self,
         supi: &str,
     ) -> Result<Option<serde_json::Value>, SbiError> {
-        let resp = self.http.get(self.amf_reg_url(supi)).send().await?;
+        let resp = self.bearer(self.http.get(self.amf_reg_url(supi))).await.send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -437,13 +466,13 @@ impl UdrClient {
         supi: &str,
         doc: &serde_json::Value,
     ) -> Result<(), SbiError> {
-        self.http.put(self.amf_reg_url(supi)).json(doc).send().await?.error_for_status()?;
+        self.bearer(self.http.put(self.amf_reg_url(supi)).json(doc)).await.send().await?.error_for_status()?;
         Ok(())
     }
 
     /// Purge the serving AMF's registration. `Ok(false)` if none was recorded.
     pub async fn delete_amf_registration(&self, supi: &str) -> Result<bool, SbiError> {
-        let resp = self.http.delete(self.amf_reg_url(supi)).send().await?;
+        let resp = self.bearer(self.http.delete(self.amf_reg_url(supi))).await.send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
         }
@@ -462,9 +491,8 @@ impl UdrClient {
         pdu_session_id: u8,
         doc: &serde_json::Value,
     ) -> Result<(), SbiError> {
-        self.http
-            .put(self.smf_reg_url(supi, pdu_session_id))
-            .json(doc)
+        self.bearer(self.http.put(self.smf_reg_url(supi, pdu_session_id)).json(doc))
+            .await
             .send()
             .await?
             .error_for_status()?;
@@ -477,7 +505,7 @@ impl UdrClient {
         supi: &str,
         pdu_session_id: u8,
     ) -> Result<Option<serde_json::Value>, SbiError> {
-        let resp = self.http.get(self.smf_reg_url(supi, pdu_session_id)).send().await?;
+        let resp = self.bearer(self.http.get(self.smf_reg_url(supi, pdu_session_id))).await.send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -490,7 +518,7 @@ impl UdrClient {
         supi: &str,
         pdu_session_id: u8,
     ) -> Result<bool, SbiError> {
-        let resp = self.http.delete(self.smf_reg_url(supi, pdu_session_id)).send().await?;
+        let resp = self.bearer(self.http.delete(self.smf_reg_url(supi, pdu_session_id))).await.send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
         }
@@ -513,9 +541,8 @@ impl UdrClient {
         plmn: &str,
         doc: &serde_json::Value,
     ) -> Result<(), SbiError> {
-        self.http
-            .put(self.doc_url(ds, supi, plmn))
-            .json(doc)
+        self.bearer(self.http.put(self.doc_url(ds, supi, plmn)).json(doc))
+            .await
             .send()
             .await?
             .error_for_status()?;
@@ -537,6 +564,54 @@ impl UdrClient {
 mod tests {
     use super::*;
     use subscriber_db::InMemoryStore;
+
+    /// End-to-end SBI OAuth2: a UDR protected with an explicit secret rejects
+    /// tokenless calls, and a UdrClient carrying an NRF-issued token succeeds.
+    #[tokio::test]
+    async fn protected_udr_requires_a_valid_access_token() {
+        // Secret shared by the NRF (signer) and the UDR (verifier). Test injects it
+        // explicitly rather than via env (which is process-global).
+        let secret = vec![0x11u8; 32];
+
+        // NRF (token endpoint, injected secret) with the client NF ("udm-1") registered.
+        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nrf_addr = nrf_l.local_addr().unwrap();
+        let nrf_store = crate::nnrf::NrfStore::default().with_secret(Some(secret.clone()));
+        tokio::spawn(async move { crate::run_on(nrf_l, crate::nnrf::router(nrf_store)).await.unwrap() });
+        let nrf_base = format!("http://{nrf_addr}");
+        crate::nnrf::NrfClient::new(nrf_base.clone())
+            .register(&crate::nnrf::NfProfile::new("udm-1", "UDM", "127.0.0.1"))
+            .await
+            .unwrap();
+
+        // UDR protected with the same secret; one provisioned subscriber.
+        let store = Arc::new(InMemoryStore::new());
+        store.provision_hex("imsi-1", "465b5ce8b199b49faa5f0a2ee238a6bc", "cd63cb71954a9f4e48a5994e37a02baf", "8000").unwrap();
+        let store: Arc<dyn SubscriberStore> = store;
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        let protected = crate::oauth::protect(router(store), "UDR", Some(secret.clone()));
+        tokio::spawn(async move { crate::run_on(udr_l, protected).await.unwrap() });
+        let udr_url = format!("http://{udr_addr}");
+
+        // Tokenless client → 401.
+        let open = UdrClient::new(udr_url.clone());
+        let err = open.get_amf_registration("imsi-1").await.expect_err("must be rejected");
+        assert!(matches!(err, SbiError::Http(ref e) if e.status() == Some(reqwest::StatusCode::UNAUTHORIZED)));
+
+        // Token-bearing client (fetches from the NRF as "udm-1") → authorized.
+        let tokens = std::sync::Arc::new(crate::oauth::TokenSource::new(nrf_base.clone(), "udm-1"));
+        let client = UdrClient::with_tokens(udr_url.clone(), tokens);
+        // No registration yet, but the store answers 404 through the auth layer.
+        assert!(client.get_amf_registration("imsi-1").await.unwrap().is_none());
+        // And a real read works.
+        assert!(client.generate_av("imsi-1", "999", "70").await.unwrap().is_some());
+
+        // A token from an unregistered client is refused by the NRF (no token → 401).
+        let tokens_bad = std::sync::Arc::new(crate::oauth::TokenSource::new(nrf_base, "rogue-1"));
+        let rogue = UdrClient::with_tokens(udr_url, tokens_bad);
+        assert!(rogue.get_amf_registration("imsi-1").await.is_err(), "unregistered client can't get a token");
+    }
 
     async fn serve(store: Arc<dyn SubscriberStore>) -> UdrClient {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

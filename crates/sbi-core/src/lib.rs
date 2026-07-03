@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod nausf;
 pub mod nnrf;
+pub mod oauth;
 pub mod nudm;
 pub mod nudr;
 

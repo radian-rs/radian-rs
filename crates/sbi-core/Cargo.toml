@@ -17,6 +17,10 @@ aka.workspace = true
 subscriber-db.workspace = true
 hex = "0.4"
 getrandom = "0.2"
+# OAuth2 access-token signing/verification (HS256 JWT, TS 33.501 §13.4).
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 hex-literal = "0.4"
