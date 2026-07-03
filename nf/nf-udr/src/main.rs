@@ -129,10 +129,26 @@ fn provision_demo(store: &RedbStore) -> anyhow::Result<()> {
             "1-010203": { "dnnInfos": [ { "dnn": "internet" } ] }
         }
     });
+    // SM policy data (TS 29.519) — the PCF's per-subscriber policy source. Shaped
+    // as `sbi_core::npcf::PolicyConfig` (default decision + optional per-DNN
+    // overrides). The default here matches the sm-data QoS so the PCF-driven
+    // session is identical to the SMF's sm-data fallback. Not PLMN-scoped (key "").
+    let policy = serde_json::json!({
+        "default": {
+            "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+            "qosFlows": [
+                { "qfi": 1, "fiveQi": 9, "arpPriority": 8 },
+                { "qfi": 2, "fiveQi": 1, "arpPriority": 5, "preEmptCap": true,
+                  "gbr": { "gfbrDl": "100 Mbps", "gfbrUl": "100 Mbps",
+                           "mfbrDl": "200 Mbps", "mfbrUl": "200 Mbps" } }
+            ]
+        }
+    });
     store
         .put_provisioned(DataSet::Am, DEMO_SUPI, DEMO_PLMN, &am)
         .and_then(|()| store.put_provisioned(DataSet::Sm, DEMO_SUPI, DEMO_PLMN, &sm))
         .and_then(|()| store.put_provisioned(DataSet::SmfSelection, DEMO_SUPI, DEMO_PLMN, &smf_sel))
+        .and_then(|()| store.put_provisioned(DataSet::Policy, DEMO_SUPI, "", &policy))
         .map_err(|e| anyhow::anyhow!("provision demo documents: {e}"))
 }
 
