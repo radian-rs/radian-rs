@@ -197,6 +197,114 @@ pub fn initial_ue_message_with_stmsi(ran_ue_id: u32, tmsi: u32, nas: Vec<u8>) ->
     )
 }
 
+/// An NR user location (NR-CGI + TAI) at `tac` — gNB 1 / cell 0, for the builders.
+fn nr_user_location(mcc: &str, mnc: &str, tac: &[u8; 3]) -> UserLocationInformation {
+    UserLocationInformation::UserLocationInformationNR(UserLocationInformationNR {
+        nr_cgi: helpers::nr_cgi(plmn(mcc, mnc), 1, 0),
+        tai: helpers::tai(plmn(mcc, mnc), tac),
+        time_stamp: None,
+        ie_extensions: None,
+    })
+}
+
+/// [`initial_ue_message_with_nas`] plus a **User Location Information** IE placing
+/// the UE in tracking area `tac` — what a real gNB sends (TS 38.413 §9.2.5.1). For
+/// tests / a gNB simulator; the AMF reads the TAI as the UE's registration area.
+pub fn initial_ue_message_with_nas_at(
+    ran_ue_id: u32,
+    nas: Vec<u8>,
+    mcc: &str,
+    mnc: &str,
+    tac: &[u8; 3],
+) -> NGAP_PDU {
+    build_ngap!(InitiatingMessage, InitialUEMessage,
+        IGNORE, InitialUEMessage,
+        REJECT RAN_UE_NGAP_ID(ran_ue_id),
+        REJECT NAS_PDU(nas),
+        REJECT UserLocationInformation(nr_user_location(mcc, mnc, tac)),
+    )
+}
+
+/// [`initial_ue_message_with_stmsi`] plus a **User Location Information** IE — a
+/// CM-IDLE UE resuming from tracking area `tac`. For tests / a gNB simulator.
+pub fn initial_ue_message_with_stmsi_at(
+    ran_ue_id: u32,
+    tmsi: u32,
+    nas: Vec<u8>,
+    mcc: &str,
+    mnc: &str,
+    tac: &[u8; 3],
+) -> NGAP_PDU {
+    build_ngap!(InitiatingMessage, InitialUEMessage,
+        IGNORE, InitialUEMessage,
+        REJECT RAN_UE_NGAP_ID(ran_ue_id),
+        REJECT NAS_PDU(nas),
+        REJECT FiveG_S_TMSI(fiveg_s_tmsi(tmsi)),
+        REJECT UserLocationInformation(nr_user_location(mcc, mnc, tac)),
+    )
+}
+
+/// The UE's tracking area code from an `InitialUEMessage`'s User Location
+/// Information (NR TAI) — the AMF records it as the UE's registration area.
+pub fn tac_from_initial_ue(msg: &InitialUEMessage) -> Option<[u8; 3]> {
+    msg.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        InitialUEMessageProtocolIEs_EntryValue::Id_UserLocationInformation(
+            UserLocationInformation::UserLocationInformationNR(nr),
+        ) => <[u8; 3]>::try_from(nr.tai.tac.0.as_slice()).ok(),
+        _ => None,
+    })
+}
+
+/// Build an `NGSetupRequest` (TS 38.413 §9.2.6.1) advertising the tracking areas
+/// the gNB serves — for tests and a gNB simulator. Mandatory IEs: Global RAN Node
+/// ID, Supported TA List, Default Paging DRX.
+pub fn ng_setup_request(mcc: &str, mnc: &str, tacs: &[[u8; 3]]) -> NGAP_PDU {
+    let ta_list = SupportedTAList(
+        tacs.iter()
+            .map(|tac| SupportedTAItem {
+                tac: TAC(tac.to_vec()),
+                broadcast_plmn_list: BroadcastPLMNList(vec![BroadcastPLMNItem {
+                    plmn_identity: plmn(mcc, mnc),
+                    tai_slice_support_list: SliceSupportList(vec![SliceSupportItem {
+                        s_nssai: s_nssai(1, None),
+                        ie_extensions: None,
+                    }]),
+                    ie_extensions: None,
+                }]),
+                ie_extensions: None,
+            })
+            .collect(),
+    );
+    let node_id = GlobalRANNodeID::GlobalGNB_ID(helpers::global_gnb_id(plmn(mcc, mnc), 1));
+    build_ngap!(InitiatingMessage, NGSetup,
+        REJECT, NGSetupRequest,
+        REJECT GlobalRANNodeID(node_id),
+        REJECT SupportedTAList(ta_list),
+        IGNORE DefaultPagingDRX(PagingDRX(PagingDRX::V128)),
+    )
+}
+
+/// The tracking area codes a gNB advertised in its `NGSetupRequest` Supported TA
+/// List — the AMF uses them for registration-area paging. `None` for other PDUs.
+pub fn supported_tacs_from_ng_setup(pdu: &NGAP_PDU) -> Option<Vec<[u8; 3]>> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_NGSetup(req) = value else {
+        return None;
+    };
+    let list = req.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        NGSetupRequestProtocolIEs_EntryValue::Id_SupportedTAList(l) => Some(l),
+        _ => None,
+    })?;
+    Some(
+        list.0
+            .iter()
+            .filter_map(|item| <[u8; 3]>::try_from(item.tac.0.as_slice()).ok())
+            .collect(),
+    )
+}
+
 /// Build a 5G-S-TMSI IE from a 5G-TMSI (AMF Set ID 10 bits, AMF Pointer 6 bits,
 /// 5G-TMSI 32 bits). Set ID / pointer are fixed (single-AMF core).
 fn fiveg_s_tmsi(tmsi: u32) -> FiveG_S_TMSI {
@@ -964,6 +1072,48 @@ mod release_tests {
         assert_eq!(parse_ue_context_release_request(&back), Some((99, 3)));
         // A different message type isn't misread as a release request.
         assert_eq!(parse_ue_context_release_request(&initial_ue_message_with_nas(1, vec![1])), None);
+    }
+
+    #[test]
+    fn user_location_and_supported_tas_roundtrip() {
+        // The UE's TAI rides the InitialUEMessage (registration and resume forms).
+        let pdu = initial_ue_message_with_nas_at(1, vec![0x7e], "999", "70", &[0, 0, 2]);
+        let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) =
+            NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode")
+        else {
+            panic!("not an initiating message");
+        };
+        let InitiatingMessageValue::Id_InitialUEMessage(msg) = &value else {
+            panic!("not an InitialUEMessage");
+        };
+        assert_eq!(tac_from_initial_ue(msg), Some([0, 0, 2]));
+
+        let pdu = initial_ue_message_with_stmsi_at(1, 0xbeef, vec![0x7e], "999", "70", &[0, 0, 3]);
+        let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) =
+            NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode")
+        else {
+            panic!("not an initiating message");
+        };
+        let InitiatingMessageValue::Id_InitialUEMessage(msg) = &value else {
+            panic!("not an InitialUEMessage");
+        };
+        assert_eq!(tac_from_initial_ue(msg), Some([0, 0, 3]));
+        assert_eq!(fiveg_s_tmsi_from_initial_ue(msg), Some(0xbeef), "5G-S-TMSI still present");
+
+        // A ULI-less InitialUEMessage yields no TAC (the old builders).
+        let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) =
+            initial_ue_message_with_nas(1, vec![0x7e])
+        else {
+            panic!();
+        };
+        let InitiatingMessageValue::Id_InitialUEMessage(msg) = &value else { panic!() };
+        assert_eq!(tac_from_initial_ue(msg), None);
+
+        // The gNB's supported TAs ride the NGSetupRequest.
+        let pdu = ng_setup_request("999", "70", &[[0, 0, 1], [0, 0, 2]]);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(supported_tacs_from_ng_setup(&back), Some(vec![[0, 0, 1], [0, 0, 2]]));
+        assert_eq!(supported_tacs_from_ng_setup(&initial_ue_message_with_nas(1, vec![1])), None);
     }
 
     #[test]
