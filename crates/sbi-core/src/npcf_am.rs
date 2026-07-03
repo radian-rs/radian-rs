@@ -442,5 +442,29 @@ mod tests {
         }
         assert_eq!(NOTIFS.load(O::Relaxed), 1, "AMF notified once on the change");
         assert_eq!(last.lock().unwrap().as_ref().unwrap().rfsp, Some(8));
+
+        // A service-area-only edit (RFSP unchanged) still counts as a change: the
+        // notify fires and the pushed policy carries the new servAreaRes.
+        udr.put_am_policy_data(
+            "imsi-1",
+            &serde_json::json!({
+                "rfsp": 8,
+                "servAreaRes": { "restrictionType": "ALLOWED_AREAS", "tacs": ["000007"] }
+            }),
+        )
+        .await
+        .unwrap();
+        let fresh = client.update(&created.assoc_id).await.unwrap().expect("service area changed");
+        assert_eq!(fresh.rfsp, Some(8), "RFSP unchanged");
+        assert_eq!(fresh.serv_area_res.as_ref().unwrap().tacs, ["000007"]);
+        for _ in 0..50 {
+            if NOTIFS.load(O::Relaxed) == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(NOTIFS.load(O::Relaxed), 2, "AMF notified again on the service-area change");
+        let got = last.lock().unwrap();
+        assert_eq!(got.as_ref().unwrap().serv_area_res.as_ref().unwrap().restriction_type, "ALLOWED_AREAS");
     }
 }
