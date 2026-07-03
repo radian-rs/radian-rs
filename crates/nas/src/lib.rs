@@ -255,6 +255,47 @@ pub mod mm_cause {
     pub const NO_NETWORK_SLICES_AVAILABLE: u8 = 62;
 }
 
+/// Whether a decoded 5GMM **Deregistration Request (UE originating)**
+/// (TS 24.501 §8.2.12) asks for **switch-off** (bit 4 of the de-registration
+/// type, §9.11.3.20) — a switched-off UE expects no Deregistration Accept.
+pub fn deregistration_is_switch_off(msg: &Nas5gsMessage) -> Option<bool> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::DeregistrationRequestFromUe(req)) = msg else {
+        return None;
+    };
+    Some(req.de_registration_type.value & 0x08 != 0)
+}
+
+/// Build a 5GMM **Deregistration Accept (UE originating)** (TS 24.501 §8.2.13) —
+/// header-only.
+pub fn deregistration_accept() -> Nas5gsMessage {
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::DeregistrationAcceptFromUe,
+        Nas5gmmMessage::DeregistrationAcceptFromUe(messages::NasDeregistrationAcceptFromUe::new()),
+    )
+}
+
+/// Build a 5GMM **Deregistration Request (UE originating)**. UE side / tests.
+/// `dereg_type` is the §9.11.3.20 half-octet (bit 4 = switch-off, bits 2-1 =
+/// access type) with ngKSI in the high nibble.
+pub fn deregistration_request_from_ue(dereg_type: u8, mcc: &str, mnc: &str, tmsi: u32) -> Nas5gsMessage {
+    let identity = NasFGsMobileIdentity::from_guti(&Guti {
+        mcc: mcc_digits(mcc),
+        mnc: mnc_digits(mnc),
+        amf_region_id: 0x01,
+        amf_set_id: 0x001,
+        amf_pointer: 0x00,
+        tmsi,
+    });
+    let req = messages::NasDeregistrationRequestFromUe::new(
+        NasDeRegistrationType::new(dereg_type),
+        identity,
+    );
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::DeregistrationRequestFromUe,
+        Nas5gmmMessage::DeregistrationRequestFromUe(req),
+    )
+}
+
 /// GPRS Timer 2 (TS 24.008 §10.5.7.4): one octet holding a 3-bit unit (bits 6-8)
 /// and a 5-bit multiple (bits 1-5) — coarser than [`GprsTimer3`] (units 2s /
 /// 1min / decihour). Carried as the **T3346 value** IE in 5GMM rejects: the UE
@@ -1003,6 +1044,27 @@ mod tests {
         let bare = registration_reject(mm_cause::NO_NETWORK_SLICES_AVAILABLE, &[], None);
         let back = decode_nas_5gs_message(&encode_nas_5gs_message(&bare).unwrap()).unwrap();
         assert_eq!(parse_registration_reject(&back), Some((62, vec![], None)));
+    }
+
+    #[test]
+    fn deregistration_roundtrips() {
+        // Normal deregistration (3GPP access, no switch-off) — bit 4 clear.
+        let req = deregistration_request_from_ue(0x01, "999", "70", 1);
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&req).unwrap()).unwrap();
+        assert_eq!(gmm_message_type(&back), Some(Nas5gmmMessageType::DeregistrationRequestFromUe));
+        assert_eq!(deregistration_is_switch_off(&back), Some(false));
+
+        // Switch-off (bit 4 set) — the UE expects no accept.
+        let req = deregistration_request_from_ue(0x09, "999", "70", 1);
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&req).unwrap()).unwrap();
+        assert_eq!(deregistration_is_switch_off(&back), Some(true));
+
+        // The accept is header-only and round-trips.
+        let acc = deregistration_accept();
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&acc).unwrap()).unwrap();
+        assert_eq!(gmm_message_type(&back), Some(Nas5gmmMessageType::DeregistrationAcceptFromUe));
+        // A non-dereg message yields None (not a bool).
+        assert_eq!(deregistration_is_switch_off(&back), None);
     }
 
     #[test]

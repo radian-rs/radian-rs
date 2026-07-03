@@ -221,6 +221,10 @@ pub fn router(state: Arc<SmfState>) -> Router {
             "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
             post(update_sm_context),
         )
+        .route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release",
+            post(release_sm_context),
+        )
         .with_state(state)
 }
 
@@ -479,6 +483,40 @@ async fn update_sm_context(
     StatusCode::OK
 }
 
+/// `Nsmf_PDUSession_ReleaseSMContext` (TS 29.502 §5.2.2.4): tear the N4 session
+/// down at the UPF and drop the SM context. Driven by the AMF on deregistration.
+async fn release_sm_context(
+    State(smf): State<Arc<SmfState>>,
+    Path(sm_ref): Path<String>,
+) -> Result<StatusCode, SbiProblem> {
+    let up_seid = {
+        let ctxs = smf.contexts.lock().unwrap();
+        match ctxs.get(&sm_ref) {
+            Some(c) => c.up_seid,
+            None => {
+                return Err(problem(
+                    StatusCode::NOT_FOUND,
+                    "CONTEXT_NOT_FOUND",
+                    "unknown SM context",
+                ))
+            }
+        }
+    };
+    let seq = smf.next_seq();
+    let del = pfcp::session_deletion_request(up_seid, seq);
+    // Keep the context if the UPF is unreachable (the AMF may retry); a non-accepted
+    // answer means the UPF already lost the session — drop our side anyway.
+    let resp = smf.transact(&del, seq).await.ok_or_else(|| {
+        problem(StatusCode::BAD_GATEWAY, "UPF_NOT_RESPONDING", "no PFCP deletion response")
+    })?;
+    if !pfcp::response_accepted(&resp) {
+        tracing::warn!(%sm_ref, up_seid, "UPF did not accept the N4 deletion (already gone?)");
+    }
+    smf.contexts.lock().unwrap().remove(&sm_ref);
+    tracing::info!(%sm_ref, up_seid, "released SM context; N4 session deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Whether a gNB downlink target is plausibly routable (not a zero TEID, nor an
 /// unspecified / broadcast / multicast address).
 fn valid_gnb_target(teid: u32, ip: Ipv4Addr) -> bool {
@@ -684,6 +722,31 @@ mod tests {
             Some((0x5678, Ipv4Addr::new(10, 0, 0, 9))),
             "UPF routes an N6 downlink packet to the gNB by the UE's assigned IP"
         );
+
+        // AMF → SMF: ReleaseSMContext (deregistration) — the N4 session goes too.
+        let status = client
+            .post(format!(
+                "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
+                created.sm_context_ref
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 204, "release succeeded");
+        assert_eq!(upf_state.lock().unwrap().session_count(), 0, "N4 session deleted at the UPF");
+
+        // A second release of the same context → 404.
+        let status = client
+            .post(format!(
+                "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
+                created.sm_context_ref
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 404, "released context is gone");
     }
 
     /// An unsubscribed DNN is rejected with 403 *before* any N4 state is created.

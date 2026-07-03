@@ -37,6 +37,8 @@ use rs_pfcp::message::heartbeat_request::HeartbeatRequestBuilder;
 use rs_pfcp::message::heartbeat_response::HeartbeatResponseBuilder;
 use rs_pfcp::message::session_establishment_request::SessionEstablishmentRequestBuilder;
 use rs_pfcp::message::session_establishment_response::SessionEstablishmentResponseBuilder;
+use rs_pfcp::message::session_deletion_request::SessionDeletionRequestBuilder;
+use rs_pfcp::message::session_deletion_response::SessionDeletionResponseBuilder;
 use rs_pfcp::message::session_modification_request::SessionModificationRequestBuilder;
 use rs_pfcp::message::session_modification_response::SessionModificationResponseBuilder;
 use rs_pfcp::message::Message;
@@ -116,6 +118,12 @@ impl UpfState {
 
     /// Allocate a UP-SEID + N3 TEID for a new session and record it (with the
     /// SMF-allocated UE IP, if the establishment carried one).
+    /// Remove a session (PFCP Session Deletion) — its TEID and UE-IP routes go
+    /// with it. Returns whether the session existed.
+    fn remove(&mut self, up_seid: u64) -> bool {
+        self.sessions.remove(&up_seid).is_some()
+    }
+
     fn establish(&mut self, ue_ip: Option<Ipv4Addr>) -> (u64, u32) {
         let up_seid = self.next_seid;
         let teid = self.next_teid;
@@ -229,6 +237,12 @@ pub fn session_modification_request(
         .marshal()
 }
 
+/// SMF: build a PFCP Session Deletion Request (TS 29.244 §7.5.6) — addressed by
+/// UP-SEID; the UPF drops the session and every rule provisioned under it.
+pub fn session_deletion_request(up_seid: u64, seq: u32) -> Vec<u8> {
+    SessionDeletionRequestBuilder::new(up_seid, seq).build().marshal()
+}
+
 /// UPF: handle an inbound N4 message, returning the response to send (if any).
 pub fn handle_n4(data: &[u8], node_ip: Ipv4Addr, state: &mut UpfState) -> Option<Vec<u8>> {
     let msg = rs_pfcp::message::parse(data).ok()?;
@@ -297,7 +311,20 @@ pub fn handle_n4(data: &[u8], node_ip: Ipv4Addr, state: &mut UpfState) -> Option
                     .marshal(),
             )
         }
-        // Session deletion and others arrive in later slices.
+        MsgType::SessionDeletionRequest => {
+            let up_seid = u64::from(msg.seid()?);
+            let cause = if state.remove(up_seid) {
+                CauseValue::RequestAccepted
+            } else {
+                CauseValue::SessionContextNotFound
+            };
+            Some(
+                SessionDeletionResponseBuilder::new(up_seid, seq)
+                    .cause(cause)
+                    .build()
+                    .marshal(),
+            )
+        }
         _ => None,
     }
 }
@@ -375,6 +402,29 @@ mod tests {
         assert_eq!(parsed.msg_type(), MsgType::SessionEstablishmentResponse);
         assert_eq!(parsed.ies(IeType::CreatedPdr).count(), 1, "Created PDR with allocated F-TEID");
         assert_eq!(parsed.ies(IeType::Fseid).count(), 1, "UP F-SEID returned");
+    }
+
+    #[test]
+    fn session_deletion_removes_the_session() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP), node_ip, &mut state)
+            .expect("establish");
+        let up_seid = 1; // first allocation
+        assert_eq!(state.session_count(), 1);
+
+        // SMF deletes the session — TEID and N6 route go with it.
+        let resp = handle_n4(&session_deletion_request(up_seid, 2), node_ip, &mut state)
+            .expect("deletion response");
+        assert!(response_accepted(&resp), "deletion accepted");
+        assert_eq!(state.session_count(), 0, "session removed");
+        assert!(!state.knows_teid(1), "TEID no longer routable");
+        assert_eq!(state.route_downlink(UE_IP), None, "N6 route gone");
+
+        // Deleting an unknown session answers, but not with 'accepted'.
+        let resp = handle_n4(&session_deletion_request(99, 3), node_ip, &mut state)
+            .expect("response for unknown session");
+        assert!(!response_accepted(&resp), "unknown session is not 'accepted'");
     }
 
     #[test]

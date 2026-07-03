@@ -148,6 +148,21 @@ impl AmfSmf {
         Ok(SmContextCreated { sm_ref, up_n3_teid, up_n3_addr, ue_ip, snssai_sst, snssai_sd, ambr })
     }
 
+    /// Release an SM context (TS 29.502) — the SMF tears the N4 session down at
+    /// the UPF. Driven by deregistration.
+    pub async fn release_sm_context(&self, sm_ref: &str) -> Result<(), String> {
+        let smf_base = self.discover_smf().await?;
+        let resp = sbi_core::h2c_client()
+            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release"))
+            .send()
+            .await
+            .map_err(|e| format!("Nsmf ReleaseSMContext request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Nsmf ReleaseSMContext returned {}", resp.status()));
+        }
+        Ok(())
+    }
+
     /// Update the SM context with the gNB's DL N3 F-TEID (from the N2 setup response),
     /// driving the SMF's N4 Session Modification (the downlink path).
     pub async fn update_sm_context(
