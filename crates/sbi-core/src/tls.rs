@@ -16,16 +16,22 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
 
 use crate::SbiError;
 
 /// An NF's mTLS identity: its certificate chain + private key + the core CA trust
-/// root, loaded from PEM files.
+/// root (and, when the PKI maintains one, the CA's CRL), loaded from PEM files.
 pub struct TlsIdentity {
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     ca: Vec<CertificateDer<'static>>,
+    /// The core CA's revocation list (`ca.crl`, e.g. maintained by `radian-pki`).
+    /// When present, BOTH verifiers refuse revoked peers (design/58).
+    crls: Vec<CertificateRevocationListDer<'static>>,
+    /// `(dir, name)` this identity was loaded from — lets [`serve`] hot-reload a
+    /// rotated certificate or a regenerated CRL. `None` for in-memory identities.
+    source: Option<(String, String)>,
 }
 
 impl TlsIdentity {
@@ -40,7 +46,10 @@ impl TlsIdentity {
     }
 
     /// Load an identity from `dir`: `<name>.crt` (chain), `<name>.key`, and
-    /// `ca.crt` (the core CA trust root).
+    /// `ca.crt` (the core CA trust root). A `ca.crl`, when present, is loaded
+    /// too and enforced by both [`server_config`](Self::server_config) and
+    /// [`client_config`](Self::client_config); a present-but-unreadable CRL is
+    /// an error (fail closed — never silently skip revocation).
     pub fn load(dir: &str, name: &str) -> Result<Self, SbiError> {
         let certs = CertificateDer::pem_file_iter(format!("{dir}/{name}.crt"))
             .map_err(|e| SbiError::Tls(format!("read {name}.crt: {e}")))?
@@ -52,7 +61,16 @@ impl TlsIdentity {
             .map_err(|e| SbiError::Tls(format!("read ca.crt: {e}")))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| SbiError::Tls(format!("parse ca.crt: {e}")))?;
-        Ok(Self { certs, key, ca })
+        let crl_path = format!("{dir}/ca.crl");
+        let crls = if std::path::Path::new(&crl_path).exists() {
+            vec![
+                CertificateRevocationListDer::from_pem_file(&crl_path)
+                    .map_err(|e| SbiError::Tls(format!("read ca.crl: {e}")))?,
+            ]
+        } else {
+            Vec::new()
+        };
+        Ok(Self { certs, key, ca, crls, source: Some((dir.to_string(), name.to_string())) })
     }
 
     fn provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -68,13 +86,15 @@ impl TlsIdentity {
     }
 
     /// A rustls `ServerConfig` that **requires** and verifies the client certificate
-    /// against the CA (mutual TLS), advertising HTTP/2 via ALPN.
+    /// against the CA — and, when a CRL is loaded, refuses **revoked** clients —
+    /// advertising HTTP/2 via ALPN.
     pub fn server_config(&self) -> Result<Arc<rustls::ServerConfig>, SbiError> {
         let roots = Arc::new(self.root_store()?);
         let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
             roots,
             Self::provider(),
         )
+        .with_crls(self.crls.iter().cloned())
         .build()
         .map_err(|e| SbiError::Tls(format!("build client verifier: {e}")))?;
         let mut cfg = rustls::ServerConfig::builder_with_provider(Self::provider())
@@ -88,12 +108,27 @@ impl TlsIdentity {
     }
 
     /// A rustls `ClientConfig` that presents this identity and verifies the server
-    /// against the CA, advertising HTTP/2 via ALPN.
+    /// against the CA — and, when a CRL is loaded, refuses **revoked** servers —
+    /// advertising HTTP/2 via ALPN.
     pub fn client_config(&self) -> Result<rustls::ClientConfig, SbiError> {
-        let mut cfg = rustls::ClientConfig::builder_with_provider(Self::provider())
+        let builder = rustls::ClientConfig::builder_with_provider(Self::provider())
             .with_safe_default_protocol_versions()
-            .map_err(|e| SbiError::Tls(format!("tls versions: {e}")))?
-            .with_root_certificates(self.root_store()?)
+            .map_err(|e| SbiError::Tls(format!("tls versions: {e}")))?;
+        let builder = if self.crls.is_empty() {
+            builder.with_root_certificates(self.root_store()?)
+        } else {
+            // The default verifier can't check revocation; build the same webpki
+            // verifier explicitly with the CRL attached.
+            let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(self.root_store()?),
+                Self::provider(),
+            )
+            .with_crls(self.crls.iter().cloned())
+            .build()
+            .map_err(|e| SbiError::Tls(format!("build server verifier: {e}")))?;
+            builder.dangerous().with_custom_certificate_verifier(verifier)
+        };
+        let mut cfg = builder
             .with_client_auth_cert(self.certs.clone(), self.key.clone_key())
             .map_err(|e| SbiError::Tls(format!("client cert: {e}")))?;
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -131,32 +166,97 @@ pub async fn run_tls_on(
     app: axum::Router,
     config: Arc<rustls::ServerConfig>,
 ) -> Result<(), SbiError> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(config);
     loop {
         let (stream, peer) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-        tokio::spawn(async move {
-            let tls = match acceptor.accept(stream).await {
-                Ok(tls) => tls,
-                // A failed handshake (no/invalid client cert, etc.) — drop the conn.
-                Err(e) => {
-                    tracing::debug!(%peer, "mTLS handshake rejected: {e}");
-                    return;
-                }
-            };
-            let io = hyper_util::rt::TokioIo::new(tls);
-            let service = hyper_util::service::TowerToHyperService::new(app);
-            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .serve_connection(io, service)
-            .await
-            {
-                tracing::debug!(%peer, "connection error: {e}");
-            }
-        });
+        spawn_conn(stream, peer, config.clone(), app.clone());
     }
+}
+
+/// Serve an SBI router over mutual TLS with **hot reload**: a rotated certificate
+/// or a regenerated CRL (e.g. `radian-pki rotate`/`revoke`, design/58) is picked
+/// up on the next accepted connection — no restart. The identity must have been
+/// [`load`](TlsIdentity::load)ed from files (an in-memory identity serves fixed).
+pub async fn serve(
+    addr: SocketAddr,
+    app: axum::Router,
+    identity: TlsIdentity,
+) -> Result<(), SbiError> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "SBI mutual-TLS listener up (hot-reloading identity/CRL)");
+    serve_on(listener, app, identity).await
+}
+
+/// [`serve`] on an already-bound listener.
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    identity: TlsIdentity,
+) -> Result<(), SbiError> {
+    let Some((dir, name)) = identity.source.clone() else {
+        return run_tls_on(listener, app, identity.server_config()?).await;
+    };
+    let mut config = identity.server_config()?;
+    let mut stamp = source_stamp(&dir, &name);
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        // Reload when any source file changed since the config was built. A failed
+        // reload (e.g. files mid-rewrite) keeps the previous config and retries on
+        // the next connection.
+        let now = source_stamp(&dir, &name);
+        if now != stamp {
+            match TlsIdentity::load(&dir, &name).and_then(|id| id.server_config()) {
+                Ok(fresh) => {
+                    config = fresh;
+                    stamp = now;
+                    tracing::info!(%name, "TLS identity/CRL reloaded");
+                }
+                Err(e) => tracing::warn!(%name, "TLS reload failed (keeping previous): {e}"),
+            }
+        }
+        spawn_conn(stream, peer, config.clone(), app.clone());
+    }
+}
+
+/// Modification times of an identity's source files — the reload trigger.
+fn source_stamp(dir: &str, name: &str) -> Vec<Option<std::time::SystemTime>> {
+    [
+        format!("{dir}/{name}.crt"),
+        format!("{dir}/{name}.key"),
+        format!("{dir}/ca.crt"),
+        format!("{dir}/ca.crl"),
+    ]
+    .iter()
+    .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+    .collect()
+}
+
+/// Handshake + serve one accepted connection on its own task.
+fn spawn_conn(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    config: Arc<rustls::ServerConfig>,
+    app: axum::Router,
+) {
+    tokio::spawn(async move {
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let tls = match acceptor.accept(stream).await {
+            Ok(tls) => tls,
+            // A failed handshake (no/invalid/revoked client cert, etc.) — drop the conn.
+            Err(e) => {
+                tracing::debug!(%peer, "mTLS handshake rejected: {e}");
+                return;
+            }
+        };
+        let io = hyper_util::rt::TokioIo::new(tls);
+        let service = hyper_util::service::TowerToHyperService::new(app);
+        if let Err(e) =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(io, service)
+                .await
+        {
+            tracing::debug!(%peer, "connection error: {e}");
+        }
+    });
 }
 
 #[cfg(test)]
@@ -237,6 +337,8 @@ mod tests {
                 .unwrap()
                 .collect::<Result<_, _>>()
                 .unwrap(),
+            crls: Vec::new(),
+            source: None,
         };
         assert!(
             rogue.client().unwrap().get(&url).send().await.is_err(),
@@ -260,6 +362,82 @@ mod tests {
         assert!(
             no_cert.get(&url).send().await.is_err(),
             "a client with no certificate is rejected (mutual auth required)"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// CRL enforcement + hot reload (design/58): a `radian-pki` revocation takes
+    /// effect on the RUNNING server's next connection, and a rotated server
+    /// identity is served without a restart.
+    #[tokio::test]
+    async fn crl_revocation_is_enforced_and_hot_reloaded() {
+        if !radian_pki::openssl_available() {
+            eprintln!("skipping CRL test: openssl not found");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("radian-crl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        radian_pki::init(&tmp, &["server", "client", "mallory"], "127.0.0.1").unwrap();
+        let dir = tmp.to_str().unwrap();
+
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://127.0.0.1:{}/", listener.local_addr().unwrap().port());
+        let identity = TlsIdentity::load(dir, "server").unwrap();
+        tokio::spawn(async move { serve_on(listener, app, identity).await.unwrap() });
+
+        // Fresh reqwest client per assertion: connection pooling would otherwise
+        // reuse a pre-revocation TLS session and mask the handshake-level check.
+        let hit = |name: &'static str| {
+            let client = TlsIdentity::load(dir, name).unwrap().client().unwrap();
+            let url = url.clone();
+            async move { client.get(&url).send().await }
+        };
+
+        // Both core-signed clients are admitted while unrevoked.
+        assert_eq!(hit("client").await.unwrap().status(), 200);
+        assert_eq!(hit("mallory").await.unwrap().status(), 200);
+
+        // Revoke mallory: the running server reloads ca.crl on the next accept and
+        // refuses the revoked certificate at the handshake; others are unaffected.
+        radian_pki::revoke(&tmp, "mallory").unwrap();
+        assert!(hit("mallory").await.is_err(), "revoked client refused after CRL hot reload");
+        assert_eq!(hit("client").await.unwrap().status(), 200);
+
+        // Rotate the server's identity: served live, still CA-verified by clients.
+        radian_pki::rotate(&tmp, "server", "127.0.0.1").unwrap();
+        assert_eq!(hit("client").await.unwrap().status(), 200, "rotated server cert served live");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The client side of revocation: a dialing NF refuses a server whose
+    /// certificate the CRL lists (the server here keeps its pre-revocation config).
+    #[tokio::test]
+    async fn client_refuses_a_revoked_server() {
+        if !radian_pki::openssl_available() {
+            eprintln!("skipping CRL test: openssl not found");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("radian-crl-srv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        radian_pki::init(&tmp, &["server", "client"], "127.0.0.1").unwrap();
+        let dir = tmp.to_str().unwrap();
+
+        // Fixed config, loaded BEFORE the revocation — it keeps presenting the
+        // soon-to-be-revoked certificate.
+        let cfg = TlsIdentity::load(dir, "server").unwrap().server_config().unwrap();
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://127.0.0.1:{}/", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { run_tls_on(listener, app, cfg).await.unwrap() });
+
+        radian_pki::revoke(&tmp, "server").unwrap();
+        let client = TlsIdentity::load(dir, "client").unwrap().client().unwrap();
+        assert!(
+            client.get(&url).send().await.is_err(),
+            "a client refuses a server presenting a CRL-revoked certificate"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

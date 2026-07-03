@@ -39,8 +39,8 @@ async fn main() -> anyhow::Result<()> {
         store
     };
     let sbi: SocketAddr = "0.0.0.0:8000".parse()?;
-    match &tls {
-        Some(id) => sbi_core::tls::run_tls(sbi, sbi_core::nnrf::router(store), id.server_config()?).await?,
+    match tls {
+        Some(id) => sbi_core::tls::serve(sbi, sbi_core::nnrf::router(store), id).await?,
         None => sbi_core::run(sbi, sbi_core::nnrf::router(store)).await?,
     }
     Ok(())

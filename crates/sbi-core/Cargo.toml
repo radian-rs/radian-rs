@@ -33,3 +33,5 @@ p256 = "0.13"
 
 [dev-dependencies]
 hex-literal = "0.4"
+# CRL/rotation tests generate their PKI with the real bootstrap tool (design/58).
+radian-pki = { path = "../../tools/radian-pki" }

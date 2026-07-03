@@ -32,8 +32,8 @@ async fn main() -> anyhow::Result<()> {
     let udm_base = sbi_core::sbi_base("http://127.0.0.1:8004");
     let state = sbi_core::nausf::AusfState::new(udm_base);
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
-    match &tls {
-        Some(id) => sbi_core::tls::run_tls(sbi, sbi_core::nausf::router(state), id.server_config()?).await?,
+    match tls {
+        Some(id) => sbi_core::tls::serve(sbi, sbi_core::nausf::router(state), id).await?,
         None => sbi_core::run(sbi, sbi_core::nausf::router(state)).await?,
     }
     Ok(())

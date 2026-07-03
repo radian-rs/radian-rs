@@ -97,10 +97,10 @@ async fn main() -> anyhow::Result<()> {
     }
     // Subscription withdrawals notify the serving AMF recorded in the UECM
     // context data (its deregCallbackUri) — over the same transport (mTLS when on).
-    match &tls {
+    match tls {
         Some(id) => {
             info!("Nudr served over mutual TLS");
-            sbi_core::tls::run_tls(sbi, router, id.server_config()?).await?;
+            sbi_core::tls::serve(sbi, router, id).await?;
         }
         None => sbi_core::run(sbi, router).await?,
     }

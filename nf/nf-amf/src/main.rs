@@ -243,10 +243,9 @@ async fn main() -> anyhow::Result<()> {
     // SBI callback surface (namf-callback): the UDR notifies subscription
     // withdrawals here (design/38). Registered with the NRF so it can be found.
     let sbi_addr: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
-    let sbi_tls = tls.as_ref().map(|id| id.server_config()).transpose()?;
     tokio::spawn(async move {
-        let serve = match sbi_tls {
-            Some(cfg) => sbi_core::tls::run_tls(sbi_addr, namf_callback_router(), cfg).await,
+        let serve = match tls {
+            Some(id) => sbi_core::tls::serve(sbi_addr, namf_callback_router(), id).await,
             None => sbi_core::run(sbi_addr, namf_callback_router()).await,
         };
         if let Err(e) = serve {

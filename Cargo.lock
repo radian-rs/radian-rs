@@ -2202,6 +2202,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "radian-pki"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+]
+
+[[package]]
 name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2488,6 +2496,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "p256",
+ "radian-pki",
  "reqwest",
  "rustls",
  "rustls-pki-types",
