@@ -48,6 +48,14 @@ pub trait ArpfKeyStore: Send + Sync {
         mcc: &str,
         mnc: &str,
     ) -> Option<AuthVector>;
+
+    /// Resynchronise the subscriber's SQN from a UE **AUTS** (TS 33.102 §6.3.5):
+    /// verify MAC-S against the `rand` of the failed challenge and, when valid,
+    /// adopt the UE's SQN (the next generated vector advances past it). `false`
+    /// when the subscriber is unknown or MAC-S doesn't verify (an AUTS not from
+    /// this subscriber's USIM never moves the stored SQN). K/OPc never leave
+    /// the impl.
+    fn resync_sqn(&self, supi: &str, rand: &[u8; 16], auts: &[u8; 14]) -> bool;
 }
 
 /// A provisioned-data document family (TS 29.505 `provisioned-data` resources).
@@ -240,6 +248,18 @@ impl ArpfKeyStore for InMemoryStore {
         let g = self.inner.lock().unwrap();
         let key = g.credentials.get(supi)?;
         aka::generate_5g_he_av(key, sqn, rand, mcc, mnc).ok()
+    }
+
+    fn resync_sqn(&self, supi: &str, rand: &[u8; 16], auts: &[u8; 14]) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let Some(key) = g.credentials.get(supi) else {
+            return false;
+        };
+        let Some(sqn_ms) = aka::sqn_ms_from_auts(key, rand, auts) else {
+            return false;
+        };
+        g.sqn.insert(supi.to_string(), sqn_ms);
+        true
     }
 }
 
@@ -540,6 +560,25 @@ impl ArpfKeyStore for RedbStore {
         let key = self.read_key(supi)?;
         aka::generate_5g_he_av(&key, sqn, rand, mcc, mnc).ok()
     }
+
+    fn resync_sqn(&self, supi: &str, rand: &[u8; 16], auts: &[u8; 14]) -> bool {
+        let Some(key) = self.read_key(supi) else {
+            return false;
+        };
+        let Some(sqn_ms) = aka::sqn_ms_from_auts(&key, rand, auts) else {
+            return false;
+        };
+        let Ok(w) = self.db.begin_write() else {
+            return false;
+        };
+        let ok = {
+            match w.open_table(AUTH_STATE) {
+                Ok(mut t) => t.insert(supi, sqn_ms.as_slice()).is_ok(),
+                Err(_) => false,
+            }
+        };
+        ok && w.commit().is_ok()
+    }
 }
 
 impl ProvisionedDataStore for RedbStore {
@@ -693,6 +732,35 @@ mod tests {
             .generate_he_av("imsi-1", &[0, 0, 0, 0, 0, 1], &[0x11; 16], "999", "70")
             .expect("AV");
         assert_ne!(av.kausf, [0u8; 32]);
+    }
+
+    #[test]
+    fn resync_adopts_the_ue_sqn_and_rejects_forgeries() {
+        let store = InMemoryStore::new();
+        store.provision_hex("imsi-1", K, OPC, "8000").unwrap();
+        let key = parse_key(K, OPC, "8000").unwrap();
+
+        // The UE's USIM is far ahead (e.g. it authenticated against another
+        // network): its AUTS resynchronises the stored SQN, and the next vector
+        // advances PAST the UE's value — fresh again from the UE's viewpoint.
+        let rand = [0x5A; 16];
+        let sqn_ms = [0, 0, 0, 0, 0xFF, 0x00];
+        assert!(store.resync_sqn("imsi-1", &rand, &aka::compute_auts(&key, &rand, &sqn_ms)));
+        assert_eq!(store.next_sqn("imsi-1"), Some([0, 0, 0, 0, 0xFF, 0x01]));
+
+        // A tampered AUTS moves nothing; unknown subscribers are refused.
+        let mut forged = aka::compute_auts(&key, &rand, &[0u8; 6]);
+        forged[13] ^= 0x01;
+        assert!(!store.resync_sqn("imsi-1", &rand, &forged));
+        assert_eq!(store.next_sqn("imsi-1"), Some([0, 0, 0, 0, 0xFF, 0x02]), "SQN untouched");
+        assert!(!store.resync_sqn("imsi-9", &rand, &aka::compute_auts(&key, &rand, &sqn_ms)));
+
+        // The redb store persists the resynchronised SQN.
+        let dir = tempfile::tempdir().unwrap();
+        let redb = RedbStore::open(dir.path().join("s.redb"), KEK).unwrap();
+        redb.provision_hex("imsi-1", K, OPC, "8000").unwrap();
+        assert!(redb.resync_sqn("imsi-1", &rand, &aka::compute_auts(&key, &rand, &sqn_ms)));
+        assert_eq!(redb.next_sqn("imsi-1"), Some([0, 0, 0, 0, 0xFF, 0x01]));
     }
 
     #[test]

@@ -47,6 +47,19 @@ impl AusfState {
 pub struct AuthenticationInfo {
     pub supi_or_suci: String,
     pub serving_network_name: String,
+    /// Present on a **resynchronisation** retry (TS 29.509 §6.1): the UE's AUTS
+    /// (from a NAS Authentication Failure, cause #21) with the `rand` it answers.
+    /// The AUSF relays it to the UDM to adopt the UE's SQN before fetching a
+    /// fresh 5G HE AV.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resynchronization_info: Option<ResynchronizationInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResynchronizationInfo {
+    pub rand: String,
+    pub auts: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,6 +111,23 @@ async fn authenticate(
     Json(info): Json<AuthenticationInfo>,
 ) -> Result<(StatusCode, Json<UeAuthenticationCtx>), StatusCode> {
     let (mcc, mnc) = parse_snn(&info.serving_network_name).ok_or(StatusCode::BAD_REQUEST)?;
+
+    // Resynchronisation retry: relay the UE's AUTS to the UDM (which adopts the
+    // UE's SQN) before fetching a fresh AV, so the new challenge is in sync. A
+    // refused resync (MAC-S mismatch) fails the request rather than handing back
+    // a vector the UE will reject again.
+    if let Some(rs) = &info.resynchronization_info {
+        let ok = state
+            .udm
+            .resync(&info.supi_or_suci, &rs.rand, &rs.auts)
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        if !ok {
+            tracing::warn!(supi = %info.supi_or_suci, "resync refused by the UDM");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        tracing::info!(supi = %info.supi_or_suci, "SQN resynchronised; issuing a fresh challenge");
+    }
 
     // Fetch the HE AV from the UDM.
     let result = state
@@ -193,12 +223,36 @@ impl AusfClient {
         supi_or_suci: &str,
         serving_network_name: &str,
     ) -> Result<UeAuthenticationCtx, SbiError> {
+        self.authenticate_inner(supi_or_suci, serving_network_name, None).await
+    }
+
+    /// Like [`authenticate`], but carries the UE's **AUTS** (hex `rand`/`auts`) so
+    /// the AUSF/UDM resynchronise the SQN before issuing a fresh challenge
+    /// (TS 29.509 §6.1). Returns the new RAND/AUTN/HXRES* + ctx.
+    pub async fn authenticate_resync(
+        &self,
+        supi_or_suci: &str,
+        serving_network_name: &str,
+        rand: &str,
+        auts: &str,
+    ) -> Result<UeAuthenticationCtx, SbiError> {
+        let info = ResynchronizationInfo { rand: rand.to_string(), auts: auts.to_string() };
+        self.authenticate_inner(supi_or_suci, serving_network_name, Some(info)).await
+    }
+
+    async fn authenticate_inner(
+        &self,
+        supi_or_suci: &str,
+        serving_network_name: &str,
+        resynchronization_info: Option<ResynchronizationInfo>,
+    ) -> Result<UeAuthenticationCtx, SbiError> {
         let resp = self
             .http
             .post(format!("{}/nausf-auth/v1/ue-authentications", self.base))
             .json(&AuthenticationInfo {
                 supi_or_suci: supi_or_suci.to_string(),
                 serving_network_name: serving_network_name.to_string(),
+                resynchronization_info,
             })
             .send()
             .await?

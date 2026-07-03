@@ -27,6 +27,14 @@ pub struct AuthenticationInfoRequest {
     pub ausf_instance_id: Option<String>,
 }
 
+/// Resynchronisation info (TS 29.503): the challenge `rand` and the UE `auts`, hex.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResyncInfo {
+    pub rand: String,
+    pub auts: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthenticationInfoResult {
@@ -54,6 +62,7 @@ pub fn router(udr: Arc<UdrClient>) -> Router {
             "/nudm-ueau/v1/{supi_or_suci}/security-information/generate-auth-data",
             post(generate_auth_data),
         )
+        .route("/nudm-ueau/v1/{supi}/auth-events/resync", post(resync))
         .route(
             "/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access",
             axum::routing::put(uecm_register_amf).delete(uecm_deregister_amf),
@@ -230,6 +239,25 @@ async fn generate_auth_data(
     }))
 }
 
+/// Nudm_UEAuthentication resynchronisation (TS 29.503 §5.2): relay the UE's AUTS
+/// (from a NAS Authentication Failure, cause #21) to the UDR/ARPF, which verifies
+/// MAC-S and adopts the UE's SQN. `204` on success, `403` on a MAC-S mismatch,
+/// `404` for an unknown subscriber (mapped from the Nudr response).
+async fn resync(
+    State(udr): State<Arc<UdrClient>>,
+    Path(supi): Path<String>,
+    Json(req): Json<ResyncInfo>,
+) -> StatusCode {
+    match udr.resync_av(&supi, &req.rand, &req.auts).await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::FORBIDDEN,
+        Err(e) => {
+            tracing::warn!(supi = %supi, "UDR resync failed: {e}");
+            StatusCode::BAD_GATEWAY
+        }
+    }
+}
+
 /// Parse `5G:mnc<MNC3>.mcc<MCC3>.3gppnetwork.org` → (mcc, mnc).
 pub fn parse_snn(snn: &str) -> Option<(String, String)> {
     let mnc = snn.split("mnc").nth(1)?.get(..3)?.to_string();
@@ -273,6 +301,18 @@ impl NudmClient {
             .await?
             .error_for_status()?;
         Ok(resp.json().await?)
+    }
+
+    /// Nudm_UEAuthentication — resynchronise the subscriber's SQN from a UE AUTS
+    /// (hex `rand` + `auts`). `Ok(true)` when the SQN was adopted.
+    pub async fn resync(&self, supi: &str, rand: &str, auts: &str) -> Result<bool, SbiError> {
+        let resp = self
+            .http
+            .post(format!("{}/nudm-ueau/v1/{}/auth-events/resync", self.base, supi))
+            .json(&ResyncInfo { rand: rand.to_string(), auts: auts.to_string() })
+            .send()
+            .await?;
+        Ok(resp.status().is_success())
     }
 
     /// Nudm_UECM — register as the serving AMF for `supi` (create or replace).

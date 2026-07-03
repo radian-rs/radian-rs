@@ -79,6 +79,37 @@ impl AmfAuth {
         ))
     }
 
+    /// Resynchronise after a UE Authentication Failure (synch failure, #21):
+    /// re-run Nausf_UEAuthentication carrying the UE's AUTS + the RAND of the
+    /// failed challenge (from `pending`), so the AUSF/UDM adopt the UE's SQN and
+    /// return a **fresh** challenge. Returns the new pending state + NAS
+    /// Authentication Request. Reuses the AUSF the failed attempt found.
+    pub async fn resync(
+        &self,
+        pending: &PendingAuth,
+        supi_or_suci: &str,
+        auts: &[u8],
+    ) -> Result<(PendingAuth, Vec<u8>), AuthError> {
+        let snn = aka::serving_network_name(&self.mcc, &self.mnc);
+        let ctx = AusfClient::new(pending.ausf_base.clone())
+            .authenticate_resync(supi_or_suci, &snn, &hex::encode(pending.rand), &hex::encode(auts))
+            .await?;
+
+        let rand = hex16(&ctx.fiveg_auth_data.rand).ok_or(AuthError::BadAv)?;
+        let autn = hex16(&ctx.fiveg_auth_data.autn).ok_or(AuthError::BadAv)?;
+        let hxres = hex16(&ctx.fiveg_auth_data.hxres_star).ok_or(AuthError::BadAv)?;
+        let nas = nas::authentication_request(0, &rand, &autn);
+        Ok((
+            PendingAuth {
+                ausf_base: pending.ausf_base.clone(),
+                ctx_id: ctx.auth_ctx_id,
+                rand,
+                hxres,
+            },
+            nas,
+        ))
+    }
+
     /// Finish authentication: SEAF-verify the UE's RES* (HRES* == HXRES*), then
     /// confirm with the AUSF (which compares RES* to XRES* and returns K_SEAF).
     pub async fn finish(

@@ -230,6 +230,10 @@ struct UeContext {
     /// Network-initiated deregistration in progress: how many Deregistration
     /// Requests have been sent (T3522 governs retransmission). `None` = idle.
     dereg_attempts: Option<u8>,
+    /// Whether an SQN resynchronisation was already attempted for this UE — a
+    /// second synch failure aborts (TS 33.501: at most one resync per procedure,
+    /// so a persistent mismatch can't loop).
+    resync_attempted: bool,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
@@ -771,6 +775,7 @@ impl UeContext {
             allowed_nssai: None,
             requested_nssai: Vec::new(),
             dereg_attempts: None,
+            resync_attempted: false,
         }
     }
 }
@@ -915,6 +920,9 @@ async fn dispatch_uplink_nas(
         Some(Nas5gmmMessageType::AuthenticationResponse) => {
             let res_star = nas::res_star_from_authentication_response(&nas_msg)?.to_vec();
             complete_authentication(ues, amf_auth, amf_ue_id, &res_star).await
+        }
+        Some(Nas5gmmMessageType::AuthenticationFailure) => {
+            on_authentication_failure(ues, amf_auth, amf_ue_id, &nas_msg).await
         }
         Some(Nas5gmmMessageType::IdentityResponse) => {
             // The UE answers the Identity Request we sent from `on_initial_ue`
@@ -1188,6 +1196,71 @@ async fn dispatch_uplink_nas(
 
 /// Confirm the UE's RES* with the AUSF, derive the NAS security context, and return
 /// the protected Security Mode Command downlink.
+/// Handle a UE **Authentication Failure** (TS 24.501 §5.4.1.3.7). On a *synch
+/// failure* (#21) the AMF resynchronises the SQN once — re-running
+/// Nausf_UEAuthentication with the UE's AUTS (which flows AUSF→UDM→UDR/ARPF) and
+/// sending the UE the fresh challenge. A second synch failure, or any other
+/// cause, aborts the procedure (the UE context is dropped; the gNB releases it).
+async fn on_authentication_failure(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_auth: &auth::AmfAuth,
+    amf_ue_id: u64,
+    nas_msg: &Nas5gsMessage,
+) -> Option<(NGAP_PDU, &'static str)> {
+    let Some((cause, auts)) = nas::authentication_failure_info(nas_msg) else {
+        return None;
+    };
+    let ran_ue_id = ues.get(&amf_ue_id)?.ran_ue_id;
+
+    // Only a synch failure with an AUTS is recoverable, and only once.
+    let recoverable = cause == nas::GMM_CAUSE_SYNCH_FAILURE
+        && auts.is_some()
+        && !ues.get(&amf_ue_id)?.resync_attempted;
+    if !recoverable {
+        warn!("UE {amf_ue_id}: Authentication Failure (5GMM cause {cause:#x}) — aborting registration");
+        ues.remove(&amf_ue_id);
+        return Some((
+            ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::NORMAL_RELEASE),
+            "UEContextReleaseCommand",
+        ));
+    }
+
+    // Re-authenticate with the AUTS: the AUSF/UDM adopt the UE's SQN and mint a
+    // fresh challenge on the same AUSF the first attempt used.
+    let pending_supi = {
+        let ctx = ues.get(&amf_ue_id)?;
+        ctx.auth.clone().zip(ctx.suci.clone())
+    };
+    let Some((pending, supi)) = pending_supi else {
+        warn!("UE {amf_ue_id}: synch failure with no pending authentication — aborting");
+        ues.remove(&amf_ue_id);
+        return Some((
+            ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::NORMAL_RELEASE),
+            "UEContextReleaseCommand",
+        ));
+    };
+    info!("UE {amf_ue_id}: synch failure — resynchronising SQN and re-challenging");
+    match amf_auth.resync(&pending, &supi, &auts.unwrap()).await {
+        Ok((fresh, nas_req)) => {
+            let ctx = ues.get_mut(&amf_ue_id)?;
+            ctx.auth = Some(fresh);
+            ctx.resync_attempted = true;
+            Some((
+                ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, nas_req),
+                "DownlinkNASTransport (AuthenticationRequest, resync)",
+            ))
+        }
+        Err(e) => {
+            warn!("UE {amf_ue_id}: resynchronisation failed: {e} — aborting registration");
+            ues.remove(&amf_ue_id);
+            Some((
+                ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::NORMAL_RELEASE),
+                "UEContextReleaseCommand",
+            ))
+        }
+    }
+}
+
 async fn complete_authentication(
     ues: &mut HashMap<u64, UeContext>,
     amf_auth: &auth::AmfAuth,
@@ -2050,15 +2123,17 @@ mod tests {
     /// an AMF restart) falls back to the Identity Request.
     #[test]
     fn guti_reregistration_resolves_without_identity_request() {
-        let supi = "imsi-999700000000042";
-        GUTI_DIRECTORY.lock().unwrap().insert(0x4242, supi.to_string());
+        // A SUPI no other test touches (UE_DIRECTORY / GUTI_DIRECTORY are
+        // process-wide statics shared across parallel tests).
+        let supi = "imsi-999700000000052";
+        GUTI_DIRECTORY.lock().unwrap().insert(0x4252, supi.to_string());
 
         // Known GUTI → identified straight away, caps/NSSAI captured.
         let mut ues = HashMap::new();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let pdu = ngap::initial_ue_message_with_nas(
             8,
-            nas::registration_request_with_guti("999", "70", 0x4242, &[0x20, 0x20]),
+            nas::registration_request_with_guti("999", "70", 0x4252, &[0x20, 0x20]),
         );
         match on_initial_ue(&mut ues, as_initial_ue(&pdu), 500, &tx) {
             Some(InitialUeOutcome::Identified { supi: got, .. }) => assert_eq!(got, supi),
@@ -2088,7 +2163,7 @@ mod tests {
         assert_eq!(ctx.state, RegState::IdentityRequested);
         assert_eq!(ctx.replayed_ue_sec_cap, Some([0x20, 0x20]), "caps kept for the resume");
 
-        GUTI_DIRECTORY.lock().unwrap().remove(&0x4242);
+        GUTI_DIRECTORY.lock().unwrap().remove(&0x4252);
         UE_DIRECTORY.lock().unwrap().remove(supi);
     }
 
@@ -2138,6 +2213,61 @@ mod tests {
         );
 
         UE_DIRECTORY.lock().unwrap().remove(supi);
+    }
+
+    /// SQN resync: a UE whose USIM is ahead answers the challenge with an
+    /// Authentication Failure (#21) carrying an AUTS; the AMF re-runs
+    /// Nausf_UEAuthentication with it (AUSF→UDM→UDR/ARPF adopt the SQN) and the
+    /// **fresh** challenge authenticates end to end.
+    #[tokio::test]
+    async fn resync_recovers_from_a_synch_failure() {
+        let supi = "imsi-999700000000061";
+        let sub = test_subscriber();
+        let nrf_base = spin_auth_backend(supi, sub.clone()).await;
+        let amf_auth = auth::AmfAuth::new(nrf_base, "999", "70");
+
+        // First challenge; the UE's USIM is far ahead → it returns an AUTS for its
+        // own SQN instead of a RES*.
+        let (pending1, req1) = amf_auth.begin(supi).await.unwrap();
+        let (rand1, _autn1) = nas::parse_authentication_request(&req1).unwrap();
+        let sqn_ms = [0, 0, 0, 0, 0xFF, 0x00];
+        let auts = aka::compute_auts(&sub, &rand1, &sqn_ms);
+        let failure = nas::decode_nas_5gs_message(&nas::authentication_failure_synch(&auts)).unwrap();
+        let (cause, got_auts) = nas::authentication_failure_info(&failure).unwrap();
+        assert_eq!(cause, nas::GMM_CAUSE_SYNCH_FAILURE);
+        assert_eq!(got_auts.as_deref(), Some(&auts[..]));
+
+        // Resync → a fresh challenge on the adopted SQN.
+        let (pending2, req2) = amf_auth.resync(&pending1, supi, &auts).await.unwrap();
+        let (rand2, autn2) = nas::parse_authentication_request(&req2).unwrap();
+        assert_ne!(rand2, rand1, "a new challenge was issued");
+
+        // The UE accepts the fresh AUTN (its SQN is now in range) and RES* confirms.
+        let res_star = aka::ue_compute_res_star(&sub, &rand2, &autn2, "999", "70")
+            .expect("resync'd AUTN verifies at the UE");
+        let outcome = amf_auth.finish(&pending2, &res_star).await.unwrap();
+        assert!(outcome.success, "authentication succeeds after resync");
+        assert_eq!(outcome.supi.as_deref(), Some(supi));
+    }
+
+    /// A second synch failure is not retried (at most one resync per procedure):
+    /// the registration aborts — the UE context is dropped and the gNB is told to
+    /// release it. No network needed (the abort path never re-authenticates).
+    #[tokio::test]
+    async fn repeated_synch_failure_aborts() {
+        let amf_auth = auth::AmfAuth::new("http://127.0.0.1:1", "999", "70");
+        let mut ues = HashMap::new();
+        let mut ctx = UeContext::new(88, RegState::Authenticating, Some("imsi-x".into()));
+        ctx.resync_attempted = true; // a resync already happened for this UE
+        ues.insert(700u64, ctx);
+
+        let failure =
+            nas::decode_nas_5gs_message(&nas::authentication_failure_synch(&[0u8; 14])).unwrap();
+        let (_, label) = on_authentication_failure(&mut ues, &amf_auth, 700, &failure)
+            .await
+            .expect("a release command");
+        assert_eq!(label, "UEContextReleaseCommand");
+        assert!(!ues.contains_key(&700), "context dropped on abort");
     }
 
     /// The payoff: authenticate, then complete registration with NAS security —
