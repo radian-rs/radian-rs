@@ -48,6 +48,9 @@ const DEFAULT_DNN: &str = "internet";
 /// T3396 back-off sent with a subscription-refused PDU session reject (cause #27):
 /// retrying can't succeed until provisioning changes, so hold the UE off.
 const REJECT_BACKOFF_SECS: u32 = 600;
+/// T3346 back-off sent with a #62 Registration Reject: re-registering can't
+/// succeed until the slice subscription changes.
+const REG_REJECT_BACKOFF_SECS: u32 = 600;
 /// NRF the AMF uses to discover the AUSF.
 const NRF_BASE: &str = "http://127.0.0.1:8000";
 
@@ -624,8 +627,11 @@ async fn on_security_mode_complete(
         let Some(sec) = ctx.sec.as_mut() else {
             return Vec::new();
         };
-        let reject =
-            nas::registration_reject(nas::mm_cause::NO_NETWORK_SLICES_AVAILABLE, &rejected);
+        let reject = nas::registration_reject(
+            nas::mm_cause::NO_NETWORK_SLICES_AVAILABLE,
+            &rejected,
+            Some(nas::GprsTimer2::from_secs(REG_REJECT_BACKOFF_SECS)),
+        );
         let bytes = sec.protect(&reject, nas::sht::INTEGRITY_CIPHERED, 1);
         warn!(
             "UE {amf_ue_id}: no requested slice is subscribed ({rejected:?}); sending \
@@ -912,7 +918,8 @@ mod tests {
             nas::parse_registration_reject(&msg),
             Some((
                 nas::mm_cause::NO_NETWORK_SLICES_AVAILABLE,
-                vec![((9, None), nas::nssai_cause::NOT_AVAILABLE_IN_PLMN)]
+                vec![((9, None), nas::nssai_cause::NOT_AVAILABLE_IN_PLMN)],
+                Some(nas::GprsTimer2::from_secs(REG_REJECT_BACKOFF_SECS).octet()),
             ))
         );
     }
