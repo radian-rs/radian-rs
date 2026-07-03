@@ -3,7 +3,9 @@
 //! Terminates N2 (NGAP/SCTP, TS 38.413) and drives a UE through a complete
 //! registration, joining the N2 (binary) and SBI (JSON) planes:
 //!
-//! 1. `InitialUEMessage` → identify from the RegistrationRequest SUCI (or ask).
+//! 1. `InitialUEMessage` → identify from the RegistrationRequest SUCI, resolve a
+//!    5G-GUTI re-registration against the GUTI directory, or ask (Identity
+//!    Request → Identity Response).
 //! 2. Discover the AUSF via NRF, run `Nausf` 5G-AKA, send a NAS Authentication
 //!    Request; on the Authentication Response, confirm RES* → K_SEAF.
 //! 3. Derive K_AMF + NAS keys, send an integrity-protected **Security Mode Command**;
@@ -173,6 +175,15 @@ fn spawn_uecm_purge(supi: String) {
 static UE_DIRECTORY: LazyLock<Mutex<HashMap<String, (u64, UnboundedSender<UeCmd>)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Assigned 5G-GUTIs: 5G-TMSI → SUPI. A returning UE registers with the GUTI its
+/// last Registration Accept assigned (TS 24.501 §5.5.1.2 — the SUCI is only for
+/// first contact); the AMF resolves it here and **re-authenticates**. Entries
+/// survive UE-initiated deregistration (the UE keeps its GUTI in the USIM) and
+/// are dropped when a fresh GUTI supersedes them or the subscription is
+/// withdrawn.
+static GUTI_DIRECTORY: LazyLock<Mutex<HashMap<u32, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Arm T3522: after `secs`, post an expiry for this UE onto its association.
 fn arm_t3522(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64, secs: u64) {
     let tx = tx.clone();
@@ -222,6 +233,7 @@ struct UeContext {
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
+#[derive(Debug)]
 enum InitialUeOutcome {
     NeedIdentity(NGAP_PDU),
     Identified { ran_ue_id: u32, supi: String },
@@ -568,6 +580,8 @@ fn on_t3522_expiry(
          aborting deregistration and releasing the contexts"
     );
     if let Some(supi) = ctx.suci.clone() {
+        // The subscription is gone — its GUTI must not resolve again.
+        GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
         spawn_uecm_purge(supi);
     }
     ues.remove(&amf_ue_id);
@@ -614,7 +628,7 @@ async fn handle_ngap(
                 }
             }
             InitiatingMessageValue::Id_UplinkNASTransport(msg) => {
-                for (dl, label) in on_uplink_nas(ues, amf_auth, amf_smf, msg).await {
+                for (dl, label) in on_uplink_nas(ues, amf_auth, amf_smf, msg, dereg_tx).await {
                     send_or_log(conn, &dl, label).await;
                 }
             }
@@ -697,8 +711,31 @@ fn on_initial_ue(
         .and_then(|b| nas::decode_nas_5gs_message(b).ok())
         .and_then(registration_identity);
 
-    match identity {
-        Some((supi, ue_sec_cap, requested_nssai)) => {
+    // Resolve the identity to a SUPI: directly from a SUCI, or via the GUTI
+    // directory for a returning UE (which is then re-authenticated like any
+    // other — fresh 5G-AKA + NAS security). An unknown GUTI (e.g. an AMF
+    // restart lost the mapping) falls back to an Identity Request for the SUCI.
+    let (resolved, ue_sec_cap, requested_nssai) = match identity {
+        Some((RegIdentity::Supi(supi), cap, nssai)) => (Some(supi), cap, nssai),
+        Some((RegIdentity::GutiTmsi(tmsi), cap, nssai)) => {
+            let hit = GUTI_DIRECTORY.lock().unwrap().get(&tmsi).cloned();
+            match &hit {
+                Some(supi) => info!(
+                    "UE {amf_ue_id}: 5G-GUTI re-registration (tmsi {tmsi:#010x}) resolved to \
+                     {supi}; re-authenticating"
+                ),
+                None => info!(
+                    "UE {amf_ue_id}: unknown 5G-GUTI (tmsi {tmsi:#010x}) — asking for the SUCI"
+                ),
+            }
+            (hit, cap, nssai)
+        }
+        Some((RegIdentity::Unknown, cap, nssai)) => (None, cap, nssai),
+        None => (None, None, Vec::new()),
+    };
+
+    match resolved {
+        Some(supi) => {
             let mut ctx = UeContext::new(ran_ue_id, RegState::Identified, Some(supi.clone()));
             ctx.replayed_ue_sec_cap = ue_sec_cap;
             ctx.requested_nssai = requested_nssai;
@@ -708,7 +745,12 @@ fn on_initial_ue(
             Some(InitialUeOutcome::Identified { ran_ue_id, supi })
         }
         None => {
-            ues.insert(amf_ue_id, UeContext::new(ran_ue_id, RegState::IdentityRequested, None));
+            // Keep whatever the request carried: when the Identity Response
+            // resolves the SUPI, the security caps + requested NSSAI still apply.
+            let mut ctx = UeContext::new(ran_ue_id, RegState::IdentityRequested, None);
+            ctx.replayed_ue_sec_cap = ue_sec_cap;
+            ctx.requested_nssai = requested_nssai;
+            ues.insert(amf_ue_id, ctx);
             let dl = ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, nas::identity_request_suci());
             Some(InitialUeOutcome::NeedIdentity(dl))
         }
@@ -763,6 +805,7 @@ async fn on_uplink_nas(
     amf_auth: &auth::AmfAuth,
     amf_smf: &pdu_session::AmfSmf,
     msg: &UplinkNASTransport,
+    dereg_tx: &UnboundedSender<UeCmd>,
 ) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(amf_ue_id) = uplink_amf_ue_id(msg) else {
         warn!("UplinkNASTransport without AMF-UE-NGAP-ID");
@@ -803,7 +846,10 @@ async fn on_uplink_nas(
         }
         _ => {}
     }
-    dispatch_uplink_nas(ues, amf_auth, amf_smf, amf_ue_id, nas_msg).await.into_iter().collect()
+    dispatch_uplink_nas(ues, amf_auth, amf_smf, amf_ue_id, nas_msg, dereg_tx)
+        .await
+        .into_iter()
+        .collect()
 }
 
 /// UE-initiated deregistration (TS 24.501 §5.5.2.2): release the PDU session at
@@ -863,11 +909,48 @@ async fn dispatch_uplink_nas(
     amf_smf: &pdu_session::AmfSmf,
     amf_ue_id: u64,
     nas_msg: Nas5gsMessage,
+    dereg_tx: &UnboundedSender<UeCmd>,
 ) -> Option<(NGAP_PDU, &'static str)> {
     match nas::gmm_message_type(&nas_msg) {
         Some(Nas5gmmMessageType::AuthenticationResponse) => {
             let res_star = nas::res_star_from_authentication_response(&nas_msg)?.to_vec();
             complete_authentication(ues, amf_auth, amf_ue_id, &res_star).await
+        }
+        Some(Nas5gmmMessageType::IdentityResponse) => {
+            // The UE answers the Identity Request we sent from `on_initial_ue`
+            // (unresolvable mobile identity, e.g. an unknown GUTI): resolve the
+            // SUPI and resume the paused registration at authentication.
+            let (state, ran_ue_id) = {
+                let ctx = ues.get(&amf_ue_id)?;
+                (ctx.state, ctx.ran_ue_id)
+            };
+            if state != RegState::IdentityRequested {
+                warn!("UE {amf_ue_id}: unexpected Identity Response in state {state:?}");
+                return None;
+            }
+            let Some(supi) = nas::supi_from_identity_response(&nas_msg) else {
+                warn!("UE {amf_ue_id}: Identity Response without a usable SUCI");
+                return None;
+            };
+            info!("UE {amf_ue_id} identified via Identity Response ({supi}); starting authentication");
+            match amf_auth.begin(&supi).await {
+                Ok((pending, nas_req)) => {
+                    let ctx = ues.get_mut(&amf_ue_id)?;
+                    ctx.suci = Some(supi.clone());
+                    ctx.auth = Some(pending);
+                    ctx.state = RegState::Authenticating;
+                    // Reachable from the SBI callback surface from now on.
+                    UE_DIRECTORY.lock().unwrap().insert(supi, (amf_ue_id, dereg_tx.clone()));
+                    Some((
+                        ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, nas_req),
+                        "DownlinkNASTransport (AuthenticationRequest)",
+                    ))
+                }
+                Err(e) => {
+                    warn!("UE {amf_ue_id}: authentication start failed: {e}");
+                    None
+                }
+            }
         }
         Some(Nas5gmmMessageType::DeregistrationAcceptToUe) => {
             let ctx = ues.get(&amf_ue_id)?;
@@ -879,6 +962,8 @@ async fn dispatch_uplink_nas(
             info!("UE {amf_ue_id}: Deregistration Accept — network-initiated deregistration complete");
             if let Some(supi) = ctx.suci.clone() {
                 UE_DIRECTORY.lock().unwrap().remove(&supi);
+                // The subscription is gone — its GUTI must not resolve again.
+                GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
                 spawn_uecm_purge(supi);
             }
             ues.remove(&amf_ue_id);
@@ -1239,6 +1324,13 @@ async fn on_security_mode_complete(
     let Some(sec) = ctx.sec.as_mut() else {
         return Vec::new();
     };
+    // Record the assigned 5G-GUTI so a returning UE can re-register with it; a
+    // fresh GUTI supersedes any earlier one held by the same SUPI.
+    if let Some(supi) = &supi {
+        let mut gutis = GUTI_DIRECTORY.lock().unwrap();
+        gutis.retain(|_, s| s != supi);
+        gutis.insert(tmsi, supi.clone());
+    }
     let accept = nas::registration_accept(PLMN_MCC, PLMN_MNC, tmsi, &allowed, &rejected);
     let bytes = sec.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1);
     info!(
@@ -1347,22 +1439,40 @@ async fn discover_nf(nrf_base: &str, nf_type: &str) -> Result<String, String> {
     Ok(format!("http://{ip}:{port}"))
 }
 
-/// From a decoded NAS RegistrationRequest, extract the identity the AMF needs: the
-/// **SUPI** (deconcealed from the SUCI, TS 33.501) and the UE's advertised 5GS security
-/// capabilities `[EA, IA]` (to replay in the Security Mode Command).
+/// How a Registration Request's mobile identity identifies the UE.
+enum RegIdentity {
+    /// A SUCI, deconcealed to the SUPI (null scheme, TS 33.501).
+    Supi(String),
+    /// A 5G-GUTI — the 5G-TMSI to resolve against [`GUTI_DIRECTORY`].
+    GutiTmsi(u32),
+    /// Another/unusable identity type — ask for the SUCI.
+    Unknown,
+}
+
+/// From a decoded NAS RegistrationRequest, extract the identity the AMF needs
+/// (SUCI→SUPI, or the 5G-GUTI's TMSI) plus the UE's advertised 5GS security
+/// capabilities `[EA, IA]` (to replay in the Security Mode Command) and its
+/// requested NSSAI — the latter two are captured even when the identity still
+/// needs resolving. `None` if the message is not a RegistrationRequest.
 fn registration_identity(
     msg: Nas5gsMessage,
-) -> Option<(String, Option<[u8; 2]>, Vec<(u8, Option<[u8; 3]>)>)> {
+) -> Option<(RegIdentity, Option<[u8; 2]>, Vec<(u8, Option<[u8; 3]>)>)> {
     let requested_nssai = nas::requested_nssai_from_registration_request(&msg);
     let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationRequest(reg)) = msg else {
         return None;
     };
-    let supi = reg.fgs_mobile_identity.as_suci().map(|s| nas::suci_to_supi(&s))?;
+    let identity = if let Some(suci) = reg.fgs_mobile_identity.as_suci() {
+        RegIdentity::Supi(nas::suci_to_supi(&suci))
+    } else if let Some(guti) = reg.fgs_mobile_identity.as_guti() {
+        RegIdentity::GutiTmsi(guti.tmsi)
+    } else {
+        RegIdentity::Unknown
+    };
     let ue_sec_cap = reg
         .ue_security_capability
         .as_ref()
         .map(|c| [c.ea_byte(), c.ia_byte()]);
-    Some((supi, ue_sec_cap, requested_nssai))
+    Some((identity, ue_sec_cap, requested_nssai))
 }
 
 fn initial_ue_nas_pdu(msg: &InitialUEMessage) -> Option<&[u8]> {
@@ -1674,10 +1784,16 @@ mod tests {
 
         // The UE's Deregistration Accept completes the procedure.
         let amf_auth = auth::AmfAuth::new("http://127.0.0.1:1", "999", "70");
-        let done =
-            dispatch_uplink_nas(&mut ues, &amf_auth, &amf_smf, 42, nas::deregistration_accept_to_ue())
-                .await
-                .expect("a release to send");
+        let done = dispatch_uplink_nas(
+            &mut ues,
+            &amf_auth,
+            &amf_smf,
+            42,
+            nas::deregistration_accept_to_ue(),
+            &tx,
+        )
+        .await
+        .expect("a release to send");
         assert_eq!(done.1, "UEContextReleaseCommand");
         assert_eq!(
             ngap::parse_ue_context_release_command(&done.0),
@@ -1884,17 +2000,11 @@ mod tests {
         assert!(!ues.contains_key(&999));
     }
 
-    /// The payoff: authenticate, then complete registration with NAS security —
-    /// SMC ⇄ SMC Complete, Registration Accept ⇄ Registration Complete.
-    #[tokio::test]
-    async fn full_registration_completes() {
+    /// Spin an NRF + UDR (with `supi` provisioned) + UDM + AUSF (NRF-registered)
+    /// — the backend a real authentication run needs. Returns the NRF base URL.
+    async fn spin_auth_backend(supi: &str, sub: aka::SubscriberKey) -> String {
         use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService, NrfClient, NrfStore};
 
-        let supi = "imsi-999700000000001";
-        let sub = test_subscriber();
-
-        // Spin NRF, UDR (with the subscriber), UDM (fronting the UDR), and AUSF
-        // (pointed at the UDM).
         let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let nrf_addr = nrf_l.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1902,7 +2012,7 @@ mod tests {
         });
 
         let udr_store = std::sync::Arc::new(subscriber_db::InMemoryStore::new());
-        udr_store.provision(supi, sub.clone());
+        udr_store.provision(supi, sub);
         let udr_store: std::sync::Arc<dyn subscriber_db::SubscriberStore> = udr_store;
         let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udr_addr = udr_l.local_addr().unwrap();
@@ -1931,9 +2041,115 @@ mod tests {
             }],
         }]);
         NrfClient::new(format!("http://{nrf_addr}")).register(&profile).await.unwrap();
+        format!("http://{nrf_addr}")
+    }
+
+    /// A returning UE registers with the 5G-GUTI a previous Registration Accept
+    /// assigned: the AMF resolves it from the GUTI directory — no Identity
+    /// Request round trip — and re-authenticates. An unknown GUTI (e.g. lost on
+    /// an AMF restart) falls back to the Identity Request.
+    #[test]
+    fn guti_reregistration_resolves_without_identity_request() {
+        let supi = "imsi-999700000000042";
+        GUTI_DIRECTORY.lock().unwrap().insert(0x4242, supi.to_string());
+
+        // Known GUTI → identified straight away, caps/NSSAI captured.
+        let mut ues = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let pdu = ngap::initial_ue_message_with_nas(
+            8,
+            nas::registration_request_with_guti("999", "70", 0x4242, &[0x20, 0x20]),
+        );
+        match on_initial_ue(&mut ues, as_initial_ue(&pdu), 500, &tx) {
+            Some(InitialUeOutcome::Identified { supi: got, .. }) => assert_eq!(got, supi),
+            other => panic!("expected Identified, got {other:?}"),
+        }
+        let ctx = ues.get(&500).unwrap();
+        assert_eq!(ctx.state, RegState::Identified);
+        assert_eq!(ctx.replayed_ue_sec_cap, Some([0x20, 0x20]));
+        assert!(UE_DIRECTORY.lock().unwrap().contains_key(supi));
+
+        // Unknown GUTI → Identity Request, with the caps kept for the resume.
+        let pdu = ngap::initial_ue_message_with_nas(
+            9,
+            nas::registration_request_with_guti("999", "70", 0xDEAD_BEEF, &[0x20, 0x20]),
+        );
+        match on_initial_ue(&mut ues, as_initial_ue(&pdu), 501, &tx) {
+            Some(InitialUeOutcome::NeedIdentity(dl)) => {
+                let req = nas::decode_nas_5gs_message(&downlink_nas_pdu(&dl).unwrap()).unwrap();
+                assert_eq!(
+                    nas::gmm_message_type(&req),
+                    Some(nas::Nas5gmmMessageType::IdentityRequest)
+                );
+            }
+            other => panic!("expected NeedIdentity, got {other:?}"),
+        }
+        let ctx = ues.get(&501).unwrap();
+        assert_eq!(ctx.state, RegState::IdentityRequested);
+        assert_eq!(ctx.replayed_ue_sec_cap, Some([0x20, 0x20]), "caps kept for the resume");
+
+        GUTI_DIRECTORY.lock().unwrap().remove(&0x4242);
+        UE_DIRECTORY.lock().unwrap().remove(supi);
+    }
+
+    /// The Identity Response resumes a paused registration: the AMF deconceals
+    /// the SUCI and answers with the Authentication Request (previously the
+    /// response was silently dropped — a dead end).
+    #[tokio::test]
+    async fn identity_response_resumes_registration_at_authentication() {
+        // A SUPI no other test touches: UE_DIRECTORY / GUTI_DIRECTORY are
+        // process-wide statics shared across parallel tests.
+        let supi = "imsi-999700000000031";
+        let nrf_base = spin_auth_backend(supi, test_subscriber()).await;
+        let amf_auth = auth::AmfAuth::new(nrf_base, "999", "70");
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70"); // unused
+
+        // A UE parked on the Identity Request (e.g. after an unknown GUTI).
+        let mut ues = HashMap::new();
+        ues.insert(600u64, UeContext::new(77, RegState::IdentityRequested, None));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let resp =
+            nas::decode_nas_5gs_message(&nas::identity_response_suci("999", "70", "0000000031"))
+                .unwrap();
+        let (dl, label) = dispatch_uplink_nas(&mut ues, &amf_auth, &amf_smf, 600, resp, &tx)
+            .await
+            .expect("a downlink to send");
+        assert_eq!(label, "DownlinkNASTransport (AuthenticationRequest)");
+        let auth_req = nas::decode_nas_5gs_message(&downlink_nas_pdu(&dl).unwrap()).unwrap();
+        assert!(nas::parse_authentication_request(&downlink_nas_pdu(&dl).unwrap()).is_some());
+        assert_eq!(
+            nas::gmm_message_type(&auth_req),
+            Some(nas::Nas5gmmMessageType::AuthenticationRequest)
+        );
+        let ctx = ues.get(&600).unwrap();
+        assert_eq!(ctx.state, RegState::Authenticating);
+        assert_eq!(ctx.suci.as_deref(), Some(supi));
+        assert!(ctx.auth.is_some(), "pending AKA challenge stored");
+        assert!(UE_DIRECTORY.lock().unwrap().contains_key(supi));
+
+        // An Identity Response outside the IdentityRequested state is refused.
+        let resp =
+            nas::decode_nas_5gs_message(&nas::identity_response_suci("999", "70", "0000000031"))
+                .unwrap();
+        assert!(
+            dispatch_uplink_nas(&mut ues, &amf_auth, &amf_smf, 600, resp, &tx).await.is_none(),
+            "unexpected Identity Response ignored"
+        );
+
+        UE_DIRECTORY.lock().unwrap().remove(supi);
+    }
+
+    /// The payoff: authenticate, then complete registration with NAS security —
+    /// SMC ⇄ SMC Complete, Registration Accept ⇄ Registration Complete.
+    #[tokio::test]
+    async fn full_registration_completes() {
+        let supi = "imsi-999700000000001";
+        let sub = test_subscriber();
+        let nrf_base = spin_auth_backend(supi, sub.clone()).await;
 
         // ── Authentication ──
-        let amf_auth = auth::AmfAuth::new(format!("http://{nrf_addr}"), "999", "70");
+        let amf_auth = auth::AmfAuth::new(nrf_base, "999", "70");
         let (pending, nas_req) = amf_auth.begin(supi).await.unwrap();
         let (rand, autn) = nas::parse_authentication_request(&nas_req).unwrap();
         let res_star = aka::ue_compute_res_star(&sub, &rand, &autn, "999", "70").unwrap();
