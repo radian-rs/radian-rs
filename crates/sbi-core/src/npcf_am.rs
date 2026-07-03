@@ -5,8 +5,10 @@
 //! Priority) and a policy **UE-AMBR** the AMF enforces at the gNB. Deleted at
 //! deregistration.
 //!
-//! Policy source is a local [`AmPolicyConfig`] (per-subscriber UDR am-policy-data
-//! sourcing is a follow-up, mirroring the SM side's Nudr wiring).
+//! Policy is sourced per-subscriber from the UDR (Nudr am-policy-data) when a UDR
+//! client is configured ([`AmPcfState::with_udr`]), falling back to a local
+//! [`AmPolicyConfig`]. An `Npcf_AMPolicyControl_UpdateNotify` trigger re-evaluates
+//! an association and pushes a changed policy to the AMF.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,7 +24,7 @@ use crate::nudr::UdrClient;
 use crate::SbiError;
 
 /// An aggregate maximum bit rate (TS 29.571 `Ambr`) — bitrate strings like "1 Gbps".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Ambr {
     pub uplink: String,
@@ -37,10 +39,14 @@ pub struct PolicyAssociationRequest {
     pub supi: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serving_plmn: Option<String>,
+    /// The AMF's callback URI for `Npcf_AMPolicyControl_UpdateNotify` — where the
+    /// PCF pushes a mid-registration AM policy change (TS 29.507 §5.6.2.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_uri: Option<String>,
 }
 
 /// `PolicyAssociation` (TS 29.507 §5.6.2.4) — the AM policy the PCF returns.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyAssociation {
     /// RAT/Frequency Selection Priority index (TS 23.501 §5.3.4.3) — RAN steering.
@@ -91,7 +97,9 @@ pub struct AmPcfState {
     /// UDR client — the authoritative source (Nudr am-policy-data). `None` ⇒ local
     /// config only.
     udr: Option<Arc<UdrClient>>,
-    associations: Arc<Mutex<HashMap<String, PolicyAssociationRequest>>>,
+    /// association id → (creating request, current decision). The decision lets an
+    /// Update re-evaluate and notify the AMF only when the policy actually changed.
+    associations: Arc<Mutex<HashMap<String, (PolicyAssociationRequest, PolicyAssociation)>>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -134,10 +142,12 @@ impl AmPcfState {
     }
 }
 
-/// The Npcf_AMPolicyControl router (create / delete). Merge with the SM router.
+/// The Npcf_AMPolicyControl router (create / update / delete). Merge with the SM
+/// router.
 pub fn router(state: AmPcfState) -> Router {
     Router::new()
         .route("/npcf-am-policy-control/v1/policies", post(create))
+        .route("/npcf-am-policy-control/v1/policies/{id}/update", post(update))
         .route("/npcf-am-policy-control/v1/policies/{id}/delete", post(delete))
         .with_state(state)
 }
@@ -151,9 +161,36 @@ async fn create(
     let id = pcf.next_id.fetch_add(1, Ordering::Relaxed).to_string();
     let decision = pcf.decide_for(&req.supi).await;
     tracing::info!(supi = %req.supi, assoc = %id, rfsp = ?decision.rfsp, "created AM policy association");
-    pcf.associations.lock().unwrap().insert(id.clone(), req);
+    pcf.associations.lock().unwrap().insert(id.clone(), (req, decision.clone()));
     let location = format!("/npcf-am-policy-control/v1/policies/{id}");
     (StatusCode::CREATED, [(axum::http::header::LOCATION, location)], Json(decision))
+}
+
+/// Re-evaluate an association against the *current* AM policy (re-reading the UDR)
+/// and, when it changed, push **`Npcf_AMPolicyControl_UpdateNotify`** to the AMF's
+/// notification URI. A trigger for a mid-registration AM policy change (an OAM /
+/// operator edit of the subscriber's UDR am-policy-data). Returns the fresh policy
+/// (`200`), `204` when unchanged, `404` for an unknown association.
+async fn update(State(pcf): State<AmPcfState>, Path(id): Path<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some((req, prev)) = pcf.associations.lock().unwrap().get(&id).cloned() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let fresh = pcf.decide_for(&req.supi).await;
+    if fresh == prev {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    // Store the new decision (skip if the association was deleted meanwhile).
+    if let Some(entry) = pcf.associations.lock().unwrap().get_mut(&id) {
+        entry.1 = fresh.clone();
+    }
+    if let Some(uri) = &req.notification_uri {
+        tracing::info!(supi = %req.supi, assoc = %id, "AM policy changed — notifying the AMF (UpdateNotify)");
+        if let Err(e) = crate::sbi_client().post(uri).json(&fresh).send().await {
+            tracing::warn!("Npcf_AMPolicyControl_UpdateNotify failed: {e}");
+        }
+    }
+    (StatusCode::OK, Json(fresh)).into_response()
 }
 
 /// `Npcf_AMPolicyControl_Delete`.
@@ -203,6 +240,21 @@ impl AmPolicyClient {
         Ok(AmPolicyCreated { assoc_id, policy })
     }
 
+    /// Trigger a re-evaluation of an association (OAM): the PCF re-reads the UDR and
+    /// pushes `Npcf_AMPolicyControl_UpdateNotify` to the AMF if the policy changed.
+    /// Returns the fresh policy (`Some`) when it changed, `None` when unchanged.
+    pub async fn update(&self, assoc_id: &str) -> Result<Option<PolicyAssociation>, SbiError> {
+        let resp = self
+            .http
+            .post(format!("{}/npcf-am-policy-control/v1/policies/{assoc_id}/update", self.base))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
     /// Delete an AM policy association (best-effort at deregistration).
     pub async fn delete(&self, assoc_id: &str) -> Result<(), SbiError> {
         self.http
@@ -233,7 +285,7 @@ mod tests {
         let created = client
             .create(&PolicyAssociationRequest {
                 supi: "imsi-999700000000001".into(),
-                serving_plmn: Some("99970".into()),
+                serving_plmn: Some("99970".into()), notification_uri: None,
             })
             .await
             .expect("create AM policy");
@@ -277,7 +329,7 @@ mod tests {
 
         // The provisioned subscriber gets the UDR policy.
         let got = client
-            .create(&PolicyAssociationRequest { supi: "imsi-1".into(), serving_plmn: None })
+            .create(&PolicyAssociationRequest { supi: "imsi-1".into(), serving_plmn: None, notification_uri: None })
             .await
             .unwrap();
         assert_eq!(got.policy.rfsp, Some(7));
@@ -285,9 +337,82 @@ mod tests {
 
         // An unprovisioned subscriber falls back to the local demo (RFSP 3).
         let fallback = client
-            .create(&PolicyAssociationRequest { supi: "imsi-unknown".into(), serving_plmn: None })
+            .create(&PolicyAssociationRequest { supi: "imsi-unknown".into(), serving_plmn: None, notification_uri: None })
             .await
             .unwrap();
         assert_eq!(fallback.policy.rfsp, Some(3));
+    }
+
+    /// Npcf_AMPolicyControl_UpdateNotify: after the subscriber's UDR am-policy-data
+    /// changes, an Update trigger re-evaluates and pushes the new policy to the AMF's
+    /// notification URI; an unchanged Update notifies nothing.
+    #[tokio::test]
+    async fn update_notifies_the_amf_on_a_policy_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        use subscriber_db::SubscriberStore;
+
+        // Mock AMF notification surface recording the pushed policies.
+        static NOTIFS: AtomicUsize = AtomicUsize::new(0);
+        let last: Arc<Mutex<Option<PolicyAssociation>>> = Arc::new(Mutex::new(None));
+        let last_h = last.clone();
+        let amf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let amf_addr = amf_l.local_addr().unwrap();
+        let amf = axum::Router::new().route(
+            "/npcf-am-policy-notify/{supi}",
+            post(move |axum::Json(p): axum::Json<PolicyAssociation>| {
+                let last = last_h.clone();
+                async move {
+                    NOTIFS.fetch_add(1, O::Relaxed);
+                    *last.lock().unwrap() = Some(p);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        tokio::spawn(async move { crate::run_on(amf_l, amf).await.unwrap() });
+
+        // UDR + PCF, with a subscriber provisioned (RFSP 4).
+        let store: Arc<dyn SubscriberStore> = Arc::new(subscriber_db::InMemoryStore::new());
+        let store2 = store.clone();
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udr_l, crate::nudr::router(store2)).await.unwrap() });
+        let udr = Arc::new(UdrClient::new(format!("http://{udr_addr}")));
+        udr.put_am_policy_data("imsi-1", &serde_json::json!({ "rfsp": 4 })).await.unwrap();
+
+        let state = AmPcfState::new(AmPolicyConfig::demo()).with_udr(udr.clone());
+        let pcf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pcf_addr = pcf_l.local_addr().unwrap();
+        let served = state.clone();
+        tokio::spawn(async move { crate::run_on(pcf_l, router(served)).await.unwrap() });
+        let client = AmPolicyClient::new(format!("http://{pcf_addr}"));
+
+        // Create with the AMF notification URI.
+        let created = client
+            .create(&PolicyAssociationRequest {
+                supi: "imsi-1".into(),
+                serving_plmn: None,
+                notification_uri: Some(format!("http://{amf_addr}/npcf-am-policy-notify/imsi-1")),
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.policy.rfsp, Some(4));
+
+        // Update with no change → 204, no notify.
+        assert!(client.update(&created.assoc_id).await.unwrap().is_none());
+        assert_eq!(NOTIFS.load(O::Relaxed), 0);
+
+        // The operator edits the UDR am-policy-data, then triggers the Update.
+        udr.put_am_policy_data("imsi-1", &serde_json::json!({ "rfsp": 8 })).await.unwrap();
+        let fresh = client.update(&created.assoc_id).await.unwrap().expect("policy changed");
+        assert_eq!(fresh.rfsp, Some(8));
+        // The AMF was notified with the new policy.
+        for _ in 0..50 {
+            if NOTIFS.load(O::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(NOTIFS.load(O::Relaxed), 1, "AMF notified once on the change");
+        assert_eq!(last.lock().unwrap().as_ref().unwrap().rfsp, Some(8));
     }
 }

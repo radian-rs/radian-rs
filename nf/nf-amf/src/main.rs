@@ -135,6 +135,9 @@ enum UeCmd {
     /// Page a CM-IDLE UE by 5G-TMSI (downlink data arrived — the SMF asked the AMF
     /// to page). Broadcast to every gNB association; each sends an NGAP Paging.
     Page(u32),
+    /// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify):
+    /// the new UE-AMBR `(downlink, uplink)` bits/sec for this UE.
+    UpdateAmPolicy { amf_ue_id: u64, ue_ambr: (u64, u64) },
 }
 
 /// A network-initiated PDU-session modification for one UE — the parsed QoS the
@@ -421,6 +424,9 @@ async fn serve_gnb(
                     }
                     UeCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, T3522_SECS),
                     UeCmd::ModifyPolicy(m) => on_network_modification(&mut ues, &m),
+                    UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr } => {
+                        on_am_policy_update(&mut ues, amf_ue_id, ue_ambr)
+                    }
                     // Page a CM-IDLE UE on this gNB (non-UE-associated NGAP Paging).
                     UeCmd::Page(tmsi) => {
                         info!("paging CM-IDLE UE (5G-TMSI {tmsi:#010x}) on this gNB");
@@ -543,6 +549,34 @@ fn namf_callback_router() -> axum::Router {
         axum::http::StatusCode::ACCEPTED
     }
 
+    /// `Npcf_AMPolicyControl_UpdateNotify` (TS 29.507) — the PCF pushes a changed
+    /// AM policy for a UE. The AMF applies the new UE-AMBR and runs the UE
+    /// Configuration Update procedure. `204` if delivered; `404` if the UE isn't
+    /// reachable over N2.
+    async fn am_policy_notify(
+        axum::extract::Path(supi): axum::extract::Path<String>,
+        axum::Json(policy): axum::Json<sbi_core::npcf_am::PolicyAssociation>,
+    ) -> axum::http::StatusCode {
+        // Only the UE-AMBR is applied (RFSP/service-area application is deferred).
+        let Some(ambr) = policy.ue_ambr.as_ref() else {
+            return axum::http::StatusCode::NO_CONTENT; // nothing actionable
+        };
+        let (Some(dl), Some(ul)) =
+            (pdu_session::bitrate_to_bps(&ambr.downlink), pdu_session::bitrate_to_bps(&ambr.uplink))
+        else {
+            return axum::http::StatusCode::BAD_REQUEST;
+        };
+        match UE_DIRECTORY.lock().unwrap().get(&supi).cloned() {
+            Some((amf_ue_id, tx))
+                if tx.send(UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr: (dl, ul) }).is_ok() =>
+            {
+                info!(%supi, "AM policy update (UpdateNotify) delivered to the association");
+                axum::http::StatusCode::NO_CONTENT
+            }
+            _ => axum::http::StatusCode::NOT_FOUND,
+        }
+    }
+
     axum::Router::new()
         .route("/namf-callback/v1/{supi}/dereg-notify", axum::routing::post(dereg_notify))
         .route(
@@ -552,6 +586,10 @@ fn namf_callback_router() -> axum::Router {
         .route(
             "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages",
             axum::routing::post(page_ue),
+        )
+        .route(
+            "/npcf-callback/v1/am-policy-notify/{supi}",
+            axum::routing::post(am_policy_notify),
         )
 }
 
@@ -633,6 +671,32 @@ async fn on_network_deregistration(
 /// Request** carrying the new session AMBR + QoS flows, for the gNB to apply and
 /// relay to the UE. No-ops (empty) for an unknown UE, an unsecured UE, or a psi the
 /// UE has no session for.
+/// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify): store
+/// the new UE-AMBR (so subsequent PDU Session Resource Setups carry it to the gNB)
+/// and run the Generic UE Configuration Update procedure (TS 24.501 §5.4.4) — a
+/// protected Configuration Update Command signalling the UE that its config changed.
+fn on_am_policy_update(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_ue_id: u64,
+    ue_ambr: (u64, u64),
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        warn!("AM policy update for unknown UE {amf_ue_id}");
+        return Vec::new();
+    };
+    ctx.ue_ambr = Some(ue_ambr);
+    let ran_ue_id = ctx.ran_ue_id;
+    info!("UE {amf_ue_id}: AM policy updated — UE-AMBR now {}/{} (dl/ul) bps", ue_ambr.0, ue_ambr.1);
+    let Some(sec) = ctx.sec.as_mut() else {
+        return Vec::new();
+    };
+    let cuc = sec.protect(&nas::configuration_update_command(), nas::sht::INTEGRITY_CIPHERED, 1);
+    vec![(
+        ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
+        "DownlinkNASTransport (ConfigurationUpdateCommand)",
+    )]
+}
+
 fn on_network_modification(
     ues: &mut HashMap<u64, UeContext>,
     m: &ModifyPolicy,
@@ -1830,6 +1894,12 @@ async fn create_am_policy(
     let req = sbi_core::npcf_am::PolicyAssociationRequest {
         supi: supi.to_string(),
         serving_plmn: Some(format!("{mcc}{mnc}")),
+        // Where the PCF pushes Npcf_AMPolicyControl_UpdateNotify (the AMF's callback).
+        notification_uri: Some(format!(
+            "{}://{}:{SBI_PORT}/npcf-callback/v1/am-policy-notify/{supi}",
+            sbi_core::sbi_scheme(),
+            &*ADVERTISE_ADDR
+        )),
     };
     match sbi_core::npcf_am::AmPolicyClient::new(pcf.clone()).create(&req).await {
         Ok(created) => Some((pcf, created.assoc_id, created.policy)),
@@ -2203,6 +2273,38 @@ mod tests {
 
         // A release request for an unknown UE produces no command.
         assert!(on_ue_context_release_request(&mut ues, &amf_smf, &ngap::ue_context_release_request(99, 1, 20)).await.is_none());
+    }
+
+    /// Npcf_AMPolicyControl_UpdateNotify handling: the AMF's am-policy-notify
+    /// callback resolves the SUPI, delivers the new UE-AMBR to the association, and
+    /// the handler updates the context + emits a Configuration Update Command.
+    #[tokio::test]
+    async fn am_policy_update_notify_applies_the_new_ue_ambr() {
+        // The association-task handler: the update stores the new UE-AMBR and emits
+        // a protected Configuration Update Command.
+        let (ki, ke) = ([0x77u8; 16], [0x88u8; 16]);
+        let mut ctx = UeContext::new(9, RegState::Registered, Some("imsi-999700000000111".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.ue_ambr = Some((2_000_000_000, 1_000_000_000));
+        let mut ues = HashMap::new();
+        ues.insert(1u64, ctx);
+
+        let dls = on_am_policy_update(&mut ues, 1, (600_000_000, 300_000_000));
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["DownlinkNASTransport (ConfigurationUpdateCommand)"]
+        );
+        assert_eq!(ues.get(&1).unwrap().ue_ambr, Some((600_000_000, 300_000_000)), "UE-AMBR updated");
+        // The UE decodes the Configuration Update Command under its context.
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let bytes = downlink_nas_pdu(&dls[0].0).expect("NAS PDU");
+        let cuc = ue_sec.unprotect(&bytes, 1).expect("UE verifies the CUC");
+        assert_eq!(
+            nas::gmm_message_type(&cuc),
+            Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand)
+        );
+        // Unknown UE → no downlinks.
+        assert!(on_am_policy_update(&mut ues, 999, (1, 1)).is_empty());
     }
 
     /// AM policy: the AMF discovers the PCF and creates an AM policy association at
