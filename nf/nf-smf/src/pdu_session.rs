@@ -187,6 +187,37 @@ struct SessionAmbrDto {
     downlink: String,
 }
 
+/// A GBR flow's rates (TS 29.571 BitRate strings), for the CreateSMContext response.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GbrDto {
+    gfbr_dl: String,
+    gfbr_ul: String,
+    mfbr_dl: String,
+    mfbr_ul: String,
+}
+
+/// An authorized QoS flow (default from `5gQosProfile`, plus any provisioned GBR
+/// flows) returned to the AMF for the N2 transfer + N1 accept.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QosFlowDto {
+    qfi: u8,
+    five_qi: u8,
+    #[serde(default = "default_arp_priority")]
+    arp_priority: u8,
+    #[serde(default)]
+    pre_empt_cap: bool,
+    #[serde(default)]
+    pre_empt_vuln: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gbr: Option<GbrDto>,
+}
+
+fn default_arp_priority() -> u8 {
+    8
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SmContextCreatedData {
@@ -205,12 +236,17 @@ struct SmContextCreatedData {
     /// provisioned — likewise for the N1 accept.
     #[serde(skip_serializing_if = "Option::is_none")]
     session_ambr: Option<SessionAmbrDto>,
+    /// The authorized QoS flows (default + any GBR flows) — the AMF puts them in
+    /// the N2 setup transfer and the N1 accept's QoS flow descriptions.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    qos_flows: Vec<QosFlowDto>,
 }
 
 /// What the SMF needs out of the subscriber's session-management subscription.
 struct SessionSubscription {
     snssai: Snssai,
     ambr: Option<SessionAmbrDto>,
+    qos_flows: Vec<QosFlowDto>,
 }
 
 #[derive(Deserialize)]
@@ -332,6 +368,7 @@ async fn create_sm_context(
             ue_ipv4_addr: ue_ip,
             s_nssai: sub.snssai,
             session_ambr: sub.ambr,
+            qos_flows: sub.qos_flows,
         }),
     ))
 }
@@ -436,7 +473,30 @@ async fn fetch_session_subscription(
     let ambr = dnn_config
         .get("sessionAmbr")
         .and_then(|v| serde_json::from_value::<SessionAmbrDto>(v.clone()).ok());
-    Ok(SessionSubscription { snssai, ambr })
+
+    // Default QoS flow (QFI 1) from the DNN's 5gQosProfile — 5QI 9 / ARP 8 when
+    // absent. Additional (e.g. GBR) flows come from the demo `qosFlows` array
+    // (TS: these are PCF-driven; provisioned in sm-data here for lack of a PCF).
+    let default_5qi = dnn_config.pointer("/5gQosProfile/5qi").and_then(|v| v.as_u64());
+    let default_arp = dnn_config
+        .pointer("/5gQosProfile/arp/priorityLevel")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u8::try_from(v).ok())
+        .unwrap_or(8);
+    let mut qos_flows = vec![QosFlowDto {
+        qfi: 1,
+        five_qi: default_5qi.and_then(|v| u8::try_from(v).ok()).unwrap_or(9),
+        arp_priority: default_arp,
+        pre_empt_cap: false,
+        pre_empt_vuln: false,
+        gbr: None,
+    }];
+    if let Some(extra) = dnn_config.get("qosFlows").and_then(|v| v.as_array()) {
+        qos_flows.extend(
+            extra.iter().filter_map(|f| serde_json::from_value::<QosFlowDto>(f.clone()).ok()),
+        );
+    }
+    Ok(SessionSubscription { snssai, ambr, qos_flows })
 }
 
 /// Discover the UDM's Nudm service endpoint via the NRF.
@@ -671,7 +731,15 @@ mod tests {
                 &serde_json::json!([{
                     "singleNssai": { "sst": 1, "sd": "010203" },
                     "dnnConfigurations": {
-                        "internet": { "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" } }
+                        "internet": {
+                            "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+                            "5gQosProfile": { "5qi": 9, "arp": { "priorityLevel": 8 } },
+                            "qosFlows": [{
+                                "qfi": 2, "fiveQi": 1, "arpPriority": 5, "preEmptCap": true,
+                                "gbr": { "gfbrDl": "100 Mbps", "gfbrUl": "100 Mbps",
+                                         "mfbrDl": "200 Mbps", "mfbrUl": "200 Mbps" }
+                            }]
+                        }
                     }
                 }]),
             )
@@ -784,6 +852,11 @@ mod tests {
         assert_eq!(created.s_nssai.sd.as_deref(), Some("010203"));
         let ambr = created.session_ambr.as_ref().expect("subscribed session AMBR");
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("1 Gbps", "2 Gbps"));
+        // The default (QFI 1, 5QI 9) + the provisioned GBR flow (QFI 2, 5QI 1) ride back.
+        assert_eq!(created.qos_flows.len(), 2, "default + GBR flow");
+        assert_eq!((created.qos_flows[0].qfi, created.qos_flows[0].five_qi), (1, 9));
+        assert_eq!((created.qos_flows[1].qfi, created.qos_flows[1].five_qi), (2, 1));
+        assert!(created.qos_flows[1].gbr.is_some(), "the second flow is GBR");
         assert_eq!(
             created.ue_ipv4_addr,
             Ipv4Addr::new(10, 45, 0, 2),

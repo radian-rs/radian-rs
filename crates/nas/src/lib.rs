@@ -476,6 +476,55 @@ pub fn session_ambr_from_bitrates(uplink: &str, downlink: &str) -> Option<Sessio
     Some(SessionAmbr { dl_unit, dl, ul_unit, ul })
 }
 
+/// A GBR flow's guaranteed/maximum bit rates, each in NAS unit+value form (reuse
+/// the Session-AMBR encoding: a unit octet + 16-bit multiple, per direction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GbrFlow {
+    pub gfbr: SessionAmbr,
+    pub mfbr: SessionAmbr,
+}
+
+/// One authorized QoS flow description (TS 24.501 §9.11.4.12): the QFI, its 5QI,
+/// and the GBR rates when guaranteed. Carried in the accept's `Authorized QoS
+/// flow descriptions` IE (0x79).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QosFlowDesc {
+    pub qfi: u8,
+    pub five_qi: u8,
+    pub gbr: Option<GbrFlow>,
+}
+
+/// Encode a list of QoS flow descriptions as the IE *value* (TS 24.501
+/// §9.11.4.12), using the free5gc byte layout: per flow `QFI`, `opcode<<5`
+/// (create=1), `E<<6 | numParams`, then each parameter as `id, len, content`.
+/// A GBR flow adds GFBR/MFBR params (unit octet + 16-bit value per direction).
+fn qos_flow_descriptions_value(flows: &[QosFlowDesc]) -> Vec<u8> {
+    let mut v = Vec::new();
+    for f in flows {
+        v.push(f.qfi);
+        v.push(0x01 << 5); // operation code 1 (create) in bits 8-6
+        // Parameters: 5QI always, plus GFBR-ul/dl + MFBR-ul/dl when GBR.
+        let n_params: u8 = if f.gbr.is_some() { 5 } else { 1 };
+        v.push((1 << 6) | n_params); // E=1, number of parameters
+        // 5QI (id 0x01, len 1).
+        v.extend_from_slice(&[0x01, 0x01, f.five_qi]);
+        if let Some(g) = f.gbr {
+            // GFBR uplink (0x02), downlink (0x03), MFBR uplink (0x04), downlink (0x05).
+            // Each: unit octet + 16-bit value (len 3).
+            let param = |id: u8, unit: u8, value: u16| {
+                let mut p = vec![id, 0x03, unit];
+                p.extend_from_slice(&value.to_be_bytes());
+                p
+            };
+            v.extend(param(0x02, g.gfbr.ul_unit, g.gfbr.ul));
+            v.extend(param(0x03, g.gfbr.dl_unit, g.gfbr.dl));
+            v.extend(param(0x04, g.mfbr.ul_unit, g.mfbr.ul));
+            v.extend(param(0x05, g.mfbr.dl_unit, g.mfbr.dl));
+        }
+    }
+    v
+}
+
 /// Build a 5GSM **PDU Session Establishment Accept** (TS 24.501 §8.3.2) as the raw N1 SM
 /// container bytes. Hand-encoded to the exact TS 24.501 layout (so it interoperates with a
 /// free5GC UE regardless of codec quirks): SSC mode 1 + IPv4, one default *match-all* QoS
@@ -491,6 +540,7 @@ pub fn pdu_session_establishment_accept(
     snssai_sst: u8,
     snssai_sd: Option<[u8; 3]>,
     ambr: SessionAmbr,
+    flows: &[QosFlowDesc],
 ) -> Vec<u8> {
     let mut m = Vec::with_capacity(48);
     // 5GSM header: EPD, PDU session id, PTI, message type (0xC2 = Establishment Accept).
@@ -525,6 +575,15 @@ pub fn pdu_session_establishment_accept(
             m.push(1);
             m.push(snssai_sst);
         }
+    }
+    // Authorized QoS flow descriptions (IEI 0x79, LV-E) — per-flow 5QI/GBR — when
+    // the network authorized flows beyond the implicit default. Omitted (bytes
+    // unchanged) when empty, keeping the common single-flow accept minimal.
+    if !flows.is_empty() {
+        let desc = qos_flow_descriptions_value(flows);
+        m.push(0x79);
+        m.extend_from_slice(&(desc.len() as u16).to_be_bytes());
+        m.extend_from_slice(&desc);
     }
     // DNN (IEI 0x25): RFC 1035 label form — a length-prefixed label per dot-separated part.
     m.push(0x25);
@@ -863,7 +922,7 @@ mod tests {
         let ue_ip = std::net::Ipv4Addr::new(10, 45, 0, 2);
         let ambr = session_ambr_from_bitrates("1 Gbps", "2 Gbps").expect("bitrates parse");
         let accept =
-            pdu_session_establishment_accept(5, 1, ue_ip, "internet", 1, Some([1, 2, 3]), ambr);
+            pdu_session_establishment_accept(5, 1, ue_ip, "internet", 1, Some([1, 2, 3]), ambr, &[]);
         // A 5GSM Establishment Accept: header, the UE's IPv4 in the PDU address, and the DNN.
         assert_eq!(&accept[..4], &[0x2e, 5, 1, 0xc2]);
         assert!(accept.windows(7).any(|w| w == [0x29, 5, 0x01, 10, 45, 0, 2]), "PDU address = UE IPv4");
@@ -909,6 +968,46 @@ mod tests {
         // Beyond the encodable range: clamp to 31 x 320h.
         assert_eq!(GprsTimer3::from_secs(u32::MAX).octet(), 0b110_11111);
         assert_eq!(GprsTimer3::deactivated().octet(), 0b111_00000);
+    }
+
+    #[test]
+    fn qos_flow_descriptions_ie_encoding() {
+        // Default non-GBR flow: QFI 1, 5QI 9, one param (5QI).
+        let default = QosFlowDesc { qfi: 1, five_qi: 9, gbr: None };
+        assert_eq!(
+            qos_flow_descriptions_value(&[default]),
+            // QFI, opcode<<5, E<<6|1, [5QI id, len, value]
+            [0x01, 0x20, 0x41, 0x01, 0x01, 0x09]
+        );
+
+        // GBR flow: QFI 2, 5QI 1, GFBR 100 Mbps each way, MFBR 200 Mbps each way.
+        let gfbr = session_ambr_from_bitrates("100 Mbps", "100 Mbps").unwrap();
+        let mfbr = session_ambr_from_bitrates("200 Mbps", "200 Mbps").unwrap();
+        let gbr = QosFlowDesc { qfi: 2, five_qi: 1, gbr: Some(GbrFlow { gfbr, mfbr }) };
+        assert_eq!(
+            qos_flow_descriptions_value(&[gbr]),
+            [
+                0x02, 0x20, 0x45, // QFI 2, create, E + 5 params
+                0x01, 0x01, 0x01, // 5QI = 1
+                0x02, 0x03, 0x06, 0x00, 0x64, // GFBR ul: unit 0x06 (Mbps), 100
+                0x03, 0x03, 0x06, 0x00, 0x64, // GFBR dl: 100
+                0x04, 0x03, 0x06, 0x00, 0xC8, // MFBR ul: 200
+                0x05, 0x03, 0x06, 0x00, 0xC8, // MFBR dl: 200
+            ]
+        );
+
+        // In the accept, the IE rides as 0x79 + 2-byte length + value; the default
+        // flow set present, DNN still last.
+        let ue_ip = std::net::Ipv4Addr::new(10, 45, 0, 2);
+        let ambr = session_ambr_from_bitrates("1 Gbps", "2 Gbps").unwrap();
+        let accept =
+            pdu_session_establishment_accept(5, 1, ue_ip, "internet", 1, Some([1, 2, 3]), ambr, &[default]);
+        assert!(accept.windows(3).any(|w| w == [0x79, 0x00, 0x06]), "0x79 IE header (len 6)");
+        assert!(accept.ends_with(&[0x25, 0x09, 0x08, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't']), "DNN still last");
+        // An empty flow list omits the IE entirely (single-flow accept stays minimal).
+        let bare =
+            pdu_session_establishment_accept(5, 1, ue_ip, "internet", 1, Some([1, 2, 3]), ambr, &[]);
+        assert!(!bare.windows(1).any(|w| w == [0x79]), "no QoS flow descriptions IE when empty");
     }
 
     #[test]

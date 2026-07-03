@@ -106,7 +106,19 @@ fn provision_demo(store: &RedbStore) -> anyhow::Result<()> {
         "dnnConfigurations": {
             "internet": {
                 "pduSessionTypes": { "defaultSessionType": "IPV4" },
-                "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" }
+                "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+                // Default QoS flow: non-GBR, 5QI 9. (ARP defaults to priority 8.)
+                "5gQosProfile": { "5qi": 9, "arp": { "priorityLevel": 8 } },
+                // A demo GBR flow (5QI 1, conversational voice) to exercise per-flow
+                // QoS end to end. Real GBR flows are PCF-driven; provisioned here for
+                // lack of a PCF.
+                "qosFlows": [{
+                    "qfi": 2, "fiveQi": 1, "arpPriority": 5, "preEmptCap": true,
+                    "gbr": {
+                        "gfbrDl": "100 Mbps", "gfbrUl": "100 Mbps",
+                        "mfbrDl": "200 Mbps", "mfbrUl": "200 Mbps"
+                    }
+                }]
             }
         }
     }]);

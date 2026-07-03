@@ -147,36 +147,82 @@ fn fteid_from_uptnl(info: &UPTransportLayerInformation) -> Option<(u32, Ipv4Addr
     Some((u32::from_be_bytes(teid), Ipv4Addr::from(addr)))
 }
 
-/// One non-GBR QoS flow (5QI 9, default ARP) for `qfi`.
-fn qos_flow_setup_list(qfi: u8) -> QosFlowSetupRequestList {
-    QosFlowSetupRequestList(vec![QosFlowSetupRequestItem {
-        qos_flow_identifier: QosFlowIdentifier(qfi),
-        qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
-            qos_characteristics: QosCharacteristics::NonDynamic5QI(NonDynamic5QIDescriptor {
-                five_qi: FiveQI(9),
-                priority_level_qos: None,
-                averaging_window: None,
-                maximum_data_burst_volume: None,
+/// Guaranteed bit rates for a GBR QoS flow, in bits/sec.
+#[derive(Debug, Clone, Copy)]
+pub struct Gbr {
+    pub gfbr_dl_bps: u64,
+    pub gfbr_ul_bps: u64,
+    pub mfbr_dl_bps: u64,
+    pub mfbr_ul_bps: u64,
+}
+
+/// One authorized QoS flow (TS 23.501 §5.7) — QFI, 5QI, ARP, and GBR rates when
+/// the flow is guaranteed-bit-rate.
+#[derive(Debug, Clone, Copy)]
+pub struct QosFlow {
+    pub qfi: u8,
+    pub five_qi: u8,
+    pub arp_priority: u8,
+    pub pre_empt_cap: bool,
+    pub pre_empt_vuln: bool,
+    pub gbr: Option<Gbr>,
+}
+
+impl QosFlow {
+    /// The default non-GBR flow: QFI 1, 5QI 9, ARP priority 8, no pre-emption.
+    pub fn default_non_gbr() -> Self {
+        QosFlow { qfi: 1, five_qi: 9, arp_priority: 8, pre_empt_cap: false, pre_empt_vuln: false, gbr: None }
+    }
+}
+
+/// Build the NGAP `QosFlowSetupRequestList` from the authorized flows.
+fn qos_flow_setup_list(flows: &[QosFlow]) -> QosFlowSetupRequestList {
+    QosFlowSetupRequestList(
+        flows
+            .iter()
+            .map(|f| QosFlowSetupRequestItem {
+                qos_flow_identifier: QosFlowIdentifier(f.qfi),
+                qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
+                    qos_characteristics: QosCharacteristics::NonDynamic5QI(NonDynamic5QIDescriptor {
+                        five_qi: FiveQI(f.five_qi),
+                        priority_level_qos: None,
+                        averaging_window: None,
+                        maximum_data_burst_volume: None,
+                        ie_extensions: None,
+                    }),
+                    allocation_and_retention_priority: AllocationAndRetentionPriority {
+                        priority_level_arp: PriorityLevelARP(f.arp_priority),
+                        pre_emption_capability: Pre_emptionCapability(if f.pre_empt_cap {
+                            Pre_emptionCapability::MAY_TRIGGER_PRE_EMPTION
+                        } else {
+                            Pre_emptionCapability::SHALL_NOT_TRIGGER_PRE_EMPTION
+                        }),
+                        pre_emption_vulnerability: Pre_emptionVulnerability(if f.pre_empt_vuln {
+                            Pre_emptionVulnerability::PRE_EMPTABLE
+                        } else {
+                            Pre_emptionVulnerability::NOT_PRE_EMPTABLE
+                        }),
+                        ie_extensions: None,
+                    },
+                    gbr_qos_information: f.gbr.map(|g| GBR_QosInformation {
+                        maximum_flow_bit_rate_dl: BitRate(g.mfbr_dl_bps),
+                        maximum_flow_bit_rate_ul: BitRate(g.mfbr_ul_bps),
+                        guaranteed_flow_bit_rate_dl: BitRate(g.gfbr_dl_bps),
+                        guaranteed_flow_bit_rate_ul: BitRate(g.gfbr_ul_bps),
+                        notification_control: None,
+                        maximum_packet_loss_rate_dl: None,
+                        maximum_packet_loss_rate_ul: None,
+                        ie_extensions: None,
+                    }),
+                    reflective_qos_attribute: None,
+                    additional_qos_flow_information: None,
+                    ie_extensions: None,
+                },
+                e_rab_id: None,
                 ie_extensions: None,
-            }),
-            allocation_and_retention_priority: AllocationAndRetentionPriority {
-                priority_level_arp: PriorityLevelARP(8),
-                pre_emption_capability: Pre_emptionCapability(
-                    Pre_emptionCapability::SHALL_NOT_TRIGGER_PRE_EMPTION,
-                ),
-                pre_emption_vulnerability: Pre_emptionVulnerability(
-                    Pre_emptionVulnerability::NOT_PRE_EMPTABLE,
-                ),
-                ie_extensions: None,
-            },
-            gbr_qos_information: None,
-            reflective_qos_attribute: None,
-            additional_qos_flow_information: None,
-            ie_extensions: None,
-        },
-        e_rab_id: None,
-        ie_extensions: None,
-    }])
+            })
+            .collect(),
+    )
 }
 
 /// APER-encode a standalone N2 SM-info `*Transfer` sub-PDU to octets.
@@ -187,12 +233,12 @@ fn encode_aper<T: AperCodec>(pdu: &T) -> Vec<u8> {
 }
 
 /// The N2 SM info the SMF gives the gNB: the UPF's UL N3 F-TEID + PDU type + QoS.
-fn setup_request_transfer(qfi: u8, upf_teid: u32, upf_addr: Ipv4Addr) -> PDUSessionResourceSetupRequestTransfer {
+fn setup_request_transfer(flows: &[QosFlow], upf_teid: u32, upf_addr: Ipv4Addr) -> PDUSessionResourceSetupRequestTransfer {
     PDUSessionResourceSetupRequestTransfer {
         protocol_i_es: PDUSessionResourceSetupRequestTransferProtocolIEs(vec![
             build_ngap_ie!(PDUSessionResourceSetupRequestTransfer, REJECT UL_NGU_UP_TNLInformation(gtp_tunnel(upf_teid, upf_addr))),
             build_ngap_ie!(PDUSessionResourceSetupRequestTransfer, REJECT PDUSessionType(PDUSessionType(PDUSessionType::IPV4))),
-            build_ngap_ie!(PDUSessionResourceSetupRequestTransfer, REJECT QosFlowSetupRequestList(qos_flow_setup_list(qfi))),
+            build_ngap_ie!(PDUSessionResourceSetupRequestTransfer, REJECT QosFlowSetupRequestList(qos_flow_setup_list(flows))),
         ]),
     }
 }
@@ -223,14 +269,14 @@ pub fn pdu_session_resource_setup_request(
     amf_ue_id: u64,
     ran_ue_id: u32,
     psi: u8,
-    qfi: u8,
+    flows: &[QosFlow],
     upf_teid: u32,
     upf_addr: Ipv4Addr,
     ue_ambr_dl_bps: u64,
     ue_ambr_ul_bps: u64,
     nas: Vec<u8>,
 ) -> NGAP_PDU {
-    let transfer = encode_aper(&setup_request_transfer(qfi, upf_teid, upf_addr));
+    let transfer = encode_aper(&setup_request_transfer(flows, upf_teid, upf_addr));
     build_ngap!(InitiatingMessage, PDUSessionResourceSetup,
         REJECT, PDUSessionResourceSetupRequest,
         REJECT AMF_UE_NGAP_ID(amf_ue_id),
@@ -311,7 +357,22 @@ mod tests {
             1,
             2,
             5,
-            1,
+            &[
+                QosFlow::default_non_gbr(),
+                QosFlow {
+                    qfi: 2,
+                    five_qi: 1,
+                    arp_priority: 5,
+                    pre_empt_cap: true,
+                    pre_empt_vuln: false,
+                    gbr: Some(Gbr {
+                        gfbr_dl_bps: 100_000_000,
+                        gfbr_ul_bps: 100_000_000,
+                        mfbr_dl_bps: 200_000_000,
+                        mfbr_ul_bps: 200_000_000,
+                    }),
+                },
+            ],
             0x1111,
             Ipv4Addr::new(127, 0, 0, 1),
             2_000_000_000,
