@@ -21,6 +21,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::SbiError;
+use crate::nudr::UdrClient;
 
 /// A GBR flow's rates (TS 29.571 BitRate strings).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,10 +87,24 @@ pub struct SmPolicyDecision {
     pub qos_flows: Vec<QosFlowPolicy>,
 }
 
-/// The PCF's local policy: a decision per DNN, with a network-wide default. Real
-/// PCFs derive this from UDR policy-data + operator rules.
-#[derive(Clone)]
+/// `SmPolicyUpdateContextData` (TS 29.512 §5.6.2.4), trimmed — the SMF's update
+/// request. The met policy-control request triggers are advisory here (the PCF
+/// always re-evaluates the current policy); kept for wire shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmPolicyUpdateContextData {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rep_policy_ctrl_req_triggers: Vec<String>,
+}
+
+/// A policy decision per DNN, with a network-wide default. Used two ways: as the
+/// PCF's built-in local fallback ([`PolicyConfig::demo`]), and as the shape of the
+/// **UDR SM policy-data document** (TS 29.519) — a provisioned doc deserializes
+/// straight into this, so per-subscriber policy is just a stored `PolicyConfig`.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PolicyConfig {
+    #[serde(default)]
     per_dnn: HashMap<String, SmPolicyDecision>,
     default: SmPolicyDecision,
 }
@@ -142,12 +157,18 @@ impl PolicyConfig {
     }
 }
 
-/// PCF runtime: the local policy + in-memory SM policy associations.
+/// PCF runtime: the policy source (UDR when configured, else the local config) +
+/// in-memory SM policy associations.
 #[derive(Clone)]
 pub struct PcfState {
+    /// Local fallback policy, used per-subscriber when the UDR has no policy-data
+    /// (or no UDR is configured).
     config: PolicyConfig,
-    /// SM policy id → the context that created it (for delete + auditing).
-    associations: Arc<Mutex<HashMap<String, SmPolicyContextData>>>,
+    /// UDR client (configured base, token-bearing when a secret is set) — the
+    /// authoritative policy source (Nudr policy-data). `None` ⇒ local config only.
+    udr: Option<Arc<UdrClient>>,
+    /// SM policy id → (creating context, current decision), for update/delete/audit.
+    associations: Arc<Mutex<HashMap<String, (SmPolicyContextData, SmPolicyDecision)>>>,
     next_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -155,13 +176,46 @@ impl PcfState {
     pub fn new(config: PolicyConfig) -> Self {
         Self {
             config,
+            udr: None,
             associations: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
+    /// Source policy from the UDR (Nudr policy-data), per subscriber, falling back
+    /// to the local config when a subscriber has no provisioned policy-data.
+    pub fn with_udr(mut self, udr: Arc<UdrClient>) -> Self {
+        self.udr = Some(udr);
+        self
+    }
+
     pub fn association_count(&self) -> usize {
         self.associations.lock().unwrap().len()
+    }
+
+    /// The policy decision for a session context: the subscriber's UDR SM
+    /// policy-data when provisioned, else the local config. Re-read on every
+    /// call, so an Update reflects a mid-session UDR policy change.
+    async fn decide_for(&self, ctx: &SmPolicyContextData) -> SmPolicyDecision {
+        if let Some(udr) = &self.udr {
+            match udr.get_sm_policy_data(&ctx.supi).await {
+                Ok(Some(doc)) => match serde_json::from_value::<PolicyConfig>(doc) {
+                    Ok(cfg) => return cfg.decide(&ctx.dnn),
+                    Err(e) => tracing::warn!(
+                        supi = %ctx.supi,
+                        "UDR SM policy-data malformed ({e}); using local policy"
+                    ),
+                },
+                Ok(None) => tracing::debug!(
+                    supi = %ctx.supi,
+                    "no UDR SM policy-data; using local policy"
+                ),
+                Err(e) => {
+                    tracing::warn!("UDR SM policy-data fetch failed ({e}); using local policy")
+                }
+            }
+        }
+        self.config.decide(&ctx.dnn)
     }
 }
 
@@ -169,6 +223,7 @@ impl PcfState {
 pub fn router(state: PcfState) -> Router {
     Router::new()
         .route("/npcf-smpolicycontrol/v1/sm-policies", post(create_sm_policy))
+        .route("/npcf-smpolicycontrol/v1/sm-policies/{policy_id}/update", post(update_sm_policy))
         .route("/npcf-smpolicycontrol/v1/sm-policies/{policy_id}/delete", post(delete_sm_policy))
         .with_state(state)
 }
@@ -179,7 +234,7 @@ async fn create_sm_policy(
     State(pcf): State<PcfState>,
     Json(ctx): Json<SmPolicyContextData>,
 ) -> impl axum::response::IntoResponse {
-    let decision = pcf.config.decide(&ctx.dnn);
+    let decision = pcf.decide_for(&ctx).await;
     let id = pcf.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string();
     tracing::info!(
         supi = %ctx.supi,
@@ -188,9 +243,35 @@ async fn create_sm_policy(
         flows = decision.qos_flows.len(),
         "created SM policy association {id}"
     );
-    pcf.associations.lock().unwrap().insert(id.clone(), ctx);
+    pcf.associations.lock().unwrap().insert(id.clone(), (ctx, decision.clone()));
     let location = format!("/npcf-smpolicycontrol/v1/sm-policies/{id}");
     (StatusCode::CREATED, [(axum::http::header::LOCATION, location)], Json(decision))
+}
+
+/// `Npcf_SMPolicyControl_Update` (TS 29.512 §5.6.2.4) — re-authorize an existing
+/// association against the *current* policy (re-reading the subscriber's UDR
+/// policy-data), so a mid-session policy change is reflected. Returns the updated
+/// decision; `404` for an unknown SM policy id.
+async fn update_sm_policy(
+    State(pcf): State<PcfState>,
+    Path(policy_id): Path<String>,
+    Json(_upd): Json<SmPolicyUpdateContextData>,
+) -> Result<Json<SmPolicyDecision>, StatusCode> {
+    let ctx = match pcf.associations.lock().unwrap().get(&policy_id) {
+        Some((ctx, _)) => ctx.clone(),
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+    let decision = pcf.decide_for(&ctx).await;
+    tracing::info!(
+        %policy_id,
+        flows = decision.qos_flows.len(),
+        "updated SM policy association"
+    );
+    // Store the fresh decision (skip if the association was deleted meanwhile).
+    if let Some(entry) = pcf.associations.lock().unwrap().get_mut(&policy_id) {
+        entry.1 = decision.clone();
+    }
+    Ok(Json(decision))
 }
 
 /// `Npcf_SMPolicyControl_Delete`.
@@ -241,6 +322,27 @@ impl PcfClient {
             .to_string();
         let decision = resp.json().await?;
         Ok(SmPolicyCreated { policy_id, decision })
+    }
+
+    /// Update (re-authorize) an SM policy association; returns the fresh decision.
+    pub async fn update_sm_policy(
+        &self,
+        policy_id: &str,
+        upd: &SmPolicyUpdateContextData,
+    ) -> Result<SmPolicyDecision, SbiError> {
+        let decision = self
+            .http
+            .post(format!(
+                "{}/npcf-smpolicycontrol/v1/sm-policies/{}/update",
+                self.base, policy_id
+            ))
+            .json(upd)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(decision)
     }
 
     /// Delete an SM policy association.
@@ -313,5 +415,72 @@ mod tests {
         let d = config.decide("internet");
         assert_eq!(d.qos_flows.len(), 2);
         assert!(d.qos_flows.iter().any(|f| f.gbr.is_some()));
+    }
+
+    #[tokio::test]
+    async fn pcf_sources_policy_from_udr_and_update_reflects_changes() {
+        use subscriber_db::SubscriberStore;
+
+        // In-process UDR.
+        let store: Arc<dyn SubscriberStore> = Arc::new(subscriber_db::InMemoryStore::new());
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udr_l, crate::nudr::router(store)).await.unwrap() });
+        let udr = Arc::new(UdrClient::new(format!("http://{udr_addr}")));
+
+        // Provision the subscriber's SM policy-data (distinct from the local demo).
+        let v1 = serde_json::json!({
+            "default": {
+                "sessionAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" },
+                "qosFlows": [ { "qfi": 1, "fiveQi": 9 } ]
+            }
+        });
+        udr.put_sm_policy_data("imsi-1", &v1).await.unwrap();
+
+        // PCF backed by that UDR (its local demo config is the fallback, unused here).
+        let pcf_state = PcfState::new(PolicyConfig::demo()).with_udr(udr.clone());
+        let pcf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pcf_addr = pcf_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(pcf_l, router(pcf_state)).await.unwrap() });
+        let pcf = PcfClient::new(format!("http://{pcf_addr}"));
+
+        let ctx = SmPolicyContextData {
+            supi: "imsi-1".into(),
+            pdu_session_id: 1,
+            dnn: "internet".into(),
+            snssai_sst: Some(1),
+            snssai_sd: None,
+        };
+        // The UDR policy-data — not the local demo (1/2 Gbps) — drove the decision.
+        let created = pcf.create_sm_policy(&ctx).await.unwrap();
+        let ambr = created.decision.session_ambr.as_ref().unwrap();
+        assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("200 Mbps", "400 Mbps"));
+        assert_eq!(created.decision.qos_flows.len(), 1);
+
+        // Mid-session change: reprovision the UDR, then Update re-reads it.
+        let v2 = serde_json::json!({
+            "default": {
+                "sessionAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" },
+                "qosFlows": [
+                    { "qfi": 1, "fiveQi": 9 },
+                    { "qfi": 2, "fiveQi": 1, "gbr": {
+                        "gfbrDl": "10 Mbps", "gfbrUl": "10 Mbps",
+                        "mfbrDl": "20 Mbps", "mfbrUl": "20 Mbps" } }
+                ]
+            }
+        });
+        udr.put_sm_policy_data("imsi-1", &v2).await.unwrap();
+        let updated = pcf
+            .update_sm_policy(&created.policy_id, &SmPolicyUpdateContextData::default())
+            .await
+            .unwrap();
+        let ambr = updated.session_ambr.as_ref().unwrap();
+        assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("50 Mbps", "100 Mbps"));
+        assert_eq!(updated.qos_flows.len(), 2, "the mid-session change added a GBR flow");
+
+        // Updating an unknown association → error (404).
+        assert!(
+            pcf.update_sm_policy("nope", &SmPolicyUpdateContextData::default()).await.is_err()
+        );
     }
 }

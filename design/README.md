@@ -56,6 +56,7 @@ surface of the project and assesses build feasibility.
 | [45-per-flow-qos.md](45-per-flow-qos.md) | Per-flow QoS (5QI/ARP/GBR): NGAP QosFlow list in the N2 transfer + NAS Authorized QoS flow descriptions IE (0x79) in the N1 accept, subscription-driven; GBR flow live-verified |
 | [46-sbi-oauth.md](46-sbi-oauth.md) | SBI OAuth2 access tokens (TS 33.501): NRF token endpoint, HS256 JWT, UDR enforced via oauth::protect, secretless TokenSource; opt-in via RADIAN_SBI_SECRET |
 | [47-pcf-smpolicy.md](47-pcf-smpolicy.md) | Real PCF — Npcf_SMPolicyControl (TS 29.512): sbi_core::npcf policy engine + PcfClient, SMF sources SM policy (AMBR + QoS flows) from the NRF-discovered PCF, deletes on release, falls back to sm-data when no PCF; shared QosFlowPolicy types |
+| [48-pcf-udr-policy.md](48-pcf-udr-policy.md) | PCF policy from the UDR (Nudr policy-data, TS 29.519 — DataSet::Policy, per-subscriber, PolicyConfig-shaped doc, local fallback) + Npcf_SMPolicyControl_Update: PCF re-reads UDR on update, SMF refresh-policy trigger re-authorizes a live session; UPF/RAN propagation deferred |
 
 ## One-paragraph summary
 

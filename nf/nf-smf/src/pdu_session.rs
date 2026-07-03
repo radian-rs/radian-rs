@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -51,9 +52,13 @@ struct SmContext {
     supi: String,
     pdu_session_id: u8,
     /// The PCF SM policy association `(pcf_base, policy_id)`, when a PCF drove the
-    /// policy — deleted at release (Npcf_SMPolicyControl_Delete). `None` when the
-    /// session used the sm-data fallback.
+    /// policy — deleted at release (Npcf_SMPolicyControl_Delete), re-authorized on
+    /// refresh (Npcf_SMPolicyControl_Update). `None` when the session used the
+    /// sm-data fallback.
     sm_policy: Option<(String, String)>,
+    /// The current authorized QoS (session AMBR + flows) — the sm-context's policy
+    /// record, refreshed by an Update.
+    policy: sbi_core::npcf::SmPolicyDecision,
 }
 
 /// SMF runtime: a PFCP client toward one UPF plus the SM-context table.
@@ -241,6 +246,10 @@ pub fn router(state: Arc<SmfState>) -> Router {
             "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release",
             post(release_sm_context),
         )
+        .route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/refresh-policy",
+            post(refresh_sm_policy),
+        )
         .with_state(state)
 }
 
@@ -298,17 +307,19 @@ async fn create_sm_context(
         snssai_sst: Some(sub.snssai.sst),
         snssai_sd: sub.snssai.sd.clone(),
     };
-    let (session_ambr, qos_flows, sm_policy) = match fetch_sm_policy(&smf.nrf_base, &policy_ctx).await
-    {
+    let (decision, sm_policy) = match fetch_sm_policy(&smf.nrf_base, &policy_ctx).await {
         Some((pcf_base, created)) => {
             tracing::info!(
                 policy_id = %created.policy_id,
                 flows = created.decision.qos_flows.len(),
                 "SM policy from PCF"
             );
-            (created.decision.session_ambr, created.decision.qos_flows, Some((pcf_base, created.policy_id)))
+            (created.decision, Some((pcf_base, created.policy_id)))
         }
-        None => (sub.ambr, sub.qos_flows, None),
+        None => (
+            sbi_core::npcf::SmPolicyDecision { session_ambr: sub.ambr, qos_flows: sub.qos_flows },
+            None,
+        ),
     };
 
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
@@ -335,6 +346,7 @@ async fn create_sm_context(
             supi: req.supi.clone(),
             pdu_session_id: req.pdu_session_id,
             sm_policy,
+            policy: decision.clone(),
         },
     );
     // Record this SMF as the serving SMF for the session (Nudm_UECM). Best-effort,
@@ -364,8 +376,8 @@ async fn create_sm_context(
             up_n3_addr: est.n3_addr,
             ue_ipv4_addr: ue_ip,
             s_nssai: sub.snssai,
-            session_ambr,
-            qos_flows,
+            session_ambr: decision.session_ambr,
+            qos_flows: decision.qos_flows,
         }),
     ))
 }
@@ -633,6 +645,54 @@ async fn release_sm_context(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Re-authorize this session's policy at the PCF (`Npcf_SMPolicyControl_Update`)
+/// and refresh the sm-context's stored QoS. A trigger for a **mid-session policy
+/// change** (e.g. an operator/OAM policy update landing in the UDR): the PCF
+/// re-reads the subscriber's Nudr policy-data and returns the current decision.
+///
+/// Returns `200` + the (possibly changed) decision; `204` when the session used
+/// the sm-data fallback (no PCF association to update); `404` for an unknown
+/// context. Propagating a changed QoS onward — to the UPF (a session-AMBR QER)
+/// and to the RAN/UE (N2 PDU Session Resource Modify + N1 PDU Session Modification
+/// Command) — is a later slice; here the SMF updates its authoritative record.
+async fn refresh_sm_policy(
+    State(smf): State<Arc<SmfState>>,
+    Path(sm_ref): Path<String>,
+) -> Result<axum::response::Response, SbiProblem> {
+    let sm_policy = {
+        let ctxs = smf.contexts.lock().unwrap();
+        match ctxs.get(&sm_ref) {
+            Some(c) => c.sm_policy.clone(),
+            None => {
+                return Err(problem(
+                    StatusCode::NOT_FOUND,
+                    "CONTEXT_NOT_FOUND",
+                    "unknown SM context",
+                ))
+            }
+        }
+    };
+    let Some((pcf_base, policy_id)) = sm_policy else {
+        // sm-data fallback session — no PCF association to re-authorize.
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    let decision = sbi_core::npcf::PcfClient::new(pcf_base)
+        .update_sm_policy(&policy_id, &sbi_core::npcf::SmPolicyUpdateContextData::default())
+        .await
+        .map_err(|e| {
+            tracing::warn!(%sm_ref, "PCF SM policy update failed: {e}");
+            problem(StatusCode::BAD_GATEWAY, "PCF_UNREACHABLE", "Npcf SM policy update failed")
+        })?;
+    // Refresh the sm-context's authoritative QoS record, logging an actual change.
+    if let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref) {
+        if c.policy != decision {
+            tracing::info!(%sm_ref, flows = decision.qos_flows.len(), "SM policy refreshed from PCF (QoS changed)");
+            c.policy = decision.clone();
+        }
+    }
+    Ok((StatusCode::OK, Json(decision)).into_response())
+}
+
 /// Register this SMF as the serving SMF for `(supi, pdu_session_id)` at the UDM
 /// (Nudm_UECM). Best-effort, spawned off the signaling path.
 fn spawn_uecm_register(nrf_base: String, supi: String, pdu_session_id: u8, dnn: String) {
@@ -816,10 +876,14 @@ mod tests {
         (nrf_base, udr_base)
     }
 
-    /// Spin an in-process PCF (demo policy) and register it with the NRF at
-    /// `nrf_base`. Returns its state so the test can watch the association count.
-    async fn spin_pcf(nrf_base: &str) -> sbi_core::npcf::PcfState {
-        let state = sbi_core::npcf::PcfState::new(sbi_core::npcf::PolicyConfig::demo());
+    /// Spin an in-process PCF and register it with the NRF at `nrf_base`. With
+    /// `udr_base`, the PCF sources policy from that UDR (Nudr policy-data); without,
+    /// it uses its local demo policy. Returns its state (to watch the assoc count).
+    async fn spin_pcf(nrf_base: &str, udr_base: Option<&str>) -> sbi_core::npcf::PcfState {
+        let mut state = sbi_core::npcf::PcfState::new(sbi_core::npcf::PolicyConfig::demo());
+        if let Some(udr) = udr_base {
+            state = state.with_udr(Arc::new(sbi_core::nudr::UdrClient::new(udr.to_string())));
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let served = state.clone();
@@ -1016,7 +1080,7 @@ mod tests {
         }
 
         let (nrf_base, _udr_base) = spin_subscription_backend("imsi-999700000000001", "99970").await;
-        let pcf = spin_pcf(&nrf_base).await;
+        let pcf = spin_pcf(&nrf_base, None).await;
 
         let smf = Arc::new(
             SmfState::connect(upf_addr, Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap(),
@@ -1070,6 +1134,108 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(deleted, "PCF SM policy association deleted on release");
+    }
+
+    /// A UDR-backed PCF + the SMF's refresh-policy trigger: a mid-session change to
+    /// the subscriber's UDR policy-data is picked up by Npcf_SMPolicyControl_Update
+    /// and lands in the SMF's response.
+    #[tokio::test]
+    async fn refresh_policy_applies_a_mid_session_udr_change() {
+        let upf_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let upf_state = Arc::new(Mutex::new(pfcp::UpfState::new()));
+        let upf_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upf_addr = upf_sock.local_addr().unwrap();
+        {
+            let upf_state = upf_state.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let (n, peer) = upf_sock.recv_from(&mut buf).await.unwrap();
+                    let resp = {
+                        let mut s = upf_state.lock().unwrap();
+                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s)
+                    };
+                    if let Some(resp) = resp {
+                        upf_sock.send_to(&resp, peer).await.unwrap();
+                    }
+                }
+            });
+        }
+
+        let (nrf_base, udr_base) =
+            spin_subscription_backend("imsi-999700000000001", "99970").await;
+        // Provision the subscriber's SM policy-data (v1) in the same UDR, and back
+        // the PCF with it.
+        let udr = sbi_core::nudr::UdrClient::new(udr_base.clone());
+        let v1 = serde_json::json!({ "default": {
+            "sessionAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" },
+            "qosFlows": [ { "qfi": 1, "fiveQi": 9 } ] } });
+        udr.put_sm_policy_data("imsi-999700000000001", &v1).await.unwrap();
+        let _pcf = spin_pcf(&nrf_base, Some(&udr_base)).await;
+
+        let smf = Arc::new(
+            SmfState::connect(upf_addr, Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap(),
+        );
+        smf.associate().await.unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+
+        let created: SmContextCreatedData = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        // Initial policy = the UDR's v1 (200/400 Mbps, one flow) — not the local demo.
+        let ambr = created.session_ambr.as_ref().unwrap();
+        assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("200 Mbps", "400 Mbps"));
+        assert_eq!(created.qos_flows.len(), 1);
+
+        // Mid-session change: reprovision the UDR policy-data (v2).
+        let v2 = serde_json::json!({ "default": {
+            "sessionAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" },
+            "qosFlows": [
+                { "qfi": 1, "fiveQi": 9 },
+                { "qfi": 2, "fiveQi": 1, "gbr": {
+                    "gfbrDl": "10 Mbps", "gfbrUl": "10 Mbps",
+                    "mfbrDl": "20 Mbps", "mfbrUl": "20 Mbps" } }
+            ] } });
+        udr.put_sm_policy_data("imsi-999700000000001", &v2).await.unwrap();
+
+        // refresh-policy re-authorizes via Npcf Update → the changed decision.
+        let resp = client
+            .post(format!(
+                "{base}/nsmf-pdusession/v1/sm-contexts/{}/refresh-policy",
+                created.sm_context_ref
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "refresh succeeded");
+        let updated: sbi_core::npcf::SmPolicyDecision = resp.json().await.unwrap();
+        let ambr = updated.session_ambr.as_ref().unwrap();
+        assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("50 Mbps", "100 Mbps"));
+        assert_eq!(updated.qos_flows.len(), 2, "the mid-session change added a GBR flow");
+
+        // refresh-policy on an unknown context → 404.
+        let status = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/nope/refresh-policy"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 404, "unknown context");
     }
 
     /// An unsubscribed DNN is rejected with 403 *before* any N4 state is created.

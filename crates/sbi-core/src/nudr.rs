@@ -94,6 +94,11 @@ pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
             "/nudr-dr/v2/subscription-data/{ue_id}/{serving_plmn_id}/provisioned-data/smf-selection-subscription-data",
             get(get_smf_sel).put(put_smf_sel),
         )
+        // SM policy data (TS 29.519) — the PCF's policy source. Not PLMN-scoped.
+        .route(
+            "/nudr-dr/v2/policy-data/ues/{ue_id}/sm-data",
+            get(get_sm_policy_data).put(put_sm_policy_data),
+        )
         .with_state(state);
     // SBI security: require a valid `UDR` access token when a secret is configured
     // (open otherwise). The UDR holds subscriber data + the withdrawal that can
@@ -347,11 +352,30 @@ doc_handlers!(get_am_data, put_am_data, DataSet::Am);
 doc_handlers!(get_sm_data, put_sm_data, DataSet::Sm);
 doc_handlers!(get_smf_sel, put_smf_sel, DataSet::SmfSelection);
 
+/// Policy-data handlers (TS 29.519). The resource is keyed by ueId only, so these
+/// read/write `DataSet::Policy` under an empty PLMN key.
+async fn get_sm_policy_data(
+    State(st): State<NudrState>,
+    Path(ue_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    get_doc(st.store, DataSet::Policy, ue_id, String::new()).await
+}
+async fn put_sm_policy_data(
+    State(st): State<NudrState>,
+    Path(ue_id): Path<String>,
+    Json(doc): Json<serde_json::Value>,
+) -> StatusCode {
+    put_doc(st.store, DataSet::Policy, ue_id, String::new(), doc).await
+}
+
 fn dataset_path(ds: DataSet) -> &'static str {
     match ds {
         DataSet::Am => "am-data",
         DataSet::Sm => "sm-data",
         DataSet::SmfSelection => "smf-selection-subscription-data",
+        // Policy data has its own resource tree (see `policy_data_url`); never
+        // reached via the provisioned-data path.
+        DataSet::Policy => "sm-data",
     }
 }
 
@@ -431,6 +455,37 @@ impl UdrClient {
             return Ok(None);
         }
         Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    /// Fetch the subscriber's SM policy data (TS 29.519 `policy-data/ues/{ueId}/
+    /// sm-data`). `Ok(None)` if not provisioned. Used by the PCF.
+    pub async fn get_sm_policy_data(
+        &self,
+        supi: &str,
+    ) -> Result<Option<serde_json::Value>, SbiError> {
+        let resp = self.bearer(self.http.get(self.policy_data_url(supi))).await.send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    /// Provision (create or replace) the subscriber's SM policy data.
+    pub async fn put_sm_policy_data(
+        &self,
+        supi: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), SbiError> {
+        self.bearer(self.http.put(self.policy_data_url(supi)).json(doc))
+            .await
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    fn policy_data_url(&self, supi: &str) -> String {
+        format!("{}/nudr-dr/v2/policy-data/ues/{}/sm-data", self.base, supi)
     }
 
     /// Withdraw a subscription (`DELETE …/subscription-data/{ueId}`). `Ok(true)`

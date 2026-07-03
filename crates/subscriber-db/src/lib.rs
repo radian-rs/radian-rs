@@ -59,6 +59,9 @@ pub enum DataSet {
     Sm,
     /// SMF selection subscription data.
     SmfSelection,
+    /// SM policy data (TS 29.519 policy-data): the PCF's per-DNN policy source.
+    /// Not serving-PLMN-scoped — stored under an empty PLMN key.
+    Policy,
 }
 
 /// Provisioned subscription data as JSON documents keyed by (SUPI, serving PLMN),
@@ -323,6 +326,8 @@ const AM_DATA: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("am_d
 const SM_DATA: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("sm_data");
 const SMF_SELECTION: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("smf_selection");
+/// SM policy data (TS 29.519); keyed (SUPI, "") — not serving-PLMN-scoped.
+const POLICY_DATA: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("policy_data");
 /// Dynamic context data: the serving AMF's registration (TS 29.505
 /// `amf-3gpp-access`), keyed by SUPI, JSON value.
 const AMF_3GPP_REG: TableDefinition<&str, &[u8]> = TableDefinition::new("amf_3gpp_reg");
@@ -335,6 +340,7 @@ fn doc_table(ds: DataSet) -> TableDefinition<'static, (&'static str, &'static st
         DataSet::Am => AM_DATA,
         DataSet::Sm => SM_DATA,
         DataSet::SmfSelection => SMF_SELECTION,
+        DataSet::Policy => POLICY_DATA,
     }
 }
 
@@ -382,6 +388,7 @@ impl RedbStore {
         w.open_table(AM_DATA)?;
         w.open_table(SM_DATA)?;
         w.open_table(SMF_SELECTION)?;
+        w.open_table(POLICY_DATA)?;
         w.open_table(AMF_3GPP_REG)?;
         w.open_table(SMF_REG)?;
         w.commit()?;
@@ -477,7 +484,7 @@ impl SubscriberDb for RedbStore {
                     let _ = t.remove((supi, psi));
                 }
             }
-            for ds in [DataSet::Am, DataSet::Sm, DataSet::SmfSelection] {
+            for ds in [DataSet::Am, DataSet::Sm, DataSet::SmfSelection, DataSet::Policy] {
                 if let Ok(mut t) = w.open_table(doc_table(ds)) {
                     // Small tables: collect this SUPI's (supi, plmn) keys, then remove.
                     let keys: Vec<String> = t
