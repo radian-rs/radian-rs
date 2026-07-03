@@ -296,6 +296,15 @@ pub fn deregistration_request_from_ue(dereg_type: u8, mcc: &str, mnc: &str, tmsi
     )
 }
 
+/// Build a 5GMM **Deregistration Accept (UE terminated)** (TS 24.501 §8.2.15) —
+/// the UE's answer to a network-initiated deregistration. UE side / tests.
+pub fn deregistration_accept_to_ue() -> Nas5gsMessage {
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::DeregistrationAcceptToUe,
+        Nas5gmmMessage::DeregistrationAcceptToUe(messages::NasDeregistrationAcceptToUe::new()),
+    )
+}
+
 /// Build a 5GMM **Deregistration Request (UE terminated)** (TS 24.501 §8.2.14) —
 /// network-initiated. `dereg_type` is the §9.11.3.20 half-octet; for a
 /// subscription withdrawal use `0x01` (re-registration not required, 3GPP access).
@@ -1070,6 +1079,11 @@ mod tests {
         let req = deregistration_request_from_ue(0x09, "999", "70", 1);
         let back = decode_nas_5gs_message(&encode_nas_5gs_message(&req).unwrap()).unwrap();
         assert_eq!(deregistration_is_switch_off(&back), Some(true));
+
+        // The UE-terminated accept round-trips.
+        let acc = deregistration_accept_to_ue();
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&acc).unwrap()).unwrap();
+        assert_eq!(gmm_message_type(&back), Some(Nas5gmmMessageType::DeregistrationAcceptToUe));
 
         // Network-initiated request (UE terminated) round-trips.
         let req = deregistration_request_to_ue(0x01);
