@@ -15,6 +15,7 @@ pub mod nausf;
 pub mod nnrf;
 pub mod npcf;
 pub mod oauth;
+pub mod tls;
 pub mod nudm;
 pub mod nudr;
 
@@ -24,6 +25,8 @@ pub enum SbiError {
     Io(#[from] std::io::Error),
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("tls: {0}")]
+    Tls(String),
 }
 
 /// RFC 7807 `ProblemDetails`, the SBI error body (TS 29.500).
@@ -61,8 +64,20 @@ pub fn health_router() -> axum::Router {
     axum::Router::new().route("/", axum::routing::get(|| async { "radian-rs SBI" }))
 }
 
+/// Install the **ring** rustls crypto provider as the process default (idempotent).
+/// reqwest (built with `rustls-no-provider`, since aws-lc-rs is unavailable) requires
+/// a default provider before building *any* client — even a cleartext h2c one.
+pub(crate) fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Build an HTTP/2-prior-knowledge (cleartext h2c) JSON client for SBI calls.
 pub fn h2c_client() -> reqwest::Client {
+    ensure_crypto_provider();
     reqwest::Client::builder()
         .http2_prior_knowledge()
         .build()

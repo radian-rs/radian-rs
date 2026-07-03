@@ -24,6 +24,8 @@ const DB_ENV: &str = "RADIAN_UDR_DB";
 const KEK_ENV: &str = "RADIAN_UDR_MASTER_KEY";
 const NRF_ENV: &str = "RADIAN_UDR_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
+/// Directory holding the UDR's mTLS identity (`udr.crt`, `udr.key`, `ca.crt`).
+const TLS_DIR_ENV: &str = "RADIAN_UDR_TLS_DIR";
 /// How often to sweep UECM registrations for NFs that have left the NRF.
 const SWEEP_ENV: &str = "RADIAN_UDR_UECM_SWEEP_SECS";
 const DEFAULT_SWEEP_SECS: u64 = 30;
@@ -90,7 +92,17 @@ async fn main() -> anyhow::Result<()> {
     }
     // Subscription withdrawals notify the serving AMF recorded in the UECM
     // context data (its deregCallbackUri).
-    sbi_core::run(sbi, router).await?;
+    //
+    // Mutual TLS (design/56): with RADIAN_UDR_TLS_DIR set, serve over mTLS with the
+    // UDR's certificate — every client must present a core-CA-signed certificate.
+    match std::env::var(TLS_DIR_ENV) {
+        Ok(dir) => {
+            let cfg = sbi_core::tls::TlsIdentity::load(&dir, "udr")?.server_config()?;
+            info!(%dir, "Nudr served over mutual TLS");
+            sbi_core::tls::run_tls(sbi, router, cfg).await?;
+        }
+        Err(_) => sbi_core::run(sbi, router).await?,
+    }
     Ok(())
 }
 
