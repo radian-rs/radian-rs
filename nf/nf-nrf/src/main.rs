@@ -17,12 +17,21 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(_) => sbi_core::nnrf::NrfStore::default(),
     };
-    // Enable the OAuth2 token endpoint when a shared SBI secret is configured
-    // (RADIAN_SBI_SECRET) — otherwise the SBI is open (design/46).
-    let store = store.with_secret(sbi_core::oauth::sbi_secret());
-    if sbi_core::oauth::sbi_secret().is_some() {
-        tracing::info!("SBI security enabled — issuing OAuth2 access tokens at /oauth2/token");
-    }
+    // Enable the OAuth2 token endpoint. Asymmetric (ES256 + JWKS) when
+    // RADIAN_SBI_OAUTH=asymmetric — the NRF generates a private key and publishes
+    // its public key at /oauth2/jwks (design/55); else HS256 with a shared secret
+    // (RADIAN_SBI_SECRET, design/46); else the SBI is open.
+    let store = if sbi_core::oauth::asymmetric_enabled() {
+        let key = sbi_core::oauth::Es256Key::generate();
+        tracing::info!(kid = %key.kid(), "SBI security enabled (asymmetric ES256) — JWKS at /oauth2/jwks");
+        store.with_signing_key(key)
+    } else {
+        let store = store.with_secret(sbi_core::oauth::sbi_secret());
+        if sbi_core::oauth::sbi_secret().is_some() {
+            tracing::info!("SBI security enabled (shared secret HS256) — tokens at /oauth2/token");
+        }
+        store
+    };
     let sbi: SocketAddr = "0.0.0.0:8000".parse()?;
     sbi_core::run(sbi, sbi_core::nnrf::router(store)).await?;
     Ok(())
