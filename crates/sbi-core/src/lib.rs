@@ -15,6 +15,7 @@ pub mod nausf;
 pub mod nchf;
 pub mod nnrf;
 pub mod npcf;
+pub mod npcf_am;
 pub mod oauth;
 pub mod tls;
 pub mod nudm;

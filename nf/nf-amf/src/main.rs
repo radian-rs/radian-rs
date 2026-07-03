@@ -36,7 +36,7 @@ use ngap::{
 use sctp_rs::{
     ConnectedSocket, NotificationOrData, SendData, SendInfo, Socket, SocketToAssociation,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// SCTP Payload Protocol Identifier for NGAP (TS 38.412 §7).
 const NGAP_PPID: u32 = 60;
@@ -308,6 +308,10 @@ struct UeContext {
     /// implicitly deregisters a UE that lingers past the mobile-reachable /
     /// implicit-deregistration deadline. `None` while CM-CONNECTED.
     retained_at: Option<std::time::Instant>,
+    /// The PCF AM policy association `(pcf_base, assoc_id)` created at registration
+    /// (Npcf_AMPolicyControl) — deleted at deregistration. `None` when no PCF was
+    /// reachable (the registration proceeds with subscribed policy).
+    am_policy: Option<(String, String)>,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
@@ -717,6 +721,7 @@ fn on_t3522_expiry(
         GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
         spawn_uecm_purge(supi);
     }
+    spawn_am_policy_delete(ctx.am_policy.take());
     ues.remove(&amf_ue_id);
     vec![(
         ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
@@ -883,6 +888,7 @@ async fn evict_stale_retained(amf_smf: &pdu_session::AmfSmf, max_idle: std::time
                 Err(e) => warn!("evicted UE: PDU session {psi} release failed: {e}"),
             }
         }
+        spawn_am_policy_delete(ctx.am_policy.clone());
         if let Some(supi) = supi {
             GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
             spawn_uecm_purge(supi);
@@ -1102,6 +1108,7 @@ impl UeContext {
             cm_state: CmState::Connected,
             guti_tmsi: None,
             retained_at: None,
+            am_policy: None,
         }
     }
 }
@@ -1229,6 +1236,7 @@ async fn on_deregistration(
         UE_DIRECTORY.lock().unwrap().remove(&supi);
         spawn_uecm_purge(supi);
     }
+    spawn_am_policy_delete(ues.get_mut(&amf_ue_id).and_then(|c| c.am_policy.take()));
     ues.remove(&amf_ue_id);
     downlinks
 }
@@ -1294,6 +1302,7 @@ async fn dispatch_uplink_nas(
             }
             let ran_ue_id = ctx.ran_ue_id;
             info!("UE {amf_ue_id}: Deregistration Accept — network-initiated deregistration complete");
+            spawn_am_policy_delete(ctx.am_policy.clone());
             if let Some(supi) = ctx.suci.clone() {
                 UE_DIRECTORY.lock().unwrap().remove(&supi);
                 // The subscription is gone — its GUTI must not resolve again.
@@ -1677,11 +1686,35 @@ async fn on_security_mode_complete(
         Some(supi) => fetch_am_data(nrf_base, supi).await,
         None => (None, None),
     };
+    // Create the AM policy association at the PCF (Npcf_AMPolicyControl); its
+    // UE-AMBR (when present) overrides the subscribed one at the gNB. Best-effort:
+    // no PCF ⇒ subscribed policy stands.
+    let am = match &supi {
+        Some(supi) => create_am_policy(nrf_base, supi, PLMN_MCC, PLMN_MNC).await,
+        None => None,
+    };
 
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
         return Vec::new();
     };
-    ctx.ue_ambr = ue_ambr;
+    // AM policy: apply the UE-AMBR override (PCF policy wins) and store the
+    // association for deletion at deregistration.
+    let mut effective_ambr = ue_ambr;
+    if let Some((pcf_base, assoc_id, policy)) = am {
+        if let Some(pcf_ambr) = &policy.ue_ambr {
+            if let (Some(dl), Some(ul)) =
+                (bitrate_to_bps(&pcf_ambr.downlink), bitrate_to_bps(&pcf_ambr.uplink))
+            {
+                effective_ambr = Some((dl, ul));
+                info!(
+                    "UE {amf_ue_id}: AM policy applied — UE-AMBR {}/{} (dl/ul), RFSP {:?}",
+                    pcf_ambr.downlink, pcf_ambr.uplink, policy.rfsp
+                );
+            }
+        }
+        ctx.am_policy = Some((pcf_base, assoc_id));
+    }
+    ctx.ue_ambr = effective_ambr;
     let ran_ue_id = ctx.ran_ue_id;
     let tmsi = amf_ue_id as u32;
     // Remember the assigned 5G-TMSI as this UE's persistent identity (a Service
@@ -1781,6 +1814,44 @@ fn bitrate_to_bps(s: &str) -> Option<u64> {
         _ => return None,
     };
     value.checked_mul(mult)
+}
+
+/// Create an AM policy association at the NRF-discovered PCF
+/// (Npcf_AMPolicyControl, TS 29.507). Returns `(pcf_base, assoc_id, policy)` — the
+/// PCF's AM policy (RFSP + UE-AMBR). `None` (best-effort) when no PCF is reachable
+/// or the call fails, so registration proceeds with the subscribed policy.
+async fn create_am_policy(
+    nrf_base: &str,
+    supi: &str,
+    mcc: &str,
+    mnc: &str,
+) -> Option<(String, String, sbi_core::npcf_am::PolicyAssociation)> {
+    let pcf = discover_nf(nrf_base, "PCF").await.ok()?;
+    let req = sbi_core::npcf_am::PolicyAssociationRequest {
+        supi: supi.to_string(),
+        serving_plmn: Some(format!("{mcc}{mnc}")),
+    };
+    match sbi_core::npcf_am::AmPolicyClient::new(pcf.clone()).create(&req).await {
+        Ok(created) => Some((pcf, created.assoc_id, created.policy)),
+        Err(e) => {
+            debug!("AM policy association not created ({e}); using subscribed policy");
+            None
+        }
+    }
+}
+
+/// Delete an AM policy association at the PCF (best-effort, off the path), called
+/// when a UE's context is torn down at deregistration.
+fn spawn_am_policy_delete(am_policy: Option<(String, String)>) {
+    let Some((pcf_base, assoc_id)) = am_policy else {
+        return;
+    };
+    tokio::spawn(async move {
+        match sbi_core::npcf_am::AmPolicyClient::new(pcf_base).delete(&assoc_id).await {
+            Ok(()) => info!("deleted AM policy association {assoc_id}"),
+            Err(e) => warn!("AM policy association delete failed: {e}"),
+        }
+    });
 }
 
 /// Fetch the subscriber's am-data via the NRF-discovered UDM (Nudm_SDM) and
@@ -2132,6 +2203,60 @@ mod tests {
 
         // A release request for an unknown UE produces no command.
         assert!(on_ue_context_release_request(&mut ues, &amf_smf, &ngap::ue_context_release_request(99, 1, 20)).await.is_none());
+    }
+
+    /// AM policy: the AMF discovers the PCF and creates an AM policy association at
+    /// registration; the PCF's UE-AMBR overrides the subscribed one (verified by the
+    /// `on_security_mode_complete` override math in production).
+    #[tokio::test]
+    async fn am_policy_association_created_at_registration() {
+        use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService, NrfClient, NrfStore};
+
+        // NRF + a real AM-policy PCF (demo config) registered as nf-type PCF.
+        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nrf_addr = nrf_l.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(nrf_l, sbi_core::nnrf::router(NrfStore::default())).await.unwrap() });
+        let nrf_base = format!("http://{nrf_addr}");
+
+        let am = sbi_core::npcf_am::AmPcfState::new(sbi_core::npcf_am::AmPolicyConfig::demo());
+        let pcf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pcf_addr = pcf_l.local_addr().unwrap();
+        let am_served = am.clone();
+        tokio::spawn(async move { sbi_core::run_on(pcf_l, sbi_core::npcf_am::router(am_served)).await.unwrap() });
+        let mut profile = NfProfile::new("pcf-am", "PCF", pcf_addr.ip().to_string());
+        profile.nf_services = Some(vec![NfService {
+            service_instance_id: "npcf-am-policy-control-1".into(),
+            service_name: "npcf-am-policy-control".into(),
+            scheme: "http".into(),
+            ip_end_points: vec![IpEndPoint {
+                ipv4_address: Some(pcf_addr.ip().to_string()),
+                port: Some(pcf_addr.port()),
+            }],
+        }]);
+        NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
+
+        // create_am_policy discovers the PCF and opens the association.
+        let (pcf_base, assoc_id, policy) =
+            create_am_policy(&nrf_base, "imsi-999700000000001", "999", "70").await.expect("AM policy");
+        assert_eq!(am.association_count(), 1, "association opened at the PCF");
+        assert_eq!(policy.rfsp, Some(3));
+        let ambr = policy.ue_ambr.as_ref().expect("policy UE-AMBR");
+        // The override the AMF applies: (dl, ul) bps from the policy bitrate strings.
+        assert_eq!(
+            (bitrate_to_bps(&ambr.downlink), bitrate_to_bps(&ambr.uplink)),
+            (Some(1_000_000_000), Some(500_000_000)),
+            "policy UE-AMBR overrides the subscribed one"
+        );
+
+        // Deletion (deregistration) closes it.
+        spawn_am_policy_delete(Some((pcf_base, assoc_id)));
+        for _ in 0..50 {
+            if am.association_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(am.association_count(), 0, "association deleted at deregistration");
     }
 
     /// Implicit deregistration: a retained CM-IDLE context idle past the deadline is

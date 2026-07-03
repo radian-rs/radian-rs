@@ -58,10 +58,14 @@ async fn main() -> anyhow::Result<()> {
 
     let state = sbi_core::npcf::PcfState::new(sbi_core::npcf::PolicyConfig::demo())
         .with_udr(Arc::new(udr));
+    // Access-and-mobility policy (Npcf_AMPolicyControl): the AMF opens an AM policy
+    // association at registration; the PCF returns RFSP + a policy UE-AMBR.
+    let am_state = sbi_core::npcf_am::AmPcfState::new(sbi_core::npcf_am::AmPolicyConfig::demo());
+    let router = sbi_core::npcf::router(state).merge(sbi_core::npcf_am::router(am_state));
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     match tls {
-        Some(id) => sbi_core::tls::serve(sbi, sbi_core::npcf::router(state), id).await?,
-        None => sbi_core::run(sbi, sbi_core::npcf::router(state)).await?,
+        Some(id) => sbi_core::tls::serve(sbi, router, id).await?,
+        None => sbi_core::run(sbi, router).await?,
     }
     Ok(())
 }
@@ -69,15 +73,21 @@ async fn main() -> anyhow::Result<()> {
 async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> anyhow::Result<()> {
     use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService};
     let mut profile = NfProfile::new(PCF_INSTANCE_ID.clone(), "PCF", ip.to_string());
-    profile.nf_services = Some(vec![NfService {
-        service_instance_id: "npcf-smpolicycontrol-1".into(),
-        service_name: "npcf-smpolicycontrol".into(),
-        scheme: sbi_core::sbi_scheme().into(),
-        ip_end_points: vec![IpEndPoint {
-            ipv4_address: Some(ip.to_string()),
-            port: Some(sbi_port),
-        }],
-    }]);
+    let endpoint = vec![IpEndPoint { ipv4_address: Some(ip.to_string()), port: Some(sbi_port) }];
+    profile.nf_services = Some(vec![
+        NfService {
+            service_instance_id: "npcf-smpolicycontrol-1".into(),
+            service_name: "npcf-smpolicycontrol".into(),
+            scheme: sbi_core::sbi_scheme().into(),
+            ip_end_points: endpoint.clone(),
+        },
+        NfService {
+            service_instance_id: "npcf-am-policy-control-1".into(),
+            service_name: "npcf-am-policy-control".into(),
+            scheme: sbi_core::sbi_scheme().into(),
+            ip_end_points: endpoint,
+        },
+    ]);
     sbi_core::nnrf::register_and_maintain(nrf_base, profile).await?;
     Ok(())
 }
