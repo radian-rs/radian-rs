@@ -327,7 +327,9 @@ async fn create_sm_context(
     // The SMF owns UE IP allocation; the address rides into the UPF's downlink PDR so it
     // can route N6 traffic back to this session.
     let ue_ip = smf.alloc_ue_ip();
-    let est_req = pfcp::session_establishment_request(cp_seid, seq, smf.smf_ip, ue_ip);
+    // Install the authorized session AMBR as a QER so the UPF polices the rate.
+    let ambr = ambr_bps(&decision);
+    let est_req = pfcp::session_establishment_request(cp_seid, seq, smf.smf_ip, ue_ip, ambr);
     let resp = smf.transact(&est_req, seq).await.ok_or_else(|| {
         problem(StatusCode::BAD_GATEWAY, "UPF_NOT_RESPONDING", "no PFCP response from the UPF")
     })?;
@@ -650,19 +652,20 @@ async fn release_sm_context(
 /// change** (e.g. an operator/OAM policy update landing in the UDR): the PCF
 /// re-reads the subscriber's Nudr policy-data and returns the current decision.
 ///
-/// Returns `200` + the (possibly changed) decision; `204` when the session used
-/// the sm-data fallback (no PCF association to update); `404` for an unknown
-/// context. Propagating a changed QoS onward — to the UPF (a session-AMBR QER)
-/// and to the RAN/UE (N2 PDU Session Resource Modify + N1 PDU Session Modification
-/// Command) — is a later slice; here the SMF updates its authoritative record.
+/// When the **session AMBR changed**, the SMF propagates it onto the user plane —
+/// an **N4 Session Modification with an Update QER** re-rates the UPF's AMBR
+/// policer. Returns `200` + the (possibly changed) decision; `204` when the
+/// session used the sm-data fallback (no PCF association); `404` for an unknown
+/// context. Propagating a changed QoS to the **RAN/UE** (N2 PDU Session Resource
+/// Modify + N1 PDU Session Modification Command) remains a later slice.
 async fn refresh_sm_policy(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<axum::response::Response, SbiProblem> {
-    let sm_policy = {
+    let (sm_policy, up_seid, old_ambr) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
-            Some(c) => c.sm_policy.clone(),
+            Some(c) => (c.sm_policy.clone(), c.up_seid, ambr_bps(&c.policy)),
             None => {
                 return Err(problem(
                     StatusCode::NOT_FOUND,
@@ -683,6 +686,22 @@ async fn refresh_sm_policy(
             tracing::warn!(%sm_ref, "PCF SM policy update failed: {e}");
             problem(StatusCode::BAD_GATEWAY, "PCF_UNREACHABLE", "Npcf SM policy update failed")
         })?;
+
+    // Propagate a changed session AMBR onto the user plane: re-rate the UPF's QER.
+    let new_ambr = ambr_bps(&decision);
+    if new_ambr != old_ambr {
+        if let Some(ambr) = new_ambr {
+            let seq = smf.next_seq();
+            let req = pfcp::session_qer_update_request(up_seid, seq, ambr);
+            match smf.transact(&req, seq).await {
+                Some(resp) if pfcp::response_accepted(&resp) => tracing::info!(
+                    %sm_ref, up_seid, "N4 QER re-rated: session AMBR now {}/{} bps",
+                    ambr.uplink_bps, ambr.downlink_bps
+                ),
+                _ => tracing::warn!(%sm_ref, up_seid, "N4 QER update not accepted by the UPF"),
+            }
+        }
+    }
     // Refresh the sm-context's authoritative QoS record, logging an actual change.
     if let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref) {
         if c.policy != decision {
@@ -691,6 +710,16 @@ async fn refresh_sm_policy(
         }
     }
     Ok((StatusCode::OK, Json(decision)).into_response())
+}
+
+/// The session AMBR from a policy decision as a `pfcp::SessionAmbr` (bits/sec) for
+/// the UPF's QER — `None` when the decision has no (parseable) session AMBR.
+fn ambr_bps(decision: &sbi_core::npcf::SmPolicyDecision) -> Option<pfcp::SessionAmbr> {
+    decision
+        .session_ambr
+        .as_ref()
+        .and_then(|a| a.to_bps())
+        .map(|(uplink_bps, downlink_bps)| pfcp::SessionAmbr { uplink_bps, downlink_bps })
 }
 
 /// Register this SMF as the serving SMF for `(supi, pdu_session_id)` at the UDM
@@ -924,7 +953,7 @@ mod tests {
                     let (n, peer) = upf_sock.recv_from(&mut buf).await.unwrap();
                     let resp = {
                         let mut s = upf_state.lock().unwrap();
-                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s)
+                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s, 0)
                     };
                     if let Some(resp) = resp {
                         upf_sock.send_to(&resp, peer).await.unwrap();
@@ -1070,7 +1099,7 @@ mod tests {
                     let (n, peer) = upf_sock.recv_from(&mut buf).await.unwrap();
                     let resp = {
                         let mut s = upf_state.lock().unwrap();
-                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s)
+                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s, 0)
                     };
                     if let Some(resp) = resp {
                         upf_sock.send_to(&resp, peer).await.unwrap();
@@ -1153,7 +1182,7 @@ mod tests {
                     let (n, peer) = upf_sock.recv_from(&mut buf).await.unwrap();
                     let resp = {
                         let mut s = upf_state.lock().unwrap();
-                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s)
+                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s, 0)
                     };
                     if let Some(resp) = resp {
                         upf_sock.send_to(&resp, peer).await.unwrap();
@@ -1201,6 +1230,13 @@ mod tests {
         let ambr = created.session_ambr.as_ref().unwrap();
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("200 Mbps", "400 Mbps"));
         assert_eq!(created.qos_flows.len(), 1);
+        // The AMBR was installed on the user plane as a QER (the UPF's first session
+        // is up_seid 1).
+        assert_eq!(
+            upf_state.lock().unwrap().ambr_for(1),
+            Some(pfcp::SessionAmbr { uplink_bps: 200_000_000, downlink_bps: 400_000_000 }),
+            "UPF polices the v1 session AMBR"
+        );
 
         // Mid-session change: reprovision the UDR policy-data (v2).
         let v2 = serde_json::json!({ "default": {
@@ -1227,6 +1263,12 @@ mod tests {
         let ambr = updated.session_ambr.as_ref().unwrap();
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("50 Mbps", "100 Mbps"));
         assert_eq!(updated.qos_flows.len(), 2, "the mid-session change added a GBR flow");
+        // The change reached the user plane: the SMF re-rated the UPF's QER.
+        assert_eq!(
+            upf_state.lock().unwrap().ambr_for(1),
+            Some(pfcp::SessionAmbr { uplink_bps: 50_000_000, downlink_bps: 100_000_000 }),
+            "UPF now polices the v2 session AMBR"
+        );
 
         // refresh-policy on an unknown context → 404.
         let status = client
@@ -1253,7 +1295,7 @@ mod tests {
                     let (n, peer) = upf_sock.recv_from(&mut buf).await.unwrap();
                     let resp = {
                         let mut s = upf_state.lock().unwrap();
-                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s)
+                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s, 0)
                     };
                     if let Some(resp) = resp {
                         upf_sock.send_to(&resp, peer).await.unwrap();

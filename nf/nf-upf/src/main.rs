@@ -22,11 +22,20 @@
 //! convenience — deploy only on isolated user-plane segments. Hardening is a deferred slice.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 use anyhow::Context;
 use n6::tun::N6Tun;
 use tracing::{info, trace, warn};
+
+/// Process-start reference for the UPF's monotonic clock. Session-AMBR policers
+/// (in `pfcp`/`n6`) are metered against `now_nanos()`, which both the N4 control
+/// path (bucket rebasing) and the N3/N6 datapath share.
+static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+fn now_nanos() -> u64 {
+    START.elapsed().as_nanos() as u64
+}
 
 /// The UPF's N3/N4 address advertised to peers (the F-TEID address the gNB sends uplink
 /// G-PDUs to). From `RADIAN_UPF_N3_ADDR`, default loopback.
@@ -108,7 +117,7 @@ async fn serve_n4(socket: tokio::net::UdpSocket, node_ip: Ipv4Addr, state: Upf) 
         };
         let resp = {
             let mut g = state.lock().unwrap();
-            pfcp::handle_n4(&buf[..n], node_ip, &mut g)
+            pfcp::handle_n4(&buf[..n], node_ip, &mut g, now_nanos())
         };
         match resp {
             Some(resp) => {
@@ -145,8 +154,8 @@ async fn serve_n3(socket: Arc<tokio::net::UdpSocket>, state: Upf, tun: Option<Ar
             Some(gtpu::N3Message::GPdu { teid, payload }) => {
                 // Decide against the session table, then release the lock before any await.
                 let action = {
-                    let s = state.lock().unwrap();
-                    n6::uplink(&s, teid, payload)
+                    let mut s = state.lock().unwrap();
+                    n6::uplink(&mut s, teid, payload, now_nanos())
                 };
                 match action {
                     n6::Uplink::ToN6(inner) => match &tun {
@@ -159,6 +168,9 @@ async fn serve_n3(socket: Arc<tokio::net::UdpSocket>, state: Upf, tun: Option<Ar
                     n6::Uplink::UnknownTeid => warn!(teid, "N3 G-PDU for unknown TEID — dropped"),
                     n6::Uplink::Spoofed { claimed, assigned } => {
                         warn!(teid, %claimed, %assigned, "N3 uplink source spoofing — dropped")
+                    }
+                    n6::Uplink::RateLimited => {
+                        trace!(teid, "N3 uplink over session AMBR — policed (dropped)")
                     }
                 }
             }
@@ -180,8 +192,8 @@ async fn serve_n6_downlink(tun: Arc<N6Tun>, n3: Arc<tokio::net::UdpSocket>, stat
             }
         };
         let action = {
-            let s = state.lock().unwrap();
-            n6::downlink(&s, &buf[..n])
+            let mut s = state.lock().unwrap();
+            n6::downlink(&mut s, &buf[..n], now_nanos())
         };
         match action {
             n6::Downlink::ToN3 { gnb_ip, gpdu } => {
@@ -194,6 +206,7 @@ async fn serve_n6_downlink(tun: Arc<N6Tun>, n3: Arc<tokio::net::UdpSocket>, stat
             // No session owns this destination / not IPv4 — background DN noise; don't spam.
             n6::Downlink::NoRoute => trace!("N6 downlink with no matching session — dropped"),
             n6::Downlink::NotIpv4 => trace!("N6 downlink not IPv4 — dropped"),
+            n6::Downlink::RateLimited => trace!("N6 downlink over session AMBR — policed (dropped)"),
         }
     }
 }
@@ -210,9 +223,10 @@ mod tests {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = pfcp::UpfState::new();
         pfcp::handle_n4(
-            &pfcp::session_establishment_request(0xCAFE, 1, node_ip, UE_IP),
+            &pfcp::session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None),
             node_ip,
             &mut state,
+            0,
         )
         .expect("session established");
         if let Some((teid, ip)) = gnb {
@@ -220,6 +234,7 @@ mod tests {
                 &pfcp::session_modification_request(1, 2, 2, teid, ip),
                 node_ip,
                 &mut state,
+                0,
             )
             .expect("session modified");
         }
@@ -230,7 +245,7 @@ mod tests {
     /// that TEID sourced from the UE's IP decaps and is forwarded to N6.
     #[test]
     fn n3_uplink_from_ue_forwards_to_n6() {
-        let state = upf_with_session(None);
+        let mut state = upf_with_session(None);
         assert!(state.knows_teid(1), "session owns the first allocated N3 TEID");
 
         // A UE-sourced IPv4 packet, GTP-U encapsulated on the uplink TEID.
@@ -239,7 +254,7 @@ mod tests {
         inner[12..16].copy_from_slice(&UE_IP.octets()); // source = the UE
         let gpdu = gtpu::encap(1, &inner);
         let (teid, payload) = gtpu::decap(&gpdu).expect("uplink G-PDU");
-        assert_eq!(n6::uplink(&state, teid, payload), n6::Uplink::ToN6(&inner[..]));
+        assert_eq!(n6::uplink(&mut state, teid, payload, 0), n6::Uplink::ToN6(&inner[..]));
     }
 
     /// Downlink: after the SMF installs the gNB F-TEID, a packet from N6 destined to the
@@ -247,13 +262,13 @@ mod tests {
     #[test]
     fn n6_downlink_routes_to_gnb_teid() {
         let gnb = (0x5678, Ipv4Addr::new(10, 0, 0, 9));
-        let state = upf_with_session(Some(gnb));
+        let mut state = upf_with_session(Some(gnb));
 
         // A downlink IPv4 packet from the data network addressed to the UE.
         let mut pkt = vec![0u8; 20];
         pkt[0] = 0x45;
         pkt[16..20].copy_from_slice(&UE_IP.octets()); // destination = the UE
-        match n6::downlink(&state, &pkt) {
+        match n6::downlink(&mut state, &pkt, 0) {
             n6::Downlink::ToN3 { gnb_ip, gpdu } => {
                 assert_eq!(gnb_ip, gnb.1, "routed toward the session's gNB");
                 assert_eq!(gtpu::decap(&gpdu), Some((gnb.0, &pkt[..])), "encapped to gNB TEID");

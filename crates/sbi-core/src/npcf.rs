@@ -62,6 +62,29 @@ pub struct SessionAmbrPolicy {
     pub downlink: String,
 }
 
+/// Parse a TS 29.571 BitRate string (`"<value> <unit>"`, e.g. `"100 Mbps"`) to
+/// bits per second. `None` on a malformed value/unit.
+pub fn bitrate_to_bps(s: &str) -> Option<u64> {
+    let (value, unit) = s.trim().split_once(' ')?;
+    let value: u64 = value.parse().ok()?;
+    let mult: u64 = match unit {
+        "bps" => 1,
+        "Kbps" => 1_000,
+        "Mbps" => 1_000_000,
+        "Gbps" => 1_000_000_000,
+        "Tbps" => 1_000_000_000_000,
+        _ => return None,
+    };
+    value.checked_mul(mult)
+}
+
+impl SessionAmbrPolicy {
+    /// The `(uplink_bps, downlink_bps)` this AMBR represents, if both parse.
+    pub fn to_bps(&self) -> Option<(u64, u64)> {
+        Some((bitrate_to_bps(&self.uplink)?, bitrate_to_bps(&self.downlink)?))
+    }
+}
+
 /// `SmPolicyContextData` (TS 29.512 §5.6.2.2), trimmed — what the SMF tells the
 /// PCF about the session it wants a policy for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
