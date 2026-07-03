@@ -63,7 +63,7 @@ pub fn uplink<'a>(state: &mut UpfState, teid: u32, inner: &'a [u8], now_nanos: u
     {
         return Uplink::Spoofed { claimed: src, assigned: ue_ip };
     }
-    if !state.admit_uplink(teid, now_nanos, inner.len()) {
+    if !state.admit_uplink(teid, now_nanos, inner) {
         return Uplink::RateLimited;
     }
     Uplink::ToN6(inner)
@@ -92,7 +92,7 @@ pub fn downlink(state: &mut UpfState, pkt: &[u8], now_nanos: u64) -> Downlink {
     let Some((gnb_teid, gnb_ip)) = state.route_downlink(dst) else {
         return Downlink::NoRoute;
     };
-    if !state.admit_downlink(dst, now_nanos, pkt.len()) {
+    if !state.admit_downlink(dst, now_nanos, pkt) {
         return Downlink::RateLimited;
     }
     Downlink::ToN3 { gnb_ip, gpdu: gtpu::encap(gnb_teid, pkt) }
@@ -125,9 +125,17 @@ mod tests {
 
     /// Like [`established_upf`], with an optional session AMBR provisioned via a QER.
     fn established_upf_ambr(ambr: Option<pfcp::SessionAmbr>) -> (UpfState, u32) {
+        established_upf_flows(ambr, &[])
+    }
+
+    /// Like [`established_upf_ambr`], also provisioning per-flow (GBR) QERs.
+    fn established_upf_flows(
+        ambr: Option<pfcp::SessionAmbr>,
+        flows: &[pfcp::FlowQer],
+    ) -> (UpfState, u32) {
         let mut state = UpfState::new();
         pfcp::handle_n4(
-            &pfcp::session_establishment_request(0xCAFE, 1, UPF_IP, UE_IP, ambr),
+            &pfcp::session_establishment_request(0xCAFE, 1, UPF_IP, UE_IP, ambr, flows),
             UPF_IP,
             &mut state,
             0,
@@ -233,5 +241,42 @@ mod tests {
             assert!(matches!(downlink(&mut state, &pkt, 0), Downlink::ToN3 { .. }));
         }
         assert_eq!(downlink(&mut state, &pkt, 0), Downlink::RateLimited, "downlink burst exhausted");
+    }
+
+    /// A UDP packet from `src`/`sport` to `dst`/`dport`, padded to `len` bytes.
+    fn udp_packet(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, len: usize) -> Vec<u8> {
+        let mut p = ipv4_packet(src, dst, &vec![0u8; len.saturating_sub(20)]);
+        p[9] = 17; // UDP
+        p[20..22].copy_from_slice(&sport.to_be_bytes());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p
+    }
+
+    /// A per-flow GBR QER polices matched traffic through the datapath, independently
+    /// of the (much larger) session AMBR that carries everything else.
+    #[test]
+    fn per_flow_gbr_policed_through_datapath() {
+        let ambr = pfcp::SessionAmbr { uplink_bps: 1_000_000_000, downlink_bps: 1_000_000_000 };
+        let flow = pfcp::FlowQer {
+            qfi: 2,
+            filter: pfcp::FlowFilter { protocol: 17, port_low: 5000, port_high: 5010 },
+            mfbr_dl_bps: 80_000,
+            mfbr_ul_bps: 80_000,
+        };
+        let (mut state, teid) = established_upf_flows(Some(ambr), &[flow]);
+
+        // UE→DN UDP to :5005 (matches the GBR flow): 10×1000-byte burst then policed.
+        let matched = udp_packet(UE_IP, Ipv4Addr::new(8, 8, 8, 8), 40000, 5005, 1000);
+        for _ in 0..10 {
+            assert!(matches!(uplink(&mut state, teid, &matched, 0), Uplink::ToN6(_)));
+        }
+        assert_eq!(uplink(&mut state, teid, &matched, 0), Uplink::RateLimited, "GBR MFBR exhausted");
+
+        // Non-matching UDP (:9999) rides the big session AMBR — still forwarded.
+        let other = udp_packet(UE_IP, Ipv4Addr::new(8, 8, 8, 8), 40000, 9999, 1000);
+        assert!(
+            matches!(uplink(&mut state, teid, &other, 0), Uplink::ToN6(_)),
+            "non-GBR traffic uses the session AMBR, unaffected by the exhausted per-flow bucket"
+        );
     }
 }
