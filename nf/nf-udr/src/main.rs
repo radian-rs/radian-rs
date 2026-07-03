@@ -24,6 +24,9 @@ const DB_ENV: &str = "RADIAN_UDR_DB";
 const KEK_ENV: &str = "RADIAN_UDR_MASTER_KEY";
 const NRF_ENV: &str = "RADIAN_UDR_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
+/// How often to sweep UECM registrations for NFs that have left the NRF.
+const SWEEP_ENV: &str = "RADIAN_UDR_UECM_SWEEP_SECS";
+const DEFAULT_SWEEP_SECS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -52,6 +55,28 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let store: Arc<dyn SubscriberStore> = Arc::new(store);
+
+    // Periodically evict UECM registrations whose serving NF has vanished from
+    // the NRF (design/42) — the UECM analogue of the NRF's heartbeat expiry.
+    let sweep_secs: u64 = std::env::var(SWEEP_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_SWEEP_SECS);
+    {
+        let store = store.clone();
+        let nrf_base = nrf_base.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
+            loop {
+                tick.tick().await;
+                let n = sbi_core::nudr::sweep_stale_registrations(&store, &nrf_base).await;
+                if n > 0 {
+                    info!(evicted = n, "UECM sweep evicted stale registrations");
+                }
+            }
+        });
+    }
+
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     // Subscription withdrawals notify the serving AMF recorded in the UECM
     // context data (its deregCallbackUri).

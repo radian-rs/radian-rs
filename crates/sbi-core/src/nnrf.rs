@@ -300,6 +300,18 @@ impl NrfClient {
         Ok(resp.json::<SearchResult>().await?.nf_instances)
     }
 
+    /// NFListRetrieval (GET) — every currently-registered profile. The NRF purges
+    /// heartbeat-expired NFs lazily on read, so this reflects live instances.
+    pub async fn list_instances(&self) -> Result<Vec<NfProfile>, SbiError> {
+        let resp = self
+            .http
+            .get(format!("{}/nnrf-nfm/v1/nf-instances", self.base))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json::<SearchResult>().await?.nf_instances)
+    }
+
     fn nfm_url(&self, id: &str) -> String {
         format!("{}/nnrf-nfm/v1/nf-instances/{}", self.base, id)
     }

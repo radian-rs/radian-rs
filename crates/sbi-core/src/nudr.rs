@@ -128,6 +128,52 @@ async fn delete_subscription(
     StatusCode::NO_CONTENT
 }
 
+/// Evict UECM registrations whose serving NF is no longer alive at the NRF —
+/// **the UECM analogue of the NRF's own heartbeat-TTL eviction** (design/25).
+/// A crashed AMF/SMF stops heartbeating the NRF and is purged there; this sweep
+/// then drops any context-data registration naming a now-absent instance, so a
+/// stale record can't outlive its NF until the subscriber is withdrawn.
+///
+/// One NRF query per pass (not per registration). Returns the number evicted.
+/// **Fail-safe:** if the NRF is unreachable, nothing is evicted — an unreachable
+/// NRF must not be read as "every NF is dead".
+pub async fn sweep_stale_registrations(
+    store: &Arc<dyn SubscriberStore>,
+    nrf_base: &str,
+) -> usize {
+    let live: std::collections::HashSet<String> =
+        match crate::nnrf::NrfClient::new(nrf_base.to_string()).list_instances().await {
+            Ok(profiles) => profiles.into_iter().map(|p| p.nf_instance_id).collect(),
+            Err(e) => {
+                tracing::warn!("UECM sweep skipped (NRF unreachable): {e}");
+                return 0;
+            }
+        };
+
+    let mut evicted = 0;
+    for (supi, doc) in store.list_amf_registrations() {
+        let alive = doc
+            .get("amfInstanceId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| live.contains(id));
+        if !alive && store.remove_amf_registration(&supi) {
+            tracing::info!(supi = %supi, "evicted stale serving-AMF registration (NF gone)");
+            evicted += 1;
+        }
+    }
+    for ((supi, psi), doc) in store.list_smf_registrations() {
+        let alive = doc
+            .get("smfInstanceId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| live.contains(id));
+        if !alive && store.remove_smf_registration(&supi, psi) {
+            tracing::info!(supi = %supi, psi, "evicted stale serving-SMF registration (NF gone)");
+            evicted += 1;
+        }
+    }
+    evicted
+}
+
 /// Whether `uri` is acceptable as a serving-AMF deregistration callback: a
 /// well-formed absolute `http`/`https` URL. This is an **SSRF guard** — the URI
 /// is attacker-influenceable while the SBI is unauthenticated (see the module
@@ -647,6 +693,44 @@ mod tests {
         // Nothing was stored.
         let udr = UdrClient::new(format!("http://{udr_addr}"));
         assert!(udr.get_amf_registration("imsi-1").await.unwrap().is_none());
+    }
+
+    /// The UECM sweep evicts registrations whose serving NF is gone from the NRF,
+    /// keeps live ones, and (fail-safe) evicts nothing when the NRF is unreachable.
+    #[tokio::test]
+    async fn uecm_sweep_evicts_dead_nf_registrations() {
+        use subscriber_db::ProvisionedDataStore;
+
+        // NRF with one live AMF instance ("amf-live") registered.
+        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nrf_addr = nrf_l.local_addr().unwrap();
+        let nrf_store = crate::nnrf::NrfStore::default();
+        tokio::spawn(async move { crate::run_on(nrf_l, crate::nnrf::router(nrf_store)).await.unwrap() });
+        let nrf_base = format!("http://{nrf_addr}");
+        crate::nnrf::NrfClient::new(nrf_base.clone())
+            .register(&crate::nnrf::NfProfile::new("amf-live", "AMF", "127.0.0.1"))
+            .await
+            .unwrap();
+
+        // Two AMF registrations (one live, one dead) + one dead SMF registration.
+        let store = Arc::new(InMemoryStore::new());
+        store.put_amf_registration("imsi-live", &serde_json::json!({"amfInstanceId": "amf-live"})).unwrap();
+        store.put_amf_registration("imsi-dead", &serde_json::json!({"amfInstanceId": "amf-gone"})).unwrap();
+        store.put_smf_registration("imsi-live", 5, &serde_json::json!({"smfInstanceId": "smf-gone"})).unwrap();
+        let store: Arc<dyn SubscriberStore> = store;
+
+        let evicted = sweep_stale_registrations(&store, &nrf_base).await;
+        assert_eq!(evicted, 2, "the dead AMF and dead SMF registrations are evicted");
+        assert!(store.get_amf_registration("imsi-live").is_some(), "live AMF registration kept");
+        assert!(store.get_amf_registration("imsi-dead").is_none(), "dead AMF registration gone");
+        assert!(store.get_smf_registration("imsi-live", 5).is_none(), "dead SMF registration gone");
+
+        // Idempotent: a second pass evicts nothing more.
+        assert_eq!(sweep_stale_registrations(&store, &nrf_base).await, 0);
+
+        // Fail-safe: an unreachable NRF evicts nothing (even the still-present live one).
+        assert_eq!(sweep_stale_registrations(&store, "http://127.0.0.1:1").await, 0);
+        assert!(store.get_amf_registration("imsi-live").is_some(), "unreachable NRF is not 'all dead'");
     }
 
     /// SMF UECM register → per-session context data at the UDR; purge → gone.
