@@ -40,6 +40,7 @@ surface of the project and assesses build feasibility.
 | [29-pdu-session-reject.md](29-pdu-session-reject.md) | 5GSM PDU Session Establishment Reject: SMF 403 → cause #27 (else #31), NAS-protected DL NAS Transport; negative BDD scenario |
 | [30-reject-backoff-timer.md](30-reject-backoff-timer.md) | T3396 back-off IE on the reject: GprsTimer3 encoding (finest-fitting unit, round up), 600s on cause #27, none on #31 |
 | [31-requested-snssai.md](31-requested-snssai.md) | UE-requested S-NSSAI: parse the 0x22 IE, slice-keyed subscription validation (403 SNSSAI_DENIED/DNN_DENIED ProblemDetails), 5GSM cause #70 |
+| [32-allowed-nssai.md](32-allowed-nssai.md) | Allowed NSSAI at registration: Nudm_SDM am-data, 0x15 IE in the Registration Accept (fail-open), local slice admission at PDU establishment |
 
 ## One-paragraph summary
 
