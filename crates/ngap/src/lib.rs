@@ -69,6 +69,68 @@ pub fn downlink_nas_transport(amf_ue_id: u64, ran_ue_id: u32, nas: Vec<u8>) -> N
     )
 }
 
+/// Build a `DownlinkNASTransport` carrying both a NAS PDU **and a Mobility
+/// Restriction List** (TS 38.413 §9.2.5.3) — the AMF's way of handing the RAN a UE's
+/// **service area restriction** (allowed / non-allowed tracking areas, TS 23.501
+/// §5.3.4.1) alongside a NAS message such as the Registration Accept. TACs are the
+/// 3-octet tracking area codes; an empty allowed/non-allowed slice omits that IE.
+pub fn downlink_nas_transport_with_area_restriction(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    nas: Vec<u8>,
+    mcc: &str,
+    mnc: &str,
+    allowed_tacs: &[[u8; 3]],
+    not_allowed_tacs: &[[u8; 3]],
+) -> NGAP_PDU {
+    let to_tacs = |ts: &[[u8; 3]]| ts.iter().map(|t| TAC(t.to_vec())).collect::<Vec<_>>();
+    let area = ServiceAreaInformation_Item {
+        plmn_identity: helpers::plmn(mcc, mnc),
+        allowed_ta_cs: (!allowed_tacs.is_empty()).then(|| AllowedTACs(to_tacs(allowed_tacs))),
+        not_allowed_ta_cs: (!not_allowed_tacs.is_empty())
+            .then(|| NotAllowedTACs(to_tacs(not_allowed_tacs))),
+        ie_extensions: None,
+    };
+    let mrl = MobilityRestrictionList {
+        serving_plmn: helpers::plmn(mcc, mnc),
+        equivalent_plm_ns: None,
+        rat_restrictions: None,
+        forbidden_area_information: None,
+        service_area_information: Some(ServiceAreaInformation(vec![area])),
+        ie_extensions: None,
+    };
+    build_ngap!(InitiatingMessage, DownlinkNASTransport,
+        IGNORE, DownlinkNASTransport,
+        REJECT AMF_UE_NGAP_ID(amf_ue_id),
+        REJECT RAN_UE_NGAP_ID(ran_ue_id),
+        REJECT NAS_PDU(nas),
+        IGNORE MobilityRestrictionList(mrl),
+    )
+}
+
+/// Extract `(allowed_tacs, non_allowed_tacs)` from the Mobility Restriction List of a
+/// `DownlinkNASTransport` (first Service Area Information item) — the RAN side / tests.
+/// `None` when the message carries no mobility restriction.
+pub fn area_restriction_from_downlink_nas(pdu: &NGAP_PDU) -> Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_DownlinkNASTransport(msg) = value else {
+        return None;
+    };
+    let mrl = msg.protocol_i_es.0.iter().find_map(|e| match &e.value {
+        DownlinkNASTransportProtocolIEs_EntryValue::Id_MobilityRestrictionList(m) => Some(m),
+        _ => None,
+    })?;
+    let item = mrl.service_area_information.as_ref()?.0.first()?;
+    let collect = |tacs: &[TAC]| {
+        tacs.iter().filter_map(|t| <[u8; 3]>::try_from(t.0.as_slice()).ok()).collect::<Vec<_>>()
+    };
+    let allowed = item.allowed_ta_cs.as_ref().map(|a| collect(&a.0)).unwrap_or_default();
+    let not_allowed = item.not_allowed_ta_cs.as_ref().map(|a| collect(&a.0)).unwrap_or_default();
+    Some((allowed, not_allowed))
+}
+
 /// Build an `UplinkNASTransport` (TS 38.413 §9.2.5.4) carrying a NAS PDU from the
 /// gNB/UE to the AMF — primarily for tests and a UE/gNB simulator.
 pub fn uplink_nas_transport(amf_ue_id: u64, ran_ue_id: u32, nas: Vec<u8>) -> NGAP_PDU {
@@ -902,6 +964,27 @@ mod release_tests {
         assert_eq!(parse_ue_context_release_request(&back), Some((99, 3)));
         // A different message type isn't misread as a release request.
         assert_eq!(parse_ue_context_release_request(&initial_ue_message_with_nas(1, vec![1])), None);
+    }
+
+    #[test]
+    fn downlink_nas_with_area_restriction_roundtrips() {
+        // Allowed TAC 000001, non-allowed TAC 00000a, riding on a NAS PDU.
+        let pdu = downlink_nas_transport_with_area_restriction(
+            7,
+            3,
+            vec![0xde, 0xad],
+            "999",
+            "70",
+            &[[0, 0, 1]],
+            &[[0, 0, 0x0a]],
+        );
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(
+            area_restriction_from_downlink_nas(&back),
+            Some((vec![[0, 0, 1]], vec![[0, 0, 0x0a]]))
+        );
+        // A plain DownlinkNASTransport has no restriction.
+        assert_eq!(area_restriction_from_downlink_nas(&downlink_nas_transport(7, 3, vec![1])), None);
     }
 
     #[test]
