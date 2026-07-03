@@ -123,6 +123,40 @@ pub fn parse_ue_context_release_command(pdu: &NGAP_PDU) -> Option<(u64, u32, Opt
     Some((amf_ue_id, ran_ue_id, cause))
 }
 
+/// Build an `InitialUEMessage` carrying a **5G-S-TMSI** IE alongside the NAS PDU
+/// (TS 38.413 §9.2.5.1) — a CM-IDLE UE resuming with a Service Request identifies
+/// itself by 5G-S-TMSI, which the gNB relays from RRC. For tests / a gNB simulator.
+pub fn initial_ue_message_with_stmsi(ran_ue_id: u32, tmsi: u32, nas: Vec<u8>) -> NGAP_PDU {
+    // AMF Set ID is 10 bits, AMF Pointer 6 bits, 5G-TMSI 32 bits (4 octets).
+    let mut set_id = BitVec::<u8, Msb0>::from_slice(&[0x00, 0x40]);
+    set_id.truncate(10);
+    let mut pointer = BitVec::<u8, Msb0>::from_slice(&[0x00]);
+    pointer.truncate(6);
+    let s_tmsi = FiveG_S_TMSI {
+        amf_set_id: AMFSetID(set_id),
+        amf_pointer: AMFPointer(pointer),
+        five_g_tmsi: FiveG_TMSI(tmsi.to_be_bytes().to_vec()),
+        ie_extensions: None,
+    };
+    build_ngap!(InitiatingMessage, InitialUEMessage,
+        IGNORE, InitialUEMessage,
+        REJECT RAN_UE_NGAP_ID(ran_ue_id),
+        REJECT NAS_PDU(nas),
+        REJECT FiveG_S_TMSI(s_tmsi),
+    )
+}
+
+/// Extract the **5G-TMSI** (u32) from an `InitialUEMessage`'s 5G-S-TMSI IE, if
+/// present — the identity the AMF resolves against its retained CM-IDLE contexts.
+pub fn fiveg_s_tmsi_from_initial_ue(msg: &InitialUEMessage) -> Option<u32> {
+    msg.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        InitialUEMessageProtocolIEs_EntryValue::Id_FiveG_S_TMSI(t) => {
+            <[u8; 4]>::try_from(t.five_g_tmsi.0.as_slice()).ok().map(u32::from_be_bytes)
+        }
+        _ => None,
+    })
+}
+
 /// Build a `UEContextReleaseRequest` (TS 38.413 §9.2.2.3) — the **gNB-initiated**
 /// request to release a UE's context (e.g. on RAN user inactivity). Carries the
 /// UE-NGAP-ID pair + a RadioNetwork cause. Mainly for a gNB simulator / tests.
@@ -678,6 +712,33 @@ mod release_tests {
             parse_ue_context_release_command(&back),
             Some((42, 7, Some(CauseNas::NORMAL_RELEASE)))
         );
+    }
+
+    #[test]
+    fn initial_ue_with_stmsi_roundtrips() {
+        let pdu = initial_ue_message_with_stmsi(4, 0x00A1_B2C3, vec![0x7e, 0x00]);
+        let mut data = PerCodecData::new_aper();
+        pdu.aper_encode(&mut data).expect("APER encode");
+        let bytes = data.get_inner().expect("bytes");
+        let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) =
+            NGAP_PDU::decode(&bytes).expect("APER decode")
+        else {
+            panic!("not an initiating message");
+        };
+        let InitiatingMessageValue::Id_InitialUEMessage(msg) = value else {
+            panic!("not an InitialUEMessage");
+        };
+        assert_eq!(fiveg_s_tmsi_from_initial_ue(&msg), Some(0x00A1_B2C3));
+        // An InitialUEMessage without the S-TMSI IE yields None.
+        let InitiatingMessageValue::Id_InitialUEMessage(plain) =
+            (match initial_ue_message_with_nas(4, vec![1]) {
+                NGAP_PDU::InitiatingMessage(m) => m.value,
+                _ => unreachable!(),
+            })
+        else {
+            unreachable!()
+        };
+        assert_eq!(fiveg_s_tmsi_from_initial_ue(&plain), None);
     }
 
     #[test]

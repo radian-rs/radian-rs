@@ -204,6 +204,14 @@ static UE_DIRECTORY: LazyLock<Mutex<HashMap<String, (u64, UnboundedSender<UeCmd>
 static GUTI_DIRECTORY: LazyLock<Mutex<HashMap<u32, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// CM-IDLE UE contexts retained across the N2 release, keyed by 5G-TMSI. On AN
+/// release the context (registration + NAS security + PDU sessions) is moved here;
+/// a Service Request carrying that 5G-S-TMSI restores it into the serving
+/// association and re-activates the user plane. AMF-wide (survives the owning SCTP
+/// association ending), so a UE can resume on any gNB.
+static RETAINED: LazyLock<Mutex<HashMap<u32, UeContext>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Arm T3522: after `secs`, post an expiry for this UE onto its association.
 fn arm_t3522(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64, secs: u64) {
     let tx = tx.clone();
@@ -268,6 +276,11 @@ struct UeContext {
     /// release. A CM-IDLE context is retained (registration + PDU sessions live)
     /// for a Service Request to resume.
     cm_state: CmState,
+    /// The 5G-TMSI (from the assigned 5G-GUTI) — the persistent identity a Service
+    /// Request presents. Set when the Registration Accept assigns the GUTI; the
+    /// retained-context store is keyed by it (stable across CM-IDLE / resume,
+    /// unlike the per-N2-connection AMF-UE-NGAP-ID).
+    guti_tmsi: Option<u32>,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
@@ -654,6 +667,16 @@ async fn handle_ngap(
                 send_or_log(conn, &resp, "NGSetupResponse").await;
             }
             InitiatingMessageValue::Id_InitialUEMessage(msg) => {
+                // A 5G-S-TMSI naming a retained CM-IDLE context → a Service Request
+                // resume, not a fresh registration.
+                let resume = ngap::fiveg_s_tmsi_from_initial_ue(msg)
+                    .filter(|tmsi| RETAINED.lock().unwrap().contains_key(tmsi));
+                if let Some(tmsi) = resume {
+                    for (dl, label) in on_service_request(ues, amf_smf, msg, tmsi, dereg_tx).await {
+                        send_or_log(conn, &dl, label).await;
+                    }
+                    return;
+                }
                 let amf_ue_id = NEXT_AMF_UE_ID.fetch_add(1, Ordering::Relaxed);
                 match on_initial_ue(ues, msg, amf_ue_id, dereg_tx) {
                     Some(InitialUeOutcome::NeedIdentity(dl)) => {
@@ -727,11 +750,120 @@ async fn on_ue_context_release_request(
             Err(e) => warn!("UE {amf_ue_id}: PDU session {psi} deactivation failed: {e}"),
         }
     }
-    if let Some(ctx) = ues.get_mut(&amf_ue_id) {
+    // Move the context to the AMF-wide retained store (keyed by its 5G-TMSI) so a
+    // Service Request can resume it; the N2-connection ids and reachability channel
+    // are dropped (the UE is unreachable over N2 until it comes back).
+    if let Some(mut ctx) = ues.remove(&amf_ue_id) {
         ctx.cm_state = CmState::Idle;
+        if let Some(supi) = &ctx.suci {
+            UE_DIRECTORY.lock().unwrap().remove(supi);
+        }
+        match ctx.guti_tmsi {
+            Some(tmsi) => {
+                RETAINED.lock().unwrap().insert(tmsi, ctx);
+                info!("UE {amf_ue_id}: released RAN context — CM-IDLE, retained by 5G-TMSI {tmsi:#010x} ({} PDU session(s))", sessions.len());
+            }
+            // No GUTI assigned (shouldn't happen for a registered UE) — nothing to
+            // resume by S-TMSI; drop it.
+            None => warn!("UE {amf_ue_id}: released with no 5G-GUTI — context dropped, no resume"),
+        }
     }
-    info!("UE {amf_ue_id}: released RAN context — now CM-IDLE ({} PDU session(s) retained)", sessions.len());
     Some(ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::NORMAL_RELEASE))
+}
+
+/// Handle a **Service Request** (TS 23.502 §4.2.3.2) — a CM-IDLE UE resuming.
+/// The `tmsi` (from the InitialUEMessage 5G-S-TMSI) named a retained context: take
+/// it, verify the protected Service Request NAS with its NAS security context,
+/// restore it into this association under a fresh AMF-UE-NGAP-ID, send a Service
+/// Accept, and re-activate each PDU session's user plane (Nsmf `ACTIVATING` → N2
+/// PDU Session Resource Setup with the retained UPF N3 F-TEID). Back to CM-CONNECTED.
+async fn on_service_request(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    msg: &InitialUEMessage,
+    tmsi: u32,
+    dereg_tx: &UnboundedSender<UeCmd>,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let Some(ran_ue_id) = initial_ue_ran_id(msg) else {
+        warn!("Service Request (tmsi {tmsi:#010x}) without RAN-UE-NGAP-ID");
+        return Vec::new();
+    };
+    let Some(mut ctx) = RETAINED.lock().unwrap().remove(&tmsi) else {
+        return Vec::new(); // raced with another resume — the context was already taken
+    };
+
+    // Verify the (integrity-protected) Service Request NAS with the retained keys —
+    // the UE proves it holds the security context. A failure re-retains the context.
+    let verified = initial_ue_nas_pdu(msg)
+        .and_then(|raw| ctx.sec.as_mut().and_then(|s| s.unprotect(raw, 0)))
+        .as_ref()
+        .and_then(nas::service_request_info)
+        .is_some();
+    if !verified {
+        warn!("Service Request (tmsi {tmsi:#010x}) failed NAS verification — ignored");
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+        return Vec::new();
+    }
+
+    let amf_ue_id = NEXT_AMF_UE_ID.fetch_add(1, Ordering::Relaxed);
+    ctx.ran_ue_id = ran_ue_id;
+    ctx.cm_state = CmState::Connected;
+    let supi = ctx.suci.clone();
+    let sm_refs: Vec<(u8, (String, String))> =
+        ctx.sm_refs.iter().map(|(psi, v)| (*psi, v.clone())).collect();
+    let ue_ambr = ctx.ue_ambr;
+    // Protect the Service Accept before the context moves into the association map.
+    let accept = ctx
+        .sec
+        .as_mut()
+        .map(|s| s.protect(&nas::service_accept(), nas::sht::INTEGRITY_CIPHERED, 1));
+    ues.insert(amf_ue_id, ctx);
+    if let Some(supi) = &supi {
+        UE_DIRECTORY.lock().unwrap().insert(supi.clone(), (amf_ue_id, dereg_tx.clone()));
+    }
+    info!("UE {amf_ue_id} resuming from CM-IDLE (Service Request, tmsi {tmsi:#010x}); {} session(s)", sm_refs.len());
+
+    let mut downlinks = Vec::new();
+    if let Some(accept) = accept {
+        downlinks.push((
+            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, accept),
+            "DownlinkNASTransport (ServiceAccept)",
+        ));
+    }
+
+    // Re-activate each PDU session: the SMF returns the retained UPF N3 F-TEID + QoS,
+    // and the AMF re-sends the N2 PDU Session Resource Setup. The gNB's F-TEID comes
+    // back in the setup response (existing path) → UpdateSMContext re-installs the
+    // UPF downlink that AN release had dropped.
+    for (psi, (sm_ref, smf_base)) in &sm_refs {
+        match amf_smf.activate_up_connection(smf_base, sm_ref).await {
+            Ok(created) => {
+                let flows = if created.ngap_flows.is_empty() {
+                    vec![ngap::QosFlow::default_non_gbr()]
+                } else {
+                    created.ngap_flows.clone()
+                };
+                let (ambr_dl, ambr_ul) = ue_ambr.unwrap_or(DEFAULT_UE_AMBR_BPS);
+                downlinks.push((
+                    ngap::pdu_session_resource_setup_request(
+                        amf_ue_id,
+                        ran_ue_id,
+                        *psi,
+                        &flows,
+                        created.up_n3_teid,
+                        created.up_n3_addr,
+                        ambr_dl,
+                        ambr_ul,
+                        Vec::new(), // no N1 SM on resume; the Service Accept went separately
+                    ),
+                    "PDUSessionResourceSetupRequest (resume)",
+                ));
+                info!("UE {amf_ue_id}: PDU session {psi} reactivating (N2 setup re-sent)");
+            }
+            Err(e) => warn!("UE {amf_ue_id}: PDU session {psi} reactivation failed: {e}"),
+        }
+    }
+    downlinks
 }
 
 /// Handle a gNB's `PDUSessionResourceSetupResponse`: extract the gNB DL N3 F-TEID and
@@ -848,6 +980,7 @@ impl UeContext {
             dereg_attempts: None,
             resync_attempted: false,
             cm_state: CmState::Connected,
+            guti_tmsi: None,
         }
     }
 }
@@ -1430,6 +1563,9 @@ async fn on_security_mode_complete(
     ctx.ue_ambr = ue_ambr;
     let ran_ue_id = ctx.ran_ue_id;
     let tmsi = amf_ue_id as u32;
+    // Remember the assigned 5G-TMSI as this UE's persistent identity (a Service
+    // Request presents it; the retained-context store is keyed by it).
+    ctx.guti_tmsi = Some(tmsi);
     // Fail-open when the subscription is unreachable: no NSSAI IEs, and slice
     // admission falls back to the SMF's check.
     let (allowed, rejected) = match &subscribed {
@@ -1848,9 +1984,11 @@ mod tests {
         tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
         let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70"); // NRF unused here
 
-        // A registered UE with two active PDU sessions on the mock SMF.
+        // A registered UE (assigned 5G-TMSI 0x00000101) with two PDU sessions.
+        let tmsi = 0x0000_0101u32;
         let smf_base = format!("http://{smf_addr}");
         let mut ctx = UeContext::new(7, RegState::Registered, Some("imsi-999700000000081".into()));
+        ctx.guti_tmsi = Some(tmsi);
         ctx.sm_refs.insert(5, ("ctx-5".into(), smf_base.clone()));
         ctx.sm_refs.insert(6, ("ctx-6".into(), smf_base));
         let mut ues = HashMap::new();
@@ -1864,13 +2002,101 @@ mod tests {
             Some((1, 7, Some(ngap::CauseNas::NORMAL_RELEASE)))
         );
         assert_eq!(DEACTIVATIONS.load(AtomicOrdering::Relaxed), 2, "both sessions' UP deactivated");
-        // The context is retained in CM-IDLE with its PDU sessions intact.
-        let ctx = ues.get(&1).expect("context retained (CM-IDLE, not dropped)");
-        assert_eq!(ctx.cm_state, CmState::Idle);
-        assert_eq!(ctx.sm_refs.len(), 2, "PDU sessions kept for a later Service Request");
+        // The context left the association map and is retained by 5G-TMSI, CM-IDLE,
+        // with its PDU sessions intact for a Service Request.
+        assert!(!ues.contains_key(&1), "N2 context removed from the association");
+        let retained = RETAINED.lock().unwrap().remove(&tmsi).expect("context retained by 5G-TMSI");
+        assert_eq!(retained.cm_state, CmState::Idle);
+        assert_eq!(retained.sm_refs.len(), 2, "PDU sessions kept for a later Service Request");
 
         // A release request for an unknown UE produces no command.
         assert!(on_ue_context_release_request(&mut ues, &amf_smf, &ngap::ue_context_release_request(99, 1, 20)).await.is_none());
+    }
+
+    /// Service Request resume: a CM-IDLE UE (retained by 5G-TMSI) comes back with a
+    /// protected Service Request; the AMF restores its context under a fresh
+    /// AMF-UE-NGAP-ID, re-activates the PDU session at the SMF, and sends a Service
+    /// Accept + N2 PDU Session Resource Setup — back to CM-CONNECTED.
+    #[tokio::test]
+    async fn service_request_resumes_a_cm_idle_ue() {
+        use axum::http::StatusCode;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        // Mock SMF: an ACTIVATING UpdateSMContext returns the session's N2 info.
+        static ACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
+        async fn mock_modify(
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            if body.get("upCnxState").and_then(|v| v.as_str()) == Some("ACTIVATING") {
+                ACTIVATIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                return (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "upN3Teid": "00000001", "upN3Addr": "127.0.0.1", "ueIpv4Addr": "10.45.0.2"
+                    })),
+                )
+                    .into_response();
+            }
+            StatusCode::OK.into_response()
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new().route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
+            axum::routing::post(mock_modify),
+        );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+
+        // A CM-IDLE UE retained by its 5G-TMSI, with a NAS security context + one
+        // PDU session (as AN release would have left it).
+        let (ki, ke) = ([0x55u8; 16], [0x66u8; 16]);
+        let supi = "imsi-999700000000091";
+        let tmsi = 0x0000_0091u32;
+        let mut ctx = UeContext::new(0, RegState::Registered, Some(supi.into()));
+        ctx.cm_state = CmState::Idle;
+        ctx.guti_tmsi = Some(tmsi);
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.sm_refs.insert(5, ("ctx-5".into(), format!("http://{smf_addr}")));
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+
+        // The UE builds a protected Service Request (its own security context).
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let sr = ue_sec.protect(
+            &nas::decode_nas_5gs_message(&nas::service_request(1, 0, tmsi)).unwrap(),
+            nas::sht::INTEGRITY_CIPHERED,
+            0,
+        );
+        let pdu = ngap::initial_ue_message_with_stmsi(3, tmsi, sr);
+        let init = as_initial_ue(&pdu);
+        assert_eq!(ngap::fiveg_s_tmsi_from_initial_ue(init), Some(tmsi));
+
+        let mut ues = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dls = on_service_request(&mut ues, &amf_smf, init, tmsi, &tx).await;
+
+        // Service Accept then the N2 PDU Session Resource Setup for the reactivated session.
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["DownlinkNASTransport (ServiceAccept)", "PDUSessionResourceSetupRequest (resume)"]
+        );
+        assert_eq!(ACTIVATIONS.load(AtomicOrdering::Relaxed), 1, "SMF asked to re-activate the session");
+        // The context is restored into the association (CM-CONNECTED) and removed
+        // from the retained store; the directory points at the new AMF-UE-NGAP-ID.
+        assert!(RETAINED.lock().unwrap().get(&tmsi).is_none(), "retained context consumed");
+        let (_id, restored) = ues.iter().next().expect("context restored into the association");
+        assert_eq!(restored.cm_state, CmState::Connected);
+        assert_eq!(restored.suci.as_deref(), Some(supi));
+        assert_eq!(restored.sm_refs.len(), 1, "PDU session carried over");
+        assert!(UE_DIRECTORY.lock().unwrap().contains_key(supi), "reachable again over N2");
+
+        // The UE decodes the Service Accept under its own context.
+        let accept_bytes = downlink_nas_pdu(&dls[0].0).expect("NAS PDU");
+        let accept = ue_sec.unprotect(&accept_bytes, 1).expect("UE verifies the Service Accept");
+        assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::ServiceAccept));
+
+        UE_DIRECTORY.lock().unwrap().remove(supi);
     }
 
     /// A network-initiated PDU session modification builds the N2 PDU Session
