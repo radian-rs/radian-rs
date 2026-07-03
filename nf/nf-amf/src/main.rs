@@ -132,9 +132,10 @@ enum UeCmd {
     T3522Expiry(u64),
     /// Push a mid-session PDU-session QoS change to the RAN/UE (from the SMF).
     ModifyPolicy(Box<ModifyPolicy>),
-    /// Page a CM-IDLE UE by 5G-TMSI (downlink data arrived — the SMF asked the AMF
-    /// to page). Broadcast to every gNB association; each sends an NGAP Paging.
-    Page(u32),
+    /// Page a CM-IDLE UE by 5G-TMSI in tracking area `tac` (downlink data or a
+    /// pending AM policy change). Sent to the gNB associations serving that TA
+    /// (registration-area paging); each sends an NGAP Paging.
+    Page { tmsi: u32, tac: [u8; 3] },
     /// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify):
     /// the new UE-AMBR `(downlink, uplink)` bits/sec for this UE.
     UpdateAmPolicy {
@@ -233,15 +234,91 @@ static GUTI_DIRECTORY: LazyLock<Mutex<HashMap<u32, String>>> =
 static RETAINED: LazyLock<Mutex<HashMap<u32, UeContext>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Command channels into every live gNB association — how the SBI paging surface
-/// reaches the N2 tasks. Each `serve_gnb` registers its channel; closed ones are
-/// swept when paging broadcasts. NGAP **Paging** is non-UE-associated, so it goes
-/// to all gNBs (a real AMF filters by the UE's registration-area TAI list).
-static GNB_LINKS: LazyLock<Mutex<Vec<UnboundedSender<UeCmd>>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+/// A live gNB association's command channel + the tracking areas it serves (from
+/// its NG Setup Supported TA List; empty until NG Setup completes).
+struct GnbLink {
+    tacs: Vec<[u8; 3]>,
+    tx: UnboundedSender<UeCmd>,
+}
 
-/// The tracking-area code the AMF pages within (single-TA demo core).
+/// Command channels into every live gNB association — how the SBI paging surface
+/// reaches the N2 tasks. Each `serve_gnb` registers its link; closed ones are
+/// swept when paging. Paging is **registration-area-scoped**: only the gNBs whose
+/// Supported TA List covers the UE's TAI are paged (see [`page_gnbs`]).
+static GNB_LINKS: LazyLock<Mutex<Vec<GnbLink>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// The tracking-area code the AMF pages within when the UE's TAI is unknown
+/// (single-TA demo core default).
 const AMF_TAC: [u8; 3] = [0x00, 0x00, 0x01];
+
+/// T3513 (TS 24.501 §10.2) — the network-side paging timer: started when a Paging
+/// is sent, stopped by the paging response (the Service Request consuming the
+/// retained context). On expiry the page is retransmitted, up to
+/// [`T3513_MAX_SENDS`] attempts. Override with `RADIAN_AMF_T3513_SECS`.
+const T3513_SECS: u64 = 6;
+const T3513_ENV: &str = "RADIAN_AMF_T3513_SECS";
+const T3513_MAX_SENDS: u32 = 3;
+
+/// Page `tmsi` on the gNB associations serving tracking area `tac`
+/// (registration-area paging). A gNB that hasn't completed NG Setup (no TA list
+/// yet) is included; if the UE's TA is unknown every gNB is paged (fail-open).
+/// Closed links are swept. Returns how many associations were paged.
+fn page_gnbs(tmsi: u32, ue_tac: Option<[u8; 3]>) -> usize {
+    let page_tac = ue_tac.unwrap_or(AMF_TAC);
+    let mut paged = 0;
+    let mut links = GNB_LINKS.lock().unwrap();
+    links.retain(|l| {
+        let serving = match ue_tac {
+            Some(t) => l.tacs.contains(&t) || l.tacs.is_empty(),
+            None => true,
+        };
+        if !serving {
+            return !l.tx.is_closed();
+        }
+        match l.tx.send(UeCmd::Page { tmsi, tac: page_tac }) {
+            Ok(()) => {
+                paged += 1;
+                true
+            }
+            Err(_) => false,
+        }
+    });
+    paged
+}
+
+/// Page a CM-IDLE UE under **T3513**: page its registration area, wait, and
+/// retransmit until the UE resumes (its retained context is consumed by the
+/// Service Request) or `max_sends` attempts exhaust.
+async fn page_with_retx(supi: String, tmsi: u32, t3513: std::time::Duration, max_sends: u32) {
+    for attempt in 1..=max_sends {
+        // Resumed (or evicted) — the retained context is gone: stop paging.
+        let Some(ue_tac) = RETAINED.lock().unwrap().get(&tmsi).map(|c| c.tac) else {
+            return;
+        };
+        let paged = page_gnbs(tmsi, ue_tac);
+        info!(%supi, attempt, of = max_sends, gnbs = paged, "paging CM-IDLE UE (T3513 armed)");
+        tokio::time::sleep(t3513).await;
+        if !RETAINED.lock().unwrap().contains_key(&tmsi) {
+            info!(%supi, attempt, "UE answered the page (resumed)");
+            return;
+        }
+    }
+    warn!(%supi, "T3513 exhausted after {max_sends} attempts — UE unreachable; context stays retained");
+}
+
+/// Spawn the T3513 paging loop for a retained UE (config-driven timer).
+fn spawn_paging(supi: &str, tmsi: u32) {
+    let t3513 = std::env::var(T3513_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(T3513_SECS);
+    tokio::spawn(page_with_retx(
+        supi.to_string(),
+        tmsi,
+        std::time::Duration::from_secs(t3513),
+        T3513_MAX_SENDS,
+    ));
+}
 
 /// Arm T3522: after `secs`, post an expiry for this UE onto its association.
 fn arm_t3522(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64, secs: u64) {
@@ -320,6 +397,10 @@ struct UeContext {
     /// retained-context store is keyed by it (stable across CM-IDLE / resume,
     /// unlike the per-N2-connection AMF-UE-NGAP-ID).
     guti_tmsi: Option<u32>,
+    /// The UE's tracking area (from the InitialUEMessage's User Location
+    /// Information TAI, refreshed on resume) — the registration area paging is
+    /// scoped to. `None` when the gNB sent no ULI (paging falls back to all gNBs).
+    tac: Option<[u8; 3]>,
     /// When this context entered CM-IDLE (moved to `RETAINED`). The eviction sweep
     /// implicitly deregisters a UE that lingers past the mobile-reachable /
     /// implicit-deregistration deadline. `None` while CM-CONNECTED.
@@ -428,8 +509,9 @@ async fn serve_gnb(
     let mut ues: HashMap<u64, UeContext> = HashMap::new();
     // The SBI callback surface reaches this association's UEs through this channel.
     let (dereg_tx, mut dereg_rx) = unbounded_channel::<UeCmd>();
-    // Register this association so the paging surface can reach its gNB.
-    GNB_LINKS.lock().unwrap().push(dereg_tx.clone());
+    // Register this association so the paging surface can reach its gNB; the
+    // served TA list is filled in when the gNB's NG Setup arrives.
+    GNB_LINKS.lock().unwrap().push(GnbLink { tacs: Vec::new(), tx: dereg_tx.clone() });
     let result = loop {
         tokio::select! {
             received = conn.sctp_recv() => match received {
@@ -453,10 +535,11 @@ async fn serve_gnb(
                     UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr, rfsp, area_restriction } => {
                         on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp, area_restriction)
                     }
-                    // Page a CM-IDLE UE on this gNB (non-UE-associated NGAP Paging).
-                    UeCmd::Page(tmsi) => {
-                        info!("paging CM-IDLE UE (5G-TMSI {tmsi:#010x}) on this gNB");
-                        vec![(ngap::paging(tmsi, PLMN_MCC, PLMN_MNC, &AMF_TAC), "Paging")]
+                    // Page a CM-IDLE UE on this gNB (non-UE-associated NGAP Paging)
+                    // in the UE's registration-area tracking area.
+                    UeCmd::Page { tmsi, tac } => {
+                        info!("paging CM-IDLE UE (5G-TMSI {tmsi:#010x}, TAC {tac:02x?}) on this gNB");
+                        vec![(ngap::paging(tmsi, PLMN_MCC, PLMN_MNC, &tac), "Paging")]
                     }
                 };
                 for (dl, label) in downlinks {
@@ -553,8 +636,9 @@ fn namf_callback_router() -> axum::Router {
 
     /// `Namf_Communication_N1N2MessageTransfer` (TS 29.518, simplified) — the SMF
     /// asks the AMF to page a UE for which downlink data arrived at the UPF. The AMF
-    /// resolves the SUPI to its retained CM-IDLE 5G-TMSI and broadcasts an NGAP
-    /// Paging to every gNB. `202` if paged; `404` if the UE isn't CM-IDLE / unknown.
+    /// resolves the SUPI to its retained CM-IDLE 5G-TMSI and pages its registration
+    /// area under T3513. `202` if paging started; `404` if the UE isn't CM-IDLE /
+    /// unknown.
     async fn page_ue(
         axum::extract::Path(supi): axum::extract::Path<String>,
     ) -> axum::http::StatusCode {
@@ -568,10 +652,8 @@ fn namf_callback_router() -> axum::Router {
             warn!(%supi, "paging requested but the UE is not CM-IDLE / unknown");
             return axum::http::StatusCode::NOT_FOUND;
         };
-        // Broadcast to every live gNB association (sweeping any that have closed).
-        let mut links = GNB_LINKS.lock().unwrap();
-        links.retain(|tx| tx.send(UeCmd::Page(tmsi)).is_ok());
-        info!(%supi, gnbs = links.len(), "paging CM-IDLE UE (downlink data)");
+        info!(%supi, "downlink data for a CM-IDLE UE — paging under T3513");
+        spawn_paging(&supi, tmsi);
         axum::http::StatusCode::ACCEPTED
     }
 
@@ -613,9 +695,8 @@ fn namf_callback_router() -> axum::Router {
             _ => {}
         }
         // Not CM-CONNECTED — a retained CM-IDLE context instead? Hold the change
-        // there (latest wins) and page the UE (network-triggered Service Request,
-        // TS 23.502 §4.2.3.3); the resume path applies it. Same paging fan-out as
-        // the downlink-data path.
+        // there (latest wins) and page the UE under T3513 (network-triggered
+        // Service Request, TS 23.502 §4.2.3.3); the resume path applies it.
         let tmsi = {
             let mut retained = RETAINED.lock().unwrap();
             let entry =
@@ -628,12 +709,8 @@ fn namf_callback_router() -> axum::Router {
         };
         match tmsi {
             Some(tmsi) => {
-                let mut links = GNB_LINKS.lock().unwrap();
-                links.retain(|tx| tx.send(UeCmd::Page(tmsi)).is_ok());
-                info!(
-                    %supi, gnbs = links.len(),
-                    "AM policy update held for CM-IDLE UE — paging (applied on resume)"
-                );
+                info!(%supi, "AM policy update held for CM-IDLE UE — paging under T3513 (applied on resume)");
+                spawn_paging(&supi, tmsi);
                 axum::http::StatusCode::ACCEPTED
             }
             None => axum::http::StatusCode::NOT_FOUND,
@@ -892,6 +969,20 @@ async fn handle_ngap(
     match &pdu {
         NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) => match value {
             InitiatingMessageValue::Id_NGSetup(_req) => {
+                // Record the tracking areas this gNB serves (Supported TA List) —
+                // paging is then scoped to the gNBs covering the UE's registration
+                // area instead of broadcast to every association.
+                if let Some(tacs) = ngap::supported_tacs_from_ng_setup(&pdu) {
+                    info!("gNB serves TACs {tacs:02x?} (registration-area paging scope)");
+                    if let Some(link) = GNB_LINKS
+                        .lock()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|l| l.tx.same_channel(dereg_tx))
+                    {
+                        link.tacs = tacs;
+                    }
+                }
                 let resp = ngap::ng_setup_response(AMF_NAME, PLMN_MCC, PLMN_MNC);
                 send_or_log(conn, &resp, "NGSetupResponse").await;
             }
@@ -1085,6 +1176,9 @@ async fn on_service_request(
     ctx.ran_ue_id = ran_ue_id;
     ctx.cm_state = CmState::Connected;
     ctx.retained_at = None; // resumed — the mobile-reachable timer stops
+    // Refresh the UE's tracking area from where it resumed (the UE may have moved
+    // while idle — the next paging round must target the new area).
+    ctx.tac = ngap::tac_from_initial_ue(msg).or(ctx.tac);
     // An AM policy change that arrived while the UE was CM-IDLE — applied below,
     // once the context is back in the association map.
     let pending_am_policy = ctx.pending_am_policy.take();
@@ -1235,6 +1329,12 @@ fn on_initial_ue(
             let mut ctx = UeContext::new(ran_ue_id, RegState::Identified, Some(supi.clone()));
             ctx.replayed_ue_sec_cap = ue_sec_cap;
             ctx.requested_nssai = requested_nssai;
+            // The UE's tracking area (from the gNB's ULI) — the registration area
+            // its paging is scoped to.
+            ctx.tac = ngap::tac_from_initial_ue(msg);
+            if let Some(tac) = ctx.tac {
+                info!("UE {amf_ue_id}: registering from TAC {tac:02x?} (registration area)");
+            }
             ues.insert(amf_ue_id, ctx);
             // Make the UE reachable from the SBI callback surface (withdrawals).
             UE_DIRECTORY.lock().unwrap().insert(supi.clone(), (amf_ue_id, dereg_tx.clone()));
@@ -1246,6 +1346,7 @@ fn on_initial_ue(
             let mut ctx = UeContext::new(ran_ue_id, RegState::IdentityRequested, None);
             ctx.replayed_ue_sec_cap = ue_sec_cap;
             ctx.requested_nssai = requested_nssai;
+            ctx.tac = ngap::tac_from_initial_ue(msg);
             ues.insert(amf_ue_id, ctx);
             let dl = ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, nas::identity_request_suci());
             Some(InitialUeOutcome::NeedIdentity(dl))
@@ -1272,6 +1373,7 @@ impl UeContext {
             resync_attempted: false,
             cm_state: CmState::Connected,
             guti_tmsi: None,
+            tac: None,
             retained_at: None,
             am_policy: None,
             pending_am_policy: None,
@@ -2651,9 +2753,9 @@ mod tests {
         ctx.guti_tmsi = Some(tmsi);
         RETAINED.lock().unwrap().insert(tmsi, ctx);
 
-        // A mock gNB association link registered in GNB_LINKS.
+        // A mock gNB association link registered in GNB_LINKS (serving the AMF TAC).
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        GNB_LINKS.lock().unwrap().push(tx);
+        GNB_LINKS.lock().unwrap().push(GnbLink { tacs: vec![AMF_TAC], tx });
 
         // The SMF calls the AMF's N1N2 paging surface.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2668,8 +2770,20 @@ mod tests {
             .unwrap()
             .status();
         assert_eq!(status.as_u16(), 202, "paging accepted");
-        // The gNB link received a Page for this TMSI.
-        assert!(matches!(rx.recv().await, Some(UeCmd::Page(t)) if t == tmsi));
+        // The gNB link received a Page for this TMSI (tolerating broadcasts from
+        // parallel tests sharing the global registry).
+        let mut paged = false;
+        for _ in 0..10 {
+            match rx.recv().await {
+                Some(UeCmd::Page { tmsi: t, .. }) if t == tmsi => {
+                    paged = true;
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        assert!(paged, "gNB paged for the downlink data");
 
         // Paging an unknown (not CM-IDLE) UE → 404.
         let status = client
@@ -2682,6 +2796,110 @@ mod tests {
         assert_eq!(status.as_u16(), 404);
 
         RETAINED.lock().unwrap().remove(&tmsi);
+    }
+
+    /// Registration-area paging: only the gNB associations whose Supported TA List
+    /// covers the UE's tracking area are paged; a gNB with no NG Setup yet (empty
+    /// TA list) is included fail-open, and an unknown UE TA pages everyone.
+    #[tokio::test]
+    async fn paging_is_scoped_to_the_ue_registration_area() {
+        let tmsi = 0x0000_0131u32;
+        let ue_tac = [0u8, 0, 0x77]; // unique to this test
+        let mut ctx = UeContext::new(0, RegState::Registered, Some("imsi-999700000000131".into()));
+        ctx.cm_state = CmState::Idle;
+        ctx.tac = Some(ue_tac);
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+
+        // gNB A serves the UE's TA; gNB B serves a different one; gNB C has no
+        // NG Setup yet (empty list → fail-open).
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_c, mut rx_c) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut links = GNB_LINKS.lock().unwrap();
+            links.push(GnbLink { tacs: vec![ue_tac], tx: tx_a });
+            links.push(GnbLink { tacs: vec![[0, 0, 0x78]], tx: tx_b });
+            links.push(GnbLink { tacs: Vec::new(), tx: tx_c });
+        }
+
+        // Page in the UE's TA: A and C see it (with the UE's TAC), B does not.
+        page_gnbs(tmsi, Some(ue_tac));
+        let mine = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<UeCmd>| {
+            let mut hits = 0;
+            while let Ok(cmd) = rx.try_recv() {
+                if matches!(cmd, UeCmd::Page { tmsi: t, tac } if t == tmsi && tac == ue_tac) {
+                    hits += 1;
+                }
+            }
+            hits
+        };
+        assert_eq!(mine(&mut rx_a), 1, "the serving gNB is paged");
+        assert_eq!(mine(&mut rx_b), 0, "a gNB outside the registration area is not");
+        assert_eq!(mine(&mut rx_c), 1, "a gNB with no TA list yet is paged fail-open");
+
+        // An unknown UE TA falls back to paging everyone (in the default TAC).
+        page_gnbs(tmsi, None);
+        let broadcast = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<UeCmd>| {
+            let mut hits = 0;
+            while let Ok(cmd) = rx.try_recv() {
+                if matches!(cmd, UeCmd::Page { tmsi: t, tac } if t == tmsi && tac == AMF_TAC) {
+                    hits += 1;
+                }
+            }
+            hits
+        };
+        assert_eq!(broadcast(&mut rx_a), 1);
+        assert_eq!(broadcast(&mut rx_b), 1);
+        assert_eq!(broadcast(&mut rx_c), 1);
+
+        RETAINED.lock().unwrap().remove(&tmsi);
+    }
+
+    /// T3513: the page is retransmitted until the UE resumes (the retained context
+    /// is consumed) or the attempts exhaust — and stops early on a resume.
+    #[tokio::test]
+    async fn t3513_retransmits_until_resume_or_exhaust() {
+        let tmsi = 0x0000_0141u32;
+        let supi = "imsi-999700000000141";
+        let ue_tac = [0u8, 0, 0x79]; // unique to this test
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        GNB_LINKS.lock().unwrap().push(GnbLink { tacs: vec![ue_tac], tx });
+        let my_pages = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<UeCmd>| {
+            let mut hits = 0;
+            while let Ok(cmd) = rx.try_recv() {
+                if matches!(cmd, UeCmd::Page { tmsi: t, .. } if t == tmsi) {
+                    hits += 1;
+                }
+            }
+            hits
+        };
+
+        // Never answered → exactly max_sends pages, context stays retained.
+        let mut ctx = UeContext::new(0, RegState::Registered, Some(supi.into()));
+        ctx.cm_state = CmState::Idle;
+        ctx.tac = Some(ue_tac);
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+        page_with_retx(supi.into(), tmsi, std::time::Duration::from_millis(20), 3).await;
+        assert_eq!(my_pages(&mut rx), 3, "T3513 exhausted after max_sends attempts");
+        assert!(RETAINED.lock().unwrap().contains_key(&tmsi), "context stays retained");
+
+        // Answered after the first page → the loop stops early.
+        let task = tokio::spawn(page_with_retx(
+            supi.into(),
+            tmsi,
+            std::time::Duration::from_millis(20),
+            5,
+        ));
+        loop {
+            match rx.recv().await {
+                Some(UeCmd::Page { tmsi: t, .. }) if t == tmsi => break,
+                Some(_) => continue,
+                None => panic!("link closed"),
+            }
+        }
+        RETAINED.lock().unwrap().remove(&tmsi); // the Service Request consumed it
+        task.await.unwrap();
+        assert!(my_pages(&mut rx) <= 1, "paging stopped once the UE resumed");
     }
 
     /// An AM policy change for a CM-IDLE UE: the UpdateNotify is held in the
@@ -2703,9 +2921,10 @@ mod tests {
         ctx.ue_ambr = Some((2_000_000_000, 1_000_000_000));
         RETAINED.lock().unwrap().insert(tmsi, ctx);
 
-        // A mock gNB association link to observe the page.
+        // A mock gNB association link to observe the page (no NG Setup yet — an
+        // empty TA list is still paged, fail-open).
         let (gnb_tx, mut gnb_rx) = tokio::sync::mpsc::unbounded_channel();
-        GNB_LINKS.lock().unwrap().push(gnb_tx);
+        GNB_LINKS.lock().unwrap().push(GnbLink { tacs: Vec::new(), tx: gnb_tx });
 
         // The PCF pushes the UpdateNotify while the UE is idle → 202 (held + paged).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2730,7 +2949,7 @@ mod tests {
         let mut paged = false;
         for _ in 0..10 {
             match gnb_rx.recv().await {
-                Some(UeCmd::Page(t)) if t == tmsi => {
+                Some(UeCmd::Page { tmsi: t, .. }) if t == tmsi => {
                     paged = true;
                     break;
                 }
