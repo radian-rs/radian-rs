@@ -652,20 +652,23 @@ async fn release_sm_context(
 /// change** (e.g. an operator/OAM policy update landing in the UDR): the PCF
 /// re-reads the subscriber's Nudr policy-data and returns the current decision.
 ///
-/// When the **session AMBR changed**, the SMF propagates it onto the user plane —
-/// an **N4 Session Modification with an Update QER** re-rates the UPF's AMBR
-/// policer. Returns `200` + the (possibly changed) decision; `204` when the
+/// When the QoS changed, the SMF propagates it two ways: onto the **user plane**
+/// (an N4 Session Modification with an Update QER re-rates the UPF's AMBR policer),
+/// and to the **RAN/UE** via the serving AMF (Namf_Communication →
+/// N2 PDU Session Resource Modify + N1 PDU Session Modification Command,
+/// best-effort). Returns `200` + the (possibly changed) decision; `204` when the
 /// session used the sm-data fallback (no PCF association); `404` for an unknown
-/// context. Propagating a changed QoS to the **RAN/UE** (N2 PDU Session Resource
-/// Modify + N1 PDU Session Modification Command) remains a later slice.
+/// context.
 async fn refresh_sm_policy(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<axum::response::Response, SbiProblem> {
-    let (sm_policy, up_seid, old_ambr) = {
+    let (sm_policy, up_seid, old_policy, supi, psi) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
-            Some(c) => (c.sm_policy.clone(), c.up_seid, ambr_bps(&c.policy)),
+            Some(c) => {
+                (c.sm_policy.clone(), c.up_seid, c.policy.clone(), c.supi.clone(), c.pdu_session_id)
+            }
             None => {
                 return Err(problem(
                     StatusCode::NOT_FOUND,
@@ -686,8 +689,10 @@ async fn refresh_sm_policy(
             tracing::warn!(%sm_ref, "PCF SM policy update failed: {e}");
             problem(StatusCode::BAD_GATEWAY, "PCF_UNREACHABLE", "Npcf SM policy update failed")
         })?;
+    let changed = old_policy != decision;
 
     // Propagate a changed session AMBR onto the user plane: re-rate the UPF's QER.
+    let old_ambr = ambr_bps(&old_policy);
     let new_ambr = ambr_bps(&decision);
     if new_ambr != old_ambr {
         if let Some(ambr) = new_ambr {
@@ -702,14 +707,52 @@ async fn refresh_sm_policy(
             }
         }
     }
-    // Refresh the sm-context's authoritative QoS record, logging an actual change.
+    // Refresh the sm-context's authoritative QoS record.
     if let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref) {
-        if c.policy != decision {
-            tracing::info!(%sm_ref, flows = decision.qos_flows.len(), "SM policy refreshed from PCF (QoS changed)");
-            c.policy = decision.clone();
-        }
+        c.policy = decision.clone();
+    }
+    // Signal the change to the RAN/UE via the serving AMF (Namf_Communication →
+    // N2 PDU Session Resource Modify + N1 PDU Session Modification Command).
+    // Best-effort, off the response path — only when the QoS actually changed.
+    if changed {
+        tracing::info!(%sm_ref, flows = decision.qos_flows.len(), "SM policy refreshed from PCF (QoS changed)");
+        spawn_amf_pdu_modify(smf.nrf_base.clone(), supi, psi, decision.clone());
     }
     Ok((StatusCode::OK, Json(decision)).into_response())
+}
+
+/// Push a mid-session QoS change to the serving AMF (Namf_Communication), which
+/// signals the RAN/UE (N2 PDU Session Resource Modify + N1 PDU Session Modification
+/// Command). Best-effort, spawned off the refresh path; the AMF is discovered via
+/// the NRF (single-AMF demo — a real deployment would use the UECM serving AMF).
+fn spawn_amf_pdu_modify(
+    nrf_base: String,
+    supi: String,
+    psi: u8,
+    decision: sbi_core::npcf::SmPolicyDecision,
+) {
+    tokio::spawn(async move {
+        let amf = match discover_endpoint(&nrf_base, "AMF").await {
+            Ok(base) => base,
+            Err(e) => {
+                tracing::warn!(psi, "PDU modify: no AMF to notify ({e})");
+                return;
+            }
+        };
+        let body = serde_json::json!({
+            "pduSessionId": psi,
+            "sessionAmbr": decision.session_ambr,
+            "qosFlows": decision.qos_flows,
+        });
+        let url = format!("{amf}/namf-comm/v1/ue-contexts/{supi}/modify");
+        match sbi_core::h2c_client().post(url).json(&body).send().await {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(psi, "notified serving AMF of the mid-session QoS change")
+            }
+            Ok(r) => tracing::warn!(psi, status = %r.status(), "AMF PDU modify rejected"),
+            Err(e) => tracing::warn!(psi, "AMF PDU modify call failed: {e}"),
+        }
+    });
 }
 
 /// The session AMBR from a policy decision as a `pfcp::SessionAmbr` (bits/sec) for
@@ -931,6 +974,37 @@ mod tests {
         }]);
         sbi_core::nnrf::NrfClient::new(nrf_base.to_string()).register(&profile).await.unwrap();
         state
+    }
+
+    /// Spin a mock AMF that records `Namf_Communication` PDU-modify posts, registered
+    /// with the NRF as nf-type `AMF`. Returns the shared record of received bodies.
+    async fn spin_mock_amf(nrf_base: &str) -> Arc<Mutex<Vec<serde_json::Value>>> {
+        async fn record(
+            State(rec): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> StatusCode {
+            rec.lock().unwrap().push(body);
+            StatusCode::ACCEPTED
+        }
+        let recorder: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/namf-comm/v1/ue-contexts/{supi}/modify", post(record))
+            .with_state(recorder.clone());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(l, app).await.unwrap() });
+        let mut profile = sbi_core::nnrf::NfProfile::new("amf-mock", "AMF", addr.ip().to_string());
+        profile.nf_services = Some(vec![sbi_core::nnrf::NfService {
+            service_instance_id: "namf-callback-1".into(),
+            service_name: "namf-callback".into(),
+            scheme: "http".into(),
+            ip_end_points: vec![sbi_core::nnrf::IpEndPoint {
+                ipv4_address: Some(addr.ip().to_string()),
+                port: Some(addr.port()),
+            }],
+        }]);
+        sbi_core::nnrf::NrfClient::new(nrf_base.to_string()).register(&profile).await.unwrap();
+        recorder
     }
 
     /// Full Nsmf → N4 spine: an in-process UPF, the SMF as PFCP client + SBI server,
@@ -1201,6 +1275,8 @@ mod tests {
             "qosFlows": [ { "qfi": 1, "fiveQi": 9 } ] } });
         udr.put_sm_policy_data("imsi-999700000000001", &v1).await.unwrap();
         let _pcf = spin_pcf(&nrf_base, Some(&udr_base)).await;
+        // A mock AMF records the SMF's Namf_Communication PDU-modify notification.
+        let amf_modifies = spin_mock_amf(&nrf_base).await;
 
         let smf = Arc::new(
             SmfState::connect(upf_addr, Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap(),
@@ -1269,6 +1345,23 @@ mod tests {
             Some(pfcp::SessionAmbr { uplink_bps: 50_000_000, downlink_bps: 100_000_000 }),
             "UPF now polices the v2 session AMBR"
         );
+        // And it reached the RAN/UE path: the SMF notified the serving AMF
+        // (Namf_Communication) — spawned off the response, so poll briefly.
+        let mut notified = None;
+        for _ in 0..50 {
+            if let Some(b) = amf_modifies.lock().unwrap().first().cloned() {
+                notified = Some(b);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let body = notified.expect("SMF notified the AMF of the QoS change");
+        assert_eq!(body.get("pduSessionId").and_then(|v| v.as_u64()), Some(5));
+        assert_eq!(
+            body.pointer("/sessionAmbr/downlink").and_then(|v| v.as_str()),
+            Some("100 Mbps")
+        );
+        assert_eq!(body.get("qosFlows").and_then(|v| v.as_array()).map(|a| a.len()), Some(2));
 
         // refresh-policy on an unknown context → 404.
         let status = client

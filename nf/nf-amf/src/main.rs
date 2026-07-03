@@ -88,13 +88,31 @@ static ADVERTISE_ADDR: LazyLock<String> = LazyLock::new(|| {
 const T3522_SECS: u64 = 6;
 const T3522_MAX_SENDS: u8 = 5; // initial + 4 retransmissions
 
-/// A command for a gNB association's deregistration channel.
-#[derive(Debug, Clone, Copy)]
-enum DeregCmd {
+/// A command delivered to a gNB association's per-UE control channel (from the SBI
+/// callback surface into the association task that owns the NAS security context).
+#[derive(Debug, Clone)]
+enum UeCmd {
     /// Begin network-initiated deregistration for this UE (subscription withdrawn).
     Start(u64),
     /// T3522 fired for this UE — retransmit or abort.
     T3522Expiry(u64),
+    /// Push a mid-session PDU-session QoS change to the RAN/UE (from the SMF).
+    ModifyPolicy(Box<ModifyPolicy>),
+}
+
+/// A network-initiated PDU-session modification for one UE — the parsed QoS the
+/// association task turns into an N1 PDU Session Modification Command + an N2 PDU
+/// Session Resource Modify Request.
+#[derive(Debug, Clone)]
+struct ModifyPolicy {
+    amf_ue_id: u64,
+    psi: u8,
+    /// Session AMBR in NAS wire form (the N1 command) and bits/sec (the N2 transfer).
+    ambr_nas: nas::SessionAmbr,
+    session_ambr_dl_bps: u64,
+    session_ambr_ul_bps: u64,
+    ngap_flows: Vec<ngap::QosFlow>,
+    nas_flows: Vec<nas::QosFlowDesc>,
 }
 
 /// This AMF's stable NF instance id — used for the NRF profile and every UECM
@@ -147,15 +165,15 @@ fn spawn_uecm_purge(supi: String) {
 /// Directory of served UEs: SUPI → (AMF-UE-NGAP-ID, the owning association's
 /// deregistration channel). Lets the SBI callback surface (subscription
 /// withdrawal) reach a UE that lives inside an SCTP association task.
-static UE_DIRECTORY: LazyLock<Mutex<HashMap<String, (u64, UnboundedSender<DeregCmd>)>>> =
+static UE_DIRECTORY: LazyLock<Mutex<HashMap<String, (u64, UnboundedSender<UeCmd>)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Arm T3522: after `secs`, post an expiry for this UE onto its association.
-fn arm_t3522(tx: &UnboundedSender<DeregCmd>, amf_ue_id: u64, secs: u64) {
+fn arm_t3522(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64, secs: u64) {
     let tx = tx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-        let _ = tx.send(DeregCmd::T3522Expiry(amf_ue_id));
+        let _ = tx.send(UeCmd::T3522Expiry(amf_ue_id));
     });
 }
 
@@ -252,7 +270,7 @@ async fn serve_gnb(
 ) -> anyhow::Result<()> {
     let mut ues: HashMap<u64, UeContext> = HashMap::new();
     // The SBI callback surface reaches this association's UEs through this channel.
-    let (dereg_tx, mut dereg_rx) = unbounded_channel::<DeregCmd>();
+    let (dereg_tx, mut dereg_rx) = unbounded_channel::<UeCmd>();
     let result = loop {
         tokio::select! {
             received = conn.sctp_recv() => match received {
@@ -268,10 +286,11 @@ async fn serve_gnb(
             },
             Some(cmd) = dereg_rx.recv() => {
                 let downlinks = match cmd {
-                    DeregCmd::Start(id) => {
+                    UeCmd::Start(id) => {
                         on_network_deregistration(&mut ues, &amf_smf, id, &dereg_tx, T3522_SECS).await
                     }
-                    DeregCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, T3522_SECS),
+                    UeCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, T3522_SECS),
+                    UeCmd::ModifyPolicy(m) => on_network_modification(&mut ues, &m),
                 };
                 for (dl, label) in downlinks {
                     send_or_log(&conn, &dl, label).await;
@@ -295,17 +314,76 @@ fn namf_callback_router() -> axum::Router {
     ) -> axum::http::StatusCode {
         let entry = UE_DIRECTORY.lock().unwrap().get(&supi).cloned();
         match entry {
-            Some((amf_ue_id, tx)) if tx.send(DeregCmd::Start(amf_ue_id)).is_ok() => {
+            Some((amf_ue_id, tx)) if tx.send(UeCmd::Start(amf_ue_id)).is_ok() => {
                 info!(%supi, "subscription withdrawn — deregistering UE {amf_ue_id}");
                 axum::http::StatusCode::NO_CONTENT
             }
             _ => axum::http::StatusCode::NOT_FOUND,
         }
     }
-    axum::Router::new().route(
-        "/namf-callback/v1/{supi}/dereg-notify",
-        axum::routing::post(dereg_notify),
-    )
+    /// `Namf_Communication`-style N1N2 message transfer for a network-initiated PDU
+    /// session modification: the SMF posts the re-authorized QoS (session AMBR + QoS
+    /// flows) for a UE's session; the AMF hands it to the owning association task,
+    /// which signals the RAN/UE. `202` if the UE is reachable, `404` otherwise.
+    async fn modify_policy(
+        axum::extract::Path(supi): axum::extract::Path<String>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::http::StatusCode {
+        let Some(psi) =
+            body.get("pduSessionId").and_then(|v| v.as_u64()).and_then(|v| u8::try_from(v).ok())
+        else {
+            return axum::http::StatusCode::BAD_REQUEST;
+        };
+        // Session AMBR: NAS wire form (for the N1 command) + bits/sec (for the N2 transfer).
+        let (ambr_nas, dl_bps, ul_bps) = match body.get("sessionAmbr") {
+            Some(a) => {
+                let ul = a.get("uplink").and_then(|v| v.as_str());
+                let dl = a.get("downlink").and_then(|v| v.as_str());
+                match (ul, dl) {
+                    (Some(ul), Some(dl)) => (
+                        nas::session_ambr_from_bitrates(ul, dl),
+                        pdu_session::bitrate_to_bps(dl),
+                        pdu_session::bitrate_to_bps(ul),
+                    ),
+                    _ => (None, None, None),
+                }
+            }
+            None => (None, None, None),
+        };
+        let (Some(ambr_nas), Some(dl_bps), Some(ul_bps)) = (ambr_nas, dl_bps, ul_bps) else {
+            return axum::http::StatusCode::BAD_REQUEST;
+        };
+        let (ngap_flows, nas_flows) = pdu_session::parse_qos_flows(&body);
+
+        let entry = UE_DIRECTORY.lock().unwrap().get(&supi).cloned();
+        match entry {
+            Some((amf_ue_id, tx)) => {
+                let cmd = UeCmd::ModifyPolicy(Box::new(ModifyPolicy {
+                    amf_ue_id,
+                    psi,
+                    ambr_nas,
+                    session_ambr_dl_bps: dl_bps,
+                    session_ambr_ul_bps: ul_bps,
+                    ngap_flows,
+                    nas_flows,
+                }));
+                if tx.send(cmd).is_ok() {
+                    info!(%supi, psi, "PDU session modification requested by the SMF");
+                    axum::http::StatusCode::ACCEPTED
+                } else {
+                    axum::http::StatusCode::NOT_FOUND
+                }
+            }
+            None => axum::http::StatusCode::NOT_FOUND,
+        }
+    }
+
+    axum::Router::new()
+        .route("/namf-callback/v1/{supi}/dereg-notify", axum::routing::post(dereg_notify))
+        .route(
+            "/namf-comm/v1/ue-contexts/{supi}/modify",
+            axum::routing::post(modify_policy),
+        )
 }
 
 /// Register the AMF's callback surface with the NRF and keep it alive.
@@ -335,7 +413,7 @@ async fn on_network_deregistration(
     ues: &mut HashMap<u64, UeContext>,
     amf_smf: &pdu_session::AmfSmf,
     amf_ue_id: u64,
-    dereg_tx: &UnboundedSender<DeregCmd>,
+    dereg_tx: &UnboundedSender<UeCmd>,
     t3522_secs: u64,
 ) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
@@ -380,13 +458,60 @@ async fn on_network_deregistration(
     )]
 }
 
+/// Push a mid-session **PDU-session QoS change** to the RAN/UE (SMF-initiated, via
+/// the SBI callback). Builds the N1 **PDU Session Modification Command** (protected
+/// with the UE's NAS security context) and the N2 **PDU Session Resource Modify
+/// Request** carrying the new session AMBR + QoS flows, for the gNB to apply and
+/// relay to the UE. No-ops (empty) for an unknown UE, an unsecured UE, or a psi the
+/// UE has no session for.
+fn on_network_modification(
+    ues: &mut HashMap<u64, UeContext>,
+    m: &ModifyPolicy,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let Some(ctx) = ues.get_mut(&m.amf_ue_id) else {
+        warn!("PDU session modification for unknown UE {}", m.amf_ue_id);
+        return Vec::new();
+    };
+    if !ctx.sm_refs.contains_key(&m.psi) {
+        warn!("UE {}: modification for psi {} with no active session", m.amf_ue_id, m.psi);
+        return Vec::new();
+    }
+    let ran_ue_id = ctx.ran_ue_id;
+    let Some(sec) = ctx.sec.as_mut() else {
+        warn!("UE {}: PDU session modification before NAS security — skipped", m.amf_ue_id);
+        return Vec::new();
+    };
+    // N1: the PDU Session Modification Command (network-initiated ⇒ PTI 0), wrapped
+    // in a DL NAS Transport and NAS-protected.
+    let cmd = nas::pdu_session_modification_command(m.psi, 0, m.ambr_nas, &m.nas_flows);
+    let dl = nas::dl_nas_transport_sm(m.psi, cmd);
+    let nas_bytes = sec.protect(&dl, nas::sht::INTEGRITY_CIPHERED, 1);
+    // N2: the PDU Session Resource Modify Request (new session AMBR + flows + the N1).
+    let flows = if m.ngap_flows.is_empty() {
+        vec![ngap::QosFlow::default_non_gbr()]
+    } else {
+        m.ngap_flows.clone()
+    };
+    let modify = ngap::pdu_session_resource_modify_request(
+        m.amf_ue_id,
+        ran_ue_id,
+        m.psi,
+        &flows,
+        m.session_ambr_dl_bps,
+        m.session_ambr_ul_bps,
+        nas_bytes,
+    );
+    info!("UE {}: PDU Session Resource Modify sent (psi {})", m.amf_ue_id, m.psi);
+    vec![(modify, "PDUSessionResourceModifyRequest")]
+}
+
 /// T3522 fired: retransmit the Deregistration Request while attempts remain;
 /// after [`T3522_MAX_SENDS`] transmissions, abort the procedure (§5.5.2.3.4) —
 /// release the RAN-side context and drop ours anyway.
 fn on_t3522_expiry(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
-    dereg_tx: &UnboundedSender<DeregCmd>,
+    dereg_tx: &UnboundedSender<UeCmd>,
     t3522_secs: u64,
 ) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
@@ -436,7 +561,7 @@ async fn handle_ngap(
     ues: &mut HashMap<u64, UeContext>,
     amf_auth: &auth::AmfAuth,
     amf_smf: &pdu_session::AmfSmf,
-    dereg_tx: &UnboundedSender<DeregCmd>,
+    dereg_tx: &UnboundedSender<UeCmd>,
     bytes: &[u8],
 ) {
     let pdu = match NGAP_PDU::decode(bytes) {
@@ -485,6 +610,15 @@ async fn handle_ngap(
         }) => {
             info!("gNB confirmed UE context release (UEContextReleaseComplete)");
         }
+        NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+            value: SuccessfulOutcomeValue::Id_PDUSessionResourceModify(_),
+            ..
+        }) => match ngap::modify_response_result(&pdu) {
+            Some((amf_ue_id, _ran, modified)) => {
+                info!("gNB applied PDU session modification for UE {amf_ue_id} (psi {modified:?})")
+            }
+            None => info!("gNB PDUSessionResourceModifyResponse (unparseable)"),
+        },
         _ => info!("unhandled PDU: {}", pdu.procedure_name()),
     }
 }
@@ -534,7 +668,7 @@ fn on_initial_ue(
     ues: &mut HashMap<u64, UeContext>,
     msg: &InitialUEMessage,
     amf_ue_id: u64,
-    dereg_tx: &UnboundedSender<DeregCmd>,
+    dereg_tx: &UnboundedSender<UeCmd>,
 ) -> Option<InitialUeOutcome> {
     let ran_ue_id = initial_ue_ran_id(msg)?;
     let identity = initial_ue_nas_pdu(msg)
@@ -1393,6 +1527,59 @@ mod tests {
         assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 2, "no session, no extra release");
     }
 
+    /// A network-initiated PDU session modification builds the N2 PDU Session
+    /// Resource Modify (new session AMBR + flows) carrying a UE-decodable N1 PDU
+    /// Session Modification Command.
+    #[test]
+    fn network_modification_signals_ran_and_ue() {
+        let (ki, ke) = ([0x33u8; 16], [0x44u8; 16]);
+        let mut ctx = UeContext::new(7, RegState::Registered, Some("imsi-999700000000001".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.sm_refs.insert(5, ("ctx-5".into(), "http://smf".into()));
+        let mut ues = HashMap::new();
+        ues.insert(1u64, ctx);
+
+        // The SMF's re-authorized QoS, parsed as the callback surface would.
+        let body = serde_json::json!({
+            "pduSessionId": 5,
+            "sessionAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" },
+            "qosFlows": [ { "qfi": 1, "fiveQi": 9 }, { "qfi": 2, "fiveQi": 1, "gbr": {
+                "gfbrDl": "10 Mbps", "gfbrUl": "10 Mbps", "mfbrDl": "20 Mbps", "mfbrUl": "20 Mbps" } } ]
+        });
+        let (ngap_flows, nas_flows) = pdu_session::parse_qos_flows(&body);
+        let m = ModifyPolicy {
+            amf_ue_id: 1,
+            psi: 5,
+            ambr_nas: nas::session_ambr_from_bitrates("50 Mbps", "100 Mbps").unwrap(),
+            session_ambr_dl_bps: 100_000_000,
+            session_ambr_ul_bps: 50_000_000,
+            ngap_flows,
+            nas_flows,
+        };
+        let downlinks = on_network_modification(&mut ues, &m);
+        assert_eq!(
+            downlinks.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["PDUSessionResourceModifyRequest"]
+        );
+
+        // The N2 PDU decodes as a PDU Session Resource Modify...
+        let back = NGAP_PDU::decode(&downlinks[0].0.encode().unwrap()).unwrap();
+        assert_eq!(back.procedure_name(), "PDUSessionResourceModify");
+        // ...and the UE verifies its embedded N1 PDU Session Modification Command (0xCB).
+        let (psi, nas_bytes) = ngap::nas_pdu_from_modify_request(&back).expect("N1 in the modify");
+        assert_eq!(psi, 5);
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let msg = ue_sec.unprotect(&nas_bytes, 1).expect("UE verifies the modification command");
+        let (sm_psi, container) =
+            nas::sm_container_from_dl_nas_transport(&msg).expect("N1 SM container");
+        assert_eq!(sm_psi, 5);
+        assert_eq!(container[3], 0xcb, "5GSM PDU Session Modification Command");
+
+        // A psi the UE has no session for is a no-op.
+        let m_bad = ModifyPolicy { psi: 9, ..m.clone() };
+        assert!(on_network_modification(&mut ues, &m_bad).is_empty(), "no session for psi 9");
+    }
+
     /// A subscription-withdrawal callback reaches the UE's association; the
     /// network-initiated deregistration waits on T3522 and completes when the
     /// UE's Deregistration Accept arrives.
@@ -1400,7 +1587,7 @@ mod tests {
     async fn subscription_withdrawal_deregisters_the_ue() {
         // Directory entry wired to a test channel (as serve_gnb would).
         let supi = "imsi-999700000000042";
-        let (tx, mut rx) = unbounded_channel::<DeregCmd>();
+        let (tx, mut rx) = unbounded_channel::<UeCmd>();
         UE_DIRECTORY.lock().unwrap().insert(supi.to_string(), (42, tx.clone()));
 
         // The callback surface turns the POST into a Start command.
@@ -1415,7 +1602,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 204);
         assert!(
-            matches!(rx.recv().await, Some(DeregCmd::Start(42))),
+            matches!(rx.recv().await, Some(UeCmd::Start(42))),
             "association told to deregister UE 42"
         );
 
@@ -1477,7 +1664,7 @@ mod tests {
     #[tokio::test]
     async fn t3522_retransmits_then_aborts() {
         let supi = "imsi-999700000000043";
-        let (tx, mut rx) = unbounded_channel::<DeregCmd>();
+        let (tx, mut rx) = unbounded_channel::<UeCmd>();
         let (ki, ke) = ([0x11u8; 16], [0x22u8; 16]);
         let mut ctx = UeContext::new(11, RegState::Registered, Some(supi.to_string()));
         ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
@@ -1488,7 +1675,7 @@ mod tests {
         // Start with an instant timer: the expiry lands on the channel.
         let downlinks = on_network_deregistration(&mut ues, &amf_smf, 43, &tx, 0).await;
         assert_eq!(downlinks.len(), 1, "initial request");
-        assert!(matches!(rx.recv().await, Some(DeregCmd::T3522Expiry(43))), "T3522 fired");
+        assert!(matches!(rx.recv().await, Some(UeCmd::T3522Expiry(43))), "T3522 fired");
 
         // Expiries 2..=T3522_MAX_SENDS retransmit; the next one aborts.
         for attempt in 2..=T3522_MAX_SENDS {

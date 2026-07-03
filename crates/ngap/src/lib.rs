@@ -175,6 +175,47 @@ impl QosFlow {
     }
 }
 
+/// The NGAP `QosFlowLevelQosParameters` (5QI + ARP + optional GBR) for one flow —
+/// shared by the setup and the add-or-modify lists.
+fn qos_flow_level_params(f: &QosFlow) -> QosFlowLevelQosParameters {
+    QosFlowLevelQosParameters {
+        qos_characteristics: QosCharacteristics::NonDynamic5QI(NonDynamic5QIDescriptor {
+            five_qi: FiveQI(f.five_qi),
+            priority_level_qos: None,
+            averaging_window: None,
+            maximum_data_burst_volume: None,
+            ie_extensions: None,
+        }),
+        allocation_and_retention_priority: AllocationAndRetentionPriority {
+            priority_level_arp: PriorityLevelARP(f.arp_priority),
+            pre_emption_capability: Pre_emptionCapability(if f.pre_empt_cap {
+                Pre_emptionCapability::MAY_TRIGGER_PRE_EMPTION
+            } else {
+                Pre_emptionCapability::SHALL_NOT_TRIGGER_PRE_EMPTION
+            }),
+            pre_emption_vulnerability: Pre_emptionVulnerability(if f.pre_empt_vuln {
+                Pre_emptionVulnerability::PRE_EMPTABLE
+            } else {
+                Pre_emptionVulnerability::NOT_PRE_EMPTABLE
+            }),
+            ie_extensions: None,
+        },
+        gbr_qos_information: f.gbr.map(|g| GBR_QosInformation {
+            maximum_flow_bit_rate_dl: BitRate(g.mfbr_dl_bps),
+            maximum_flow_bit_rate_ul: BitRate(g.mfbr_ul_bps),
+            guaranteed_flow_bit_rate_dl: BitRate(g.gfbr_dl_bps),
+            guaranteed_flow_bit_rate_ul: BitRate(g.gfbr_ul_bps),
+            notification_control: None,
+            maximum_packet_loss_rate_dl: None,
+            maximum_packet_loss_rate_ul: None,
+            ie_extensions: None,
+        }),
+        reflective_qos_attribute: None,
+        additional_qos_flow_information: None,
+        ie_extensions: None,
+    }
+}
+
 /// Build the NGAP `QosFlowSetupRequestList` from the authorized flows.
 fn qos_flow_setup_list(flows: &[QosFlow]) -> QosFlowSetupRequestList {
     QosFlowSetupRequestList(
@@ -182,42 +223,22 @@ fn qos_flow_setup_list(flows: &[QosFlow]) -> QosFlowSetupRequestList {
             .iter()
             .map(|f| QosFlowSetupRequestItem {
                 qos_flow_identifier: QosFlowIdentifier(f.qfi),
-                qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
-                    qos_characteristics: QosCharacteristics::NonDynamic5QI(NonDynamic5QIDescriptor {
-                        five_qi: FiveQI(f.five_qi),
-                        priority_level_qos: None,
-                        averaging_window: None,
-                        maximum_data_burst_volume: None,
-                        ie_extensions: None,
-                    }),
-                    allocation_and_retention_priority: AllocationAndRetentionPriority {
-                        priority_level_arp: PriorityLevelARP(f.arp_priority),
-                        pre_emption_capability: Pre_emptionCapability(if f.pre_empt_cap {
-                            Pre_emptionCapability::MAY_TRIGGER_PRE_EMPTION
-                        } else {
-                            Pre_emptionCapability::SHALL_NOT_TRIGGER_PRE_EMPTION
-                        }),
-                        pre_emption_vulnerability: Pre_emptionVulnerability(if f.pre_empt_vuln {
-                            Pre_emptionVulnerability::PRE_EMPTABLE
-                        } else {
-                            Pre_emptionVulnerability::NOT_PRE_EMPTABLE
-                        }),
-                        ie_extensions: None,
-                    },
-                    gbr_qos_information: f.gbr.map(|g| GBR_QosInformation {
-                        maximum_flow_bit_rate_dl: BitRate(g.mfbr_dl_bps),
-                        maximum_flow_bit_rate_ul: BitRate(g.mfbr_ul_bps),
-                        guaranteed_flow_bit_rate_dl: BitRate(g.gfbr_dl_bps),
-                        guaranteed_flow_bit_rate_ul: BitRate(g.gfbr_ul_bps),
-                        notification_control: None,
-                        maximum_packet_loss_rate_dl: None,
-                        maximum_packet_loss_rate_ul: None,
-                        ie_extensions: None,
-                    }),
-                    reflective_qos_attribute: None,
-                    additional_qos_flow_information: None,
-                    ie_extensions: None,
-                },
+                qos_flow_level_qos_parameters: qos_flow_level_params(f),
+                e_rab_id: None,
+                ie_extensions: None,
+            })
+            .collect(),
+    )
+}
+
+/// Build the NGAP `QosFlowAddOrModifyRequestList` from the (updated) flows.
+fn qos_flow_add_or_modify_list(flows: &[QosFlow]) -> QosFlowAddOrModifyRequestList {
+    QosFlowAddOrModifyRequestList(
+        flows
+            .iter()
+            .map(|f| QosFlowAddOrModifyRequestItem {
+                qos_flow_identifier: QosFlowIdentifier(f.qfi),
+                qos_flow_level_qos_parameters: Some(qos_flow_level_params(f)),
                 e_rab_id: None,
                 ie_extensions: None,
             })
@@ -347,6 +368,126 @@ pub fn gnb_fteid_from_setup_response(pdu: &NGAP_PDU) -> Option<(u8, u32, Ipv4Add
     Some((item.pdu_session_id.0, teid, addr))
 }
 
+/// The N2 SM info for a modification: the session AMBR + the add-or-modified QoS flows.
+fn modify_request_transfer(
+    flows: &[QosFlow],
+    session_ambr_dl_bps: u64,
+    session_ambr_ul_bps: u64,
+) -> PDUSessionResourceModifyRequestTransfer {
+    PDUSessionResourceModifyRequestTransfer {
+        protocol_i_es: PDUSessionResourceModifyRequestTransferProtocolIEs(vec![
+            build_ngap_ie!(PDUSessionResourceModifyRequestTransfer, IGNORE PDUSessionAggregateMaximumBitRate(PDUSessionAggregateMaximumBitRate {
+                pdu_session_aggregate_maximum_bit_rate_dl: BitRate(session_ambr_dl_bps),
+                pdu_session_aggregate_maximum_bit_rate_ul: BitRate(session_ambr_ul_bps),
+                ie_extensions: None,
+            })),
+            build_ngap_ie!(PDUSessionResourceModifyRequestTransfer, REJECT QosFlowAddOrModifyRequestList(qos_flow_add_or_modify_list(flows))),
+        ]),
+    }
+}
+
+/// Build a `PDUSessionResourceModifyRequest` (AMF→gNB) for a **mid-session QoS
+/// change**: the N1 SM container (`nas`, a PDU Session Modification Command) for the
+/// UE, plus the N2 SM info carrying the new session AMBR + the updated QoS flows.
+pub fn pdu_session_resource_modify_request(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    psi: u8,
+    flows: &[QosFlow],
+    session_ambr_dl_bps: u64,
+    session_ambr_ul_bps: u64,
+    nas: Vec<u8>,
+) -> NGAP_PDU {
+    let transfer = encode_aper(&modify_request_transfer(flows, session_ambr_dl_bps, session_ambr_ul_bps));
+    build_ngap!(InitiatingMessage, PDUSessionResourceModify,
+        REJECT, PDUSessionResourceModifyRequest,
+        REJECT AMF_UE_NGAP_ID(amf_ue_id),
+        REJECT RAN_UE_NGAP_ID(ran_ue_id),
+        REJECT PDUSessionResourceModifyListModReq(PDUSessionResourceModifyListModReq(vec![
+            PDUSessionResourceModifyItemModReq {
+                pdu_session_id: PDUSessionID(psi),
+                nas_pdu: Some(NAS_PDU(nas)),
+                pdu_session_resource_modify_request_transfer:
+                    PDUSessionResourceModifyItemModReqPDUSessionResourceModifyRequestTransfer(transfer),
+                ie_extensions: None,
+            },
+        ])),
+    )
+}
+
+/// Build a `PDUSessionResourceModifyResponse` (gNB→AMF) accepting the modification
+/// of `psi` — for tests and a gNB simulator.
+pub fn pdu_session_resource_modify_response(amf_ue_id: u64, ran_ue_id: u32, psi: u8) -> NGAP_PDU {
+    let transfer = encode_aper(&PDUSessionResourceModifyResponseTransfer {
+        dl_ngu_up_tnl_information: None,
+        ul_ngu_up_tnl_information: None,
+        qos_flow_add_or_modify_response_list: None,
+        additional_dl_qos_flow_per_tnl_information: None,
+        qos_flow_failed_to_add_or_modify_list: None,
+        ie_extensions: None,
+    });
+    build_ngap!(SuccessfulOutcome, PDUSessionResourceModify,
+        REJECT, PDUSessionResourceModifyResponse,
+        REJECT AMF_UE_NGAP_ID(amf_ue_id),
+        REJECT RAN_UE_NGAP_ID(ran_ue_id),
+        REJECT PDUSessionResourceModifyListModRes(PDUSessionResourceModifyListModRes(vec![
+            PDUSessionResourceModifyItemModRes {
+                pdu_session_id: PDUSessionID(psi),
+                pdu_session_resource_modify_response_transfer:
+                    PDUSessionResourceModifyItemModResPDUSessionResourceModifyResponseTransfer(transfer),
+                ie_extensions: None,
+            },
+        ])),
+    )
+}
+
+/// Extract `(pdu_session_id, N1 NAS-PDU)` from a `PDUSessionResourceModifyRequest` —
+/// the N1 SM container (PDU Session Modification Command) the gNB relays to the UE.
+pub fn nas_pdu_from_modify_request(pdu: &NGAP_PDU) -> Option<(u8, Vec<u8>)> {
+    let NGAP_PDU::InitiatingMessage(im) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_PDUSessionResourceModify(req) = &im.value else {
+        return None;
+    };
+    let list = req.protocol_i_es.0.iter().find_map(|e| match &e.value {
+        PDUSessionResourceModifyRequestProtocolIEs_EntryValue::Id_PDUSessionResourceModifyListModReq(l) => Some(l),
+        _ => None,
+    })?;
+    let item = list.0.first()?;
+    let nas = item.nas_pdu.as_ref()?.0.clone();
+    Some((item.pdu_session_id.0, nas))
+}
+
+/// The `(amf_ue_id, ran_ue_id, [modified pdu_session_id])` reported by a decoded
+/// `PDUSessionResourceModifyResponse` — the AMF's confirmation the gNB applied it.
+pub fn modify_response_result(pdu: &NGAP_PDU) -> Option<(u64, u32, Vec<u8>)> {
+    let NGAP_PDU::SuccessfulOutcome(so) = pdu else {
+        return None;
+    };
+    let SuccessfulOutcomeValue::Id_PDUSessionResourceModify(resp) = &so.value else {
+        return None;
+    };
+    let mut amf_ue_id = None;
+    let mut ran_ue_id = None;
+    let mut modified = Vec::new();
+    for e in &resp.protocol_i_es.0 {
+        match &e.value {
+            PDUSessionResourceModifyResponseProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            PDUSessionResourceModifyResponseProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => {
+                ran_ue_id = Some(v.0)
+            }
+            PDUSessionResourceModifyResponseProtocolIEs_EntryValue::Id_PDUSessionResourceModifyListModRes(l) => {
+                modified = l.0.iter().map(|it| it.pdu_session_id.0).collect()
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, modified))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,6 +532,45 @@ mod tests {
         let pdu = pdu_session_resource_setup_response(1, 2, 5, 1, 0x5678, gnb_addr);
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
         assert_eq!(gnb_fteid_from_setup_response(&back), Some((5, 0x5678, gnb_addr)));
+    }
+
+    #[test]
+    fn modify_request_roundtrips() {
+        let pdu = pdu_session_resource_modify_request(
+            1,
+            2,
+            5,
+            &[
+                QosFlow::default_non_gbr(),
+                QosFlow {
+                    qfi: 2,
+                    five_qi: 1,
+                    arp_priority: 5,
+                    pre_empt_cap: true,
+                    pre_empt_vuln: false,
+                    gbr: Some(Gbr {
+                        gfbr_dl_bps: 10_000_000,
+                        gfbr_ul_bps: 10_000_000,
+                        mfbr_dl_bps: 20_000_000,
+                        mfbr_ul_bps: 20_000_000,
+                    }),
+                },
+            ],
+            100_000_000,
+            50_000_000,
+            vec![0x2e, 0x05, 0x00, 0xcb],
+        );
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(pdu, back, "the session AMBR + add-or-modify flows survive the APER round trip");
+        assert_eq!(back.procedure_name(), "PDUSessionResourceModify");
+        assert!(back.is_initiating());
+    }
+
+    #[test]
+    fn modify_response_yields_result() {
+        let pdu = pdu_session_resource_modify_response(7, 3, 5);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(modify_response_result(&back), Some((7, 3, vec![5])));
     }
 
     #[test]

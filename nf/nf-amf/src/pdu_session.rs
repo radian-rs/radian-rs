@@ -35,7 +35,7 @@ pub struct SmContextCreated {
 /// Parse the CreateSMContext response's `qosFlows` into NGAP + NAS flow lists.
 /// Empty → the AMF falls back to the default non-GBR flow for the N2 transfer and
 /// omits the N1 QoS flow descriptions IE (single-flow accept stays minimal).
-fn parse_qos_flows(body: &serde_json::Value) -> (Vec<ngap::QosFlow>, Vec<nas::QosFlowDesc>) {
+pub(crate) fn parse_qos_flows(body: &serde_json::Value) -> (Vec<ngap::QosFlow>, Vec<nas::QosFlowDesc>) {
     let Some(flows) = body.get("qosFlows").and_then(|v| v.as_array()) else {
         return (Vec::new(), Vec::new());
     };
@@ -74,7 +74,7 @@ fn parse_qos_flows(body: &serde_json::Value) -> (Vec<ngap::QosFlow>, Vec<nas::Qo
 }
 
 /// Convert a TS 29.571 `BitRate` string ("100 Mbps") to bits/sec (integer values).
-fn bitrate_to_bps(s: &str) -> Option<u64> {
+pub(crate) fn bitrate_to_bps(s: &str) -> Option<u64> {
     let (value, unit) = s.trim().split_once(' ')?;
     let value: u64 = value.parse().ok()?;
     let mult: u64 = match unit {
