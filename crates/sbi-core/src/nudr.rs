@@ -13,6 +13,19 @@
 //! the SQN advances and the vector is derived next to the credentials, and only
 //! RAND/AUTN/XRES*/K_AUSF ever leave (design/24). When TLS + HSM arrive this seam
 //! is where they plug in.
+//!
+//! # Security: the withdrawal callback is a bounded SSRF surface
+//!
+//! On subscription withdrawal the UDR POSTs to the serving AMF's stored
+//! `deregCallbackUri` (Nudm_UECM). That URI is written through **unauthenticated**
+//! SBI endpoints (the whole SBI is cleartext h2c with no OAuth2 — the deferred
+//! TS 33.501 hardening slice), so a hostile client can register an arbitrary URI
+//! and trigger the callback: server-side request forgery. Mitigations here:
+//! [`is_valid_callback_uri`] restricts it to `http`/`https`, and the callback
+//! client does **not** follow redirects. The residual risk (an attacker steering
+//! the callback at an internal *HTTP* target) is only fully closed by SBI mutual
+//! auth — only a cert-holding AMF may register a callback. Do not expose this UDR
+//! on an untrusted network.
 
 use std::sync::Arc;
 
@@ -111,10 +124,33 @@ async fn delete_subscription(
     StatusCode::NO_CONTENT
 }
 
+/// Whether `uri` is acceptable as a serving-AMF deregistration callback: a
+/// well-formed absolute `http`/`https` URL. This is an **SSRF guard** — the URI
+/// is attacker-influenceable while the SBI is unauthenticated (see the module
+/// `# Security` note), so a hostile client must not be able to steer the UDR's
+/// callback at non-HTTP schemes (`file:`, `gopher:`, …). It does **not** bound
+/// the host: the legitimate AMF lives on the same private/loopback space as any
+/// internal target, so host allowlisting needs deployment config — the real fix
+/// is SBI mutual auth (only a cert-holding AMF can register a callback).
+pub(crate) fn is_valid_callback_uri(uri: &str) -> bool {
+    reqwest::Url::parse(uri).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
 /// POST a `DeregistrationData` (TS 29.503-shaped) to the serving AMF's stored
-/// deregistration callback URI.
+/// deregistration callback URI. The URI is re-validated here (the guaranteed
+/// choke point — a raw context-data PUT bypasses the UECM handler's check), and
+/// redirects are **not** followed so a stored callback can't bounce the request
+/// to a different host/port.
 async fn notify_amf_deregistration(callback_uri: &str, supi: &str) -> Result<(), String> {
-    let resp = crate::h2c_client()
+    if !is_valid_callback_uri(callback_uri) {
+        return Err("stored deregCallbackUri is not a valid http(s) URL".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("build callback client: {e}"))?;
+    let resp = client
         .post(callback_uri)
         .json(&serde_json::json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN" }))
         .send()
@@ -478,6 +514,51 @@ mod tests {
         assert_eq!(udr.delete_subscriber("imsi-2").await.unwrap(), true);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(NOTIFIED.load(Ordering::Relaxed), 1, "no extra notification");
+    }
+
+    #[test]
+    fn callback_uri_ssrf_guard() {
+        assert!(is_valid_callback_uri("http://127.0.0.1:8001/namf-callback/v1/imsi-1/dereg-notify"));
+        assert!(is_valid_callback_uri("https://amf.example/cb"));
+        // Non-HTTP schemes and junk are rejected (would otherwise be SSRF vectors).
+        assert!(!is_valid_callback_uri("file:///etc/passwd"));
+        assert!(!is_valid_callback_uri("gopher://169.254.169.254/"));
+        assert!(!is_valid_callback_uri("ftp://internal/x"));
+        assert!(!is_valid_callback_uri("not a url"));
+        assert!(!is_valid_callback_uri(""));
+    }
+
+    /// A UECM registration with a non-http(s) callback is rejected at the UDM
+    /// front (400) and never stored.
+    #[tokio::test]
+    async fn uecm_rejects_ssrf_callback_uri() {
+        let store: Arc<dyn SubscriberStore> = Arc::new(InMemoryStore::new());
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udr_l, router(store)).await.unwrap() });
+
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        let udr_for_udm = Arc::new(UdrClient::new(format!("http://{udr_addr}")));
+        tokio::spawn(async move {
+            crate::run_on(udm_l, crate::nudm::router(udr_for_udm)).await.unwrap()
+        });
+        let sdm = crate::nudm::NudmClient::new(format!("http://{udm_addr}"));
+
+        let err = sdm
+            .uecm_register_amf(
+                "imsi-1",
+                &crate::nudm::Amf3GppAccessRegistration {
+                    amf_instance_id: "amf-1".into(),
+                    dereg_callback_uri: "file:///etc/passwd".into(),
+                },
+            )
+            .await
+            .expect_err("malicious callback must be rejected");
+        assert!(matches!(err, SbiError::Http(_)), "got {err:?}");
+        // Nothing was stored.
+        let udr = UdrClient::new(format!("http://{udr_addr}"));
+        assert!(udr.get_amf_registration("imsi-1").await.unwrap().is_none());
     }
 
     /// UECM register → readable context data; purge → gone (and 404 on re-purge).

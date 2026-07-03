@@ -79,6 +79,11 @@ async fn uecm_register_amf(
     Path(supi): Path<String>,
     Json(reg): Json<Amf3GppAccessRegistration>,
 ) -> Result<StatusCode, StatusCode> {
+    // Reject an unusable callback up front (SSRF guard — see nudr's `# Security`).
+    // The UDR re-checks at call time, so a raw context-data PUT can't slip past.
+    if !crate::nudr::is_valid_callback_uri(&reg.dereg_callback_uri) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let doc = serde_json::to_value(&reg).map_err(|_| StatusCode::BAD_REQUEST)?;
     udr.put_amf_registration(&supi, &doc).await.map_err(|e| {
         tracing::warn!("UDR amf-3gpp-access put failed: {e}");

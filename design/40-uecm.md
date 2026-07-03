@@ -51,6 +51,19 @@ registration and purged at deregistration.
   starts the T3522-supervised deregistration.
 - **BDD, 5 scenarios / 25 steps green** (regression).
 
+## Security: the callback is a bounded SSRF surface
+
+The `deregCallbackUri` is written through **unauthenticated** SBI endpoints and
+then POSTed to by the UDR on withdrawal — server-side request forgery (flagged
+by the commit security review). Mitigations landed: the URI is restricted to
+`http`/`https` (rejected with `400` at the UECM front, re-checked at call time so
+a raw context-data PUT can't bypass it), and the callback client does **not**
+follow redirects. The residual risk — steering the callback at an internal
+*HTTP* target — is only fully closed by SBI mutual auth (the deferred TS 33.501
+hardening: only a cert-holding AMF may register a callback). Host allowlisting
+isn't viable here because the legitimate AMF shares the private/loopback space
+with any internal target. Documented in `sbi_core::nudr`'s `# Security` note.
+
 ## Known limitations / next steps
 
 - **The callback URI is loopback-built** (`127.0.0.1:8001`) — fine for the
