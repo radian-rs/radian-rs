@@ -137,14 +137,73 @@ pub fn parse_nssai_value(mut v: &[u8]) -> Vec<(u8, Option<[u8; 3]>)> {
     out
 }
 
+/// Rejection causes for the **rejected NSSAI** IE (TS 24.501 §9.11.3.46).
+pub mod nssai_cause {
+    /// The S-NSSAI is not available in the current PLMN (not subscribed).
+    pub const NOT_AVAILABLE_IN_PLMN: u8 = 0;
+}
+
+/// Encode a **rejected NSSAI** IE *value* (TS 24.501 §9.11.3.46): each rejected
+/// S-NSSAI is one octet `(contents-length << 4) | cause` followed by SST
+/// (+ optional SD), with the same `cause` applied to every slice.
+pub fn rejected_nssai_value(slices: &[(u8, Option<[u8; 3]>)], cause: u8) -> Vec<u8> {
+    let mut v = Vec::with_capacity(slices.len() * 5);
+    for (sst, sd) in slices {
+        match sd {
+            Some(sd) => {
+                v.push((4 << 4) | (cause & 0x0F));
+                v.push(*sst);
+                v.extend_from_slice(sd);
+            }
+            None => {
+                v.push((1 << 4) | (cause & 0x0F));
+                v.push(*sst);
+            }
+        }
+    }
+    v
+}
+
+/// Decode a rejected NSSAI IE *value* into `((SST, optional SD), cause)` entries
+/// (UE side / tests). Entries with contents-lengths other than 1 or 4 are skipped.
+pub fn parse_rejected_nssai_value(mut v: &[u8]) -> Vec<((u8, Option<[u8; 3]>), u8)> {
+    let mut out = Vec::new();
+    while let Some((&head, rest)) = v.split_first() {
+        let len = (head >> 4) as usize;
+        let cause = head & 0x0F;
+        if len == 0 || rest.len() < len {
+            break;
+        }
+        match len {
+            1 => out.push(((rest[0], None), cause)),
+            4 => out.push(((rest[0], Some([rest[1], rest[2], rest[3]])), cause)),
+            _ => {}
+        }
+        v = &rest[len..];
+    }
+    out
+}
+
+/// Extract the UE's **requested NSSAI** from a decoded Registration Request
+/// (TS 24.501 §8.2.6, IEI 0x2F). Empty when the UE omitted the IE (the network
+/// then grants the subscribed defaults).
+pub fn requested_nssai_from_registration_request(msg: &Nas5gsMessage) -> Vec<(u8, Option<[u8; 3]>)> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationRequest(reg)) = msg else {
+        return Vec::new();
+    };
+    reg.requested_nssai.as_ref().map(|n| parse_nssai_value(&n.value)).unwrap_or_default()
+}
+
 /// Build a 5GMM **Registration Accept** (TS 24.501 §8.2.7) assigning a 5G-GUTI,
-/// with the **allowed NSSAI** (IEI 0x15) when the network grants any slices —
-/// sourced from the subscriber's am-data (design/32).
+/// with the **allowed NSSAI** (IEI 0x15) when the network grants any slices and
+/// the **rejected NSSAI** (IEI 0x11, cause *not available in the current PLMN*)
+/// for requested slices the subscription doesn't cover (design/32, design/33).
 pub fn registration_accept(
     mcc: &str,
     mnc: &str,
     tmsi: u32,
     allowed_nssai: &[(u8, Option<[u8; 3]>)],
+    rejected_nssai: &[(u8, Option<[u8; 3]>)],
 ) -> Nas5gsMessage {
     let guti = NasFGsMobileIdentity::from_guti(&Guti {
         mcc: mcc_digits(mcc),
@@ -159,6 +218,12 @@ pub fn registration_accept(
     if !allowed_nssai.is_empty() {
         accept = accept.set_allowed_nssai(NasNssai::new(nssai_value(allowed_nssai)));
     }
+    if !rejected_nssai.is_empty() {
+        accept = accept.set_rejected_nssai(NasRejectedNssai::new(rejected_nssai_value(
+            rejected_nssai,
+            nssai_cause::NOT_AVAILABLE_IN_PLMN,
+        )));
+    }
     Nas5gsMessage::new_5gmm(
         Nas5gmmMessageType::RegistrationAccept,
         Nas5gmmMessage::RegistrationAccept(accept),
@@ -171,6 +236,17 @@ pub fn allowed_nssai_from_registration_accept(msg: &Nas5gsMessage) -> Vec<(u8, O
         return Vec::new();
     };
     accept.allowed_nssai.as_ref().map(|n| parse_nssai_value(&n.value)).unwrap_or_default()
+}
+
+/// Extract the rejected NSSAI (with causes) from a decoded Registration Accept
+/// (UE side / tests).
+pub fn rejected_nssai_from_registration_accept(
+    msg: &Nas5gsMessage,
+) -> Vec<((u8, Option<[u8; 3]>), u8)> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationAccept(accept)) = msg else {
+        return Vec::new();
+    };
+    accept.rejected_nssai.as_ref().map(|n| parse_rejected_nssai_value(&n.value)).unwrap_or_default()
 }
 
 /// Build a minimal 5GMM **Configuration Update Command** (TS 24.501 §8.2.19). The AMF
@@ -792,20 +868,26 @@ mod tests {
     #[test]
     fn registration_accept_builds_and_decodes() {
         let allowed = [(1u8, Some([1u8, 2, 3])), (2, None)];
-        let msg = registration_accept("999", "70", 0x01020304, &allowed);
+        let rejected = [(9u8, Some([9u8, 9, 9]))];
+        let msg = registration_accept("999", "70", 0x01020304, &allowed, &rejected);
         let bytes = encode_nas_5gs_message(&msg).unwrap();
         let back = decode_nas_5gs_message(&bytes).unwrap();
         assert_eq!(
             gmm_message_type(&back),
             Some(Nas5gmmMessageType::RegistrationAccept)
         );
-        // The allowed NSSAI (IEI 0x15) survives the round trip.
+        // The allowed (IEI 0x15) and rejected (IEI 0x11) NSSAIs survive the round trip.
         assert_eq!(allowed_nssai_from_registration_accept(&back), allowed.to_vec());
+        assert_eq!(
+            rejected_nssai_from_registration_accept(&back),
+            vec![((9, Some([9, 9, 9])), nssai_cause::NOT_AVAILABLE_IN_PLMN)]
+        );
 
         // No slices → no IE.
-        let bare = registration_accept("999", "70", 0x01020304, &[]);
+        let bare = registration_accept("999", "70", 0x01020304, &[], &[]);
         let back = decode_nas_5gs_message(&encode_nas_5gs_message(&bare).unwrap()).unwrap();
         assert!(allowed_nssai_from_registration_accept(&back).is_empty());
+        assert!(rejected_nssai_from_registration_accept(&back).is_empty());
     }
 
     #[test]
@@ -816,6 +898,51 @@ mod tests {
         assert!(parse_nssai_value(&[]).is_empty());
         // A truncated entry stops the parse instead of panicking.
         assert_eq!(parse_nssai_value(&[4, 1, 2]), Vec::<(u8, Option<[u8; 3]>)>::new());
+    }
+
+    #[test]
+    fn rejected_nssai_value_roundtrips() {
+        let slices = vec![(1u8, Some([0x01, 0x02, 0x03])), (7, None)];
+        // Head octet = (contents-length << 4) | cause.
+        assert_eq!(rejected_nssai_value(&slices, 0), [0x40, 1, 1, 2, 3, 0x10, 7]);
+        assert_eq!(
+            parse_rejected_nssai_value(&rejected_nssai_value(&slices, 0)),
+            vec![((1, Some([1, 2, 3])), 0), ((7, None), 0)]
+        );
+        assert_eq!(parse_rejected_nssai_value(&[0x41, 1, 2]), vec![], "truncated entry");
+    }
+
+    #[test]
+    fn requested_nssai_extraction_from_registration_request() {
+        let identity = NasFGsMobileIdentity::from_guti(&Guti {
+            mcc: [9, 9, 9],
+            mnc: [7, 0, 0x0F],
+            amf_region_id: 1,
+            amf_set_id: 1,
+            amf_pointer: 0,
+            tmsi: 1,
+        });
+        let requested = vec![(1u8, Some([1u8, 2, 3])), (2, None)];
+        let reg = messages::NasRegistrationRequest::new(
+            NasFGsRegistrationType::new(0x09), // initial registration
+            identity.clone(),
+        )
+        .set_requested_nssai(NasNssai::new(nssai_value(&requested)));
+        let msg = Nas5gsMessage::new_5gmm(
+            Nas5gmmMessageType::RegistrationRequest,
+            Nas5gmmMessage::RegistrationRequest(reg),
+        );
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&msg).unwrap()).unwrap();
+        assert_eq!(requested_nssai_from_registration_request(&back), requested);
+
+        // Omitted IE → empty (the network grants the subscribed defaults).
+        let bare = messages::NasRegistrationRequest::new(NasFGsRegistrationType::new(0x09), identity);
+        let msg = Nas5gsMessage::new_5gmm(
+            Nas5gmmMessageType::RegistrationRequest,
+            Nas5gmmMessage::RegistrationRequest(bare),
+        );
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&msg).unwrap()).unwrap();
+        assert!(requested_nssai_from_registration_request(&back).is_empty());
     }
 
     #[test]
@@ -835,7 +962,7 @@ mod tests {
         );
 
         // Integrity-protected + ciphered Registration Accept, downlink.
-        let accept = registration_accept("999", "70", 0xDEAD_BEEF, &[]);
+        let accept = registration_accept("999", "70", 0xDEAD_BEEF, &[], &[]);
         let protected = amf.protect(&accept, sht::INTEGRITY_CIPHERED, 1);
         let decoded = ue.unprotect(&protected, 1).expect("UE verifies + deciphers Accept");
         assert_eq!(
