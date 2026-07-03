@@ -6,7 +6,7 @@
 //! wire (`sbi_core::nudr`).
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use tracing::{info, warn};
 
@@ -17,17 +17,29 @@ const DEFAULT_UDR: &str = "http://127.0.0.1:8005";
 const NRF_ENV: &str = "RADIAN_UDM_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 
+/// Stable NF instance id — the same value in the NRF profile and in every SBI
+/// access-token request (the NRF issues tokens only to registered NFs).
+static UDM_INSTANCE_ID: LazyLock<String> = LazyLock::new(sbi_core::new_nf_instance_id);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("udm");
 
     let udr_base = std::env::var(UDR_ENV).unwrap_or_else(|_| DEFAULT_UDR.to_string());
+    let nrf_base = std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string());
     info!(%udr_base, "UDM fronting UDR over Nudr");
-    let udr = Arc::new(sbi_core::nudr::UdrClient::new(udr_base));
+    // With SBI security on, obtain a `UDR` access token from the NRF for each
+    // Nudr call; otherwise call the UDR openly.
+    let udr = Arc::new(if sbi_core::oauth::sbi_secret().is_some() {
+        let tokens =
+            Arc::new(sbi_core::oauth::TokenSource::new(nrf_base.clone(), UDM_INSTANCE_ID.clone()));
+        sbi_core::nudr::UdrClient::with_tokens(udr_base, tokens)
+    } else {
+        sbi_core::nudr::UdrClient::new(udr_base)
+    });
 
     // Register with the NRF so the AUSF can discover the Nudm service.
-    let nrf_base = std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string());
     match register_with_nrf(&nrf_base, Ipv4Addr::LOCALHOST, SBI_PORT).await {
         Ok(()) => info!(%nrf_base, "registered UDM with NRF"),
         Err(e) => warn!("NRF registration failed (continuing without discovery): {e}"),
@@ -40,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> anyhow::Result<()> {
     use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService};
-    let mut profile = NfProfile::new(sbi_core::new_nf_instance_id(), "UDM", ip.to_string());
+    let mut profile = NfProfile::new(UDM_INSTANCE_ID.clone(), "UDM", ip.to_string());
     profile.nf_services = Some(vec![NfService {
         service_instance_id: "nudm-ueau-1".into(),
         service_name: "nudm-ueau".into(),

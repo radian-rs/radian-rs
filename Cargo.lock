@@ -1739,6 +1739,7 @@ dependencies = [
  "common",
  "sbi-core",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2352,12 +2353,15 @@ version = "0.1.0"
 dependencies = [
  "aka",
  "axum",
+ "base64",
  "getrandom 0.2.17",
  "hex",
  "hex-literal",
+ "hmac 0.12.1",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "subscriber-db",
  "thiserror 2.0.18",
  "tokio",

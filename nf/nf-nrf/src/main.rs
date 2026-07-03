@@ -17,6 +17,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(_) => sbi_core::nnrf::NrfStore::default(),
     };
+    // Enable the OAuth2 token endpoint when a shared SBI secret is configured
+    // (RADIAN_SBI_SECRET) — otherwise the SBI is open (design/46).
+    let store = store.with_secret(sbi_core::oauth::sbi_secret());
+    if sbi_core::oauth::sbi_secret().is_some() {
+        tracing::info!("SBI security enabled — issuing OAuth2 access tokens at /oauth2/token");
+    }
     let sbi: SocketAddr = "0.0.0.0:8000".parse()?;
     sbi_core::run(sbi, sbi_core::nnrf::router(store)).await?;
     Ok(())
