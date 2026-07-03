@@ -15,6 +15,8 @@ const UPF_N4_ENV: &str = "RADIAN_SMF_UPF_N4";
 const DEFAULT_UPF_N4: &str = "127.0.0.1:8805";
 const NRF_ENV: &str = "RADIAN_SMF_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
+/// GFBR admission-control budget (Mbps, each direction). Absent ⇒ unlimited.
+const GFBR_BUDGET_ENV: &str = "RADIAN_SMF_GFBR_BUDGET_MBPS";
 const SBI_PORT: u16 = 8002;
 
 #[tokio::main]
@@ -29,7 +31,14 @@ async fn main() -> anyhow::Result<()> {
     let nrf_base = std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string());
 
     // The NRF base is also how the SMF finds the UDM for Nudm_SDM subscription checks.
-    let smf = Arc::new(SmfState::connect(upf_n4, smf_ip, nrf_base.clone()).await?);
+    let mut smf = SmfState::connect(upf_n4, smf_ip, nrf_base.clone()).await?;
+    // Optional GFBR admission-control budget (else unlimited).
+    if let Some(mbps) = std::env::var(GFBR_BUDGET_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
+        let bps = mbps.saturating_mul(1_000_000);
+        smf = smf.with_gfbr_budget(bps, bps);
+        tracing::info!(gfbr_budget_mbps = mbps, "GFBR admission control enabled");
+    }
+    let smf = Arc::new(smf);
     smf.associate().await?;
     tracing::info!(%upf_n4, "PFCP association established with UPF");
 

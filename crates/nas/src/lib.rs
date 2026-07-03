@@ -635,6 +635,8 @@ pub fn pdu_session_modification_command(
 
 /// 5GSM cause values (TS 24.501 §9.11.4.2) this stack emits.
 pub mod sm_cause {
+    /// #26 — insufficient resources (GFBR admission control refused the session).
+    pub const INSUFFICIENT_RESOURCES: u8 = 26;
     /// #27 — the requested DNN is not subscribed / unknown.
     pub const MISSING_OR_UNKNOWN_DNN: u8 = 27;
     /// #31 — request rejected, unspecified (internal / upstream failure).

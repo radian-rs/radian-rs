@@ -1055,6 +1055,11 @@ async fn dispatch_uplink_nas(
                             },
                             Some(nas::GprsTimer3::from_secs(REJECT_BACKOFF_SECS)),
                         ),
+                        // GFBR admission control refused it — #26 insufficient
+                        // resources, no back-off (capacity may free up).
+                        pdu_session::CreateSmError::InsufficientResources => {
+                            (nas::sm_cause::INSUFFICIENT_RESOURCES, None)
+                        }
                         pdu_session::CreateSmError::Other(_) => {
                             (nas::sm_cause::REQUEST_REJECTED_UNSPECIFIED, None)
                         }
