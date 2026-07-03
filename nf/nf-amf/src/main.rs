@@ -137,7 +137,7 @@ enum UeCmd {
     Page(u32),
     /// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify):
     /// the new UE-AMBR `(downlink, uplink)` bits/sec for this UE.
-    UpdateAmPolicy { amf_ue_id: u64, ue_ambr: (u64, u64) },
+    UpdateAmPolicy { amf_ue_id: u64, ue_ambr: (u64, u64), rfsp: Option<u16> },
 }
 
 /// A network-initiated PDU-session modification for one UE — the parsed QoS the
@@ -286,6 +286,10 @@ struct UeContext {
     /// The subscribed UE-AMBR from am-data as `(downlink, uplink)` bits/sec, sent
     /// to the gNB in the N2 PDU Session Resource Setup. `None` → a default is used.
     ue_ambr: Option<(u64, u64)>,
+    /// The AM policy RFSP index (RAT/Frequency Selection Priority, TS 23.501
+    /// §5.3.4.3) from the PCF — signalled to the RAN in a UE Context Modification.
+    /// `None` when the PCF provided no RFSP.
+    rfsp: Option<u16>,
     /// The allowed NSSAI granted at registration (from am-data). `None` = the fetch
     /// failed or hasn't happened — slice admission then falls back to the SMF's check.
     allowed_nssai: Option<Vec<(u8, Option<[u8; 3]>)>>,
@@ -424,8 +428,8 @@ async fn serve_gnb(
                     }
                     UeCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, T3522_SECS),
                     UeCmd::ModifyPolicy(m) => on_network_modification(&mut ues, &m),
-                    UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr } => {
-                        on_am_policy_update(&mut ues, amf_ue_id, ue_ambr)
+                    UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr, rfsp } => {
+                        on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp)
                     }
                     // Page a CM-IDLE UE on this gNB (non-UE-associated NGAP Paging).
                     UeCmd::Page(tmsi) => {
@@ -557,7 +561,8 @@ fn namf_callback_router() -> axum::Router {
         axum::extract::Path(supi): axum::extract::Path<String>,
         axum::Json(policy): axum::Json<sbi_core::npcf_am::PolicyAssociation>,
     ) -> axum::http::StatusCode {
-        // Only the UE-AMBR is applied (RFSP/service-area application is deferred).
+        // The UE-AMBR (enforced at the gNB) + the RFSP (RAT/frequency steering) are
+        // applied; service-area application is deferred.
         let Some(ambr) = policy.ue_ambr.as_ref() else {
             return axum::http::StatusCode::NO_CONTENT; // nothing actionable
         };
@@ -566,9 +571,10 @@ fn namf_callback_router() -> axum::Router {
         else {
             return axum::http::StatusCode::BAD_REQUEST;
         };
+        let rfsp = policy.rfsp;
         match UE_DIRECTORY.lock().unwrap().get(&supi).cloned() {
             Some((amf_ue_id, tx))
-                if tx.send(UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr: (dl, ul) }).is_ok() =>
+                if tx.send(UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr: (dl, ul), rfsp }).is_ok() =>
             {
                 info!(%supi, "AM policy update (UpdateNotify) delivered to the association");
                 axum::http::StatusCode::NO_CONTENT
@@ -672,29 +678,41 @@ async fn on_network_deregistration(
 /// relay to the UE. No-ops (empty) for an unknown UE, an unsecured UE, or a psi the
 /// UE has no session for.
 /// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify): store
-/// the new UE-AMBR (so subsequent PDU Session Resource Setups carry it to the gNB)
-/// and run the Generic UE Configuration Update procedure (TS 24.501 §5.4.4) — a
-/// protected Configuration Update Command signalling the UE that its config changed.
+/// the new RFSP + UE-AMBR, signal them to the **RAN** in a UE Context Modification
+/// Request (TS 38.413 §9.2.2.7), and run the Generic UE Configuration Update
+/// procedure toward the **UE** (TS 24.501 §5.4.4) — a protected Configuration
+/// Update Command telling the UE its config changed.
 fn on_am_policy_update(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
     ue_ambr: (u64, u64),
+    rfsp: Option<u16>,
 ) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
         warn!("AM policy update for unknown UE {amf_ue_id}");
         return Vec::new();
     };
     ctx.ue_ambr = Some(ue_ambr);
+    ctx.rfsp = rfsp;
     let ran_ue_id = ctx.ran_ue_id;
-    info!("UE {amf_ue_id}: AM policy updated — UE-AMBR now {}/{} (dl/ul) bps", ue_ambr.0, ue_ambr.1);
-    let Some(sec) = ctx.sec.as_mut() else {
-        return Vec::new();
-    };
-    let cuc = sec.protect(&nas::configuration_update_command(), nas::sht::INTEGRITY_CIPHERED, 1);
-    vec![(
-        ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
-        "DownlinkNASTransport (ConfigurationUpdateCommand)",
-    )]
+    info!(
+        "UE {amf_ue_id}: AM policy updated — signalling RFSP {rfsp:?}, UE-AMBR {}/{} (dl/ul) bps to the RAN",
+        ue_ambr.0, ue_ambr.1
+    );
+    // Tell the RAN the new UE-context policy (RFSP + UE-AMBR).
+    let mut dl = vec![(
+        ngap::ue_context_modification_request(amf_ue_id, ran_ue_id, rfsp, Some(ue_ambr)),
+        "UEContextModificationRequest (RFSP)",
+    )];
+    // Tell the UE its configuration changed (Generic UE Configuration Update).
+    if let Some(sec) = ctx.sec.as_mut() {
+        let cuc = sec.protect(&nas::configuration_update_command(), nas::sht::INTEGRITY_CIPHERED, 1);
+        dl.push((
+            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
+            "DownlinkNASTransport (ConfigurationUpdateCommand)",
+        ));
+    }
+    dl
 }
 
 fn on_network_modification(
@@ -871,6 +889,15 @@ async fn handle_ngap(
                 info!("gNB applied PDU session modification for UE {amf_ue_id} (psi {modified:?})")
             }
             None => info!("gNB PDUSessionResourceModifyResponse (unparseable)"),
+        },
+        NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+            value: SuccessfulOutcomeValue::Id_UEContextModification(_),
+            ..
+        }) => match ngap::ue_context_modification_response_ids(&pdu) {
+            Some((amf_ue_id, _ran)) => {
+                info!("gNB applied the UE context modification (RFSP / UE-AMBR) for UE {amf_ue_id}")
+            }
+            None => info!("gNB UEContextModificationResponse (unparseable)"),
         },
         _ => info!("unhandled PDU: {}", pdu.procedure_name()),
     }
@@ -1165,6 +1192,7 @@ impl UeContext {
             replayed_ue_sec_cap: None,
             sm_refs: HashMap::new(),
             ue_ambr: None,
+            rfsp: None,
             allowed_nssai: None,
             requested_nssai: Vec::new(),
             dereg_attempts: None,
@@ -1776,6 +1804,7 @@ async fn on_security_mode_complete(
                 );
             }
         }
+        ctx.rfsp = policy.rfsp;
         ctx.am_policy = Some((pcf_base, assoc_id));
     }
     ctx.ue_ambr = effective_ambr;
@@ -1845,10 +1874,23 @@ async fn on_security_mode_complete(
         "UE {amf_ue_id}: SecurityModeComplete — sending Registration Accept \
          (allowed NSSAI: {allowed:?}, rejected: {rejected:?})"
     );
-    vec![(
+    let mut dl = vec![(
         ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
         "DownlinkNASTransport (RegistrationAccept)",
-    )]
+    )];
+    // Signal the AM policy (RFSP + UE-AMBR) to the RAN at the UE-context level
+    // (TS 38.413 §9.2.2.7). RFSP has no other N2 home, so this is where the gNB
+    // learns the UE's RAT/frequency-selection priority. Skipped when the PCF
+    // supplied neither (nothing to steer).
+    let (rfsp, ambr) = (ctx.rfsp, ctx.ue_ambr);
+    if rfsp.is_some() || ambr.is_some() {
+        info!("UE {amf_ue_id}: signalling AM policy to the RAN — RFSP {rfsp:?}, UE-AMBR {ambr:?} bps");
+        dl.push((
+            ngap::ue_context_modification_request(amf_ue_id, ran_ue_id, rfsp, ambr),
+            "UEContextModificationRequest (RFSP)",
+        ));
+    }
+    dl
 }
 
 /// Intersect the UE's requested NSSAI with the subscribed one (TS 23.501 slice
@@ -2276,35 +2318,44 @@ mod tests {
     }
 
     /// Npcf_AMPolicyControl_UpdateNotify handling: the AMF's am-policy-notify
-    /// callback resolves the SUPI, delivers the new UE-AMBR to the association, and
-    /// the handler updates the context + emits a Configuration Update Command.
+    /// callback resolves the SUPI, delivers the new RFSP + UE-AMBR to the
+    /// association, and the handler signals the RAN (UE Context Modification) and
+    /// the UE (Configuration Update Command).
     #[tokio::test]
     async fn am_policy_update_notify_applies_the_new_ue_ambr() {
-        // The association-task handler: the update stores the new UE-AMBR and emits
-        // a protected Configuration Update Command.
         let (ki, ke) = ([0x77u8; 16], [0x88u8; 16]);
         let mut ctx = UeContext::new(9, RegState::Registered, Some("imsi-999700000000111".into()));
         ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
         ctx.ue_ambr = Some((2_000_000_000, 1_000_000_000));
+        ctx.rfsp = Some(3);
         let mut ues = HashMap::new();
         ues.insert(1u64, ctx);
 
-        let dls = on_am_policy_update(&mut ues, 1, (600_000_000, 300_000_000));
+        let dls = on_am_policy_update(&mut ues, 1, (600_000_000, 300_000_000), Some(9));
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
-            ["DownlinkNASTransport (ConfigurationUpdateCommand)"]
+            [
+                "UEContextModificationRequest (RFSP)",
+                "DownlinkNASTransport (ConfigurationUpdateCommand)",
+            ]
         );
         assert_eq!(ues.get(&1).unwrap().ue_ambr, Some((600_000_000, 300_000_000)), "UE-AMBR updated");
+        assert_eq!(ues.get(&1).unwrap().rfsp, Some(9), "RFSP updated");
+        // The RAN sees the new RFSP + UE-AMBR in the UE Context Modification.
+        assert_eq!(
+            ngap::ue_context_modification_params(&dls[0].0),
+            Some((1, 9, Some(9), Some((600_000_000, 300_000_000))))
+        );
         // The UE decodes the Configuration Update Command under its context.
         let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
-        let bytes = downlink_nas_pdu(&dls[0].0).expect("NAS PDU");
+        let bytes = downlink_nas_pdu(&dls[1].0).expect("NAS PDU");
         let cuc = ue_sec.unprotect(&bytes, 1).expect("UE verifies the CUC");
         assert_eq!(
             nas::gmm_message_type(&cuc),
             Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand)
         );
         // Unknown UE → no downlinks.
-        assert!(on_am_policy_update(&mut ues, 999, (1, 1)).is_empty());
+        assert!(on_am_policy_update(&mut ues, 999, (1, 1), None).is_empty());
     }
 
     /// AM policy: the AMF discovers the PCF and creates an AM policy association at

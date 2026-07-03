@@ -227,6 +227,109 @@ pub fn parse_ue_context_release_request(pdu: &NGAP_PDU) -> Option<(u64, u32)> {
     Some((amf_ue_id?, ran_ue_id?))
 }
 
+/// Build a `UEContextModificationRequest` (TS 38.413 §9.2.2.7) — the AMF asks the
+/// NG-RAN to update the UE context. Only the two UE-NGAP-IDs are mandatory; the
+/// **Index to RAT/Frequency Selection Priority** (RFSP, TS 23.501 §5.3.4.3, steers
+/// the UE to RAT/frequency layers) and the **UE Aggregate Maximum Bit Rate** are
+/// optional and included only when supplied. This is the canonical vehicle for
+/// pushing an access-and-mobility policy (RFSP / UE-AMBR) to the RAN after
+/// registration or on a mid-connection change.
+pub fn ue_context_modification_request(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    rfsp: Option<u16>,
+    ue_ambr: Option<(u64, u64)>,
+) -> NGAP_PDU {
+    let mut ies = vec![
+        build_ngap_ie!(UEContextModificationRequest, REJECT AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id))),
+        build_ngap_ie!(UEContextModificationRequest, REJECT RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id))),
+    ];
+    if let Some(rfsp) = rfsp {
+        // Index to RFSP (IE id 31), criticality ignore — advisory to the RAN.
+        ies.push(build_ngap_ie!(UEContextModificationRequest, IGNORE IndexToRFSP(IndexToRFSP(rfsp))));
+    }
+    if let Some((dl_bps, ul_bps)) = ue_ambr {
+        ies.push(build_ngap_ie!(UEContextModificationRequest, IGNORE UEAggregateMaximumBitRate(UEAggregateMaximumBitRate {
+            ue_aggregate_maximum_bit_rate_dl: BitRate(dl_bps),
+            ue_aggregate_maximum_bit_rate_ul: BitRate(ul_bps),
+            ie_extensions: None,
+        })));
+    }
+    // UEContextModification = procedure code 40 (TS 38.413 §9.3.5).
+    NGAP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(40),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_UEContextModification(UEContextModificationRequest {
+            protocol_i_es: UEContextModificationRequestProtocolIEs(ies),
+        }),
+    })
+}
+
+/// Extract `(amf_ue_id, ran_ue_id, RFSP, UE-AMBR (dl,ul) bps)` from a
+/// `UEContextModificationRequest` — the RAN side / tests.
+pub fn ue_context_modification_params(
+    pdu: &NGAP_PDU,
+) -> Option<(u64, u32, Option<u16>, Option<(u64, u64)>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_UEContextModification(req) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id, mut rfsp, mut ambr) = (None, None, None, None);
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            UEContextModificationRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(id) => {
+                amf_ue_id = Some(id.0)
+            }
+            UEContextModificationRequestProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(id) => {
+                ran_ue_id = Some(id.0)
+            }
+            UEContextModificationRequestProtocolIEs_EntryValue::Id_IndexToRFSP(v) => {
+                rfsp = Some(v.0)
+            }
+            UEContextModificationRequestProtocolIEs_EntryValue::Id_UEAggregateMaximumBitRate(v) => {
+                ambr = Some((v.ue_aggregate_maximum_bit_rate_dl.0, v.ue_aggregate_maximum_bit_rate_ul.0))
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, rfsp, ambr))
+}
+
+/// Build a `UEContextModificationResponse` (NG-RAN→AMF) acknowledging the update —
+/// for tests and a gNB simulator.
+pub fn ue_context_modification_response(amf_ue_id: u64, ran_ue_id: u32) -> NGAP_PDU {
+    build_ngap!(SuccessfulOutcome, UEContextModification,
+        REJECT, UEContextModificationResponse,
+        IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        IGNORE RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+    )
+}
+
+/// `(amf_ue_id, ran_ue_id)` from a decoded `UEContextModificationResponse`.
+pub fn ue_context_modification_response_ids(pdu: &NGAP_PDU) -> Option<(u64, u32)> {
+    let NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome { value, .. }) = pdu else {
+        return None;
+    };
+    let SuccessfulOutcomeValue::Id_UEContextModification(resp) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id) = (None, None);
+    for ie in &resp.protocol_i_es.0 {
+        match &ie.value {
+            UEContextModificationResponseProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(id) => {
+                amf_ue_id = Some(id.0)
+            }
+            UEContextModificationResponseProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(id) => {
+                ran_ue_id = Some(id.0)
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?))
+}
+
 // ─── N2 PDU Session Resource Setup (TS 38.413 §9.2.1.1/§9.2.1.2) ───────────────
 //
 // The N2 SM information is carried as separately-APER-encoded `*Transfer` sub-PDUs
@@ -799,5 +902,30 @@ mod release_tests {
         assert_eq!(parse_ue_context_release_request(&back), Some((99, 3)));
         // A different message type isn't misread as a release request.
         assert_eq!(parse_ue_context_release_request(&initial_ue_message_with_nas(1, vec![1])), None);
+    }
+
+    #[test]
+    fn ue_context_modification_roundtrips() {
+        // RFSP index 7 + UE-AMBR 300/600 Mbps (dl/ul) reach the RAN intact.
+        let pdu = ue_context_modification_request(42, 5, Some(7), Some((600_000_000, 300_000_000)));
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(
+            ue_context_modification_params(&back),
+            Some((42, 5, Some(7), Some((600_000_000, 300_000_000))))
+        );
+
+        // The optional IEs are genuinely optional: a request with neither still
+        // carries just the two UE-NGAP-IDs.
+        let bare = ue_context_modification_request(1, 2, None, None);
+        let back = NGAP_PDU::decode(&bare.encode().expect("encode")).expect("decode");
+        assert_eq!(ue_context_modification_params(&back), Some((1, 2, None, None)));
+
+        // The gNB's acknowledgement round-trips to the same IDs.
+        let resp = ue_context_modification_response(42, 5);
+        let back = NGAP_PDU::decode(&resp.encode().expect("encode")).expect("decode");
+        assert_eq!(ue_context_modification_response_ids(&back), Some((42, 5)));
+        // A request isn't misread as a response, and vice versa.
+        assert_eq!(ue_context_modification_response_ids(&pdu), None);
+        assert_eq!(ue_context_modification_params(&resp), None);
     }
 }
