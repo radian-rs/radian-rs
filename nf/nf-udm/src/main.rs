@@ -29,9 +29,9 @@ async fn main() -> anyhow::Result<()> {
     let udr_base = std::env::var(UDR_ENV).unwrap_or_else(|_| DEFAULT_UDR.to_string());
     let nrf_base = std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string());
     info!(%udr_base, "UDM fronting UDR over Nudr");
-    // With SBI security on, obtain a `UDR` access token from the NRF for each
-    // Nudr call; otherwise call the UDR openly.
-    let udr = Arc::new(if sbi_core::oauth::sbi_secret().is_some() {
+    // With SBI security on (shared secret or asymmetric), obtain a `UDR` access
+    // token from the NRF for each Nudr call; otherwise call the UDR openly.
+    let udr = Arc::new(if sbi_core::oauth::client_tokens_enabled() {
         let tokens =
             Arc::new(sbi_core::oauth::TokenSource::new(nrf_base.clone(), UDM_INSTANCE_ID.clone()));
         sbi_core::nudr::UdrClient::with_tokens(udr_base, tokens)

@@ -100,10 +100,11 @@ pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
             get(get_sm_policy_data).put(put_sm_policy_data),
         )
         .with_state(state);
-    // SBI security: require a valid `UDR` access token when a secret is configured
-    // (open otherwise). The UDR holds subscriber data + the withdrawal that can
-    // trigger the AMF callback, so it is the first service protected (design/46).
-    crate::oauth::protect(router, "UDR", crate::oauth::sbi_secret())
+    // SBI security (design/46): the UDR holds subscriber data + the withdrawal that
+    // can trigger the AMF callback, so it is the first service protected. The
+    // `oauth::protect` layer (audience `UDR`) is applied by `nf-udr` at deployment,
+    // where the NRF base (for asymmetric JWKS) is configured.
+    router
 }
 
 /// Withdraw a subscription: remove everything stored for the SUPI, then notify
@@ -645,7 +646,11 @@ mod tests {
         let store: Arc<dyn SubscriberStore> = store;
         let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udr_addr = udr_l.local_addr().unwrap();
-        let protected = crate::oauth::protect(router(store), "UDR", Some(secret.clone()));
+        let protected = crate::oauth::protect(
+            router(store),
+            "UDR",
+            Some(crate::oauth::TokenVerifier::Shared(secret.clone())),
+        );
         tokio::spawn(async move { crate::run_on(udr_l, protected).await.unwrap() });
         let udr_url = format!("http://{udr_addr}");
 
@@ -666,6 +671,64 @@ mod tests {
         let tokens_bad = std::sync::Arc::new(crate::oauth::TokenSource::new(nrf_base, "rogue-1"));
         let rogue = UdrClient::with_tokens(udr_url, tokens_bad);
         assert!(rogue.get_amf_registration("imsi-1").await.is_err(), "unregistered client can't get a token");
+    }
+
+    /// Asymmetric (ES256 + JWKS): the NRF signs with a private key, the UDR verifies
+    /// against the NRF's published public key — and a token forged with any other key
+    /// is rejected (the property a shared secret can't provide). Env-free.
+    #[tokio::test]
+    async fn asymmetric_udr_verifies_against_nrf_jwks() {
+        use crate::nnrf::{NfProfile, NrfClient, NrfStore};
+
+        // NRF holds an ES256 private key; serves /oauth2/token + /oauth2/jwks.
+        let nrf_store = NrfStore::default().with_signing_key(crate::oauth::Es256Key::generate());
+        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nrf_addr = nrf_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(nrf_l, crate::nnrf::router(nrf_store)).await.unwrap() });
+        let nrf_base = format!("http://{nrf_addr}");
+        NrfClient::new(nrf_base.clone())
+            .register(&NfProfile::new("udm-1", "UDM", "127.0.0.1"))
+            .await
+            .unwrap();
+
+        // UDR verifies via the NRF's JWKS (no shared secret anywhere).
+        let store = Arc::new(InMemoryStore::new());
+        store.provision_hex("imsi-1", "465b5ce8b199b49faa5f0a2ee238a6bc", "cd63cb71954a9f4e48a5994e37a02baf", "8000").unwrap();
+        let store: Arc<dyn SubscriberStore> = store;
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        let verifier = crate::oauth::TokenVerifier::Jwks(std::sync::Arc::new(
+            crate::oauth::JwksCache::new(nrf_base.clone()),
+        ));
+        let protected = crate::oauth::protect(router(store), "UDR", Some(verifier));
+        tokio::spawn(async move { crate::run_on(udr_l, protected).await.unwrap() });
+        let udr_url = format!("http://{udr_addr}");
+
+        // Tokenless → 401.
+        assert!(UdrClient::new(udr_url.clone()).get_amf_registration("imsi-1").await.is_err());
+
+        // A client bearing an NRF-issued ES256 token → authorized.
+        let tokens = std::sync::Arc::new(crate::oauth::TokenSource::new(nrf_base, "udm-1"));
+        let client = UdrClient::with_tokens(udr_url.clone(), tokens);
+        assert!(client.generate_av("imsi-1", "999", "70").await.unwrap().is_some());
+
+        // A token forged with the UDR's OWN key (not the NRF's) is rejected — the UDR
+        // cannot mint valid tokens.
+        let forged = crate::oauth::Es256Key::generate().mint(&crate::oauth::AccessTokenClaims {
+            iss: "radian-nrf".into(),
+            sub: "udr-self".into(),
+            aud: "UDR".into(),
+            scope: "nudr-dr".into(),
+            iat: 0,
+            exp: u64::MAX,
+        });
+        let resp = crate::h2c_client()
+            .get(format!("{udr_url}/nudr-dr/v2/subscription-data/imsi-1/context-data/amf-3gpp-access"))
+            .bearer_auth(forged)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 401, "a self-signed token is not the NRF's — rejected");
     }
 
     async fn serve(store: Arc<dyn SubscriberStore>) -> UdrClient {

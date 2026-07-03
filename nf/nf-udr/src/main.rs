@@ -78,9 +78,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
+    // SBI security (design/46/55): require a valid `UDR` access token — HS256 (shared
+    // secret) or ES256 (verified against the NRF's JWKS) — when configured, else open.
+    let router = sbi_core::oauth::protect(
+        sbi_core::nudr::router(store),
+        "UDR",
+        sbi_core::oauth::verifier(&nrf_base),
+    );
+    if sbi_core::oauth::verifier(&nrf_base).is_some() {
+        info!("Nudr protected by OAuth2 (audience UDR)");
+    }
     // Subscription withdrawals notify the serving AMF recorded in the UECM
     // context data (its deregCallbackUri).
-    sbi_core::run(sbi, sbi_core::nudr::router(store)).await?;
+    sbi_core::run(sbi, router).await?;
     Ok(())
 }
 

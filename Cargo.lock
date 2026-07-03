@@ -2359,6 +2359,7 @@ dependencies = [
  "hex",
  "hex-literal",
  "hmac 0.12.1",
+ "p256",
  "reqwest",
  "serde",
  "serde_json",

@@ -191,9 +191,11 @@ struct Entry {
 pub struct NrfStore {
     entries: Arc<Mutex<HashMap<String, Entry>>>,
     heartbeat_timer: Duration,
-    /// SBI signing secret for the OAuth2 token endpoint (`None` = token endpoint
-    /// disabled / open SBI).
+    /// SBI signing secret for HS256 tokens (`None` = no shared-secret signing).
     secret: Option<Vec<u8>>,
+    /// The NRF's ES256 private key (asymmetric mode) — signs tokens; its public key
+    /// is served at `/oauth2/jwks`. Takes precedence over `secret`.
+    signing_key: Option<Arc<crate::oauth::Es256Key>>,
 }
 
 impl Default for NrfStore {
@@ -205,14 +207,31 @@ impl Default for NrfStore {
 impl NrfStore {
     /// A registry that assigns `heartbeat_timer` and evicts after 2× that interval.
     pub fn with_heartbeat_timer(heartbeat_timer: Duration) -> Self {
-        Self { entries: Arc::new(Mutex::new(HashMap::new())), heartbeat_timer, secret: None }
+        Self {
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            heartbeat_timer,
+            secret: None,
+            signing_key: None,
+        }
     }
 
-    /// Enable the OAuth2 token endpoint with this signing secret. In production
-    /// pass `oauth::sbi_secret()`; `None` leaves the endpoint disabled.
+    /// Enable HS256 token signing with this shared secret. In production pass
+    /// `oauth::sbi_secret()`; `None` leaves it disabled.
     pub fn with_secret(mut self, secret: Option<Vec<u8>>) -> Self {
         self.secret = secret;
         self
+    }
+
+    /// Enable ES256 token signing with this private key (asymmetric mode); its
+    /// public key is served at `/oauth2/jwks`.
+    pub fn with_signing_key(mut self, key: crate::oauth::Es256Key) -> Self {
+        self.signing_key = Some(Arc::new(key));
+        self
+    }
+
+    /// Whether any token signing is enabled (HS256 or ES256).
+    fn oauth_enabled(&self) -> bool {
+        self.secret.is_some() || self.signing_key.is_some()
     }
 
     pub fn len(&self) -> usize {
@@ -259,7 +278,14 @@ pub fn router(store: NrfStore) -> Router {
         .route("/nnrf-nfm/v1/nf-instances", get(list))
         .route("/nnrf-disc/v1/nf-instances", get(discover))
         .route("/oauth2/token", post(access_token))
+        .route("/oauth2/jwks", get(jwks))
         .with_state(store)
+}
+
+/// `GET /oauth2/jwks` — the NRF's public signing keys (asymmetric mode). Empty in
+/// shared-secret / disabled mode.
+async fn jwks(State(store): State<NrfStore>) -> Json<crate::oauth::Jwks> {
+    Json(store.signing_key.as_ref().map(|k| k.jwks()).unwrap_or_default())
 }
 
 // ── Nnrf_AccessToken (TS 29.510 §6.3) — the OAuth2 authorization server ────────
@@ -282,9 +308,9 @@ async fn access_token(
             }),
         )
     };
-    let Some(secret) = store.secret.clone() else {
+    if !store.oauth_enabled() {
         return Err(problem(StatusCode::NOT_FOUND, "SERVICE_DISABLED", "SBI security is not enabled"));
-    };
+    }
     if req.grant_type != "client_credentials" {
         return Err(problem(StatusCode::BAD_REQUEST, "UNSUPPORTED_GRANT_TYPE", "expected client_credentials"));
     }
@@ -292,8 +318,14 @@ async fn access_token(
     if !store.is_registered(&req.nf_instance_id) {
         return Err(problem(StatusCode::FORBIDDEN, "UNAUTHORIZED_CLIENT", "requesting NF is not registered"));
     }
+    // Prefer asymmetric (ES256) signing when a private key is configured.
+    let rsp = match (&store.signing_key, &store.secret) {
+        (Some(key), _) => crate::oauth::issue_token_es256(key, "radian-nrf", &req),
+        (None, Some(secret)) => crate::oauth::issue_token(secret, "radian-nrf", &req),
+        (None, None) => unreachable!("oauth_enabled() checked above"),
+    };
     tracing::info!(client = %req.nf_instance_id, target = %req.target_nf_type, "issued SBI access token");
-    Ok(Json(crate::oauth::issue_token(&secret, "radian-nrf", &req)))
+    Ok(Json(rsp))
 }
 
 // ── Nnrf_NFManagement ────────────────────────────────────────────────────────

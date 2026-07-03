@@ -21,6 +21,8 @@ getrandom = "0.2"
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+# Asymmetric access-token signing (ES256 / ECDSA P-256 + JWKS).
+p256 = "0.13"
 
 [dev-dependencies]
 hex-literal = "0.4"
