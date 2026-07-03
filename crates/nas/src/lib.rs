@@ -313,6 +313,7 @@ pub fn registration_accept(
     allowed_nssai: &[(u8, Option<[u8; 3]>)],
     rejected_nssai: &[(u8, Option<[u8; 3]>)],
     t3512_secs: u32,
+    registration_area: &[[u8; 3]],
 ) -> Nas5gsMessage {
     let guti = NasFGsMobileIdentity::from_guti(&Guti {
         mcc: mcc_digits(mcc),
@@ -328,6 +329,16 @@ pub fn registration_accept(
     let mut accept = messages::NasRegistrationAccept::new(NasFGsRegistrationResult::new(vec![0x01]))
         .set_fg_guti(guti)
         .set_t3512_value(NasGprsTimer3::new(vec![GprsTimer3::from_secs(t3512_secs).octet()]));
+    // 5GS TAI list (IEI 0x54): the UE's registration area — it may move among
+    // these tracking areas without a mobility registration update, and paging is
+    // scoped to them.
+    if !registration_area.is_empty() {
+        accept = accept.set_tai_list(NasFGsTrackingAreaIdentityList::new(tai_list_value(
+            mcc,
+            mnc,
+            registration_area,
+        )));
+    }
     if !allowed_nssai.is_empty() {
         accept = accept.set_allowed_nssai(NasNssai::new(nssai_value(allowed_nssai)));
     }
@@ -341,6 +352,38 @@ pub fn registration_accept(
         Nas5gmmMessageType::RegistrationAccept,
         Nas5gmmMessage::RegistrationAccept(accept),
     )
+}
+
+/// Encode a 5GS tracking area identity list value (TS 24.501 §9.11.3.9) as one
+/// **type-00 partial list** — non-consecutive TACs belonging to one PLMN:
+/// `[0(spare) | 00(type) | NNNNN(count-1)] [PLMN TBCD ×3] [TAC ×3]…`. A partial
+/// list holds at most 16 TACs; excess is truncated.
+fn tai_list_value(mcc: &str, mnc: &str, tacs: &[[u8; 3]]) -> Vec<u8> {
+    let tacs = &tacs[..tacs.len().min(16)];
+    let plmn = PlmnId { mcc: mcc_digits(mcc), mnc: mnc_digits(mnc) };
+    let mut value = vec![(tacs.len() as u8 - 1) & 0x1F];
+    value.extend_from_slice(&plmn.to_tbcd());
+    for tac in tacs {
+        value.extend_from_slice(tac);
+    }
+    value
+}
+
+/// The registration area (TAC list) from a decoded Registration Accept's 5GS TAI
+/// list IE — type-00 partial list only (UE side / tests). `None` when absent or
+/// not type-00.
+pub fn registration_area_from_registration_accept(msg: &Nas5gsMessage) -> Option<Vec<[u8; 3]>> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationAccept(accept)) = msg else {
+        return None;
+    };
+    let value = &accept.tai_list.as_ref()?.value;
+    // Octet 0: spare + list type (bits 6-5) + element count - 1 (bits 4-0).
+    if value.len() < 7 || (value[0] >> 5) & 0b11 != 0b00 {
+        return None;
+    }
+    let n = (value[0] & 0x1F) as usize + 1;
+    let tacs = &value[4..]; // past the header octet + 3-octet PLMN
+    Some(tacs.chunks_exact(3).take(n).map(|c| [c[0], c[1], c[2]]).collect())
 }
 
 /// Extract the allowed NSSAI from a decoded Registration Accept (UE side / tests).
@@ -1419,7 +1462,8 @@ mod tests {
     fn registration_accept_builds_and_decodes() {
         let allowed = [(1u8, Some([1u8, 2, 3])), (2, None)];
         let rejected = [(9u8, Some([9u8, 9, 9]))];
-        let msg = registration_accept("999", "70", 0x01020304, &allowed, &rejected, 3240);
+        let area = [[0u8, 0, 1], [0, 0, 2]];
+        let msg = registration_accept("999", "70", 0x01020304, &allowed, &rejected, 3240, &area);
         let bytes = encode_nas_5gs_message(&msg).unwrap();
         let back = decode_nas_5gs_message(&bytes).unwrap();
         assert_eq!(
@@ -1437,12 +1481,27 @@ mod tests {
             t3512_octet_from_registration_accept(&back),
             Some(GprsTimer3::from_secs(3240).octet())
         );
+        // The registration area (5GS TAI list, IEI 0x54) survives the round trip.
+        assert_eq!(registration_area_from_registration_accept(&back), Some(area.to_vec()));
 
-        // No slices → no IE.
-        let bare = registration_accept("999", "70", 0x01020304, &[], &[], 3240);
+        // No slices / no registration area → no IEs.
+        let bare = registration_accept("999", "70", 0x01020304, &[], &[], 3240, &[]);
         let back = decode_nas_5gs_message(&encode_nas_5gs_message(&bare).unwrap()).unwrap();
         assert!(allowed_nssai_from_registration_accept(&back).is_empty());
         assert!(rejected_nssai_from_registration_accept(&back).is_empty());
+        assert_eq!(registration_area_from_registration_accept(&back), None);
+    }
+
+    #[test]
+    fn tai_list_value_encodes_type_00() {
+        // 2 TACs, PLMN 999/70: [count-1=1][TBCD 99 F9 07][TAC][TAC].
+        let v = tai_list_value("999", "70", &[[0, 0, 1], [0, 0, 0x0a]]);
+        assert_eq!(v, [0x01, 0x99, 0xf9, 0x07, 0, 0, 1, 0, 0, 0x0a]);
+        // A partial list caps at 16 TACs.
+        let many: Vec<[u8; 3]> = (0..20).map(|i| [0, 0, i as u8]).collect();
+        let v = tai_list_value("999", "70", &many);
+        assert_eq!(v[0], 15, "count-1 capped at 16 elements");
+        assert_eq!(v.len(), 1 + 3 + 16 * 3);
     }
 
     #[test]
@@ -1584,7 +1643,7 @@ mod tests {
         );
 
         // Integrity-protected + ciphered Registration Accept, downlink.
-        let accept = registration_accept("999", "70", 0xDEAD_BEEF, &[], &[], 3240);
+        let accept = registration_accept("999", "70", 0xDEAD_BEEF, &[], &[], 3240, &[]);
         let protected = amf.protect(&accept, sht::INTEGRITY_CIPHERED, 1);
         let decoded = ue.unprotect(&protected, 1).expect("UE verifies + deciphers Accept");
         assert_eq!(

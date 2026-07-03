@@ -132,10 +132,10 @@ enum UeCmd {
     T3522Expiry(u64),
     /// Push a mid-session PDU-session QoS change to the RAN/UE (from the SMF).
     ModifyPolicy(Box<ModifyPolicy>),
-    /// Page a CM-IDLE UE by 5G-TMSI in tracking area `tac` (downlink data or a
-    /// pending AM policy change). Sent to the gNB associations serving that TA
-    /// (registration-area paging); each sends an NGAP Paging.
-    Page { tmsi: u32, tac: [u8; 3] },
+    /// Page a CM-IDLE UE by 5G-TMSI across its registration area (downlink data or
+    /// a pending AM policy change). Sent to the gNB associations serving any of the
+    /// area's TAs; each sends an NGAP Paging carrying the full TAI list.
+    Page { tmsi: u32, tacs: Vec<[u8; 3]> },
     /// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify):
     /// the new UE-AMBR `(downlink, uplink)` bits/sec for this UE.
     UpdateAmPolicy {
@@ -259,23 +259,42 @@ const T3513_SECS: u64 = 6;
 const T3513_ENV: &str = "RADIAN_AMF_T3513_SECS";
 const T3513_MAX_SENDS: u32 = 3;
 
-/// Page `tmsi` on the gNB associations serving tracking area `tac`
-/// (registration-area paging). A gNB that hasn't completed NG Setup (no TA list
-/// yet) is included; if the UE's TA is unknown every gNB is paged (fail-open).
-/// Closed links are swept. Returns how many associations were paged.
-fn page_gnbs(tmsi: u32, ue_tac: Option<[u8; 3]>) -> usize {
-    let page_tac = ue_tac.unwrap_or(AMF_TAC);
+/// The registration area assigned at registration: the serving gNB's Supported TA
+/// List (its association found by channel identity) ∪ the UE's own TAI, capped at
+/// 16 (one 5GS TAI list partial list).
+fn registration_area_for(ue_tac: Option<[u8; 3]>, dereg_tx: &UnboundedSender<UeCmd>) -> Vec<[u8; 3]> {
+    let mut area: Vec<[u8; 3]> = GNB_LINKS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|l| l.tx.same_channel(dereg_tx))
+        .map(|l| l.tacs.clone())
+        .unwrap_or_default();
+    if let Some(tac) = ue_tac {
+        if !area.contains(&tac) {
+            area.push(tac);
+        }
+    }
+    area.truncate(16);
+    area
+}
+
+/// Page `tmsi` across registration area `area`: the gNB associations serving any
+/// of its tracking areas are paged, each with the full area in its TAI List for
+/// Paging. A gNB that hasn't completed NG Setup (no TA list yet) is included; an
+/// empty area pages every gNB in the default TAC (fail-open). Closed links are
+/// swept. Returns how many associations were paged.
+fn page_gnbs(tmsi: u32, area: &[[u8; 3]]) -> usize {
+    let page_tacs: Vec<[u8; 3]> = if area.is_empty() { vec![AMF_TAC] } else { area.to_vec() };
     let mut paged = 0;
     let mut links = GNB_LINKS.lock().unwrap();
     links.retain(|l| {
-        let serving = match ue_tac {
-            Some(t) => l.tacs.contains(&t) || l.tacs.is_empty(),
-            None => true,
-        };
+        let serving =
+            area.is_empty() || l.tacs.is_empty() || l.tacs.iter().any(|t| area.contains(t));
         if !serving {
             return !l.tx.is_closed();
         }
-        match l.tx.send(UeCmd::Page { tmsi, tac: page_tac }) {
+        match l.tx.send(UeCmd::Page { tmsi, tacs: page_tacs.clone() }) {
             Ok(()) => {
                 paged += 1;
                 true
@@ -292,10 +311,16 @@ fn page_gnbs(tmsi: u32, ue_tac: Option<[u8; 3]>) -> usize {
 async fn page_with_retx(supi: String, tmsi: u32, t3513: std::time::Duration, max_sends: u32) {
     for attempt in 1..=max_sends {
         // Resumed (or evicted) — the retained context is gone: stop paging.
-        let Some(ue_tac) = RETAINED.lock().unwrap().get(&tmsi).map(|c| c.tac) else {
+        let Some(area) = RETAINED.lock().unwrap().get(&tmsi).map(|c| {
+            if c.registration_area.is_empty() {
+                c.tac.map(|t| vec![t]).unwrap_or_default()
+            } else {
+                c.registration_area.clone()
+            }
+        }) else {
             return;
         };
-        let paged = page_gnbs(tmsi, ue_tac);
+        let paged = page_gnbs(tmsi, &area);
         info!(%supi, attempt, of = max_sends, gnbs = paged, "paging CM-IDLE UE (T3513 armed)");
         tokio::time::sleep(t3513).await;
         if !RETAINED.lock().unwrap().contains_key(&tmsi) {
@@ -397,10 +422,14 @@ struct UeContext {
     /// retained-context store is keyed by it (stable across CM-IDLE / resume,
     /// unlike the per-N2-connection AMF-UE-NGAP-ID).
     guti_tmsi: Option<u32>,
-    /// The UE's tracking area (from the InitialUEMessage's User Location
-    /// Information TAI, refreshed on resume) — the registration area paging is
-    /// scoped to. `None` when the gNB sent no ULI (paging falls back to all gNBs).
+    /// The UE's current tracking area (from the InitialUEMessage's User Location
+    /// Information TAI, refreshed on resume). `None` when the gNB sent no ULI.
     tac: Option<[u8; 3]>,
+    /// The UE's assigned **registration area** (TS 23.501 §5.3.2.3): the serving
+    /// gNB's Supported TA List ∪ the UE's TAI, capped at 16. Sent to the UE in the
+    /// Registration Accept's 5GS TAI list (TS 24.501 §9.11.3.9); paging is scoped
+    /// to it. Empty = none assigned (paging falls back to the current TAC).
+    registration_area: Vec<[u8; 3]>,
     /// When this context entered CM-IDLE (moved to `RETAINED`). The eviction sweep
     /// implicitly deregisters a UE that lingers past the mobile-reachable /
     /// implicit-deregistration deadline. `None` while CM-CONNECTED.
@@ -536,10 +565,10 @@ async fn serve_gnb(
                         on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp, area_restriction)
                     }
                     // Page a CM-IDLE UE on this gNB (non-UE-associated NGAP Paging)
-                    // in the UE's registration-area tracking area.
-                    UeCmd::Page { tmsi, tac } => {
-                        info!("paging CM-IDLE UE (5G-TMSI {tmsi:#010x}, TAC {tac:02x?}) on this gNB");
-                        vec![(ngap::paging(tmsi, PLMN_MCC, PLMN_MNC, &tac), "Paging")]
+                    // across its registration area.
+                    UeCmd::Page { tmsi, tacs } => {
+                        info!("paging CM-IDLE UE (5G-TMSI {tmsi:#010x}, area {tacs:02x?}) on this gNB");
+                        vec![(ngap::paging(tmsi, PLMN_MCC, PLMN_MNC, &tacs), "Paging")]
                     }
                 };
                 for (dl, label) in downlinks {
@@ -1177,8 +1206,16 @@ async fn on_service_request(
     ctx.cm_state = CmState::Connected;
     ctx.retained_at = None; // resumed — the mobile-reachable timer stops
     // Refresh the UE's tracking area from where it resumed (the UE may have moved
-    // while idle — the next paging round must target the new area).
+    // while idle — the next paging round must target the new area). A resume from
+    // outside the assigned registration area extends it (a full re-assignment
+    // belongs to the mobility registration update, not modelled).
     ctx.tac = ngap::tac_from_initial_ue(msg).or(ctx.tac);
+    if let Some(tac) = ctx.tac {
+        if !ctx.registration_area.is_empty() && !ctx.registration_area.contains(&tac) {
+            ctx.registration_area.push(tac);
+            ctx.registration_area.truncate(16);
+        }
+    }
     // An AM policy change that arrived while the UE was CM-IDLE — applied below,
     // once the context is back in the association map.
     let pending_am_policy = ctx.pending_am_policy.take();
@@ -1329,11 +1366,17 @@ fn on_initial_ue(
             let mut ctx = UeContext::new(ran_ue_id, RegState::Identified, Some(supi.clone()));
             ctx.replayed_ue_sec_cap = ue_sec_cap;
             ctx.requested_nssai = requested_nssai;
-            // The UE's tracking area (from the gNB's ULI) — the registration area
-            // its paging is scoped to.
+            // The UE's tracking area (from the gNB's ULI) + its assigned
+            // registration area: the serving gNB's Supported TA List ∪ the UE's
+            // TAI (the UE roams those areas without re-registering; paging is
+            // scoped to them).
             ctx.tac = ngap::tac_from_initial_ue(msg);
+            ctx.registration_area = registration_area_for(ctx.tac, dereg_tx);
             if let Some(tac) = ctx.tac {
-                info!("UE {amf_ue_id}: registering from TAC {tac:02x?} (registration area)");
+                info!(
+                    "UE {amf_ue_id}: registering from TAC {tac:02x?}; registration area {:02x?}",
+                    ctx.registration_area
+                );
             }
             ues.insert(amf_ue_id, ctx);
             // Make the UE reachable from the SBI callback surface (withdrawals).
@@ -1374,6 +1417,7 @@ impl UeContext {
             cm_state: CmState::Connected,
             guti_tmsi: None,
             tac: None,
+            registration_area: Vec::new(),
             retained_at: None,
             am_policy: None,
             pending_am_policy: None,
@@ -2040,6 +2084,7 @@ async fn on_security_mode_complete(
     }
 
     ctx.allowed_nssai = subscribed.is_some().then(|| allowed.clone());
+    let registration_area = ctx.registration_area.clone();
     let Some(sec) = ctx.sec.as_mut() else {
         return Vec::new();
     };
@@ -2050,7 +2095,17 @@ async fn on_security_mode_complete(
         gutis.retain(|_, s| s != supi);
         gutis.insert(tmsi, supi.clone());
     }
-    let accept = nas::registration_accept(PLMN_MCC, PLMN_MNC, tmsi, &allowed, &rejected, T3512_SECS);
+    // The Registration Accept assigns the GUTI, the granted slices, T3512, and the
+    // registration area (5GS TAI list) paging is scoped to.
+    let accept = nas::registration_accept(
+        PLMN_MCC,
+        PLMN_MNC,
+        tmsi,
+        &allowed,
+        &rejected,
+        T3512_SECS,
+        &registration_area,
+    );
     let bytes = sec.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1);
     info!(
         "UE {amf_ue_id}: SecurityModeComplete — sending Registration Accept \
@@ -2799,50 +2854,48 @@ mod tests {
     }
 
     /// Registration-area paging: only the gNB associations whose Supported TA List
-    /// covers the UE's tracking area are paged; a gNB with no NG Setup yet (empty
-    /// TA list) is included fail-open, and an unknown UE TA pages everyone.
+    /// intersects the UE's registration area are paged (each with the full area in
+    /// its TAI list); a gNB with no NG Setup yet (empty TA list) is included
+    /// fail-open, and an empty area pages everyone in the default TAC.
     #[tokio::test]
     async fn paging_is_scoped_to_the_ue_registration_area() {
         let tmsi = 0x0000_0131u32;
-        let ue_tac = [0u8, 0, 0x77]; // unique to this test
-        let mut ctx = UeContext::new(0, RegState::Registered, Some("imsi-999700000000131".into()));
-        ctx.cm_state = CmState::Idle;
-        ctx.tac = Some(ue_tac);
-        RETAINED.lock().unwrap().insert(tmsi, ctx);
+        // A two-TA registration area, unique to this test.
+        let area = vec![[0u8, 0, 0x77], [0u8, 0, 0x7a]];
 
-        // gNB A serves the UE's TA; gNB B serves a different one; gNB C has no
-        // NG Setup yet (empty list → fail-open).
+        // gNB A serves one of the area's TAs; gNB B serves a different one; gNB C
+        // has no NG Setup yet (empty list → fail-open).
         let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
         let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
         let (tx_c, mut rx_c) = tokio::sync::mpsc::unbounded_channel();
         {
             let mut links = GNB_LINKS.lock().unwrap();
-            links.push(GnbLink { tacs: vec![ue_tac], tx: tx_a });
+            links.push(GnbLink { tacs: vec![[0, 0, 0x7a]], tx: tx_a });
             links.push(GnbLink { tacs: vec![[0, 0, 0x78]], tx: tx_b });
             links.push(GnbLink { tacs: Vec::new(), tx: tx_c });
         }
 
-        // Page in the UE's TA: A and C see it (with the UE's TAC), B does not.
-        page_gnbs(tmsi, Some(ue_tac));
+        // Page the area: A and C see it (carrying the FULL area), B does not.
+        page_gnbs(tmsi, &area);
         let mine = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<UeCmd>| {
             let mut hits = 0;
             while let Ok(cmd) = rx.try_recv() {
-                if matches!(cmd, UeCmd::Page { tmsi: t, tac } if t == tmsi && tac == ue_tac) {
+                if matches!(&cmd, UeCmd::Page { tmsi: t, tacs } if *t == tmsi && *tacs == area) {
                     hits += 1;
                 }
             }
             hits
         };
-        assert_eq!(mine(&mut rx_a), 1, "the serving gNB is paged");
+        assert_eq!(mine(&mut rx_a), 1, "a gNB serving part of the area is paged");
         assert_eq!(mine(&mut rx_b), 0, "a gNB outside the registration area is not");
         assert_eq!(mine(&mut rx_c), 1, "a gNB with no TA list yet is paged fail-open");
 
-        // An unknown UE TA falls back to paging everyone (in the default TAC).
-        page_gnbs(tmsi, None);
+        // An empty area falls back to paging everyone (in the default TAC).
+        page_gnbs(tmsi, &[]);
         let broadcast = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<UeCmd>| {
             let mut hits = 0;
             while let Ok(cmd) = rx.try_recv() {
-                if matches!(cmd, UeCmd::Page { tmsi: t, tac } if t == tmsi && tac == AMF_TAC) {
+                if matches!(&cmd, UeCmd::Page { tmsi: t, tacs } if *t == tmsi && *tacs == [AMF_TAC]) {
                     hits += 1;
                 }
             }
@@ -2851,8 +2904,33 @@ mod tests {
         assert_eq!(broadcast(&mut rx_a), 1);
         assert_eq!(broadcast(&mut rx_b), 1);
         assert_eq!(broadcast(&mut rx_c), 1);
+    }
 
-        RETAINED.lock().unwrap().remove(&tmsi);
+    /// The registration area assigned at registration: the serving gNB's Supported
+    /// TA List ∪ the UE's TAI (no duplicate), capped at 16; an unregistered
+    /// association (no NG Setup) yields just the UE's TAI.
+    #[test]
+    fn registration_area_combines_gnb_tas_and_ue_tai() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        GNB_LINKS
+            .lock()
+            .unwrap()
+            .push(GnbLink { tacs: vec![[0, 0, 0x81], [0, 0, 0x82]], tx: tx.clone() });
+
+        // gNB TAs + a new UE TAI.
+        assert_eq!(
+            registration_area_for(Some([0, 0, 0x83]), &tx),
+            vec![[0, 0, 0x81], [0, 0, 0x82], [0, 0, 0x83]]
+        );
+        // The UE's TAI already served → no duplicate.
+        assert_eq!(
+            registration_area_for(Some([0, 0, 0x81]), &tx),
+            vec![[0, 0, 0x81], [0, 0, 0x82]]
+        );
+        // An association with no GNB_LINKS entry (or no ULI) degrades gracefully.
+        let (other, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(registration_area_for(Some([0, 0, 0x84]), &other), vec![[0, 0, 0x84]]);
+        assert_eq!(registration_area_for(None, &other), Vec::<[u8; 3]>::new());
     }
 
     /// T3513: the page is retransmitted until the UE resumes (the retained context
@@ -3754,7 +3832,7 @@ mod tests {
         let allowed = [(1u8, Some([0x01, 0x02, 0x03]))];
         let rejected = [(5u8, None)];
         let dl = amf_sec.protect(
-            &nas::registration_accept("999", "70", 1, &allowed, &rejected, T3512_SECS),
+            &nas::registration_accept("999", "70", 1, &allowed, &rejected, T3512_SECS, &[]),
             nas::sht::INTEGRITY_CIPHERED,
             1,
         );
