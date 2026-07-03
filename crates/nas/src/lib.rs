@@ -249,6 +249,45 @@ pub fn rejected_nssai_from_registration_accept(
     accept.rejected_nssai.as_ref().map(|n| parse_rejected_nssai_value(&n.value)).unwrap_or_default()
 }
 
+/// 5GMM cause values (TS 24.501 §9.11.3.2) this stack emits.
+pub mod mm_cause {
+    /// #62 — no network slices available.
+    pub const NO_NETWORK_SLICES_AVAILABLE: u8 = 62;
+}
+
+/// Build a 5GMM **Registration Reject** (TS 24.501 §8.2.9) with `cause` (pick from
+/// [`mm_cause`]) and, when non-empty, the **rejected NSSAI** (IEI 0x69, cause *not
+/// available in the current PLMN*) so the UE learns which slices were refused.
+pub fn registration_reject(
+    cause: u8,
+    rejected_nssai: &[(u8, Option<[u8; 3]>)],
+) -> Nas5gsMessage {
+    let mut reject = messages::NasRegistrationReject::new(NasFGmmCause::new(cause));
+    if !rejected_nssai.is_empty() {
+        reject = reject.set_rejected_nssai(NasRejectedNssai::new(rejected_nssai_value(
+            rejected_nssai,
+            nssai_cause::NOT_AVAILABLE_IN_PLMN,
+        )));
+    }
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::RegistrationReject,
+        Nas5gmmMessage::RegistrationReject(reject),
+    )
+}
+
+/// Extract `(5GMM cause, rejected NSSAI)` from a decoded Registration Reject
+/// (UE side / tests).
+pub fn parse_registration_reject(
+    msg: &Nas5gsMessage,
+) -> Option<(u8, Vec<((u8, Option<[u8; 3]>), u8)>)> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationReject(rej)) = msg else {
+        return None;
+    };
+    let rejected =
+        rej.rejected_nssai.as_ref().map(|n| parse_rejected_nssai_value(&n.value)).unwrap_or_default();
+    Some((rej.fgmm_cause.value, rejected))
+}
+
 /// Build a minimal 5GMM **Configuration Update Command** (TS 24.501 §8.2.19). The AMF
 /// sends this after Registration Complete; a compliant UE waits for it before initiating
 /// a PDU session. All IEs are optional — none are included and no acknowledgement is
@@ -898,6 +937,23 @@ mod tests {
         assert!(parse_nssai_value(&[]).is_empty());
         // A truncated entry stops the parse instead of panicking.
         assert_eq!(parse_nssai_value(&[4, 1, 2]), Vec::<(u8, Option<[u8; 3]>)>::new());
+    }
+
+    #[test]
+    fn registration_reject_roundtrips() {
+        let rejected = [(9u8, Some([9u8, 9, 9]))];
+        let msg = registration_reject(mm_cause::NO_NETWORK_SLICES_AVAILABLE, &rejected);
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&msg).unwrap()).unwrap();
+        assert_eq!(gmm_message_type(&back), Some(Nas5gmmMessageType::RegistrationReject));
+        assert_eq!(
+            parse_registration_reject(&back),
+            Some((62, vec![((9, Some([9, 9, 9])), nssai_cause::NOT_AVAILABLE_IN_PLMN)]))
+        );
+
+        // Without rejected slices, only the cause rides.
+        let bare = registration_reject(mm_cause::NO_NETWORK_SLICES_AVAILABLE, &[]);
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&bare).unwrap()).unwrap();
+        assert_eq!(parse_registration_reject(&back), Some((62, vec![])));
     }
 
     #[test]

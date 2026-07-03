@@ -42,6 +42,7 @@ surface of the project and assesses build feasibility.
 | [31-requested-snssai.md](31-requested-snssai.md) | UE-requested S-NSSAI: parse the 0x22 IE, slice-keyed subscription validation (403 SNSSAI_DENIED/DNN_DENIED ProblemDetails), 5GSM cause #70 |
 | [32-allowed-nssai.md](32-allowed-nssai.md) | Allowed NSSAI at registration: Nudm_SDM am-data, 0x15 IE in the Registration Accept (fail-open), local slice admission at PDU establishment |
 | [33-nssai-intersection.md](33-nssai-intersection.md) | Requested-NSSAI intersection: 0x2F IE parsed, allowed = requested ∩ subscribed, rejected NSSAI IE 0x11 (cause: not available in PLMN) |
+| [34-registration-reject-62.md](34-registration-reject-62.md) | Registration Reject 5GMM cause #62 when no requested slice is subscribed: rejected NSSAI (0x69) attached, UE context released |
 
 ## One-paragraph summary
 

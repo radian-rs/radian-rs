@@ -345,7 +345,7 @@ async fn on_uplink_nas(
             complete_authentication(ues, amf_auth, amf_ue_id, &res_star).await
         }
         Some(Nas5gmmMessageType::SecurityModeComplete) => {
-            on_security_mode_complete(ues, amf_ue_id).await
+            on_security_mode_complete(ues, amf_ue_id, NRF_BASE).await
         }
         Some(Nas5gmmMessageType::RegistrationComplete) => {
             let ctx = ues.get_mut(&amf_ue_id)?;
@@ -568,16 +568,19 @@ fn establish_security(
 }
 
 /// On Security Mode Complete, fetch the subscriber's am-data, intersect it with
-/// the UE's requested NSSAI, and build the protected Registration Accept
-/// (assigning a 5G-GUTI, granting the allowed NSSAI, listing the rejected one).
+/// the UE's requested NSSAI, and answer: a **Registration Accept** (5G-GUTI,
+/// allowed + rejected NSSAIs) — or, when the intersection is empty, a
+/// **Registration Reject** with 5GMM cause #62 *no network slices available*
+/// (TS 24.501 §5.5.1.2.8), releasing the UE context.
 async fn on_security_mode_complete(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
+    nrf_base: &str,
 ) -> Option<(NGAP_PDU, &'static str)> {
     // Fetch before taking the mutable borrow (the fetch awaits).
     let supi = ues.get(&amf_ue_id)?.suci.clone();
     let subscribed = match &supi {
-        Some(supi) => fetch_subscribed_nssai(supi).await,
+        Some(supi) => fetch_subscribed_nssai(nrf_base, supi).await,
         None => None,
     };
 
@@ -590,6 +593,25 @@ async fn on_security_mode_complete(
         Some(subscribed) => compute_nssai(&ctx.requested_nssai, subscribed),
         None => (Vec::new(), Vec::new()),
     };
+
+    // Nothing the UE requested is subscribed → the registration cannot serve any
+    // slice: Registration Reject #62, and the UE context is released.
+    if subscribed.is_some() && allowed.is_empty() {
+        let sec = ctx.sec.as_mut()?;
+        let reject =
+            nas::registration_reject(nas::mm_cause::NO_NETWORK_SLICES_AVAILABLE, &rejected);
+        let bytes = sec.protect(&reject, nas::sht::INTEGRITY_CIPHERED, 1);
+        warn!(
+            "UE {amf_ue_id}: no requested slice is subscribed ({rejected:?}); sending \
+             Registration Reject (5GMM cause #62) and releasing the context"
+        );
+        ues.remove(&amf_ue_id);
+        return Some((
+            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
+            "DownlinkNASTransport (RegistrationReject)",
+        ));
+    }
+
     ctx.allowed_nssai = subscribed.is_some().then(|| allowed.clone());
     let sec = ctx.sec.as_mut()?;
     let accept = nas::registration_accept(PLMN_MCC, PLMN_MNC, tmsi, &allowed, &rejected);
@@ -622,8 +644,9 @@ fn compute_nssai(
 /// (Nudm_SDM): the subscribed default S-NSSAIs (`nssai.defaultSingleNssais`).
 /// `None` on any failure — registration proceeds without the IE (fail-open; the
 /// SMF's subscription check still gates session establishment).
-async fn fetch_subscribed_nssai(supi: &str) -> Option<Vec<(u8, Option<[u8; 3]>)>> {
-    let udm = discover_nf("UDM").await.map_err(|e| warn!("UDM discovery failed: {e}")).ok()?;
+async fn fetch_subscribed_nssai(nrf_base: &str, supi: &str) -> Option<Vec<(u8, Option<[u8; 3]>)>> {
+    let udm =
+        discover_nf(nrf_base, "UDM").await.map_err(|e| warn!("UDM discovery failed: {e}")).ok()?;
     let plmn = format!("{PLMN_MCC}{PLMN_MNC}");
     let am = sbi_core::nudm::NudmClient::new(udm)
         .get_am_data(supi, &plmn)
@@ -648,8 +671,8 @@ async fn fetch_subscribed_nssai(supi: &str) -> Option<Vec<(u8, Option<[u8; 3]>)>
 }
 
 /// Discover an NF's first service endpoint via the NRF.
-async fn discover_nf(nf_type: &str) -> Result<String, String> {
-    let profile = sbi_core::nnrf::NrfClient::new(NRF_BASE)
+async fn discover_nf(nrf_base: &str, nf_type: &str) -> Result<String, String> {
+    let profile = sbi_core::nnrf::NrfClient::new(nrf_base.to_string())
         .discover(nf_type, "AMF")
         .await
         .map_err(|e| format!("NRF discovery failed: {e}"))?
@@ -759,6 +782,92 @@ mod tests {
         // No overlap → everything rejected, nothing allowed.
         let req = vec![(9, None)];
         assert_eq!(compute_nssai(&req, &sub), (vec![], vec![(9, None)]));
+    }
+
+    /// Extract the NAS PDU from a built NGAP DownlinkNASTransport.
+    fn downlink_nas_pdu(pdu: &NGAP_PDU) -> Option<Vec<u8>> {
+        let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+            return None;
+        };
+        let InitiatingMessageValue::Id_DownlinkNASTransport(msg) = value else {
+            return None;
+        };
+        msg.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+            ngap::DownlinkNASTransportProtocolIEs_EntryValue::Id_NAS_PDU(nas) => Some(nas.0.clone()),
+            _ => None,
+        })
+    }
+
+    /// A UE whose requested slices are all unsubscribed is rejected at registration
+    /// with 5GMM cause #62 (rejected NSSAI attached) and its context is released.
+    #[tokio::test]
+    async fn unsubscribed_slices_reject_registration_with_cause_62() {
+        use subscriber_db::{DataSet, ProvisionedDataStore, SubscriberStore};
+
+        let supi = "imsi-999700000000001";
+
+        // NRF + UDR (am-data: subscribed slice 1/010203 only) + NRF-registered UDM.
+        let store = std::sync::Arc::new(subscriber_db::InMemoryStore::new());
+        store
+            .put_provisioned(
+                DataSet::Am,
+                supi,
+                "99970",
+                &serde_json::json!({ "nssai": { "defaultSingleNssais": [{ "sst": 1, "sd": "010203" }] } }),
+            )
+            .unwrap();
+        let store: std::sync::Arc<dyn SubscriberStore> = store;
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(udr_l, sbi_core::nudr::router(store)).await.unwrap() });
+
+        let udr = std::sync::Arc::new(sbi_core::nudr::UdrClient::new(format!("http://{udr_addr}")));
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(udm_l, sbi_core::nudm::router(udr)).await.unwrap() });
+
+        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nrf_addr = nrf_l.local_addr().unwrap();
+        let nrf_store = sbi_core::nnrf::NrfStore::default();
+        tokio::spawn(async move { sbi_core::run_on(nrf_l, sbi_core::nnrf::router(nrf_store)).await.unwrap() });
+        let nrf_base = format!("http://{nrf_addr}");
+        let mut profile =
+            sbi_core::nnrf::NfProfile::new("udm-1", "UDM", udm_addr.ip().to_string());
+        profile.nf_services = Some(vec![sbi_core::nnrf::NfService {
+            service_instance_id: "nudm-1".into(),
+            service_name: "nudm-sdm".into(),
+            scheme: "http".into(),
+            ip_end_points: vec![sbi_core::nnrf::IpEndPoint {
+                ipv4_address: Some(udm_addr.ip().to_string()),
+                port: Some(udm_addr.port()),
+            }],
+        }]);
+        sbi_core::nnrf::NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
+
+        // A secured UE context that requested only the unsubscribed slice 9.
+        let (ki, ke) = ([0x11u8; 16], [0x22u8; 16]);
+        let mut ctx = UeContext::new(7, RegState::SecurityMode, Some(supi.to_string()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.requested_nssai = vec![(9, None)];
+        let mut ues = HashMap::new();
+        ues.insert(1u64, ctx);
+
+        let (pdu, label) =
+            on_security_mode_complete(&mut ues, 1, &nrf_base).await.expect("a downlink to send");
+        assert_eq!(label, "DownlinkNASTransport (RegistrationReject)");
+        assert!(!ues.contains_key(&1), "UE context released after the reject");
+
+        // UE side: verify/decipher and check the cause + rejected NSSAI.
+        let nas_bytes = downlink_nas_pdu(&pdu).expect("NAS PDU in the downlink");
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let msg = ue_sec.unprotect(&nas_bytes, 1).expect("UE verifies the reject");
+        assert_eq!(
+            nas::parse_registration_reject(&msg),
+            Some((
+                nas::mm_cause::NO_NETWORK_SLICES_AVAILABLE,
+                vec![((9, None), nas::nssai_cause::NOT_AVAILABLE_IN_PLMN)]
+            ))
+        );
     }
 
     fn initial_ue_message(ran_ue_id: u32) -> NGAP_PDU {
