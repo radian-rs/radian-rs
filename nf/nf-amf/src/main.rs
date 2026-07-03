@@ -348,12 +348,65 @@ async fn on_uplink_nas(
         return Vec::new();
     };
 
-    // Security Mode Complete may answer with more than one downlink (a
-    // Registration Reject followed by the UE Context Release Command).
-    if nas::gmm_message_type(&nas_msg) == Some(Nas5gmmMessageType::SecurityModeComplete) {
-        return on_security_mode_complete(ues, amf_ue_id, NRF_BASE).await;
+    // These procedures answer with more than one downlink (or need the multi-PDU
+    // shape): Security Mode Complete (a Registration Reject may be followed by the
+    // UE Context Release Command) and Deregistration (Accept + Release Command).
+    match nas::gmm_message_type(&nas_msg) {
+        Some(Nas5gmmMessageType::SecurityModeComplete) => {
+            return on_security_mode_complete(ues, amf_ue_id, NRF_BASE).await;
+        }
+        Some(Nas5gmmMessageType::DeregistrationRequestFromUe) => {
+            return on_deregistration(ues, amf_smf, amf_ue_id, &nas_msg).await;
+        }
+        _ => {}
     }
     dispatch_uplink_nas(ues, amf_auth, amf_smf, amf_ue_id, nas_msg).await.into_iter().collect()
+}
+
+/// UE-initiated deregistration (TS 24.501 §5.5.2.2): release the PDU session at
+/// the SMF (N4 teardown), answer with a Deregistration Accept — unless the UE is
+/// switching off, which expects silence — then release the RAN-side UE context
+/// (UEContextReleaseCommand) and drop the AMF context.
+async fn on_deregistration(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    amf_ue_id: u64,
+    nas_msg: &Nas5gsMessage,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let switch_off = nas::deregistration_is_switch_off(nas_msg).unwrap_or(false);
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        return Vec::new();
+    };
+    let ran_ue_id = ctx.ran_ue_id;
+
+    // Tear down an in-progress/active PDU session first — best effort: the UE is
+    // leaving either way, so a release failure is logged, not fatal.
+    if let Some(sm_ref) = ctx.sm_ref.take() {
+        match amf_smf.release_sm_context(&sm_ref).await {
+            Ok(()) => info!("UE {amf_ue_id}: released SM context {sm_ref} on deregistration"),
+            Err(e) => warn!("UE {amf_ue_id}: SM context {sm_ref} release failed: {e}"),
+        }
+    }
+
+    let mut downlinks = Vec::new();
+    if switch_off {
+        info!("UE {amf_ue_id}: deregistration (switch-off) — no accept expected");
+    } else if let Some(sec) = ctx.sec.as_mut() {
+        let bytes = sec.protect(&nas::deregistration_accept(), nas::sht::INTEGRITY_CIPHERED, 1);
+        downlinks.push((
+            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
+            "DownlinkNASTransport (DeregistrationAccept)",
+        ));
+        info!("UE {amf_ue_id}: deregistered — sending Deregistration Accept");
+    } else {
+        warn!("UE {amf_ue_id}: deregistration before NAS security; no accept sent");
+    }
+    downlinks.push((
+        ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
+        "UEContextReleaseCommand",
+    ));
+    ues.remove(&amf_ue_id);
+    downlinks
 }
 
 /// Handle one verified uplink NAS message that answers with at most one downlink.
@@ -840,6 +893,92 @@ mod tests {
             ngap::DownlinkNASTransportProtocolIEs_EntryValue::Id_NAS_PDU(nas) => Some(nas.0.clone()),
             _ => None,
         })
+    }
+
+    /// Deregistration releases the SM context at the SMF, answers with an Accept
+    /// (unless switch-off), sends the UE Context Release Command, and drops the
+    /// AMF context.
+    #[tokio::test]
+    async fn deregistration_releases_session_and_contexts() {
+        use axum::http::StatusCode;
+        use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService, NrfClient};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        // Mock SMF counting /release hits, registered with an ephemeral NRF.
+        static RELEASES: AtomicUsize = AtomicUsize::new(0);
+        async fn mock_release() -> StatusCode {
+            RELEASES.fetch_add(1, AtomicOrdering::Relaxed);
+            StatusCode::NO_CONTENT
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new().route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release",
+            axum::routing::post(mock_release),
+        );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+
+        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nrf_addr = nrf_l.local_addr().unwrap();
+        let store = sbi_core::nnrf::NrfStore::default();
+        tokio::spawn(async move { sbi_core::run_on(nrf_l, sbi_core::nnrf::router(store)).await.unwrap() });
+        let nrf_base = format!("http://{nrf_addr}");
+        let mut profile = NfProfile::new("smf-mock", "SMF", smf_addr.ip().to_string());
+        profile.nf_services = Some(vec![NfService {
+            service_instance_id: "nsmf-pdusession-1".into(),
+            service_name: "nsmf-pdusession".into(),
+            scheme: "http".into(),
+            ip_end_points: vec![IpEndPoint {
+                ipv4_address: Some(smf_addr.ip().to_string()),
+                port: Some(smf_addr.port()),
+            }],
+        }]);
+        NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
+        let amf_smf = pdu_session::AmfSmf::new(nrf_base, "999", "70");
+
+        // A registered, secured UE with an active PDU session.
+        let (ki, ke) = ([0x11u8; 16], [0x22u8; 16]);
+        let mut ctx = UeContext::new(7, RegState::Registered, Some("imsi-999700000000001".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.sm_ref = Some("1".into());
+        let mut ues = HashMap::new();
+        ues.insert(1u64, ctx);
+
+        // Normal deregistration → SM release + Accept + Release Command, context gone.
+        let dereg = nas::deregistration_request_from_ue(0x01, "999", "70", 1);
+        let downlinks = on_deregistration(&mut ues, &amf_smf, 1, &dereg).await;
+        assert_eq!(
+            downlinks.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["DownlinkNASTransport (DeregistrationAccept)", "UEContextReleaseCommand"]
+        );
+        assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 1, "SM context released at the SMF");
+        assert!(!ues.contains_key(&1), "AMF context dropped");
+        assert_eq!(
+            ngap::parse_ue_context_release_command(&downlinks[1].0),
+            Some((1, 7, Some(ngap::CauseNas::DEREGISTER)))
+        );
+        // UE side: the accept verifies and decodes.
+        let nas_bytes = downlink_nas_pdu(&downlinks[0].0).expect("NAS PDU");
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let msg = ue_sec.unprotect(&nas_bytes, 1).expect("UE verifies the accept");
+        assert_eq!(
+            nas::gmm_message_type(&msg),
+            Some(nas::Nas5gmmMessageType::DeregistrationAcceptFromUe)
+        );
+
+        // Switch-off (bit 4 set) → no accept, just the release command.
+        let mut ctx = UeContext::new(9, RegState::Registered, Some("imsi-999700000000001".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ues.insert(2u64, ctx);
+        let dereg = nas::deregistration_request_from_ue(0x09, "999", "70", 1);
+        let downlinks = on_deregistration(&mut ues, &amf_smf, 2, &dereg).await;
+        assert_eq!(
+            downlinks.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["UEContextReleaseCommand"],
+            "switch-off expects silence, only the RAN release goes out"
+        );
+        assert!(!ues.contains_key(&2));
+        assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 1, "no session, no extra release");
     }
 
     /// A UE whose requested slices are all unsubscribed is rejected at registration
