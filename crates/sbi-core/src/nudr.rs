@@ -112,6 +112,11 @@ pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
             "/nudr-dr/v2/policy-data/ues/{ue_id}/sm-data",
             get(get_sm_policy_data).put(put_sm_policy_data),
         )
+        // AM policy data (TS 29.519 am-data) — the PCF's access/mobility policy source.
+        .route(
+            "/nudr-dr/v2/policy-data/ues/{ue_id}/am-data",
+            get(get_am_policy_data).put(put_am_policy_data),
+        )
         .with_state(state);
     // SBI security (design/46): the UDR holds subscriber data + the withdrawal that
     // can trigger the AMF callback, so it is the first service protected. The
@@ -415,6 +420,22 @@ async fn put_sm_policy_data(
     put_doc(st.store, DataSet::Policy, ue_id, String::new(), doc).await
 }
 
+/// AM policy-data handlers (TS 29.519 am-data) — keyed by ueId only, so these
+/// read/write `DataSet::AmPolicy` under an empty PLMN key.
+async fn get_am_policy_data(
+    State(st): State<NudrState>,
+    Path(ue_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    get_doc(st.store, DataSet::AmPolicy, ue_id, String::new()).await
+}
+async fn put_am_policy_data(
+    State(st): State<NudrState>,
+    Path(ue_id): Path<String>,
+    Json(doc): Json<serde_json::Value>,
+) -> StatusCode {
+    put_doc(st.store, DataSet::AmPolicy, ue_id, String::new(), doc).await
+}
+
 fn dataset_path(ds: DataSet) -> &'static str {
     match ds {
         DataSet::Am => "am-data",
@@ -423,6 +444,7 @@ fn dataset_path(ds: DataSet) -> &'static str {
         // Policy data has its own resource tree (see `policy_data_url`); never
         // reached via the provisioned-data path.
         DataSet::Policy => "sm-data",
+        DataSet::AmPolicy => "am-data",
     }
 }
 
@@ -563,6 +585,31 @@ impl UdrClient {
 
     fn policy_data_url(&self, supi: &str) -> String {
         format!("{}/nudr-dr/v2/policy-data/ues/{}/sm-data", self.base, supi)
+    }
+
+    /// Fetch the subscriber's **AM** policy data (TS 29.519 `policy-data/ues/{ueId}/
+    /// am-data`). `Ok(None)` if not provisioned. Used by the PCF (Npcf_AMPolicyControl).
+    pub async fn get_am_policy_data(
+        &self,
+        supi: &str,
+    ) -> Result<Option<serde_json::Value>, SbiError> {
+        let url = format!("{}/nudr-dr/v2/policy-data/ues/{}/am-data", self.base, supi);
+        let resp = self.bearer(self.http.get(url)).await.send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    /// Provision (create or replace) the subscriber's AM policy data.
+    pub async fn put_am_policy_data(
+        &self,
+        supi: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), SbiError> {
+        let url = format!("{}/nudr-dr/v2/policy-data/ues/{}/am-data", self.base, supi);
+        self.bearer(self.http.put(url).json(doc)).await.send().await?.error_for_status()?;
+        Ok(())
     }
 
     /// Withdraw a subscription (`DELETE …/subscription-data/{ueId}`). `Ok(true)`

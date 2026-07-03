@@ -48,19 +48,21 @@ async fn main() -> anyhow::Result<()> {
     // Policy from the UDR (Nudr policy-data). With SBI security on, present a `UDR`
     // access token on each call; otherwise call it openly.
     info!(%udr_base, "PCF sourcing policy from the UDR over Nudr policy-data");
-    let udr = if sbi_core::oauth::sbi_secret().is_some() {
+    let udr = Arc::new(if sbi_core::oauth::sbi_secret().is_some() {
         let tokens =
             Arc::new(sbi_core::oauth::TokenSource::new(nrf_base.clone(), PCF_INSTANCE_ID.clone()));
         sbi_core::nudr::UdrClient::with_tokens(udr_base, tokens)
     } else {
         sbi_core::nudr::UdrClient::new(udr_base)
-    };
+    });
 
     let state = sbi_core::npcf::PcfState::new(sbi_core::npcf::PolicyConfig::demo())
-        .with_udr(Arc::new(udr));
+        .with_udr(udr.clone());
     // Access-and-mobility policy (Npcf_AMPolicyControl): the AMF opens an AM policy
-    // association at registration; the PCF returns RFSP + a policy UE-AMBR.
-    let am_state = sbi_core::npcf_am::AmPcfState::new(sbi_core::npcf_am::AmPolicyConfig::demo());
+    // association at registration; the PCF returns RFSP + a policy UE-AMBR, sourced
+    // per-subscriber from the UDR (Nudr am-policy-data), else the local default.
+    let am_state = sbi_core::npcf_am::AmPcfState::new(sbi_core::npcf_am::AmPolicyConfig::demo())
+        .with_udr(udr);
     let router = sbi_core::npcf::router(state).merge(sbi_core::npcf_am::router(am_state));
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     match tls {

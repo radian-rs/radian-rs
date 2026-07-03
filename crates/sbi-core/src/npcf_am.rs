@@ -18,6 +18,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::nudr::UdrClient;
 use crate::SbiError;
 
 /// An aggregate maximum bit rate (TS 29.571 `Ambr`) — bitrate strings like "1 Gbps".
@@ -82,22 +83,54 @@ impl AmPolicyConfig {
     }
 }
 
-/// PCF AM-policy runtime: the local config + in-memory AM policy associations.
+/// PCF AM-policy runtime: the policy source (UDR when configured, else the local
+/// config) + in-memory AM policy associations.
 #[derive(Clone, Default)]
 pub struct AmPcfState {
     config: AmPolicyConfig,
+    /// UDR client — the authoritative source (Nudr am-policy-data). `None` ⇒ local
+    /// config only.
+    udr: Option<Arc<UdrClient>>,
     associations: Arc<Mutex<HashMap<String, PolicyAssociationRequest>>>,
     next_id: Arc<AtomicU64>,
 }
 
 impl AmPcfState {
     pub fn new(config: AmPolicyConfig) -> Self {
-        Self { config, associations: Arc::new(Mutex::new(HashMap::new())), next_id: Arc::new(AtomicU64::new(1)) }
+        Self {
+            config,
+            udr: None,
+            associations: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Source AM policy from the UDR (Nudr am-policy-data), per subscriber, falling
+    /// back to the local config when a subscriber has none provisioned.
+    pub fn with_udr(mut self, udr: Arc<UdrClient>) -> Self {
+        self.udr = Some(udr);
+        self
     }
 
     /// Number of open AM policy associations — test/observability hook.
     pub fn association_count(&self) -> usize {
         self.associations.lock().unwrap().len()
+    }
+
+    /// The AM policy for `supi`: the subscriber's UDR am-policy-data when
+    /// provisioned, else the local config.
+    async fn decide_for(&self, supi: &str) -> PolicyAssociation {
+        if let Some(udr) = &self.udr {
+            match udr.get_am_policy_data(supi).await {
+                Ok(Some(doc)) => match serde_json::from_value::<AmPolicyConfig>(doc) {
+                    Ok(cfg) => return cfg.decide(),
+                    Err(e) => tracing::warn!(%supi, "UDR am-policy-data malformed ({e}); using local policy"),
+                },
+                Ok(None) => tracing::debug!(%supi, "no UDR am-policy-data; using local policy"),
+                Err(e) => tracing::warn!("UDR am-policy-data fetch failed ({e}); using local policy"),
+            }
+        }
+        self.config.decide()
     }
 }
 
@@ -116,7 +149,7 @@ async fn create(
     Json(req): Json<PolicyAssociationRequest>,
 ) -> (StatusCode, [(axum::http::HeaderName, String); 1], Json<PolicyAssociation>) {
     let id = pcf.next_id.fetch_add(1, Ordering::Relaxed).to_string();
-    let decision = pcf.config.decide();
+    let decision = pcf.decide_for(&req.supi).await;
     tracing::info!(supi = %req.supi, assoc = %id, rfsp = ?decision.rfsp, "created AM policy association");
     pcf.associations.lock().unwrap().insert(id.clone(), req);
     let location = format!("/npcf-am-policy-control/v1/policies/{id}");
@@ -213,5 +246,48 @@ mod tests {
         assert_eq!(state.association_count(), 0);
         // Deleting an unknown association is an error (404).
         assert!(client.delete("999").await.is_err());
+    }
+
+    /// The PCF sources AM policy per-subscriber from the UDR (Nudr am-policy-data),
+    /// falling back to the local config for a subscriber with none provisioned.
+    #[tokio::test]
+    async fn am_policy_sourced_from_udr() {
+        use subscriber_db::SubscriberStore;
+
+        // In-process UDR with one subscriber's am-policy-data (distinct from the demo).
+        let store: Arc<dyn SubscriberStore> = Arc::new(subscriber_db::InMemoryStore::new());
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udr_l, crate::nudr::router(store)).await.unwrap() });
+        let udr = Arc::new(UdrClient::new(format!("http://{udr_addr}")));
+        udr.put_am_policy_data(
+            "imsi-1",
+            &serde_json::json!({ "rfsp": 7, "ueAmbr": { "uplink": "100 Mbps", "downlink": "200 Mbps" } }),
+        )
+        .await
+        .unwrap();
+
+        // PCF backed by that UDR; its local demo config is the fallback.
+        let state = AmPcfState::new(AmPolicyConfig::demo()).with_udr(udr);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = state.clone();
+        tokio::spawn(async move { crate::run_on(listener, router(served)).await.unwrap() });
+        let client = AmPolicyClient::new(format!("http://{addr}"));
+
+        // The provisioned subscriber gets the UDR policy.
+        let got = client
+            .create(&PolicyAssociationRequest { supi: "imsi-1".into(), serving_plmn: None })
+            .await
+            .unwrap();
+        assert_eq!(got.policy.rfsp, Some(7));
+        assert_eq!(got.policy.ue_ambr.as_ref().unwrap().downlink, "200 Mbps");
+
+        // An unprovisioned subscriber falls back to the local demo (RFSP 3).
+        let fallback = client
+            .create(&PolicyAssociationRequest { supi: "imsi-unknown".into(), serving_plmn: None })
+            .await
+            .unwrap();
+        assert_eq!(fallback.policy.rfsp, Some(3));
     }
 }

@@ -170,11 +170,19 @@ fn provision_demo(store: &RedbStore) -> anyhow::Result<()> {
             ]
         }
     });
+    // AM policy data (TS 29.519 am-data) — the PCF's access/mobility policy source.
+    // Shaped as `sbi_core::npcf_am::AmPolicyConfig` (RFSP + a policy UE-AMBR that
+    // overrides the subscribed one at the gNB). Not PLMN-scoped (key "").
+    let am_policy = serde_json::json!({
+        "rfsp": 5,
+        "ueAmbr": { "uplink": "300 Mbps", "downlink": "600 Mbps" }
+    });
     store
         .put_provisioned(DataSet::Am, DEMO_SUPI, DEMO_PLMN, &am)
         .and_then(|()| store.put_provisioned(DataSet::Sm, DEMO_SUPI, DEMO_PLMN, &sm))
         .and_then(|()| store.put_provisioned(DataSet::SmfSelection, DEMO_SUPI, DEMO_PLMN, &smf_sel))
         .and_then(|()| store.put_provisioned(DataSet::Policy, DEMO_SUPI, "", &policy))
+        .and_then(|()| store.put_provisioned(DataSet::AmPolicy, DEMO_SUPI, "", &am_policy))
         .map_err(|e| anyhow::anyhow!("provision demo documents: {e}"))
 }
 
