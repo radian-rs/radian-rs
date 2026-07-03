@@ -223,7 +223,7 @@ mod tests {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = pfcp::UpfState::new();
         pfcp::handle_n4(
-            &pfcp::session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None),
+            &pfcp::session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[]),
             node_ip,
             &mut state,
             0,

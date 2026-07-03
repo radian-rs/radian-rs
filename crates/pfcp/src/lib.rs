@@ -32,6 +32,7 @@ use rs_pfcp::ie::create_qer::CreateQer;
 use rs_pfcp::ie::mbr::Mbr;
 use rs_pfcp::ie::outer_header_creation::OuterHeaderCreation;
 use rs_pfcp::ie::qer_id::QerId;
+use rs_pfcp::ie::sdf_filter::SdfFilter;
 use rs_pfcp::ie::update_far::UpdateFar;
 use rs_pfcp::ie::update_forwarding_parameters::UpdateForwardingParameters;
 use rs_pfcp::ie::update_qer::UpdateQer;
@@ -52,6 +53,91 @@ pub const N4_PORT: u16 = 8805;
 
 /// The QER id the session-AMBR QER carries (one session-level QER per session).
 const AMBR_QER_ID: u32 = 1;
+/// A GBR flow's per-flow QER id is `PER_FLOW_QER_BASE + qfi` (distinct from the
+/// session-AMBR QER), and its classifier PDR id is `PER_FLOW_PDR_BASE + index`.
+const PER_FLOW_QER_BASE: u32 = 1000;
+const PER_FLOW_PDR_BASE: u16 = 100;
+
+/// A compact packet classifier for a QoS flow: transport protocol + a port range,
+/// matched against **either** endpoint — a greenfield stand-in for a full TS 29.244
+/// SDF filter (a production UPF parses IPFilterRule syntax). Carried in the PDR's
+/// SDF filter field as a self-described `flow_description`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowFilter {
+    pub protocol: u8,
+    pub port_low: u16,
+    pub port_high: u16,
+}
+
+impl FlowFilter {
+    /// Whether a packet with transport `(protocol, src_port, dst_port)` matches.
+    fn matches(&self, protocol: u8, src_port: u16, dst_port: u16) -> bool {
+        protocol == self.protocol
+            && ((self.port_low..=self.port_high).contains(&src_port)
+                || (self.port_low..=self.port_high).contains(&dst_port))
+    }
+
+    /// Encode as the PDR SDF filter's flow-description string.
+    fn to_flow_description(self) -> String {
+        format!("proto={};ports={}-{}", self.protocol, self.port_low, self.port_high)
+    }
+
+    /// Parse a flow-description written by [`to_flow_description`].
+    fn from_flow_description(s: &str) -> Option<Self> {
+        let (mut protocol, mut ports) = (None, None);
+        for part in s.split(';') {
+            let (k, v) = part.split_once('=')?;
+            match k {
+                "proto" => protocol = v.parse().ok(),
+                "ports" => {
+                    let (lo, hi) = v.split_once('-')?;
+                    ports = Some((lo.parse().ok()?, hi.parse().ok()?));
+                }
+                _ => {}
+            }
+        }
+        let (port_low, port_high) = ports?;
+        Some(FlowFilter { protocol: protocol?, port_low, port_high })
+    }
+}
+
+/// A GBR flow's per-flow QER the SMF installs at the UPF: its classifier + MFBR.
+#[derive(Debug, Clone, Copy)]
+pub struct FlowQer {
+    pub qfi: u8,
+    pub filter: FlowFilter,
+    pub mfbr_dl_bps: u64,
+    pub mfbr_ul_bps: u64,
+}
+
+/// A per-flow policer at the UPF: the classifier + its MFBR token buckets.
+struct FlowEnforcer {
+    #[allow(dead_code)] // retained for tracing/inspection
+    qfi: u8,
+    filter: FlowFilter,
+    ul_bucket: TokenBucket,
+    dl_bucket: TokenBucket,
+}
+
+/// Extract `(protocol, src_port, dst_port)` from a bare IPv4 packet for flow
+/// classification. Ports are 0 for protocols that don't carry them. `None` if the
+/// packet is not IPv4 or is truncated.
+fn transport_key(pkt: &[u8]) -> Option<(u8, u16, u16)> {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+    let protocol = pkt[9];
+    // TCP (6), UDP (17), SCTP (132) carry ports in the first 4 L4-header bytes.
+    let (src_port, dst_port) = match protocol {
+        6 | 17 | 132 if pkt.len() >= ihl + 4 => (
+            u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]),
+            u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]),
+        ),
+        _ => (0, 0),
+    };
+    Some((protocol, src_port, dst_port))
+}
 
 /// A session's aggregate maximum bit rate (uplink/downlink), bits per second — the
 /// value the UPF enforces via a per-session [`TokenBucket`] (TS 23.501 §5.7.2.6).
@@ -130,6 +216,25 @@ struct Session {
     /// Per-direction AMBR policers. `None` ⇒ that direction is unlimited.
     ul_bucket: Option<TokenBucket>,
     dl_bucket: Option<TokenBucket>,
+    /// Per-GBR-flow policers (MFBR), checked by classifier before the session AMBR.
+    flow_qers: Vec<FlowEnforcer>,
+}
+
+impl Session {
+    /// Admit `pkt` in the given direction: classify it to a GBR flow and police it
+    /// against that flow's MFBR, else against the session AMBR. `true` = forward.
+    fn admit(&mut self, uplink: bool, now_nanos: u64, pkt: &[u8]) -> bool {
+        let bytes = pkt.len();
+        let flow_idx = transport_key(pkt)
+            .and_then(|(p, s, d)| self.flow_qers.iter().position(|f| f.filter.matches(p, s, d)));
+        let bucket: Option<&mut TokenBucket> = match flow_idx {
+            Some(i) if uplink => Some(&mut self.flow_qers[i].ul_bucket),
+            Some(i) => Some(&mut self.flow_qers[i].dl_bucket),
+            None if uplink => self.ul_bucket.as_mut(),
+            None => self.dl_bucket.as_mut(),
+        };
+        bucket.is_none_or(|b| b.poll(now_nanos, bytes))
+    }
 }
 
 /// Minimal UPF state: the N3 F-TEID and UP-SEID allocators plus a session table
@@ -204,6 +309,7 @@ impl UpfState {
         &mut self,
         ue_ip: Option<Ipv4Addr>,
         ambr: Option<SessionAmbr>,
+        flows: &[FlowQer],
         now_nanos: u64,
     ) -> (u64, u32) {
         let up_seid = self.next_seid;
@@ -212,8 +318,19 @@ impl UpfState {
         self.next_teid += 1;
         let ul_bucket = ambr.map(|a| TokenBucket::new(a.uplink_bps, now_nanos));
         let dl_bucket = ambr.map(|a| TokenBucket::new(a.downlink_bps, now_nanos));
-        self.sessions
-            .insert(up_seid, Session { n3_teid: teid, ue_ip, downlink: None, ambr, ul_bucket, dl_bucket });
+        let flow_qers = flows
+            .iter()
+            .map(|f| FlowEnforcer {
+                qfi: f.qfi,
+                filter: f.filter,
+                ul_bucket: TokenBucket::new(f.mfbr_ul_bps, now_nanos),
+                dl_bucket: TokenBucket::new(f.mfbr_dl_bps, now_nanos),
+            })
+            .collect();
+        self.sessions.insert(
+            up_seid,
+            Session { n3_teid: teid, ue_ip, downlink: None, ambr, ul_bucket, dl_bucket, flow_qers },
+        );
         (up_seid, teid)
     }
 
@@ -253,21 +370,28 @@ impl UpfState {
         self.sessions.get(&up_seid).and_then(|s| s.ambr)
     }
 
-    /// Admit an uplink packet of `bytes` on `teid` against the session's uplink
-    /// AMBR policer. `true` (admit) when the TEID is unknown here (the caller's
-    /// TEID check handles that) or the direction is unlimited.
-    pub fn admit_uplink(&mut self, teid: u32, now_nanos: u64, bytes: usize) -> bool {
+    /// The QFIs of the per-flow (GBR) policers installed for a session.
+    pub fn flow_qfis(&self, up_seid: u64) -> Vec<u8> {
+        self.sessions
+            .get(&up_seid)
+            .map(|s| s.flow_qers.iter().map(|f| f.qfi).collect())
+            .unwrap_or_default()
+    }
+
+    /// Admit an uplink packet on `teid`: classify it and police it against the
+    /// matched GBR flow's MFBR, else the session AMBR. `true` (admit) when the TEID
+    /// is unknown here (the caller's TEID check handles that) or unlimited.
+    pub fn admit_uplink(&mut self, teid: u32, now_nanos: u64, pkt: &[u8]) -> bool {
         match self.sessions.values_mut().find(|s| s.n3_teid == teid) {
-            Some(s) => s.ul_bucket.as_mut().is_none_or(|b| b.poll(now_nanos, bytes)),
+            Some(s) => s.admit(true, now_nanos, pkt),
             None => true,
         }
     }
 
-    /// Admit a downlink packet of `bytes` destined to UE IP `dst` against the
-    /// session's downlink AMBR policer.
-    pub fn admit_downlink(&mut self, dst: Ipv4Addr, now_nanos: u64, bytes: usize) -> bool {
+    /// Admit a downlink packet destined to UE IP `dst`: classify + police as above.
+    pub fn admit_downlink(&mut self, dst: Ipv4Addr, now_nanos: u64, pkt: &[u8]) -> bool {
         match self.sessions.values_mut().find(|s| s.ue_ip == Some(dst)) {
-            Some(s) => s.dl_bucket.as_mut().is_none_or(|b| b.poll(now_nanos, bytes)),
+            Some(s) => s.admit(false, now_nanos, pkt),
             None => true,
         }
     }
@@ -301,6 +425,7 @@ pub fn session_establishment_request(
     smf_ip: Ipv4Addr,
     ue_ip: Ipv4Addr,
     ambr: Option<SessionAmbr>,
+    flows: &[FlowQer],
 ) -> Vec<u8> {
     // When a session AMBR is authorized, provision a session-level QER (open gate +
     // MBR) and bind both PDRs to it, so the UPF polices the aggregate rate.
@@ -339,17 +464,45 @@ pub fn session_establishment_request(
         .build()
         .expect("build downlink Create FAR");
 
-    let mut builder = SessionEstablishmentRequestBuilder::new(0u64, seq) // header SEID 0 — UPF has none yet
-        .node_id(smf_ip)
-        .fseid(cp_seid, smf_ip) // CP F-SEID
-        .create_pdrs(vec![ul_pdr.to_ie(), dl_pdr.to_ie()])
-        .create_fars(vec![ul_far.to_ie(), dl_far.to_ie()]);
+    let mut create_pdrs = vec![ul_pdr.to_ie(), dl_pdr.to_ie()];
+    let mut create_qers = Vec::new();
     if let Some(a) = ambr {
         let qer = CreateQer::builder(QerId::new(AMBR_QER_ID))
             .rate_limit(a.uplink_bps, a.downlink_bps)
             .build()
             .expect("build session-AMBR Create QER");
-        builder = builder.create_qers(vec![qer.to_ie()]);
+        create_qers.push(qer.to_ie());
+    }
+    // Per-GBR-flow QoS: a Create QER (MFBR) + a classifier PDR (SDF filter) per flow.
+    // The UPF links them by QER id and polices matched packets against the flow MFBR.
+    for (i, f) in flows.iter().enumerate() {
+        let flow_qer_id = QerId::new(PER_FLOW_QER_BASE + u32::from(f.qfi));
+        let qer = CreateQer::builder(flow_qer_id)
+            .rate_limit(f.mfbr_ul_bps, f.mfbr_dl_bps)
+            .build()
+            .expect("build per-flow Create QER");
+        create_qers.push(qer.to_ie());
+        let flow_pdi = PdiBuilder::uplink_access()
+            .sdf_filter(SdfFilter::new(&f.filter.to_flow_description()))
+            .build()
+            .expect("build per-flow PDI");
+        let flow_pdr = CreatePdrBuilder::new(PdrId::new(PER_FLOW_PDR_BASE + i as u16))
+            .precedence(Precedence::new(50)) // higher precedence than the match-all PDRs
+            .pdi(flow_pdi)
+            .far_id(FarId::new(1))
+            .qer_id(flow_qer_id)
+            .build()
+            .expect("build per-flow Create PDR");
+        create_pdrs.push(flow_pdr.to_ie());
+    }
+
+    let mut builder = SessionEstablishmentRequestBuilder::new(0u64, seq) // header SEID 0 — UPF has none yet
+        .node_id(smf_ip)
+        .fseid(cp_seid, smf_ip) // CP F-SEID
+        .create_pdrs(create_pdrs)
+        .create_fars(vec![ul_far.to_ie(), dl_far.to_ie()]);
+    if !create_qers.is_empty() {
+        builder = builder.create_qers(create_qers);
     }
     builder.build().expect("build Session Establishment Request").marshal()
 }
@@ -436,13 +589,28 @@ pub fn handle_n4(
                 .ies(IeType::CreatePdr)
                 .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
                 .find_map(|pdr| pdr.pdi.ue_ip_address.and_then(|u| u.ipv4_address));
-            // A session-AMBR Create QER (if any) carries the MBR the UPF polices.
-            let ambr = msg
+            // Create QERs by id → MBR: the session-AMBR QER + one per GBR flow.
+            let qer_mbrs: HashMap<u32, Mbr> = msg
                 .ies(IeType::CreateQer)
                 .filter_map(|ie| CreateQer::unmarshal(&ie.payload).ok())
-                .find_map(|q| q.mbr)
+                .filter_map(|q| q.mbr.map(|m| (q.qer_id.value, m)))
+                .collect();
+            let ambr = qer_mbrs
+                .get(&AMBR_QER_ID)
                 .map(|m| SessionAmbr { uplink_bps: m.uplink, downlink_bps: m.downlink });
-            let (up_seid, teid) = state.establish(ue_ip, ambr, now_nanos);
+            // Per-flow policers: a classifier PDR (SDF filter) linked by QER id to its MFBR.
+            let flows: Vec<FlowQer> = msg
+                .ies(IeType::CreatePdr)
+                .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
+                .filter_map(|pdr| {
+                    let filter = FlowFilter::from_flow_description(&pdr.pdi.sdf_filter?.flow_description)?;
+                    let qer_id = pdr.qer_id?.value;
+                    let mbr = qer_mbrs.get(&qer_id)?;
+                    let qfi = qer_id.saturating_sub(PER_FLOW_QER_BASE) as u8;
+                    Some(FlowQer { qfi, filter, mfbr_dl_bps: mbr.downlink, mfbr_ul_bps: mbr.uplink })
+                })
+                .collect();
+            let (up_seid, teid) = state.establish(ue_ip, ambr, &flows, now_nanos);
             let created_pdr = CreatedPdr::new(PdrId::new(1), Fteid::ipv4(teid, node_ip)).to_ie();
             Some(
                 SessionEstablishmentResponseBuilder::new(
@@ -574,7 +742,7 @@ mod tests {
     fn session_establishment_allocates_and_tracks() {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
-        let req = session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None);
+        let req = session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[]);
         let resp = handle_n4(&req, node_ip, &mut state, 0).expect("session response");
 
         assert_eq!(state.session_count(), 1, "UPF tracks the session");
@@ -590,7 +758,7 @@ mod tests {
     fn session_deletion_removes_the_session() {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
-        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None), node_ip, &mut state, 0)
+        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[]), node_ip, &mut state, 0)
             .expect("establish");
         let up_seid = 1; // first allocation
         assert_eq!(state.session_count(), 1);
@@ -613,7 +781,7 @@ mod tests {
     fn session_modification_installs_downlink() {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
-        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None), node_ip, &mut state, 0)
+        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[]), node_ip, &mut state, 0)
             .expect("establish");
         let up_seid = 1; // first allocation
         assert_eq!(state.downlink_for(up_seid), None, "no downlink before modification");
@@ -651,7 +819,7 @@ mod tests {
         let mut state = UpfState::new();
         let ambr = SessionAmbr { uplink_bps: 1_000_000_000, downlink_bps: 2_000_000_000 };
         handle_n4(
-            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, Some(ambr)),
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, Some(ambr), &[]),
             node_ip,
             &mut state,
             0,
@@ -669,6 +837,64 @@ mod tests {
         handle_n4(&session_qer_update_request(up_seid, 2, new), node_ip, &mut state, 0)
             .expect("qer update");
         assert_eq!(state.ambr_for(up_seid), Some(new), "Update QER re-rated the session AMBR");
+    }
+
+    #[test]
+    fn flow_filter_matches_and_roundtrips() {
+        let f = FlowFilter { protocol: 17, port_low: 5000, port_high: 5010 };
+        assert!(f.matches(17, 40000, 5005), "UDP with dst port in range");
+        assert!(f.matches(17, 5001, 40000), "UDP with src port in range");
+        assert!(!f.matches(6, 5005, 5005), "wrong protocol");
+        assert!(!f.matches(17, 80, 443), "ports out of range");
+        // The flow-description carried in the PDR SDF filter round-trips.
+        assert_eq!(FlowFilter::from_flow_description(&f.to_flow_description()), Some(f));
+    }
+
+    /// A UDP packet from `src_port` to `dst_port`, padded to `total_len` bytes.
+    fn udp_packet(src_port: u16, dst_port: u16, total_len: usize) -> Vec<u8> {
+        let mut p = vec![0u8; total_len.max(28)];
+        p[0] = 0x45; // IPv4, IHL 5
+        p[9] = 17; // UDP
+        p[20..22].copy_from_slice(&src_port.to_be_bytes());
+        p[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn per_flow_qer_polices_matched_flow_independently() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        // Big session AMBR (1/2 Gbps) + a small per-flow GBR QER (80 kbps, UDP 5000–5010).
+        let ambr = SessionAmbr { uplink_bps: 1_000_000_000, downlink_bps: 2_000_000_000 };
+        let flow = FlowQer {
+            qfi: 2,
+            filter: FlowFilter { protocol: 17, port_low: 5000, port_high: 5010 },
+            mfbr_dl_bps: 80_000,
+            mfbr_ul_bps: 80_000,
+        };
+        handle_n4(
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, Some(ambr), &[flow]),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("establish");
+        let up_seid = 1;
+        let teid = 1;
+        assert_eq!(state.flow_qfis(up_seid), vec![2], "the per-flow QER is installed");
+
+        // Traffic matching the flow (UDP :5005) is policed by the 80 kbps MFBR: a
+        // 10-packet burst (1000 bytes each = 80_000 bits) then throttle.
+        let matched = udp_packet(40000, 5005, 1000);
+        for i in 0..10 {
+            assert!(state.admit_uplink(teid, 0, &matched), "matched packet {i} within MFBR burst");
+        }
+        assert_eq!(state.admit_uplink(teid, 0, &matched), false, "per-flow MFBR exhausted");
+
+        // Non-matching traffic (UDP :9999) rides the session AMBR — unaffected by the
+        // exhausted per-flow bucket.
+        let other = udp_packet(40000, 9999, 1000);
+        assert!(state.admit_uplink(teid, 0, &other), "non-GBR traffic still admitted on the session AMBR");
     }
 
     #[test]
@@ -720,7 +946,7 @@ mod tests {
             MsgType::HeartbeatResponse
         );
         assert_eq!(
-            round_trip(&smf, &mut buf, session_establishment_request(0x1234, 3, upf_ip, UE_IP, None)).await,
+            round_trip(&smf, &mut buf, session_establishment_request(0x1234, 3, upf_ip, UE_IP, None, &[])).await,
             MsgType::SessionEstablishmentResponse
         );
     }

@@ -140,7 +140,10 @@ fn provision_demo(store: &RedbStore) -> anyhow::Result<()> {
                 { "qfi": 1, "fiveQi": 9, "arpPriority": 8 },
                 { "qfi": 2, "fiveQi": 1, "arpPriority": 5, "preEmptCap": true,
                   "gbr": { "gfbrDl": "100 Mbps", "gfbrUl": "100 Mbps",
-                           "mfbrDl": "200 Mbps", "mfbrUl": "200 Mbps" } }
+                           "mfbrDl": "200 Mbps", "mfbrUl": "200 Mbps" },
+                  // Classifier: UDP ports 5000–5010 steer to this GBR flow (the UPF
+                  // then polices it against the 200 Mbps MFBR).
+                  "filter": { "protocol": 17, "portLow": 5000, "portHigh": 5010 } }
             ]
         }
     });

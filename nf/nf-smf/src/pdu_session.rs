@@ -327,9 +327,12 @@ async fn create_sm_context(
     // The SMF owns UE IP allocation; the address rides into the UPF's downlink PDR so it
     // can route N6 traffic back to this session.
     let ue_ip = smf.alloc_ue_ip();
-    // Install the authorized session AMBR as a QER so the UPF polices the rate.
+    // Install the authorized session AMBR (a QER for the aggregate rate) plus a
+    // per-flow QER + classifier for each GBR flow, so the UPF polices them.
     let ambr = ambr_bps(&decision);
-    let est_req = pfcp::session_establishment_request(cp_seid, seq, smf.smf_ip, ue_ip, ambr);
+    let flows = flow_qers(&decision);
+    let est_req =
+        pfcp::session_establishment_request(cp_seid, seq, smf.smf_ip, ue_ip, ambr, &flows);
     let resp = smf.transact(&est_req, seq).await.ok_or_else(|| {
         problem(StatusCode::BAD_GATEWAY, "UPF_NOT_RESPONDING", "no PFCP response from the UPF")
     })?;
@@ -502,6 +505,7 @@ async fn fetch_session_subscription(
         pre_empt_cap: false,
         pre_empt_vuln: false,
         gbr: None,
+        filter: None,
     }];
     if let Some(extra) = dnn_config.get("qosFlows").and_then(|v| v.as_array()) {
         qos_flows.extend(
@@ -753,6 +757,30 @@ fn spawn_amf_pdu_modify(
             Err(e) => tracing::warn!(psi, "AMF PDU modify call failed: {e}"),
         }
     });
+}
+
+/// The per-flow GBR QERs (classifier + MFBR) for the UPF, from a decision's GBR
+/// flows that carry a packet filter. Non-GBR / filterless flows stay on the session
+/// AMBR; a flow whose MFBR strings don't parse is skipped.
+fn flow_qers(decision: &sbi_core::npcf::SmPolicyDecision) -> Vec<pfcp::FlowQer> {
+    decision
+        .qos_flows
+        .iter()
+        .filter_map(|f| {
+            let gbr = f.gbr.as_ref()?;
+            let filter = f.filter.as_ref()?;
+            Some(pfcp::FlowQer {
+                qfi: f.qfi,
+                filter: pfcp::FlowFilter {
+                    protocol: filter.protocol,
+                    port_low: filter.port_low,
+                    port_high: filter.port_high,
+                },
+                mfbr_dl_bps: sbi_core::npcf::bitrate_to_bps(&gbr.mfbr_dl)?,
+                mfbr_ul_bps: sbi_core::npcf::bitrate_to_bps(&gbr.mfbr_ul)?,
+            })
+        })
+        .collect()
 }
 
 /// The session AMBR from a policy decision as a `pfcp::SessionAmbr` (bits/sec) for
@@ -1216,6 +1244,12 @@ mod tests {
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("1 Gbps", "2 Gbps"));
         assert_eq!(created.qos_flows.len(), 2, "PCF default + GBR flow");
         assert!(created.qos_flows.iter().any(|f| f.gbr.is_some()), "a GBR flow from the PCF");
+        // The GBR flow's per-flow QER (classifier + MFBR) was installed at the UPF.
+        assert_eq!(
+            upf_state.lock().unwrap().flow_qfis(1),
+            vec![2],
+            "the UPF polices the GBR flow (QFI 2) per-flow"
+        );
 
         // Release deletes the PCF association (spawned off the release path — poll).
         let status = client

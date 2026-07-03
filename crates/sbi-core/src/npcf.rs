@@ -33,6 +33,17 @@ pub struct GbrPolicy {
     pub mfbr_ul: String,
 }
 
+/// A packet classifier for a QoS flow (a compact SDF filter): transport protocol +
+/// a port range. The SMF installs it as the UPF's per-flow classifier so GBR
+/// traffic is matched to the flow and policed against its MFBR.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PacketFilterPolicy {
+    pub protocol: u8,
+    pub port_low: u16,
+    pub port_high: u16,
+}
+
 /// One authorized QoS flow — the shared policy shape carried PCF → SMF → AMF
 /// (and, when there's no PCF, still built by the SMF from sm-data).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,6 +59,10 @@ pub struct QosFlowPolicy {
     pub pre_empt_vuln: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gbr: Option<GbrPolicy>,
+    /// The flow's packet classifier — present on GBR flows so the UPF can steer
+    /// matching traffic to this flow and enforce its MFBR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<PacketFilterPolicy>,
 }
 
 fn default_arp_priority() -> u8 {
@@ -149,6 +164,7 @@ impl PolicyConfig {
                     pre_empt_cap: false,
                     pre_empt_vuln: false,
                     gbr: None,
+                    filter: None,
                 },
                 QosFlowPolicy {
                     qfi: 2,
@@ -162,6 +178,8 @@ impl PolicyConfig {
                         mfbr_dl: "200 Mbps".into(),
                         mfbr_ul: "200 Mbps".into(),
                     }),
+                    // Conversational-voice-style classifier: UDP on ports 5000–5010.
+                    filter: Some(PacketFilterPolicy { protocol: 17, port_low: 5000, port_high: 5010 }),
                 },
             ],
         };
@@ -427,6 +445,7 @@ mod tests {
                 pre_empt_cap: true,
                 pre_empt_vuln: false,
                 gbr: None,
+                filter: None,
             }],
         };
         let config = PolicyConfig::demo().with_dnn("ims", ims);
