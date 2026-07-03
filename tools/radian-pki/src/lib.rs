@@ -20,7 +20,7 @@ use std::process::Command;
 use anyhow::{Context, bail};
 
 /// The NFs of the core, in the names `TlsIdentity::from_env` expects.
-pub const DEFAULT_NFS: &[&str] = &["nrf", "amf", "smf", "ausf", "udm", "udr", "pcf"];
+pub const DEFAULT_NFS: &[&str] = &["nrf", "amf", "smf", "ausf", "udm", "udr", "pcf", "chf"];
 
 const EC_KEY: &[&str] = &["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"];
 const DAYS: &str = "3650";

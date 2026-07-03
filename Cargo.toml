@@ -18,6 +18,7 @@ members = [
     "nf/nf-udm",
     "nf/nf-udr",
     "nf/nf-pcf",
+    "nf/nf-chf",
     "tools/radian-pki",
     "bdd",
 ]

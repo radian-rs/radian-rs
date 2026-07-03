@@ -17,6 +17,10 @@ const NRF_ENV: &str = "RADIAN_SMF_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 /// GFBR admission-control budget (Mbps, each direction). Absent ⇒ unlimited.
 const GFBR_BUDGET_ENV: &str = "RADIAN_SMF_GFBR_BUDGET_MBPS";
+/// Usage-reporting volume threshold (bytes): the UPF then reports each session's
+/// usage mid-session whenever it crosses the threshold (the charging trigger
+/// toward the CHF). Absent ⇒ usage is only reported at session deletion.
+const USAGE_THRESHOLD_ENV: &str = "RADIAN_SMF_USAGE_THRESHOLD_BYTES";
 const SBI_PORT: u16 = 8002;
 
 #[tokio::main]
@@ -44,9 +48,17 @@ async fn main() -> anyhow::Result<()> {
         smf = smf.with_gfbr_budget(bps, bps);
         tracing::info!(gfbr_budget_mbps = mbps, "GFBR admission control enabled");
     }
+    // Optional mid-session usage reporting (the charging trigger, design/59).
+    if let Some(bytes) = std::env::var(USAGE_THRESHOLD_ENV).ok().and_then(|v| v.parse::<u64>().ok())
+    {
+        smf = smf.with_usage_threshold(bytes);
+        tracing::info!(usage_threshold_bytes = bytes, "mid-session usage reporting enabled");
+    }
     let smf = Arc::new(smf);
     smf.associate().await?;
     tracing::info!(%upf_n4, "PFCP association established with UPF");
+    // Consume UPF-initiated usage reports: ack + relay to the CHF (Nchf update).
+    tokio::spawn(pdu_session::handle_usage_reports(smf.clone()));
 
     // Register with the NRF so the AMF can discover the Nsmf_PDUSession service.
     match pdu_session::register_with_nrf(&nrf_base, smf_ip, SBI_PORT).await {
