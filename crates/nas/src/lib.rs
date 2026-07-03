@@ -281,6 +281,38 @@ pub fn registration_request_with_guti(
     encode_nas_5gs_message(&msg).expect("encode 5GMM RegistrationRequest (GUTI)")
 }
 
+/// Build and encode a 5GMM **Registration Request** of type *mobility registration
+/// updating* (TS 24.501 §5.5.1.3) identifying by 5G-GUTI — what a UE sends when it
+/// enters a tracking area outside its registration area (UE side / tests). Sent
+/// integrity-protected under the current security context (ngKSI 0).
+pub fn registration_request_mobility(mcc: &str, mnc: &str, tmsi: u32) -> Nas5gsMessage {
+    let guti = NasFGsMobileIdentity::from_guti(&Guti {
+        mcc: mcc_digits(mcc),
+        mnc: mnc_digits(mnc),
+        amf_region_id: 0x01,
+        amf_set_id: 0x001,
+        amf_pointer: 0x00,
+        tmsi,
+    });
+    let reg = messages::NasRegistrationRequest::new(
+        NasFGsRegistrationType::from_parts(RegistrationType::MobilityRegistrationUpdate, false, 0, false),
+        guti,
+    );
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::RegistrationRequest,
+        Nas5gmmMessage::RegistrationRequest(reg),
+    )
+}
+
+/// The registration type of a decoded Registration Request (TS 24.501 §9.11.3.7) —
+/// initial / mobility updating / periodic updating / … `None` for other messages.
+pub fn registration_type_from_request(msg: &Nas5gsMessage) -> Option<RegistrationType> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationRequest(reg)) = msg else {
+        return None;
+    };
+    reg.fgs_registration_type.registration_type()
+}
+
 /// Build and encode a 5GMM **Identity Response** (TS 24.501 §8.2.22) carrying the
 /// UE's null-scheme SUCI — the answer to an Identity Request. UE side / tests.
 pub fn identity_response_suci(mcc: &str, mnc: &str, msin: &str) -> Vec<u8> {
@@ -1490,6 +1522,20 @@ mod tests {
         assert!(allowed_nssai_from_registration_accept(&back).is_empty());
         assert!(rejected_nssai_from_registration_accept(&back).is_empty());
         assert_eq!(registration_area_from_registration_accept(&back), None);
+    }
+
+    #[test]
+    fn mobility_registration_request_roundtrips() {
+        let msg = registration_request_mobility("999", "70", 0xCAFE_D00D);
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&msg).unwrap()).unwrap();
+        assert_eq!(gmm_message_type(&back), Some(Nas5gmmMessageType::RegistrationRequest));
+        assert_eq!(
+            registration_type_from_request(&back),
+            Some(RegistrationType::MobilityRegistrationUpdate)
+        );
+        assert_eq!(guti_tmsi_from_registration_request(&back), Some(0xCAFE_D00D));
+        // Other message types have no registration type.
+        assert_eq!(registration_type_from_request(&deregistration_accept()), None);
     }
 
     #[test]

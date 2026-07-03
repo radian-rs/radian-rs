@@ -1017,7 +1017,7 @@ async fn handle_ngap(
             }
             InitiatingMessageValue::Id_InitialUEMessage(msg) => {
                 // A 5G-S-TMSI naming a retained CM-IDLE context → a Service Request
-                // resume, not a fresh registration.
+                // resume or a mobility registration update, not a fresh registration.
                 let resume = ngap::fiveg_s_tmsi_from_initial_ue(msg)
                     .filter(|tmsi| RETAINED.lock().unwrap().contains_key(tmsi));
                 if let Some(tmsi) = resume {
@@ -1167,12 +1167,20 @@ async fn evict_stale_retained(amf_smf: &pdu_session::AmfSmf, max_idle: std::time
     }
 }
 
-/// Handle a **Service Request** (TS 23.502 §4.2.3.2) — a CM-IDLE UE resuming.
-/// The `tmsi` (from the InitialUEMessage 5G-S-TMSI) named a retained context: take
-/// it, verify the protected Service Request NAS with its NAS security context,
-/// restore it into this association under a fresh AMF-UE-NGAP-ID, send a Service
-/// Accept, and re-activate each PDU session's user plane (Nsmf `ACTIVATING` → N2
-/// PDU Session Resource Setup with the retained UPF N3 F-TEID). Back to CM-CONNECTED.
+/// Handle a CM-IDLE UE coming back over N2 — a **Service Request** (TS 23.502
+/// §4.2.3.2, resume) or a **mobility registration update** (TS 24.501 §5.5.1.3,
+/// the UE moved outside its registration area). The `tmsi` (from the
+/// InitialUEMessage 5G-S-TMSI) named a retained context: take it, verify the
+/// protected NAS with its security context, restore it under a fresh
+/// AMF-UE-NGAP-ID, and
+/// - **Service Request** → Service Accept + re-activate each PDU session's user
+///   plane (Nsmf `ACTIVATING` → N2 PDU Session Resource Setup); a resume from
+///   outside the registration area extends it;
+/// - **mobility update** → **re-assign** the registration area from the new
+///   serving gNB/TAI and send a Registration Accept carrying the new 5GS TAI list
+///   (PDU sessions stay established; the user plane stays deactivated until a
+///   Service Request — the Uplink Data Status IE is not modelled).
+/// Back to CM-CONNECTED either way.
 async fn on_service_request(
     ues: &mut HashMap<u64, UeContext>,
     amf_smf: &pdu_session::AmfSmf,
@@ -1181,22 +1189,26 @@ async fn on_service_request(
     dereg_tx: &UnboundedSender<UeCmd>,
 ) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(ran_ue_id) = initial_ue_ran_id(msg) else {
-        warn!("Service Request (tmsi {tmsi:#010x}) without RAN-UE-NGAP-ID");
+        warn!("CM-IDLE return (tmsi {tmsi:#010x}) without RAN-UE-NGAP-ID");
         return Vec::new();
     };
     let Some(mut ctx) = RETAINED.lock().unwrap().remove(&tmsi) else {
         return Vec::new(); // raced with another resume — the context was already taken
     };
 
-    // Verify the (integrity-protected) Service Request NAS with the retained keys —
-    // the UE proves it holds the security context. A failure re-retains the context.
-    let verified = initial_ue_nas_pdu(msg)
-        .and_then(|raw| ctx.sec.as_mut().and_then(|s| s.unprotect(raw, 0)))
+    // Verify the (integrity-protected) NAS with the retained keys — the UE proves
+    // it holds the security context — and classify what it asks for. A failure
+    // re-retains the context.
+    let decoded = initial_ue_nas_pdu(msg)
+        .and_then(|raw| ctx.sec.as_mut().and_then(|s| s.unprotect(raw, 0)));
+    let is_service_request =
+        decoded.as_ref().and_then(nas::service_request_info).is_some();
+    let is_mobility_update = decoded
         .as_ref()
-        .and_then(nas::service_request_info)
-        .is_some();
-    if !verified {
-        warn!("Service Request (tmsi {tmsi:#010x}) failed NAS verification — ignored");
+        .and_then(nas::registration_type_from_request)
+        == Some(nas::RegistrationType::MobilityRegistrationUpdate);
+    if !is_service_request && !is_mobility_update {
+        warn!("CM-IDLE return (tmsi {tmsi:#010x}) failed NAS verification — ignored");
         RETAINED.lock().unwrap().insert(tmsi, ctx);
         return Vec::new();
     }
@@ -1205,12 +1217,16 @@ async fn on_service_request(
     ctx.ran_ue_id = ran_ue_id;
     ctx.cm_state = CmState::Connected;
     ctx.retained_at = None; // resumed — the mobile-reachable timer stops
-    // Refresh the UE's tracking area from where it resumed (the UE may have moved
-    // while idle — the next paging round must target the new area). A resume from
-    // outside the assigned registration area extends it (a full re-assignment
-    // belongs to the mobility registration update, not modelled).
+    // Refresh the UE's tracking area from where it came back (it may have moved
+    // while idle — the next paging round must target the new area).
     ctx.tac = ngap::tac_from_initial_ue(msg).or(ctx.tac);
-    if let Some(tac) = ctx.tac {
+    if is_mobility_update {
+        // Mobility registration update: the UE left its registration area —
+        // re-assign it around the new serving gNB/TAI.
+        ctx.registration_area = registration_area_for(ctx.tac, dereg_tx);
+    } else if let Some(tac) = ctx.tac {
+        // Service Request from outside the area: extend it (the UE should have
+        // sent a mobility update; tolerate and stay reachable).
         if !ctx.registration_area.is_empty() && !ctx.registration_area.contains(&tac) {
             ctx.registration_area.push(tac);
             ctx.registration_area.truncate(16);
@@ -1223,30 +1239,51 @@ async fn on_service_request(
     let sm_refs: Vec<(u8, (String, String))> =
         ctx.sm_refs.iter().map(|(psi, v)| (*psi, v.clone())).collect();
     let ue_ambr = ctx.ue_ambr;
-    // Protect the Service Accept before the context moves into the association map.
-    let accept = ctx
-        .sec
-        .as_mut()
-        .map(|s| s.protect(&nas::service_accept(), nas::sht::INTEGRITY_CIPHERED, 1));
+    // Protect the accept before the context moves into the association map: a
+    // Service Accept for a resume, a Registration Accept (same GUTI, the NEW
+    // registration area's 5GS TAI list) for a mobility update.
+    let allowed = ctx.allowed_nssai.clone().unwrap_or_default();
+    let registration_area = ctx.registration_area.clone();
+    let accept = ctx.sec.as_mut().map(|s| {
+        if is_mobility_update {
+            let accept = nas::registration_accept(
+                PLMN_MCC,
+                PLMN_MNC,
+                tmsi,
+                &allowed,
+                &[],
+                T3512_SECS,
+                &registration_area,
+            );
+            (s.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1), "DownlinkNASTransport (RegistrationAccept — mobility update)")
+        } else {
+            (s.protect(&nas::service_accept(), nas::sht::INTEGRITY_CIPHERED, 1), "DownlinkNASTransport (ServiceAccept)")
+        }
+    });
     ues.insert(amf_ue_id, ctx);
     if let Some(supi) = &supi {
         UE_DIRECTORY.lock().unwrap().insert(supi.clone(), (amf_ue_id, dereg_tx.clone()));
     }
-    info!("UE {amf_ue_id} resuming from CM-IDLE (Service Request, tmsi {tmsi:#010x}); {} session(s)", sm_refs.len());
-
-    let mut downlinks = Vec::new();
-    if let Some(accept) = accept {
-        downlinks.push((
-            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, accept),
-            "DownlinkNASTransport (ServiceAccept)",
-        ));
+    if is_mobility_update {
+        info!(
+            "UE {amf_ue_id}: mobility registration update (tmsi {tmsi:#010x}) — registration area re-assigned to {registration_area:02x?}"
+        );
+    } else {
+        info!("UE {amf_ue_id} resuming from CM-IDLE (Service Request, tmsi {tmsi:#010x}); {} session(s)", sm_refs.len());
     }
 
-    // Re-activate each PDU session: the SMF returns the retained UPF N3 F-TEID + QoS,
-    // and the AMF re-sends the N2 PDU Session Resource Setup. The gNB's F-TEID comes
-    // back in the setup response (existing path) → UpdateSMContext re-installs the
-    // UPF downlink that AN release had dropped.
-    for (psi, (sm_ref, smf_base)) in &sm_refs {
+    let mut downlinks = Vec::new();
+    if let Some((accept, label)) = accept {
+        downlinks.push((ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, accept), label));
+    }
+
+    // Re-activate each PDU session (Service Request only: a mobility update leaves
+    // the user plane deactivated): the SMF returns the retained UPF N3 F-TEID +
+    // QoS, and the AMF re-sends the N2 PDU Session Resource Setup. The gNB's
+    // F-TEID comes back in the setup response (existing path) → UpdateSMContext
+    // re-installs the UPF downlink that AN release had dropped.
+    let reactivate: &[(u8, (String, String))] = if is_mobility_update { &[] } else { &sm_refs };
+    for (psi, (sm_ref, smf_base)) in reactivate {
         match amf_smf.activate_up_connection(smf_base, sm_ref).await {
             Ok(created) => {
                 let flows = if created.ngap_flows.is_empty() {
@@ -2904,6 +2941,100 @@ mod tests {
         assert_eq!(broadcast(&mut rx_a), 1);
         assert_eq!(broadcast(&mut rx_b), 1);
         assert_eq!(broadcast(&mut rx_c), 1);
+    }
+
+    /// Mobility registration update (TS 24.501 §5.5.1.3): a CM-IDLE UE that moved
+    /// outside its registration area comes back with a protected Registration
+    /// Request (type = mobility registration updating, GUTI identity). The AMF
+    /// verifies it under the retained security context, **re-assigns** the
+    /// registration area around the new serving gNB, and answers with a
+    /// Registration Accept carrying the new 5GS TAI list — no user-plane
+    /// reactivation (unlike a Service Request).
+    #[tokio::test]
+    async fn mobility_registration_update_reassigns_the_area() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        // Mock SMF counting UP activation attempts (a mobility update must not).
+        static MOBILITY_ACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
+        async fn mock_modify(axum::Json(body): axum::Json<serde_json::Value>) -> axum::http::StatusCode {
+            if body.get("upCnxState").and_then(|v| v.as_str()) == Some("ACTIVATING") {
+                MOBILITY_ACTIVATIONS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            axum::http::StatusCode::OK
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new().route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
+            axum::routing::post(mock_modify),
+        );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+
+        // A retained CM-IDLE UE registered in TAC 000001 with a one-TA area + a
+        // PDU session, holding a NAS security context.
+        let (ki, ke) = ([0xbbu8; 16], [0xccu8; 16]);
+        let supi = "imsi-999700000000151";
+        let tmsi = 0x0000_0151u32;
+        let mut ctx = UeContext::new(0, RegState::Registered, Some(supi.into()));
+        ctx.cm_state = CmState::Idle;
+        ctx.guti_tmsi = Some(tmsi);
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.tac = Some([0, 0, 1]);
+        ctx.registration_area = vec![[0, 0, 1]];
+        ctx.allowed_nssai = Some(vec![(1, Some([1, 2, 3]))]);
+        ctx.sm_refs.insert(5, ("ctx-m5".into(), format!("http://{smf_addr}")));
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+
+        // The new serving gNB's association serves TACs 000009 + 00000b.
+        let (gnb_tx, _gnb_rx) = tokio::sync::mpsc::unbounded_channel();
+        GNB_LINKS
+            .lock()
+            .unwrap()
+            .push(GnbLink { tacs: vec![[0, 0, 9], [0, 0, 0x0b]], tx: gnb_tx.clone() });
+
+        // The UE moved to TAC 000009 (outside its area) → protected mobility
+        // Registration Request, GUTI identity, via that gNB.
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let rr = ue_sec.protect(
+            &nas::registration_request_mobility("999", "70", tmsi),
+            nas::sht::INTEGRITY_CIPHERED,
+            0,
+        );
+        let pdu = ngap::initial_ue_message_with_stmsi_at(6, tmsi, rr, "999", "70", &[0, 0, 9]);
+        let init = as_initial_ue(&pdu);
+        let mut ues = HashMap::new();
+        let dls = on_service_request(&mut ues, &amf_smf, init, tmsi, &gnb_tx).await;
+
+        // One downlink: the Registration Accept. No user-plane reactivation.
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["DownlinkNASTransport (RegistrationAccept — mobility update)"]
+        );
+        assert_eq!(MOBILITY_ACTIVATIONS.load(AtomicOrdering::Relaxed), 0, "UP stays deactivated");
+        // The context is restored CM-CONNECTED with the area RE-ASSIGNED around
+        // the new serving gNB (not merely extended), sessions intact.
+        let (_id, restored) = ues.iter().next().expect("context restored");
+        assert_eq!(restored.cm_state, CmState::Connected);
+        assert_eq!(restored.tac, Some([0, 0, 9]));
+        assert_eq!(restored.registration_area, vec![[0, 0, 9], [0, 0, 0x0b]]);
+        assert_eq!(restored.sm_refs.len(), 1, "PDU session survives the mobility update");
+        assert!(UE_DIRECTORY.lock().unwrap().contains_key(supi), "reachable again over N2");
+        assert!(RETAINED.lock().unwrap().get(&tmsi).is_none(), "retained context consumed");
+
+        // The UE decodes the accept: same GUTI, the NEW 5GS TAI list, NSSAI kept.
+        let bytes = downlink_nas_pdu(&dls[0].0).expect("NAS PDU");
+        let accept = ue_sec.unprotect(&bytes, 1).expect("UE verifies the accept");
+        assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::RegistrationAccept));
+        assert_eq!(
+            nas::registration_area_from_registration_accept(&accept),
+            Some(vec![[0, 0, 9], [0, 0, 0x0b]])
+        );
+        assert_eq!(
+            nas::allowed_nssai_from_registration_accept(&accept),
+            vec![(1, Some([1, 2, 3]))]
+        );
+        UE_DIRECTORY.lock().unwrap().remove(supi);
     }
 
     /// The registration area assigned at registration: the serving gNB's Supported
