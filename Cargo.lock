@@ -1750,6 +1750,7 @@ dependencies = [
  "common",
  "sbi-core",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

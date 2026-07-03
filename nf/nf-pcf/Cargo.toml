@@ -8,4 +8,5 @@ authors.workspace = true
 common.workspace = true
 sbi-core.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 anyhow.workspace = true

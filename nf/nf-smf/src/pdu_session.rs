@@ -50,6 +50,10 @@ struct SmContext {
     /// Subscriber + session identity, for the UECM smf-registration teardown.
     supi: String,
     pdu_session_id: u8,
+    /// The PCF SM policy association `(pcf_base, policy_id)`, when a PCF drove the
+    /// policy — deleted at release (Npcf_SMPolicyControl_Delete). `None` when the
+    /// session used the sm-data fallback.
+    sm_policy: Option<(String, String)>,
 }
 
 /// SMF runtime: a PFCP client toward one UPF plus the SM-context table.
@@ -180,43 +184,10 @@ impl Snssai {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionAmbrDto {
-    uplink: String,
-    downlink: String,
-}
-
-/// A GBR flow's rates (TS 29.571 BitRate strings), for the CreateSMContext response.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GbrDto {
-    gfbr_dl: String,
-    gfbr_ul: String,
-    mfbr_dl: String,
-    mfbr_ul: String,
-}
-
-/// An authorized QoS flow (default from `5gQosProfile`, plus any provisioned GBR
-/// flows) returned to the AMF for the N2 transfer + N1 accept.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct QosFlowDto {
-    qfi: u8,
-    five_qi: u8,
-    #[serde(default = "default_arp_priority")]
-    arp_priority: u8,
-    #[serde(default)]
-    pre_empt_cap: bool,
-    #[serde(default)]
-    pre_empt_vuln: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    gbr: Option<GbrDto>,
-}
-
-fn default_arp_priority() -> u8 {
-    8
-}
+// The session AMBR and authorized QoS-flow shapes are shared with the PCF
+// (`sbi_core::npcf`): a PCF `SmPolicyDecision` and the SMF's own sm-data fallback
+// build the same types, so either drops straight into the CreateSMContext response.
+use sbi_core::npcf::{QosFlowPolicy, SessionAmbrPolicy};
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -232,21 +203,22 @@ struct SmContextCreatedData {
     /// The subscribed slice serving this DNN (from the UDR sm-data) — the AMF puts it
     /// in the N1 accept.
     s_nssai: Snssai,
-    /// The subscribed session AMBR for this DNN (TS 29.571 BitRate strings), if
-    /// provisioned — likewise for the N1 accept.
+    /// The authorized session AMBR for this DNN (TS 29.571 BitRate strings), if any
+    /// — from the PCF's SM policy, else the subscribed sm-data. For the N1 accept.
     #[serde(skip_serializing_if = "Option::is_none")]
-    session_ambr: Option<SessionAmbrDto>,
+    session_ambr: Option<SessionAmbrPolicy>,
     /// The authorized QoS flows (default + any GBR flows) — the AMF puts them in
     /// the N2 setup transfer and the N1 accept's QoS flow descriptions.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    qos_flows: Vec<QosFlowDto>,
+    qos_flows: Vec<QosFlowPolicy>,
 }
 
-/// What the SMF needs out of the subscriber's session-management subscription.
+/// What the SMF needs out of the subscriber's session-management subscription
+/// (the sm-data fallback when no PCF is available).
 struct SessionSubscription {
     snssai: Snssai,
-    ambr: Option<SessionAmbrDto>,
-    qos_flows: Vec<QosFlowDto>,
+    ambr: Option<SessionAmbrPolicy>,
+    qos_flows: Vec<QosFlowPolicy>,
 }
 
 #[derive(Deserialize)]
@@ -315,6 +287,30 @@ async fn create_sm_context(
     )
     .await?;
 
+    // Ask the PCF for the SM policy (authorized session AMBR + QoS flows). When a
+    // PCF is registered it is authoritative (TS 23.503 §6.1.3.5); otherwise fall
+    // back to the sm-data policy fetched above. Done before the N4 establishment so
+    // the authorized flows are known when the context is built.
+    let policy_ctx = sbi_core::npcf::SmPolicyContextData {
+        supi: req.supi.clone(),
+        pdu_session_id: req.pdu_session_id,
+        dnn: req.dnn.clone(),
+        snssai_sst: Some(sub.snssai.sst),
+        snssai_sd: sub.snssai.sd.clone(),
+    };
+    let (session_ambr, qos_flows, sm_policy) = match fetch_sm_policy(&smf.nrf_base, &policy_ctx).await
+    {
+        Some((pcf_base, created)) => {
+            tracing::info!(
+                policy_id = %created.policy_id,
+                flows = created.decision.qos_flows.len(),
+                "SM policy from PCF"
+            );
+            (created.decision.session_ambr, created.decision.qos_flows, Some((pcf_base, created.policy_id)))
+        }
+        None => (sub.ambr, sub.qos_flows, None),
+    };
+
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
     let seq = smf.next_seq();
     // The SMF owns UE IP allocation; the address rides into the UPF's downlink PDR so it
@@ -338,6 +334,7 @@ async fn create_sm_context(
             gnb: None,
             supi: req.supi.clone(),
             pdu_session_id: req.pdu_session_id,
+            sm_policy,
         },
     );
     // Record this SMF as the serving SMF for the session (Nudm_UECM). Best-effort,
@@ -367,8 +364,8 @@ async fn create_sm_context(
             up_n3_addr: est.n3_addr,
             ue_ipv4_addr: ue_ip,
             s_nssai: sub.snssai,
-            session_ambr: sub.ambr,
-            qos_flows: sub.qos_flows,
+            session_ambr,
+            qos_flows,
         }),
     ))
 }
@@ -472,18 +469,19 @@ async fn fetch_session_subscription(
         .ok_or_else(|| denied("DNN_DENIED", "sm-data entry has no singleNssai"))?;
     let ambr = dnn_config
         .get("sessionAmbr")
-        .and_then(|v| serde_json::from_value::<SessionAmbrDto>(v.clone()).ok());
+        .and_then(|v| serde_json::from_value::<SessionAmbrPolicy>(v.clone()).ok());
 
     // Default QoS flow (QFI 1) from the DNN's 5gQosProfile — 5QI 9 / ARP 8 when
-    // absent. Additional (e.g. GBR) flows come from the demo `qosFlows` array
-    // (TS: these are PCF-driven; provisioned in sm-data here for lack of a PCF).
+    // absent. Additional (e.g. GBR) flows come from the demo `qosFlows` array.
+    // This is the fallback when no PCF is registered; with a PCF, its decision
+    // replaces these (TS: QoS flows are PCF-driven — see `fetch_sm_policy`).
     let default_5qi = dnn_config.pointer("/5gQosProfile/5qi").and_then(|v| v.as_u64());
     let default_arp = dnn_config
         .pointer("/5gQosProfile/arp/priorityLevel")
         .and_then(|v| v.as_u64())
         .and_then(|v| u8::try_from(v).ok())
         .unwrap_or(8);
-    let mut qos_flows = vec![QosFlowDto {
+    let mut qos_flows = vec![QosFlowPolicy {
         qfi: 1,
         five_qi: default_5qi.and_then(|v| u8::try_from(v).ok()).unwrap_or(9),
         arp_priority: default_arp,
@@ -493,29 +491,57 @@ async fn fetch_session_subscription(
     }];
     if let Some(extra) = dnn_config.get("qosFlows").and_then(|v| v.as_array()) {
         qos_flows.extend(
-            extra.iter().filter_map(|f| serde_json::from_value::<QosFlowDto>(f.clone()).ok()),
+            extra.iter().filter_map(|f| serde_json::from_value::<QosFlowPolicy>(f.clone()).ok()),
         );
     }
     Ok(SessionSubscription { snssai, ambr, qos_flows })
 }
 
-/// Discover the UDM's Nudm service endpoint via the NRF.
-async fn discover_udm(nrf_base: &str) -> Result<String, String> {
+/// Discover the base URL of the first registered NF of `nf_type` via the NRF.
+async fn discover_endpoint(nrf_base: &str, nf_type: &str) -> Result<String, String> {
     let profile = sbi_core::nnrf::NrfClient::new(nrf_base.to_string())
-        .discover("UDM", "SMF")
+        .discover(nf_type, "SMF")
         .await
         .map_err(|e| format!("NRF discovery failed: {e}"))?
         .into_iter()
         .next()
-        .ok_or("no UDM registered with the NRF")?;
+        .ok_or_else(|| format!("no {nf_type} registered with the NRF"))?;
     let endpoint = profile
         .nf_services
         .and_then(|s| s.into_iter().next())
         .and_then(|svc| svc.ip_end_points.into_iter().next())
-        .ok_or("UDM profile has no service endpoint")?;
-    let ip = endpoint.ipv4_address.ok_or("UDM endpoint missing IP")?;
-    let port = endpoint.port.ok_or("UDM endpoint missing port")?;
+        .ok_or_else(|| format!("{nf_type} profile has no service endpoint"))?;
+    let ip = endpoint.ipv4_address.ok_or_else(|| format!("{nf_type} endpoint missing IP"))?;
+    let port = endpoint.port.ok_or_else(|| format!("{nf_type} endpoint missing port"))?;
     Ok(format!("http://{ip}:{port}"))
+}
+
+/// Discover the UDM's Nudm service endpoint via the NRF.
+async fn discover_udm(nrf_base: &str) -> Result<String, String> {
+    discover_endpoint(nrf_base, "UDM").await
+}
+
+/// Try to obtain the SM policy from a PCF (Npcf_SMPolicyControl). Returns the PCF
+/// base + the created decision on success; `None` when no PCF is registered or the
+/// call fails — the caller then uses the sm-data policy instead.
+async fn fetch_sm_policy(
+    nrf_base: &str,
+    ctx: &sbi_core::npcf::SmPolicyContextData,
+) -> Option<(String, sbi_core::npcf::SmPolicyCreated)> {
+    let pcf_base = match discover_endpoint(nrf_base, "PCF").await {
+        Ok(base) => base,
+        Err(e) => {
+            tracing::debug!("no PCF for SM policy ({e}); using sm-data policy");
+            return None;
+        }
+    };
+    match sbi_core::npcf::PcfClient::new(pcf_base.clone()).create_sm_policy(ctx).await {
+        Ok(created) => Some((pcf_base, created)),
+        Err(e) => {
+            tracing::warn!("PCF SM policy create failed ({e}); using sm-data policy");
+            None
+        }
+    }
 }
 
 /// `Nsmf_PDUSession_UpdateSMContext`: install the downlink path with the gNB's F-TEID.
@@ -572,10 +598,10 @@ async fn release_sm_context(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<StatusCode, SbiProblem> {
-    let (up_seid, supi, psi) = {
+    let (up_seid, supi, psi, sm_policy) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
-            Some(c) => (c.up_seid, c.supi.clone(), c.pdu_session_id),
+            Some(c) => (c.up_seid, c.supi.clone(), c.pdu_session_id, c.sm_policy.clone()),
             None => {
                 return Err(problem(
                     StatusCode::NOT_FOUND,
@@ -598,6 +624,11 @@ async fn release_sm_context(
     smf.contexts.lock().unwrap().remove(&sm_ref);
     // Purge the serving-SMF registration (Nudm_UECM). Best-effort, off the path.
     spawn_uecm_purge(smf.nrf_base.clone(), supi, psi);
+    // Delete the PCF SM policy association (Npcf_SMPolicyControl_Delete), if the
+    // session had one. Best-effort, off the path.
+    if let Some((pcf_base, policy_id)) = sm_policy {
+        spawn_sm_policy_delete(pcf_base, policy_id);
+    }
     tracing::info!(%sm_ref, up_seid, "released SM context; N4 session deleted");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -641,6 +672,16 @@ fn spawn_uecm_purge(nrf_base: String, supi: String, pdu_session_id: u8) {
                 }
             }
             Err(e) => tracing::warn!("UECM SMF purge skipped (no UDM): {e}"),
+        }
+    });
+}
+
+/// Delete the PCF SM policy association for a released session. Best-effort.
+fn spawn_sm_policy_delete(pcf_base: String, policy_id: String) {
+    tokio::spawn(async move {
+        match sbi_core::npcf::PcfClient::new(pcf_base).delete_sm_policy(&policy_id).await {
+            Ok(()) => tracing::info!(%policy_id, "PCF: SM policy association deleted"),
+            Err(e) => tracing::warn!(%policy_id, "PCF SM policy delete failed: {e}"),
         }
     });
 }
@@ -773,6 +814,30 @@ mod tests {
         }]);
         sbi_core::nnrf::NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
         (nrf_base, udr_base)
+    }
+
+    /// Spin an in-process PCF (demo policy) and register it with the NRF at
+    /// `nrf_base`. Returns its state so the test can watch the association count.
+    async fn spin_pcf(nrf_base: &str) -> sbi_core::npcf::PcfState {
+        let state = sbi_core::npcf::PcfState::new(sbi_core::npcf::PolicyConfig::demo());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = state.clone();
+        tokio::spawn(async move {
+            sbi_core::run_on(listener, sbi_core::npcf::router(served)).await.unwrap()
+        });
+        let mut profile = sbi_core::nnrf::NfProfile::new("pcf-1", "PCF", addr.ip().to_string());
+        profile.nf_services = Some(vec![sbi_core::nnrf::NfService {
+            service_instance_id: "npcf-smpolicycontrol-1".into(),
+            service_name: "npcf-smpolicycontrol".into(),
+            scheme: "http".into(),
+            ip_end_points: vec![sbi_core::nnrf::IpEndPoint {
+                ipv4_address: Some(addr.ip().to_string()),
+                port: Some(addr.port()),
+            }],
+        }]);
+        sbi_core::nnrf::NrfClient::new(nrf_base.to_string()).register(&profile).await.unwrap();
+        state
     }
 
     /// Full Nsmf → N4 spine: an in-process UPF, the SMF as PFCP client + SBI server,
@@ -921,6 +986,90 @@ mod tests {
             .unwrap()
             .status();
         assert_eq!(status.as_u16(), 404, "released context is gone");
+    }
+
+    /// With a PCF registered, the SMF sources the SM policy from it: a policy
+    /// association is created at CreateSMContext and deleted at release. (The demo
+    /// PCF returns the same QoS as sm-data, so the association count — not the flow
+    /// values — is what distinguishes the PCF path from the fallback.)
+    #[tokio::test]
+    async fn pcf_drives_sm_policy_and_release_deletes_it() {
+        let upf_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let upf_state = Arc::new(Mutex::new(pfcp::UpfState::new()));
+        let upf_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upf_addr = upf_sock.local_addr().unwrap();
+        {
+            let upf_state = upf_state.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let (n, peer) = upf_sock.recv_from(&mut buf).await.unwrap();
+                    let resp = {
+                        let mut s = upf_state.lock().unwrap();
+                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s)
+                    };
+                    if let Some(resp) = resp {
+                        upf_sock.send_to(&resp, peer).await.unwrap();
+                    }
+                }
+            });
+        }
+
+        let (nrf_base, _udr_base) = spin_subscription_backend("imsi-999700000000001", "99970").await;
+        let pcf = spin_pcf(&nrf_base).await;
+
+        let smf = Arc::new(
+            SmfState::connect(upf_addr, Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap(),
+        );
+        smf.associate().await.unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+
+        let created: SmContextCreatedData = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        // The PCF's decision drove the response, and its association was created
+        // synchronously on the create path.
+        assert_eq!(pcf.association_count(), 1, "SMF created a PCF SM policy association");
+        let ambr = created.session_ambr.as_ref().expect("PCF session AMBR");
+        assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("1 Gbps", "2 Gbps"));
+        assert_eq!(created.qos_flows.len(), 2, "PCF default + GBR flow");
+        assert!(created.qos_flows.iter().any(|f| f.gbr.is_some()), "a GBR flow from the PCF");
+
+        // Release deletes the PCF association (spawned off the release path — poll).
+        let status = client
+            .post(format!(
+                "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
+                created.sm_context_ref
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 204, "release succeeded");
+        let mut deleted = false;
+        for _ in 0..50 {
+            if pcf.association_count() == 0 {
+                deleted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(deleted, "PCF SM policy association deleted on release");
     }
 
     /// An unsubscribed DNN is rejected with 403 *before* any N4 state is created.
