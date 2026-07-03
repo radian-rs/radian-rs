@@ -26,6 +26,66 @@ pub struct SmContextCreated {
     /// The subscribed session AMBR, already in NAS wire form (falls back to the
     /// pre-subscription default when the SMF didn't supply one).
     pub ambr: nas::SessionAmbr,
+    /// The authorized QoS flows for the N2 setup transfer (NGAP form).
+    pub ngap_flows: Vec<ngap::QosFlow>,
+    /// The same flows in NAS form, for the N1 accept's QoS flow descriptions IE.
+    pub nas_flows: Vec<nas::QosFlowDesc>,
+}
+
+/// Parse the CreateSMContext response's `qosFlows` into NGAP + NAS flow lists.
+/// Empty → the AMF falls back to the default non-GBR flow for the N2 transfer and
+/// omits the N1 QoS flow descriptions IE (single-flow accept stays minimal).
+fn parse_qos_flows(body: &serde_json::Value) -> (Vec<ngap::QosFlow>, Vec<nas::QosFlowDesc>) {
+    let Some(flows) = body.get("qosFlows").and_then(|v| v.as_array()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut ngap_flows = Vec::new();
+    let mut nas_flows = Vec::new();
+    for f in flows {
+        let Some(qfi) = f.get("qfi").and_then(|v| v.as_u64()).and_then(|v| u8::try_from(v).ok())
+        else {
+            continue;
+        };
+        let five_qi = f.get("fiveQi").and_then(|v| v.as_u64()).and_then(|v| u8::try_from(v).ok()).unwrap_or(9);
+        let arp_priority =
+            f.get("arpPriority").and_then(|v| v.as_u64()).and_then(|v| u8::try_from(v).ok()).unwrap_or(8);
+        let pre_empt_cap = f.get("preEmptCap").and_then(|v| v.as_bool()).unwrap_or(false);
+        let pre_empt_vuln = f.get("preEmptVuln").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let gbr = f.get("gbr");
+        let ngap_gbr = gbr.and_then(|g| {
+            Some(ngap::Gbr {
+                gfbr_dl_bps: bitrate_to_bps(g.get("gfbrDl")?.as_str()?)?,
+                gfbr_ul_bps: bitrate_to_bps(g.get("gfbrUl")?.as_str()?)?,
+                mfbr_dl_bps: bitrate_to_bps(g.get("mfbrDl")?.as_str()?)?,
+                mfbr_ul_bps: bitrate_to_bps(g.get("mfbrUl")?.as_str()?)?,
+            })
+        });
+        let nas_gbr = gbr.and_then(|g| {
+            Some(nas::GbrFlow {
+                gfbr: nas::session_ambr_from_bitrates(g.get("gfbrUl")?.as_str()?, g.get("gfbrDl")?.as_str()?)?,
+                mfbr: nas::session_ambr_from_bitrates(g.get("mfbrUl")?.as_str()?, g.get("mfbrDl")?.as_str()?)?,
+            })
+        });
+        ngap_flows.push(ngap::QosFlow { qfi, five_qi, arp_priority, pre_empt_cap, pre_empt_vuln, gbr: ngap_gbr });
+        nas_flows.push(nas::QosFlowDesc { qfi, five_qi, gbr: nas_gbr });
+    }
+    (ngap_flows, nas_flows)
+}
+
+/// Convert a TS 29.571 `BitRate` string ("100 Mbps") to bits/sec (integer values).
+fn bitrate_to_bps(s: &str) -> Option<u64> {
+    let (value, unit) = s.trim().split_once(' ')?;
+    let value: u64 = value.parse().ok()?;
+    let mult: u64 = match unit {
+        "bps" => 1,
+        "Kbps" => 1_000,
+        "Mbps" => 1_000_000,
+        "Gbps" => 1_000_000_000,
+        "Tbps" => 1_000_000_000_000,
+        _ => return None,
+    };
+    value.checked_mul(mult)
 }
 
 /// Why CreateSMContext failed — drives which 5GSM cause the UE gets.
@@ -145,7 +205,20 @@ impl AmfSmf {
                 nas::session_ambr_from_bitrates(ul, dl)
             })
             .unwrap_or(nas::SessionAmbr::TEN_MBPS);
-        Ok(SmContextCreated { sm_ref, up_n3_teid, up_n3_addr, ue_ip, snssai_sst, snssai_sd, ambr })
+
+        // Authorized QoS flows → NGAP (bits/sec GBR) + NAS (unit/value GBR) forms.
+        let (ngap_flows, nas_flows) = parse_qos_flows(&body);
+        Ok(SmContextCreated {
+            sm_ref,
+            up_n3_teid,
+            up_n3_addr,
+            ue_ip,
+            snssai_sst,
+            snssai_sd,
+            ambr,
+            ngap_flows,
+            nas_flows,
+        })
     }
 
     /// Release an SM context (TS 29.502) — the SMF tears the N4 session down at

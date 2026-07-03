@@ -848,6 +848,15 @@ async fn dispatch_uplink_nas(
                     // S-NSSAI and session AMBR come from the subscriber's UDR sm-data
                     // (looked up by the SMF during CreateSMContext); the DNN echoes
                     // the UE's authorized request.
+                    // Per-flow QoS (5QI/ARP/GBR) from the SMF: the N1 accept lists
+                    // the flows' descriptions; the N2 transfer carries the flows.
+                    // Fall back to the single default non-GBR flow if the SMF
+                    // supplied none (older SMF / no QoS profile).
+                    let ngap_flows: Vec<ngap::QosFlow> = if created.ngap_flows.is_empty() {
+                        vec![ngap::QosFlow::default_non_gbr()]
+                    } else {
+                        created.ngap_flows.clone()
+                    };
                     let accept = nas::pdu_session_establishment_accept(
                         psi,
                         pti,
@@ -856,6 +865,7 @@ async fn dispatch_uplink_nas(
                         created.snssai_sst,
                         created.snssai_sd,
                         created.ambr,
+                        &created.nas_flows,
                     );
                     let dl = nas::dl_nas_transport_sm(psi, accept);
                     let Some(ctx) = ues.get_mut(&amf_ue_id) else { return None };
@@ -870,7 +880,7 @@ async fn dispatch_uplink_nas(
                         amf_ue_id,
                         ran_ue_id,
                         psi,
-                        1,
+                        &ngap_flows,
                         created.up_n3_teid,
                         created.up_n3_addr,
                         ambr_dl,
