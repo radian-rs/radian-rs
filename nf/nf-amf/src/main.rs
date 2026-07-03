@@ -85,6 +85,52 @@ enum DeregCmd {
     T3522Expiry(u64),
 }
 
+/// This AMF's stable NF instance id — used for the NRF profile and every UECM
+/// serving-AMF registration.
+static AMF_INSTANCE_ID: LazyLock<String> = LazyLock::new(sbi_core::new_nf_instance_id);
+
+/// Record this AMF as the SUPI's serving AMF at the UDM (Nudm_UECM), carrying
+/// the deregistration callback the UDR will use on subscription withdrawal.
+/// Best-effort, off the signaling path.
+fn spawn_uecm_register(supi: String) {
+    tokio::spawn(async move {
+        let reg = sbi_core::nudm::Amf3GppAccessRegistration {
+            amf_instance_id: AMF_INSTANCE_ID.clone(),
+            dereg_callback_uri: format!(
+                "http://127.0.0.1:{SBI_PORT}/namf-callback/v1/{supi}/dereg-notify"
+            ),
+        };
+        match discover_nf(NRF_BASE, "UDM").await {
+            Ok(udm) => {
+                if let Err(e) =
+                    sbi_core::nudm::NudmClient::new(udm).uecm_register_amf(&supi, &reg).await
+                {
+                    warn!(%supi, "UECM serving-AMF registration failed: {e}");
+                } else {
+                    info!(%supi, "UECM: registered as the serving AMF");
+                }
+            }
+            Err(e) => warn!(%supi, "UECM registration skipped (no UDM): {e}"),
+        }
+    });
+}
+
+/// Purge the SUPI's serving-AMF registration (deregistration of any flavour).
+/// Best-effort, off the signaling path.
+fn spawn_uecm_purge(supi: String) {
+    tokio::spawn(async move {
+        match discover_nf(NRF_BASE, "UDM").await {
+            Ok(udm) => match sbi_core::nudm::NudmClient::new(udm).uecm_deregister_amf(&supi).await
+            {
+                Ok(true) => info!(%supi, "UECM: serving-AMF registration purged"),
+                Ok(false) => {} // already gone (e.g. the withdrawal wiped the subscriber)
+                Err(e) => warn!(%supi, "UECM purge failed: {e}"),
+            },
+            Err(e) => warn!(%supi, "UECM purge skipped (no UDM): {e}"),
+        }
+    });
+}
+
 /// Directory of served UEs: SUPI → (AMF-UE-NGAP-ID, the owning association's
 /// deregistration channel). Lets the SBI callback surface (subscription
 /// withdrawal) reach a UE that lives inside an SCTP association task.
@@ -251,7 +297,7 @@ async fn register_with_nrf(
     sbi_port: u16,
 ) -> anyhow::Result<()> {
     use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService};
-    let mut profile = NfProfile::new(sbi_core::new_nf_instance_id(), "AMF", ip.to_string());
+    let mut profile = NfProfile::new(AMF_INSTANCE_ID.clone(), "AMF", ip.to_string());
     profile.nf_services = Some(vec![NfService {
         service_instance_id: "namf-callback-1".into(),
         service_name: "namf-callback".into(),
@@ -360,6 +406,9 @@ fn on_t3522_expiry(
         "UE {amf_ue_id}: T3522 exhausted after {T3522_MAX_SENDS} transmissions — \
          aborting deregistration and releasing the contexts"
     );
+    if let Some(supi) = ctx.suci.clone() {
+        spawn_uecm_purge(supi);
+    }
     ues.remove(&amf_ue_id);
     vec![(
         ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
@@ -629,6 +678,7 @@ async fn on_deregistration(
     ));
     if let Some(supi) = ues.get(&amf_ue_id).and_then(|c| c.suci.clone()) {
         UE_DIRECTORY.lock().unwrap().remove(&supi);
+        spawn_uecm_purge(supi);
     }
     ues.remove(&amf_ue_id);
     downlinks
@@ -657,6 +707,7 @@ async fn dispatch_uplink_nas(
             info!("UE {amf_ue_id}: Deregistration Accept — network-initiated deregistration complete");
             if let Some(supi) = ctx.suci.clone() {
                 UE_DIRECTORY.lock().unwrap().remove(&supi);
+                spawn_uecm_purge(supi);
             }
             ues.remove(&amf_ue_id);
             Some((
@@ -667,6 +718,11 @@ async fn dispatch_uplink_nas(
         Some(Nas5gmmMessageType::RegistrationComplete) => {
             let ctx = ues.get_mut(&amf_ue_id)?;
             ctx.state = RegState::Registered;
+            // Record this AMF as the serving AMF (UECM) — the UDR delivers
+            // subscription withdrawals to our callback from now on.
+            if let Some(supi) = ctx.suci.clone() {
+                spawn_uecm_register(supi);
+            }
             info!(
                 "UE {amf_ue_id} REGISTERED (suci={:?}, ran_ue_id={}, state={:?})",
                 ctx.suci, ctx.ran_ue_id, ctx.state

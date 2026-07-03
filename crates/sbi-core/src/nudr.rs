@@ -13,6 +13,19 @@
 //! the SQN advances and the vector is derived next to the credentials, and only
 //! RAND/AUTN/XRES*/K_AUSF ever leave (design/24). When TLS + HSM arrive this seam
 //! is where they plug in.
+//!
+//! # Security: the withdrawal callback is a bounded SSRF surface
+//!
+//! On subscription withdrawal the UDR POSTs to the serving AMF's stored
+//! `deregCallbackUri` (Nudm_UECM). That URI is written through **unauthenticated**
+//! SBI endpoints (the whole SBI is cleartext h2c with no OAuth2 — the deferred
+//! TS 33.501 hardening slice), so a hostile client can register an arbitrary URI
+//! and trigger the callback: server-side request forgery. Mitigations here:
+//! [`is_valid_callback_uri`] restricts it to `http`/`https`, and the callback
+//! client does **not** follow redirects. The residual risk (an attacker steering
+//! the callback at an internal *HTTP* target) is only fully closed by SBI mutual
+//! auth — only a cert-holding AMF may register a callback. Do not expose this UDR
+//! on an untrusted network.
 
 use std::sync::Arc;
 
@@ -25,12 +38,10 @@ use subscriber_db::{DataSet, SubscriberStore};
 
 use crate::SbiError;
 
-/// Router state: the store plus (optionally) the NRF used to notify the AMF of
-/// subscription withdrawals.
+/// Router state: the subscriber store.
 #[derive(Clone)]
 struct NudrState {
     store: Arc<dyn SubscriberStore>,
-    notify_nrf: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -50,23 +61,23 @@ pub struct HeAv {
     pub kausf: String,
 }
 
-/// Build the UDR router (Nudr_DataRepository) over the subscriber store.
+/// Build the UDR router (Nudr_DataRepository) over the subscriber store. A
+/// subscription withdrawal (`DELETE …/subscription-data/{ueId}`) notifies the
+/// **serving AMF recorded in the UECM context data** at its `deregCallbackUri`
+/// (deviation: TS 23.502 mediates this through UDM data-change subscriptions;
+/// we collapse UDR→UDM→AMF to UDR→AMF).
 pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
-    router_with_notify(store, None)
-}
-
-/// Like [`router`], but a subscription withdrawal (`DELETE …/subscription-data/
-/// {ueId}`) also notifies the serving AMF — discovered via the NRF at `nrf_base` —
-/// with a `DeregistrationData` callback (deviation: TS 23.502 mediates this
-/// through UDM data-change subscriptions; we collapse UDR→UDM→AMF to UDR→AMF).
-pub fn router_with_notify(store: Arc<dyn SubscriberStore>, notify_nrf: Option<String>) -> Router {
-    let state = NudrState { store, notify_nrf };
+    let state = NudrState { store };
     Router::new()
         .route(
             "/nudr-dr/v2/subscription-data/{ue_id}/authentication-data/generate-av",
             post(generate_av),
         )
         .route("/nudr-dr/v2/subscription-data/{ue_id}", delete(delete_subscription))
+        .route(
+            "/nudr-dr/v2/subscription-data/{ue_id}/context-data/amf-3gpp-access",
+            get(get_amf_reg).put(put_amf_reg).delete(delete_amf_reg),
+        )
         .route(
             "/nudr-dr/v2/subscription-data/{ue_id}/{serving_plmn_id}/provisioned-data/am-data",
             get(get_am_data).put(put_am_data),
@@ -82,45 +93,65 @@ pub fn router_with_notify(store: Arc<dyn SubscriberStore>, notify_nrf: Option<St
         .with_state(state)
 }
 
-/// Withdraw a subscription: remove everything stored for the SUPI, then (when
-/// configured) notify the serving AMF so it network-deregisters the UE.
+/// Withdraw a subscription: remove everything stored for the SUPI, then notify
+/// the serving AMF (the UECM registration's `deregCallbackUri`) so it
+/// network-deregisters the UE. No registration recorded → nobody to notify.
 async fn delete_subscription(
     State(st): State<NudrState>,
     Path(ue_id): Path<String>,
 ) -> StatusCode {
+    // The registration is wiped with the subscriber — read the callback first.
+    let callback = st
+        .store
+        .get_amf_registration(&ue_id)
+        .and_then(|r| r.get("deregCallbackUri").and_then(|v| v.as_str()).map(str::to_owned));
     if !st.store.remove_subscriber(&ue_id) {
         return StatusCode::NOT_FOUND;
     }
     tracing::info!(supi = %ue_id, "subscription withdrawn");
-    if let Some(nrf) = st.notify_nrf.clone() {
-        // Best-effort, off the request path: the withdrawal stands even if the
-        // AMF is unreachable (the UE is simply not chased off until it returns).
-        tokio::spawn(async move {
-            if let Err(e) = notify_amf_deregistration(&nrf, &ue_id).await {
-                tracing::warn!(supi = %ue_id, "AMF deregistration notify failed: {e}");
-            }
-        });
+    match callback {
+        Some(uri) => {
+            // Best-effort, off the request path: the withdrawal stands even if
+            // the AMF is unreachable.
+            tokio::spawn(async move {
+                if let Err(e) = notify_amf_deregistration(&uri, &ue_id).await {
+                    tracing::warn!(supi = %ue_id, "AMF deregistration notify failed: {e}");
+                }
+            });
+        }
+        None => tracing::info!(supi = %ue_id, "no serving AMF registered — nobody to notify"),
     }
     StatusCode::NO_CONTENT
 }
 
-/// POST a `DeregistrationData` (TS 29.503-shaped) to the NRF-discovered AMF.
-async fn notify_amf_deregistration(nrf_base: &str, supi: &str) -> Result<(), String> {
-    let profile = crate::nnrf::NrfClient::new(nrf_base.to_string())
-        .discover("AMF", "UDR")
-        .await
-        .map_err(|e| format!("NRF discovery failed: {e}"))?
-        .into_iter()
-        .next()
-        .ok_or("no AMF registered with the NRF")?;
-    let ep = profile
-        .nf_services
-        .and_then(|s| s.into_iter().next())
-        .and_then(|svc| svc.ip_end_points.into_iter().next())
-        .ok_or("AMF profile has no service endpoint")?;
-    let (ip, port) = (ep.ipv4_address.ok_or("no IP")?, ep.port.ok_or("no port")?);
-    let resp = crate::h2c_client()
-        .post(format!("http://{ip}:{port}/namf-callback/v1/{supi}/dereg-notify"))
+/// Whether `uri` is acceptable as a serving-AMF deregistration callback: a
+/// well-formed absolute `http`/`https` URL. This is an **SSRF guard** — the URI
+/// is attacker-influenceable while the SBI is unauthenticated (see the module
+/// `# Security` note), so a hostile client must not be able to steer the UDR's
+/// callback at non-HTTP schemes (`file:`, `gopher:`, …). It does **not** bound
+/// the host: the legitimate AMF lives on the same private/loopback space as any
+/// internal target, so host allowlisting needs deployment config — the real fix
+/// is SBI mutual auth (only a cert-holding AMF can register a callback).
+pub(crate) fn is_valid_callback_uri(uri: &str) -> bool {
+    reqwest::Url::parse(uri).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+/// POST a `DeregistrationData` (TS 29.503-shaped) to the serving AMF's stored
+/// deregistration callback URI. The URI is re-validated here (the guaranteed
+/// choke point — a raw context-data PUT bypasses the UECM handler's check), and
+/// redirects are **not** followed so a stored callback can't bounce the request
+/// to a different host/port.
+async fn notify_amf_deregistration(callback_uri: &str, supi: &str) -> Result<(), String> {
+    if !is_valid_callback_uri(callback_uri) {
+        return Err("stored deregCallbackUri is not a valid http(s) URL".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("build callback client: {e}"))?;
+    let resp = client
+        .post(callback_uri)
         .json(&serde_json::json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN" }))
         .send()
         .await
@@ -128,8 +159,39 @@ async fn notify_amf_deregistration(nrf_base: &str, supi: &str) -> Result<(), Str
     if !resp.status().is_success() {
         return Err(format!("AMF answered {}", resp.status()));
     }
-    tracing::info!(supi = %supi, "AMF notified of subscription withdrawal");
+    tracing::info!(supi = %supi, "serving AMF notified of subscription withdrawal");
     Ok(())
+}
+
+/// Context-data handlers (TS 29.505 `amf-3gpp-access`): the serving AMF's
+/// registration, written by the UDM's Nudm_UECM front.
+async fn get_amf_reg(
+    State(st): State<NudrState>,
+    Path(ue_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    st.store.get_amf_registration(&ue_id).map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn put_amf_reg(
+    State(st): State<NudrState>,
+    Path(ue_id): Path<String>,
+    Json(doc): Json<serde_json::Value>,
+) -> StatusCode {
+    match st.store.put_amf_registration(&ue_id, &doc) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::warn!(supi = %ue_id, "put amf-3gpp-access failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn delete_amf_reg(State(st): State<NudrState>, Path(ue_id): Path<String>) -> StatusCode {
+    if st.store.remove_amf_registration(&ue_id) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 
 async fn generate_av(
@@ -273,6 +335,42 @@ impl UdrClient {
         Ok(true)
     }
 
+    /// Fetch the serving AMF's registration (context data). `Ok(None)` if absent.
+    pub async fn get_amf_registration(
+        &self,
+        supi: &str,
+    ) -> Result<Option<serde_json::Value>, SbiError> {
+        let resp = self.http.get(self.amf_reg_url(supi)).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    /// Record the serving AMF's registration (context data).
+    pub async fn put_amf_registration(
+        &self,
+        supi: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), SbiError> {
+        self.http.put(self.amf_reg_url(supi)).json(doc).send().await?.error_for_status()?;
+        Ok(())
+    }
+
+    /// Purge the serving AMF's registration. `Ok(false)` if none was recorded.
+    pub async fn delete_amf_registration(&self, supi: &str) -> Result<bool, SbiError> {
+        let resp = self.http.delete(self.amf_reg_url(supi)).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        resp.error_for_status()?;
+        Ok(true)
+    }
+
+    fn amf_reg_url(&self, supi: &str) -> String {
+        format!("{}/nudr-dr/v2/subscription-data/{}/context-data/amf-3gpp-access", self.base, supi)
+    }
+
     /// Store (create or replace) a provisioned-data document.
     pub async fn put_provisioned(
         &self,
@@ -340,10 +438,11 @@ mod tests {
         assert!(udr.generate_av("imsi-unknown", "999", "70").await.unwrap().is_none());
     }
 
-    /// A DELETE withdraws the subscription and (when configured) notifies the
-    /// NRF-discovered AMF with a DeregistrationData callback.
+    /// A DELETE withdraws the subscription and notifies the serving AMF recorded
+    /// via Nudm_UECM — at its stored deregCallbackUri, not by NRF discovery. A
+    /// subscriber with no UECM registration notifies nobody.
     #[tokio::test]
-    async fn subscription_withdrawal_notifies_the_amf() {
+    async fn subscription_withdrawal_notifies_the_serving_amf() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NOTIFIED: AtomicUsize = AtomicUsize::new(0);
 
@@ -360,55 +459,142 @@ mod tests {
         );
         tokio::spawn(async move { crate::run_on(amf_l, amf_router).await.unwrap() });
 
-        // NRF with the mock AMF registered.
-        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let nrf_addr = nrf_l.local_addr().unwrap();
-        let store = crate::nnrf::NrfStore::default();
-        tokio::spawn(async move { crate::run_on(nrf_l, crate::nnrf::router(store)).await.unwrap() });
-        let nrf_base = format!("http://{nrf_addr}");
-        let mut profile =
-            crate::nnrf::NfProfile::new("amf-1", "AMF", amf_addr.ip().to_string());
-        profile.nf_services = Some(vec![crate::nnrf::NfService {
-            service_instance_id: "namf-callback-1".into(),
-            service_name: "namf-callback".into(),
-            scheme: "http".into(),
-            ip_end_points: vec![crate::nnrf::IpEndPoint {
-                ipv4_address: Some(amf_addr.ip().to_string()),
-                port: Some(amf_addr.port()),
-            }],
-        }]);
-        crate::nnrf::NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
-
-        // UDR with notification enabled and one provisioned subscriber.
+        // UDR (plain router — no NRF involved) with two provisioned subscribers.
         let store = Arc::new(InMemoryStore::new());
-        store
-            .provision_hex(
-                "imsi-1",
-                "465b5ce8b199b49faa5f0a2ee238a6bc",
-                "cd63cb71954a9f4e48a5994e37a02baf",
-                "8000",
-            )
-            .unwrap();
+        for supi in ["imsi-1", "imsi-2"] {
+            store
+                .provision_hex(
+                    supi,
+                    "465b5ce8b199b49faa5f0a2ee238a6bc",
+                    "cd63cb71954a9f4e48a5994e37a02baf",
+                    "8000",
+                )
+                .unwrap();
+        }
         let store: Arc<dyn SubscriberStore> = store;
         let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let udr_addr = udr_l.local_addr().unwrap();
-        tokio::spawn(async move {
-            crate::run_on(udr_l, router_with_notify(store, Some(nrf_base))).await.unwrap()
-        });
-        let udr = UdrClient::new(format!("http://{udr_addr}"));
+        tokio::spawn(async move { crate::run_on(udr_l, router(store)).await.unwrap() });
+        let udr_base = format!("http://{udr_addr}");
+        let udr = UdrClient::new(udr_base.clone());
 
+        // The serving AMF registers via the UDM's Nudm_UECM front — full chain.
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        let udr_for_udm = Arc::new(UdrClient::new(udr_base));
+        tokio::spawn(async move {
+            crate::run_on(udm_l, crate::nudm::router(udr_for_udm)).await.unwrap()
+        });
+        let sdm = crate::nudm::NudmClient::new(format!("http://{udm_addr}"));
+        sdm.uecm_register_amf(
+            "imsi-1",
+            &crate::nudm::Amf3GppAccessRegistration {
+                amf_instance_id: "amf-1".into(),
+                dereg_callback_uri: format!(
+                    "http://{amf_addr}/namf-callback/v1/imsi-1/dereg-notify"
+                ),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Withdraw imsi-1 → the stored callback fires exactly once.
         assert_eq!(udr.delete_subscriber("imsi-1").await.unwrap(), true);
         assert!(udr.generate_av("imsi-1", "999", "70").await.unwrap().is_none(), "withdrawn");
         assert_eq!(udr.delete_subscriber("imsi-1").await.unwrap(), false, "second delete 404s");
-
-        // The notification is spawned off the request path — poll briefly.
         for _ in 0..50 {
             if NOTIFIED.load(Ordering::Relaxed) == 1 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(NOTIFIED.load(Ordering::Relaxed), 1, "AMF notified exactly once");
+        assert_eq!(NOTIFIED.load(Ordering::Relaxed), 1, "serving AMF notified exactly once");
+
+        // imsi-2 has no serving AMF — its withdrawal notifies nobody.
+        assert_eq!(udr.delete_subscriber("imsi-2").await.unwrap(), true);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(NOTIFIED.load(Ordering::Relaxed), 1, "no extra notification");
+    }
+
+    #[test]
+    fn callback_uri_ssrf_guard() {
+        assert!(is_valid_callback_uri("http://127.0.0.1:8001/namf-callback/v1/imsi-1/dereg-notify"));
+        assert!(is_valid_callback_uri("https://amf.example/cb"));
+        // Non-HTTP schemes and junk are rejected (would otherwise be SSRF vectors).
+        assert!(!is_valid_callback_uri("file:///etc/passwd"));
+        assert!(!is_valid_callback_uri("gopher://169.254.169.254/"));
+        assert!(!is_valid_callback_uri("ftp://internal/x"));
+        assert!(!is_valid_callback_uri("not a url"));
+        assert!(!is_valid_callback_uri(""));
+    }
+
+    /// A UECM registration with a non-http(s) callback is rejected at the UDM
+    /// front (400) and never stored.
+    #[tokio::test]
+    async fn uecm_rejects_ssrf_callback_uri() {
+        let store: Arc<dyn SubscriberStore> = Arc::new(InMemoryStore::new());
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udr_l, router(store)).await.unwrap() });
+
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        let udr_for_udm = Arc::new(UdrClient::new(format!("http://{udr_addr}")));
+        tokio::spawn(async move {
+            crate::run_on(udm_l, crate::nudm::router(udr_for_udm)).await.unwrap()
+        });
+        let sdm = crate::nudm::NudmClient::new(format!("http://{udm_addr}"));
+
+        let err = sdm
+            .uecm_register_amf(
+                "imsi-1",
+                &crate::nudm::Amf3GppAccessRegistration {
+                    amf_instance_id: "amf-1".into(),
+                    dereg_callback_uri: "file:///etc/passwd".into(),
+                },
+            )
+            .await
+            .expect_err("malicious callback must be rejected");
+        assert!(matches!(err, SbiError::Http(_)), "got {err:?}");
+        // Nothing was stored.
+        let udr = UdrClient::new(format!("http://{udr_addr}"));
+        assert!(udr.get_amf_registration("imsi-1").await.unwrap().is_none());
+    }
+
+    /// UECM register → readable context data; purge → gone (and 404 on re-purge).
+    #[tokio::test]
+    async fn uecm_registration_roundtrips_through_udm_and_udr() {
+        let store: Arc<dyn SubscriberStore> = Arc::new(InMemoryStore::new());
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udr_l, router(store)).await.unwrap() });
+        let udr = UdrClient::new(format!("http://{udr_addr}"));
+
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        let udr_for_udm = Arc::new(UdrClient::new(format!("http://{udr_addr}")));
+        tokio::spawn(async move {
+            crate::run_on(udm_l, crate::nudm::router(udr_for_udm)).await.unwrap()
+        });
+        let sdm = crate::nudm::NudmClient::new(format!("http://{udm_addr}"));
+
+        assert!(udr.get_amf_registration("imsi-1").await.unwrap().is_none());
+        sdm.uecm_register_amf(
+            "imsi-1",
+            &crate::nudm::Amf3GppAccessRegistration {
+                amf_instance_id: "amf-1".into(),
+                dereg_callback_uri: "http://amf/cb".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let reg = udr.get_amf_registration("imsi-1").await.unwrap().expect("stored");
+        assert_eq!(reg.get("amfInstanceId").and_then(|v| v.as_str()), Some("amf-1"));
+        assert_eq!(reg.get("deregCallbackUri").and_then(|v| v.as_str()), Some("http://amf/cb"));
+
+        assert_eq!(sdm.uecm_deregister_amf("imsi-1").await.unwrap(), true);
+        assert!(udr.get_amf_registration("imsi-1").await.unwrap().is_none(), "purged");
+        assert_eq!(sdm.uecm_deregister_amf("imsi-1").await.unwrap(), false, "re-purge 404s");
     }
 
     #[tokio::test]

@@ -54,10 +54,59 @@ pub fn router(udr: Arc<UdrClient>) -> Router {
             "/nudm-ueau/v1/{supi_or_suci}/security-information/generate-auth-data",
             post(generate_auth_data),
         )
+        .route(
+            "/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access",
+            axum::routing::put(uecm_register_amf).delete(uecm_deregister_amf),
+        )
         .route("/nudm-sdm/v2/{supi}/am-data", get(sdm_am_data))
         .route("/nudm-sdm/v2/{supi}/sm-data", get(sdm_sm_data))
         .route("/nudm-sdm/v2/{supi}/smf-select-data", get(sdm_smf_select_data))
         .with_state(udr)
+}
+
+/// `Nudm_UECM` (TS 29.503 §5.3): the AMF records itself as the serving AMF for a
+/// SUPI — stored as UDR context data; a subscription withdrawal is delivered to
+/// this registration's `deregCallbackUri`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Amf3GppAccessRegistration {
+    pub amf_instance_id: String,
+    pub dereg_callback_uri: String,
+}
+
+async fn uecm_register_amf(
+    State(udr): State<Arc<UdrClient>>,
+    Path(supi): Path<String>,
+    Json(reg): Json<Amf3GppAccessRegistration>,
+) -> Result<StatusCode, StatusCode> {
+    // Reject an unusable callback up front (SSRF guard — see nudr's `# Security`).
+    // The UDR re-checks at call time, so a raw context-data PUT can't slip past.
+    if !crate::nudr::is_valid_callback_uri(&reg.dereg_callback_uri) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let doc = serde_json::to_value(&reg).map_err(|_| StatusCode::BAD_REQUEST)?;
+    udr.put_amf_registration(&supi, &doc).await.map_err(|e| {
+        tracing::warn!("UDR amf-3gpp-access put failed: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+    tracing::info!(%supi, amf = %reg.amf_instance_id, "serving AMF registered (UECM)");
+    Ok(StatusCode::CREATED)
+}
+
+async fn uecm_deregister_amf(
+    State(udr): State<Arc<UdrClient>>,
+    Path(supi): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let existed = udr.delete_amf_registration(&supi).await.map_err(|e| {
+        tracing::warn!("UDR amf-3gpp-access delete failed: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+    if existed {
+        tracing::info!(%supi, "serving AMF purged (UECM)");
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 /// `Nudm_SDM` query: the serving PLMN selects which provisioned dataset applies
@@ -180,6 +229,35 @@ impl NudmClient {
             .await?
             .error_for_status()?;
         Ok(resp.json().await?)
+    }
+
+    /// Nudm_UECM — register as the serving AMF for `supi` (create or replace).
+    pub async fn uecm_register_amf(
+        &self,
+        supi: &str,
+        reg: &Amf3GppAccessRegistration,
+    ) -> Result<(), SbiError> {
+        self.http
+            .put(format!("{}/nudm-uecm/v1/{}/registrations/amf-3gpp-access", self.base, supi))
+            .json(reg)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Nudm_UECM — purge the serving-AMF registration. `Ok(false)` when none existed.
+    pub async fn uecm_deregister_amf(&self, supi: &str) -> Result<bool, SbiError> {
+        let resp = self
+            .http
+            .delete(format!("{}/nudm-uecm/v1/{}/registrations/amf-3gpp-access", self.base, supi))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        resp.error_for_status()?;
+        Ok(true)
     }
 
     /// Nudm_SDM — Access and Mobility Subscription data (subscribed S-NSSAIs,
