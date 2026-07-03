@@ -51,6 +51,15 @@ pub struct GenerateAvRequest {
     pub mnc: String,
 }
 
+/// Resynchronisation request: the `rand` of the failed challenge + the UE's
+/// `auts` (hex). The UDR verifies MAC-S and, on success, adopts the UE's SQN.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResyncRequest {
+    pub rand: String,
+    pub auts: String,
+}
+
 /// A derived 5G HE authentication vector — hex strings, never key material.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +81,10 @@ pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
         .route(
             "/nudr-dr/v2/subscription-data/{ue_id}/authentication-data/generate-av",
             post(generate_av),
+        )
+        .route(
+            "/nudr-dr/v2/subscription-data/{ue_id}/authentication-data/resync",
+            post(resync_av),
         )
         .route("/nudr-dr/v2/subscription-data/{ue_id}", delete(delete_subscription))
         .route(
@@ -307,6 +320,38 @@ async fn generate_av(
     }))
 }
 
+fn hex16(s: &str) -> Option<[u8; 16]> {
+    hex::decode(s).ok()?.try_into().ok()
+}
+
+fn hex14(s: &str) -> Option<[u8; 14]> {
+    hex::decode(s).ok()?.try_into().ok()
+}
+
+/// Resynchronise a subscriber's SQN from a UE AUTS (TS 33.102 §6.3.5). `204` on
+/// success, `403` when MAC-S doesn't verify (the AUTS isn't from this
+/// subscriber's USIM — never move the SQN), `404` for an unknown subscriber,
+/// `400` for malformed hex.
+async fn resync_av(
+    State(st): State<NudrState>,
+    Path(ue_id): Path<String>,
+    Json(req): Json<ResyncRequest>,
+) -> StatusCode {
+    if !st.store.exists(&ue_id) {
+        return StatusCode::NOT_FOUND;
+    }
+    let (Some(rand), Some(auts)) = (hex16(&req.rand), hex14(&req.auts)) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if st.store.resync_sqn(&ue_id, &rand, &auts) {
+        tracing::info!(supi = %ue_id, "SQN resynchronised from UE AUTS");
+        StatusCode::NO_CONTENT
+    } else {
+        tracing::warn!(supi = %ue_id, "SQN resync refused (MAC-S mismatch)");
+        StatusCode::FORBIDDEN
+    }
+}
+
 async fn get_doc(
     store: Arc<dyn SubscriberStore>,
     ds: DataSet,
@@ -453,6 +498,26 @@ impl UdrClient {
             return Ok(None);
         }
         Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    /// Resynchronise the subscriber's SQN from a UE AUTS (hex `rand` + `auts`).
+    /// `Ok(true)` when the UDR adopted the UE's SQN, `Ok(false)` when it refused
+    /// (MAC-S mismatch or unknown subscriber).
+    pub async fn resync_av(&self, supi: &str, rand: &str, auts: &str) -> Result<bool, SbiError> {
+        let url = format!(
+            "{}/nudr-dr/v2/subscription-data/{}/authentication-data/resync",
+            self.base, supi
+        );
+        let resp = self
+            .bearer(
+                self.http
+                    .post(url)
+                    .json(&ResyncRequest { rand: rand.to_string(), auts: auts.to_string() }),
+            )
+            .await
+            .send()
+            .await?;
+        Ok(resp.status().is_success())
     }
 
     /// Fetch a provisioned-data document. `Ok(None)` if not provisioned.

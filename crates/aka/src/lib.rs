@@ -110,6 +110,39 @@ pub fn nas_keys(kamf: &[u8; 32], nea: u8, nia: u8) -> NasKeys {
     }
 }
 
+/// The AKA AMF field used for **resynchronisation** (TS 33.102 §6.3.3): MAC-S is
+/// computed with AMF* = 0x0000, not the subscriber's provisioned AMF.
+const RESYNC_AMF: [u8; 2] = [0x00, 0x00];
+
+/// UE/USIM side: build the **AUTS** for a synchronisation failure
+/// (TS 33.102 §6.3.3): `AUTS = (SQNms ⊕ AK*) ‖ MAC-S` with `AK* = f5*(RAND)` and
+/// `MAC-S = f1*(SQNms ‖ RAND ‖ AMF*)`. Sent in the NAS Authentication Failure
+/// (cause #21) so the network can adopt the UE's SQN. Used by tests / a UE sim.
+pub fn compute_auts(sub: &SubscriberKey, rand: &[u8; 16], sqn_ms: &[u8; 6]) -> [u8; 14] {
+    let mut m = Milenage::new_with_opc(sub.k, sub.opc);
+    let mac_s = m.f1star(rand, sqn_ms, &RESYNC_AMF);
+    let ak_star = m.f5star(rand);
+    let mut auts = [0u8; 14];
+    auts[..6].copy_from_slice(&xor6(sqn_ms, &ak_star));
+    auts[6..].copy_from_slice(&mac_s);
+    auts
+}
+
+/// UDM/ARPF side: verify an **AUTS** against the challenge `rand` it answers and
+/// extract the UE's SQN (TS 33.102 §6.3.5). `None` when MAC-S doesn't verify —
+/// the AUTS is not from this subscriber's USIM (or not for this RAND).
+pub fn sqn_ms_from_auts(
+    sub: &SubscriberKey,
+    rand: &[u8; 16],
+    auts: &[u8; 14],
+) -> Option<[u8; 6]> {
+    let mut m = Milenage::new_with_opc(sub.k, sub.opc);
+    let ak_star = m.f5star(rand);
+    let sqn_ms = xor6(&auts[..6], &ak_star);
+    let mac_s = m.f1star(rand, &sqn_ms, &RESYNC_AMF);
+    (mac_s[..] == auts[6..]).then_some(sqn_ms)
+}
+
 /// UE side: verify AUTN and compute RES* (TS 33.501). Used by tests / a UE simulator.
 pub fn ue_compute_res_star(
     sub: &SubscriberKey,
@@ -153,6 +186,33 @@ fn xor6(a: &[u8], b: &[u8; 6]) -> [u8; 6] {
 mod tests {
     use super::*;
     use hex_literal::hex;
+
+    #[test]
+    fn auts_round_trips_and_rejects_tampering() {
+        // TS 35.208 test-set-1 credentials.
+        let sub = SubscriberKey {
+            k: hex!("465b5ce8b199b49faa5f0a2ee238a6bc"),
+            opc: hex!("cd63cb71954a9f4e48a5994e37a02baf"),
+            amf: hex!("8000"),
+        };
+        let rand = hex!("23553cbe9637a89d218ae64dae47bf35");
+        let sqn_ms = hex!("ff9bb4d0b607");
+
+        // The USIM's AUTS verifies at the ARPF and yields the UE's SQN.
+        let auts = compute_auts(&sub, &rand, &sqn_ms);
+        assert_eq!(sqn_ms_from_auts(&sub, &rand, &auts), Some(sqn_ms));
+
+        // A tampered AUTS (or one computed for a different RAND) is refused.
+        let mut bad = auts;
+        bad[13] ^= 0x01;
+        assert_eq!(sqn_ms_from_auts(&sub, &rand, &bad), None, "MAC-S mismatch");
+        let other_rand = hex!("00000000000000000000000000000001");
+        assert_eq!(sqn_ms_from_auts(&sub, &other_rand, &auts), None, "wrong RAND");
+
+        // A different subscriber's key can't forge it either.
+        let other = SubscriberKey { k: hex!("00000000000000000000000000000000"), ..sub };
+        assert_eq!(sqn_ms_from_auts(&other, &rand, &auts), None, "wrong K");
+    }
 
     #[test]
     fn milenage_test_set_1() {

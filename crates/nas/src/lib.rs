@@ -63,6 +63,35 @@ pub fn parse_authentication_request(bytes: &[u8]) -> Option<([u8; 16], [u8; 16])
     Some((rand, autn))
 }
 
+/// Build and encode a 5GMM **Authentication Failure** with cause
+/// *synch failure* (#21) carrying the UE's **AUTS** (TS 24.501 §8.2.4). UE side
+/// / tests — the UE sends this when the network's SQN is out of range.
+pub fn authentication_failure_synch(auts: &[u8]) -> Vec<u8> {
+    let fail = messages::NasAuthenticationFailure::new(NasFGmmCause::from_cause(
+        GmmCause::SynchFailure,
+    ))
+    .set_authentication_failure_parameter(NasAuthenticationFailureParameter::new(auts.to_vec()));
+    let msg = Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::AuthenticationFailure,
+        Nas5gmmMessage::AuthenticationFailure(fail),
+    );
+    encode_nas_5gs_message(&msg).expect("encode AuthenticationFailure")
+}
+
+/// From a decoded **Authentication Failure**, the `(5GMM cause, optional AUTS)`.
+/// The AUTS is present only on a synch failure (#21).
+pub fn authentication_failure_info(msg: &Nas5gsMessage) -> Option<(u8, Option<Vec<u8>>)> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::AuthenticationFailure(fail)) = msg else {
+        return None;
+    };
+    let cause = fail.fgmm_cause.value;
+    let auts = fail.authentication_failure_parameter.as_ref().map(|p| p.value.clone());
+    Some((cause, auts))
+}
+
+/// The 5GMM cause value for *synchronisation failure* (TS 24.501 §9.11.3.2).
+pub const GMM_CAUSE_SYNCH_FAILURE: u8 = 0x15;
+
 /// Extract RES* from a decoded Authentication Response, if present.
 pub fn res_star_from_authentication_response(msg: &Nas5gsMessage) -> Option<&[u8]> {
     if let Nas5gsMessage::Gmm(_, Nas5gmmMessage::AuthenticationResponse(resp)) = msg {
@@ -1180,6 +1209,23 @@ mod tests {
         let bytes = encode_nas_5gs_message(&configuration_update_command()).expect("encode");
         let msg = decode_nas_5gs_message(&bytes).expect("decode");
         assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::ConfigurationUpdateCommand));
+    }
+
+    #[test]
+    fn authentication_failure_synch_round_trips() {
+        let auts: Vec<u8> = (0..14).collect();
+        let bytes = authentication_failure_synch(&auts);
+        let msg = decode_nas_5gs_message(&bytes).unwrap();
+        assert_eq!(
+            gmm_message_type(&msg),
+            Some(Nas5gmmMessageType::AuthenticationFailure)
+        );
+        assert_eq!(
+            authentication_failure_info(&msg),
+            Some((GMM_CAUSE_SYNCH_FAILURE, Some(auts)))
+        );
+        // A non-failure message carries no failure info.
+        assert_eq!(authentication_failure_info(&deregistration_accept()), None);
     }
 
     #[test]
