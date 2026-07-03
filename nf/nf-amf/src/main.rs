@@ -183,7 +183,7 @@ async fn handle_ngap(
                 }
             }
             InitiatingMessageValue::Id_UplinkNASTransport(msg) => {
-                if let Some((dl, label)) = on_uplink_nas(ues, amf_auth, amf_smf, msg).await {
+                for (dl, label) in on_uplink_nas(ues, amf_auth, amf_smf, msg).await {
                     send_or_log(conn, &dl, label).await;
                 }
             }
@@ -194,6 +194,12 @@ async fn handle_ngap(
             ..
         }) => {
             on_pdu_session_setup_response(ues, amf_smf, &pdu).await;
+        }
+        NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+            value: SuccessfulOutcomeValue::Id_UEContextRelease(_),
+            ..
+        }) => {
+            info!("gNB confirmed UE context release (UEContextReleaseComplete)");
         }
         _ => info!("unhandled PDU: {}", pdu.procedure_name()),
     }
@@ -311,18 +317,18 @@ async fn on_uplink_nas(
     amf_auth: &auth::AmfAuth,
     amf_smf: &pdu_session::AmfSmf,
     msg: &UplinkNASTransport,
-) -> Option<(NGAP_PDU, &'static str)> {
+) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(amf_ue_id) = uplink_amf_ue_id(msg) else {
         warn!("UplinkNASTransport without AMF-UE-NGAP-ID");
-        return None;
+        return Vec::new();
     };
     if !ues.contains_key(&amf_ue_id) {
         warn!("uplink NAS for unknown UE {amf_ue_id}");
-        return None;
+        return Vec::new();
     }
     let Some(raw) = uplink_nas_pdu(msg) else {
         warn!("UE {amf_ue_id}: UplinkNASTransport without NAS-PDU");
-        return None;
+        return Vec::new();
     };
 
     // After the Security Mode Command, uplink NAS is integrity-protected/ciphered.
@@ -336,16 +342,29 @@ async fn on_uplink_nas(
     };
     let Some(nas_msg) = nas_msg else {
         warn!("UE {amf_ue_id}: could not verify/decode uplink NAS");
-        return None;
+        return Vec::new();
     };
 
+    // Security Mode Complete may answer with more than one downlink (a
+    // Registration Reject followed by the UE Context Release Command).
+    if nas::gmm_message_type(&nas_msg) == Some(Nas5gmmMessageType::SecurityModeComplete) {
+        return on_security_mode_complete(ues, amf_ue_id, NRF_BASE).await;
+    }
+    dispatch_uplink_nas(ues, amf_auth, amf_smf, amf_ue_id, nas_msg).await.into_iter().collect()
+}
+
+/// Handle one verified uplink NAS message that answers with at most one downlink.
+async fn dispatch_uplink_nas(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_auth: &auth::AmfAuth,
+    amf_smf: &pdu_session::AmfSmf,
+    amf_ue_id: u64,
+    nas_msg: Nas5gsMessage,
+) -> Option<(NGAP_PDU, &'static str)> {
     match nas::gmm_message_type(&nas_msg) {
         Some(Nas5gmmMessageType::AuthenticationResponse) => {
             let res_star = nas::res_star_from_authentication_response(&nas_msg)?.to_vec();
             complete_authentication(ues, amf_auth, amf_ue_id, &res_star).await
-        }
-        Some(Nas5gmmMessageType::SecurityModeComplete) => {
-            on_security_mode_complete(ues, amf_ue_id, NRF_BASE).await
         }
         Some(Nas5gmmMessageType::RegistrationComplete) => {
             let ctx = ues.get_mut(&amf_ue_id)?;
@@ -576,15 +595,19 @@ async fn on_security_mode_complete(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
     nrf_base: &str,
-) -> Option<(NGAP_PDU, &'static str)> {
+) -> Vec<(NGAP_PDU, &'static str)> {
     // Fetch before taking the mutable borrow (the fetch awaits).
-    let supi = ues.get(&amf_ue_id)?.suci.clone();
+    let Some(supi) = ues.get(&amf_ue_id).map(|c| c.suci.clone()) else {
+        return Vec::new();
+    };
     let subscribed = match &supi {
         Some(supi) => fetch_subscribed_nssai(nrf_base, supi).await,
         None => None,
     };
 
-    let ctx = ues.get_mut(&amf_ue_id)?;
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        return Vec::new();
+    };
     let ran_ue_id = ctx.ran_ue_id;
     let tmsi = amf_ue_id as u32;
     // Fail-open when the subscription is unreachable: no NSSAI IEs, and slice
@@ -595,35 +618,50 @@ async fn on_security_mode_complete(
     };
 
     // Nothing the UE requested is subscribed → the registration cannot serve any
-    // slice: Registration Reject #62, and the UE context is released.
+    // slice: Registration Reject #62, then a UE Context Release Command so the
+    // gNB drops its side too; the AMF context is released here.
     if subscribed.is_some() && allowed.is_empty() {
-        let sec = ctx.sec.as_mut()?;
+        let Some(sec) = ctx.sec.as_mut() else {
+            return Vec::new();
+        };
         let reject =
             nas::registration_reject(nas::mm_cause::NO_NETWORK_SLICES_AVAILABLE, &rejected);
         let bytes = sec.protect(&reject, nas::sht::INTEGRITY_CIPHERED, 1);
         warn!(
             "UE {amf_ue_id}: no requested slice is subscribed ({rejected:?}); sending \
-             Registration Reject (5GMM cause #62) and releasing the context"
+             Registration Reject (5GMM cause #62) + UE Context Release Command"
         );
         ues.remove(&amf_ue_id);
-        return Some((
-            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
-            "DownlinkNASTransport (RegistrationReject)",
-        ));
+        return vec![
+            (
+                ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
+                "DownlinkNASTransport (RegistrationReject)",
+            ),
+            (
+                ngap::ue_context_release_command(
+                    amf_ue_id,
+                    ran_ue_id,
+                    ngap::CauseNas::NORMAL_RELEASE,
+                ),
+                "UEContextReleaseCommand",
+            ),
+        ];
     }
 
     ctx.allowed_nssai = subscribed.is_some().then(|| allowed.clone());
-    let sec = ctx.sec.as_mut()?;
+    let Some(sec) = ctx.sec.as_mut() else {
+        return Vec::new();
+    };
     let accept = nas::registration_accept(PLMN_MCC, PLMN_MNC, tmsi, &allowed, &rejected);
     let bytes = sec.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1);
     info!(
         "UE {amf_ue_id}: SecurityModeComplete — sending Registration Accept \
          (allowed NSSAI: {allowed:?}, rejected: {rejected:?})"
     );
-    Some((
+    vec![(
         ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
         "DownlinkNASTransport (RegistrationAccept)",
-    ))
+    )]
 }
 
 /// Intersect the UE's requested NSSAI with the subscribed one (TS 23.501 slice
@@ -852,13 +890,22 @@ mod tests {
         let mut ues = HashMap::new();
         ues.insert(1u64, ctx);
 
-        let (pdu, label) =
-            on_security_mode_complete(&mut ues, 1, &nrf_base).await.expect("a downlink to send");
-        assert_eq!(label, "DownlinkNASTransport (RegistrationReject)");
+        let downlinks = on_security_mode_complete(&mut ues, 1, &nrf_base).await;
+        assert_eq!(
+            downlinks.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["DownlinkNASTransport (RegistrationReject)", "UEContextReleaseCommand"],
+            "the reject is followed by the gNB-side context release"
+        );
         assert!(!ues.contains_key(&1), "UE context released after the reject");
 
+        // The release command addresses the same UE pair with a NAS cause.
+        assert_eq!(
+            ngap::parse_ue_context_release_command(&downlinks[1].0),
+            Some((1, 7, Some(ngap::CauseNas::NORMAL_RELEASE)))
+        );
+
         // UE side: verify/decipher and check the cause + rejected NSSAI.
-        let nas_bytes = downlink_nas_pdu(&pdu).expect("NAS PDU in the downlink");
+        let nas_bytes = downlink_nas_pdu(&downlinks[0].0).expect("NAS PDU in the downlink");
         let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
         let msg = ue_sec.unprotect(&nas_bytes, 1).expect("UE verifies the reject");
         assert_eq!(
