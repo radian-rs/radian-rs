@@ -50,6 +50,83 @@ pub struct NfProfile {
     pub nf_services: Option<Vec<NfService>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heart_beat_timer: Option<u32>,
+    /// SMF capabilities (TS 29.510 §6.1.6.2.10) — which slices/DNNs this SMF
+    /// serves. Present on SMF profiles; drives `(S-NSSAI, DNN)` discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smf_info: Option<SmfInfo>,
+}
+
+/// SMF-specific NF info (TS 29.510 §6.1.6.2.10), trimmed to the slice/DNN map
+/// used for SMF selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmfInfo {
+    pub s_nssai_smf_info_list: Vec<SnssaiSmfInfoItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnssaiSmfInfoItem {
+    pub s_nssai: ProfileSnssai,
+    pub dnn_smf_info_list: Vec<DnnSmfInfoItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSnssai {
+    pub sst: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DnnSmfInfoItem {
+    pub dnn: String,
+}
+
+impl SmfInfo {
+    /// Whether this SMF serves `dnn`, optionally within slice `snssai`
+    /// (`(sst, optional lowercase-hex sd)`). `None` slice → any slice serving
+    /// the DNN matches.
+    pub fn serves(&self, snssai: Option<(u8, Option<&str>)>, dnn: &str) -> bool {
+        self.s_nssai_smf_info_list.iter().any(|item| {
+            let slice_ok = match snssai {
+                None => true,
+                Some((sst, sd)) => {
+                    item.s_nssai.sst == sst
+                        && match (item.s_nssai.sd.as_deref(), sd) {
+                            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                }
+            };
+            slice_ok && item.dnn_smf_info_list.iter().any(|d| d.dnn == dnn)
+        })
+    }
+
+    /// Build an SmfInfo from `(sst, optional sd, dnn)` triples (config helper).
+    pub fn from_served(served: &[(u8, Option<&str>, &str)]) -> Self {
+        use std::collections::BTreeMap;
+        // Group DNNs under each (sst, sd) slice.
+        let mut by_slice: BTreeMap<(u8, Option<String>), Vec<String>> = BTreeMap::new();
+        for (sst, sd, dnn) in served {
+            by_slice
+                .entry((*sst, sd.map(|s| s.to_string())))
+                .or_default()
+                .push(dnn.to_string());
+        }
+        SmfInfo {
+            s_nssai_smf_info_list: by_slice
+                .into_iter()
+                .map(|((sst, sd), dnns)| SnssaiSmfInfoItem {
+                    s_nssai: ProfileSnssai { sst, sd },
+                    dnn_smf_info_list: dnns.into_iter().map(|dnn| DnnSmfInfoItem { dnn }).collect(),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl NfProfile {
@@ -66,6 +143,7 @@ impl NfProfile {
             ipv4_addresses: vec![ipv4.into()],
             nf_services: None,
             heart_beat_timer: None,
+            smf_info: None,
         }
     }
 }
@@ -218,6 +296,14 @@ struct DiscoveryQuery {
     #[serde(default)]
     #[allow(dead_code)] // accepted per spec; not yet used for filtering
     requester_nf_type: Option<String>,
+    // (S-NSSAI, DNN) filter for SMF selection. Trim: the spec encodes `snssais`
+    // as a JSON array; we take scalar `snssai-sst` / `snssai-sd` / `dnn`.
+    #[serde(default)]
+    snssai_sst: Option<u8>,
+    #[serde(default)]
+    snssai_sd: Option<String>,
+    #[serde(default)]
+    dnn: Option<String>,
 }
 
 async fn discover(
@@ -229,6 +315,17 @@ async fn discover(
     let nf_instances = g
         .values()
         .filter(|e| e.profile.nf_type.eq_ignore_ascii_case(&q.target_nf_type))
+        .filter(|e| match &q.dnn {
+            // A DNN filter selects SMFs whose smf_info serves it (optionally in
+            // the given slice). A profile without smf_info can't be slice/DNN
+            // matched, so it's excluded when the query is filtered.
+            Some(dnn) => e
+                .profile
+                .smf_info
+                .as_ref()
+                .is_some_and(|info| info.serves(q.snssai_sst.map(|sst| (sst, q.snssai_sd.as_deref())), dnn)),
+            None => true,
+        })
         .map(|e| e.profile.clone())
         .collect();
     Json(SearchResult { nf_instances })
@@ -281,19 +378,41 @@ impl NrfClient {
         Ok(())
     }
 
-    /// NFDiscovery (GET) — find NFs of `target_nf_type`.
+    /// NFDiscovery (GET) — find NFs of `target_nf_type` (no slice/DNN filter).
     pub async fn discover(
         &self,
         target_nf_type: &str,
         requester_nf_type: &str,
     ) -> Result<Vec<NfProfile>, SbiError> {
+        self.discover_for(target_nf_type, requester_nf_type, None, None).await
+    }
+
+    /// NFDiscovery (GET) with an optional `(S-NSSAI, DNN)` filter — SMF selection.
+    /// `snssai` is `(sst, optional lowercase-hex sd)`.
+    pub async fn discover_for(
+        &self,
+        target_nf_type: &str,
+        requester_nf_type: &str,
+        snssai: Option<(u8, Option<&str>)>,
+        dnn: Option<&str>,
+    ) -> Result<Vec<NfProfile>, SbiError> {
+        let mut query: Vec<(&str, String)> = vec![
+            ("target-nf-type", target_nf_type.to_string()),
+            ("requester-nf-type", requester_nf_type.to_string()),
+        ];
+        if let Some(dnn) = dnn {
+            query.push(("dnn", dnn.to_string()));
+        }
+        if let Some((sst, sd)) = snssai {
+            query.push(("snssai-sst", sst.to_string()));
+            if let Some(sd) = sd {
+                query.push(("snssai-sd", sd.to_string()));
+            }
+        }
         let resp = self
             .http
             .get(format!("{}/nnrf-disc/v1/nf-instances", self.base))
-            .query(&[
-                ("target-nf-type", target_nf_type),
-                ("requester-nf-type", requester_nf_type),
-            ])
+            .query(&query)
             .send()
             .await?
             .error_for_status()?;
@@ -372,6 +491,37 @@ mod tests {
         nrf.heartbeat("ausf-1").await.unwrap();
         nrf.deregister("ausf-1").await.unwrap();
         assert!(nrf.discover("AUSF", "AMF").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_filters_smf_by_snssai_and_dnn() {
+        let nrf = serve(NrfStore::default()).await;
+
+        // SMF-A serves slice 1/010203 dnn internet; SMF-B serves slice 2 dnn ims.
+        let mut a = NfProfile::new("smf-a", "SMF", "127.0.0.1");
+        a.smf_info = Some(SmfInfo::from_served(&[(1, Some("010203"), "internet")]));
+        let mut b = NfProfile::new("smf-b", "SMF", "127.0.0.2");
+        b.smf_info = Some(SmfInfo::from_served(&[(2, None, "ims")]));
+        nrf.register(&a).await.unwrap();
+        nrf.register(&b).await.unwrap();
+
+        // Filter by (1/010203, internet) → only SMF-A.
+        let got =
+            nrf.discover_for("SMF", "AMF", Some((1, Some("010203"))), Some("internet")).await.unwrap();
+        assert_eq!(got.iter().map(|p| p.nf_instance_id.as_str()).collect::<Vec<_>>(), ["smf-a"]);
+
+        // Filter by dnn ims (any slice) → only SMF-B.
+        let got = nrf.discover_for("SMF", "AMF", None, Some("ims")).await.unwrap();
+        assert_eq!(got.iter().map(|p| p.nf_instance_id.as_str()).collect::<Vec<_>>(), ["smf-b"]);
+
+        // A DNN nobody serves → empty.
+        assert!(nrf.discover_for("SMF", "AMF", None, Some("corporate")).await.unwrap().is_empty());
+
+        // Right DNN, wrong slice → empty (slice must match when given).
+        assert!(nrf.discover_for("SMF", "AMF", Some((9, None)), Some("internet")).await.unwrap().is_empty());
+
+        // Unfiltered discover still returns both.
+        assert_eq!(nrf.discover("SMF", "AMF").await.unwrap().len(), 2);
     }
 
     #[tokio::test]

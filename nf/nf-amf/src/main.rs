@@ -181,9 +181,10 @@ struct UeContext {
     /// The UE's advertised 5GS security capabilities `[EA, IA]`, replayed verbatim in the
     /// Security Mode Command (TS 24.501 §8.2.25) so the UE can detect a bidding-down attack.
     replayed_ue_sec_cap: Option<[u8; 2]>,
-    /// SM context refs of the UE's PDU sessions, keyed by PDU session id — one per
-    /// active session, addressing UpdateSMContext / ReleaseSMContext.
-    sm_refs: HashMap<u8, String>,
+    /// The UE's PDU sessions keyed by PDU session id: `(SM context ref, serving
+    /// SMF base URL)`. The stored base ensures UpdateSMContext / ReleaseSMContext
+    /// reach the *same* SMF that created the session (SMF selection, design/44).
+    sm_refs: HashMap<u8, (String, String)>,
     /// The subscribed UE-AMBR from am-data as `(downlink, uplink)` bits/sec, sent
     /// to the gNB in the N2 PDU Session Resource Setup. `None` → a default is used.
     ue_ambr: Option<(u64, u64)>,
@@ -347,8 +348,8 @@ async fn on_network_deregistration(
     }
     let ran_ue_id = ctx.ran_ue_id;
 
-    for (psi, sm_ref) in std::mem::take(&mut ctx.sm_refs) {
-        match amf_smf.release_sm_context(&sm_ref).await {
+    for (psi, (sm_ref, smf_base)) in std::mem::take(&mut ctx.sm_refs) {
+        match amf_smf.release_sm_context(&smf_base, &sm_ref).await {
             Ok(()) => info!("UE {amf_ue_id}: released SM context {sm_ref} (psi {psi}, network dereg)"),
             Err(e) => warn!("UE {amf_ue_id}: SM context {sm_ref} (psi {psi}) release failed: {e}"),
         }
@@ -503,11 +504,12 @@ async fn on_pdu_session_setup_response(
         warn!("PDUSessionResourceSetupResponse without AMF-UE-NGAP-ID");
         return;
     };
-    let Some(sm_ref) = ues.get(&amf_ue_id).and_then(|c| c.sm_refs.get(&psi).cloned()) else {
+    let Some((sm_ref, smf_base)) = ues.get(&amf_ue_id).and_then(|c| c.sm_refs.get(&psi).cloned())
+    else {
         warn!("UE {amf_ue_id}: setup response for PDU session {psi} but no SM context tracked");
         return;
     };
-    match amf_smf.update_sm_context(&sm_ref, gnb_teid, gnb_addr).await {
+    match amf_smf.update_sm_context(&smf_base, &sm_ref, gnb_teid, gnb_addr).await {
         Ok(()) => info!("UE {amf_ue_id}: PDU session {psi} downlink installed (gNB F-TEID {gnb_teid:#x})"),
         Err(e) => warn!("UE {amf_ue_id}: UpdateSMContext failed: {e}"),
     }
@@ -666,8 +668,8 @@ async fn on_deregistration(
 
     // Tear down an in-progress/active PDU session first — best effort: the UE is
     // leaving either way, so a release failure is logged, not fatal.
-    for (psi, sm_ref) in std::mem::take(&mut ctx.sm_refs) {
-        match amf_smf.release_sm_context(&sm_ref).await {
+    for (psi, (sm_ref, smf_base)) in std::mem::take(&mut ctx.sm_refs) {
+        match amf_smf.release_sm_context(&smf_base, &sm_ref).await {
             Ok(()) => info!("UE {amf_ue_id}: released SM context {sm_ref} (psi {psi}) on deregistration"),
             Err(e) => warn!("UE {amf_ue_id}: SM context {sm_ref} (psi {psi}) release failed: {e}"),
         }
@@ -808,7 +810,37 @@ async fn dispatch_uplink_nas(
                 ));
             }
 
-            match amf_smf.create_sm_context(&supi, psi, &dnn, snssai).await {
+            let smf_base = match amf_smf.select_smf(snssai, &dnn).await {
+                Ok(base) => base,
+                Err(e) => {
+                    // No SMF serves this (slice, DNN): reject the session (#27, or
+                    // #70 when the UE named a slice) with a back-off, like the SMF's
+                    // own refusal.
+                    let cause = if snssai.is_some() {
+                        nas::sm_cause::MISSING_OR_UNKNOWN_DNN_IN_SLICE
+                    } else {
+                        nas::sm_cause::MISSING_OR_UNKNOWN_DNN
+                    };
+                    warn!(
+                        "UE {amf_ue_id}: PDU session {psi} SMF selection failed ({e}); \
+                         sending Establishment Reject (5GSM cause #{cause})"
+                    );
+                    let reject = nas::pdu_session_establishment_reject(
+                        psi,
+                        pti,
+                        cause,
+                        Some(nas::GprsTimer3::from_secs(REJECT_BACKOFF_SECS)),
+                    );
+                    let dl = nas::dl_nas_transport_sm(psi, reject);
+                    let sec = ues.get_mut(&amf_ue_id).and_then(|c| c.sec.as_mut())?;
+                    let protected = sec.protect(&dl, nas::sht::INTEGRITY_CIPHERED, 1);
+                    return Some((
+                        ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, protected),
+                        "DownlinkNASTransport (PDUSessionEstablishmentReject)",
+                    ));
+                }
+            };
+            match amf_smf.create_sm_context(&smf_base, &supi, psi, &dnn, snssai).await {
                 Ok(created) => {
                     // Build the N1 PDU Session Establishment Accept (UE IP from the SMF,
                     // echoing the request's PTI) and NAS-protect a DL NAS Transport carrying
@@ -827,7 +859,7 @@ async fn dispatch_uplink_nas(
                     );
                     let dl = nas::dl_nas_transport_sm(psi, accept);
                     let Some(ctx) = ues.get_mut(&amf_ue_id) else { return None };
-                    ctx.sm_refs.insert(psi, created.sm_ref);
+                    ctx.sm_refs.insert(psi, (created.sm_ref, smf_base));
                     let (ambr_dl, ambr_ul) = ctx.ue_ambr.unwrap_or(DEFAULT_UE_AMBR_BPS);
                     let Some(sec) = ctx.sec.as_mut() else {
                         warn!("UE {amf_ue_id}: PDU session before NAS security is established");
@@ -1308,8 +1340,9 @@ mod tests {
         let (ki, ke) = ([0x11u8; 16], [0x22u8; 16]);
         let mut ctx = UeContext::new(7, RegState::Registered, Some("imsi-999700000000001".into()));
         ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
-        ctx.sm_refs.insert(5, "ctx-5".into());
-        ctx.sm_refs.insert(6, "ctx-6".into());
+        let smf_base = format!("http://{smf_addr}");
+        ctx.sm_refs.insert(5, ("ctx-5".into(), smf_base.clone()));
+        ctx.sm_refs.insert(6, ("ctx-6".into(), smf_base));
         let mut ues = HashMap::new();
         ues.insert(1u64, ctx);
 
