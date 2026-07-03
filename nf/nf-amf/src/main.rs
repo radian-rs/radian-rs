@@ -328,6 +328,19 @@ struct UeContext {
     /// (Npcf_AMPolicyControl) — deleted at deregistration. `None` when no PCF was
     /// reachable (the registration proceeds with subscribed policy).
     am_policy: Option<(String, String)>,
+    /// An AM policy change (UpdateNotify) that arrived while the UE was CM-IDLE —
+    /// held in the retained context (latest wins) and applied when the UE resumes
+    /// with a Service Request; the UE is paged so it comes back promptly.
+    pending_am_policy: Option<PendingAmPolicy>,
+}
+
+/// An AM policy change awaiting a CM-IDLE UE's return (see
+/// `UeContext::pending_am_policy`).
+#[derive(Debug, Clone, PartialEq)]
+struct PendingAmPolicy {
+    ue_ambr: (u64, u64),
+    rfsp: Option<u16>,
+    area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
@@ -564,8 +577,9 @@ fn namf_callback_router() -> axum::Router {
 
     /// `Npcf_AMPolicyControl_UpdateNotify` (TS 29.507) — the PCF pushes a changed
     /// AM policy for a UE. The AMF applies the new UE-AMBR and runs the UE
-    /// Configuration Update procedure. `204` if delivered; `404` if the UE isn't
-    /// reachable over N2.
+    /// Configuration Update procedure. `204` if delivered over N2; `202` if the UE
+    /// is CM-IDLE (the change is held in the retained context and the UE paged —
+    /// applied when it resumes); `404` if the UE is unknown.
     async fn am_policy_notify(
         axum::extract::Path(supi): axum::extract::Path<String>,
         axum::Json(policy): axum::Json<sbi_core::npcf_am::PolicyAssociation>,
@@ -585,13 +599,44 @@ fn namf_callback_router() -> axum::Router {
         match UE_DIRECTORY.lock().unwrap().get(&supi).cloned() {
             Some((amf_ue_id, tx))
                 if tx
-                    .send(UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr: (dl, ul), rfsp, area_restriction })
+                    .send(UeCmd::UpdateAmPolicy {
+                        amf_ue_id,
+                        ue_ambr: (dl, ul),
+                        rfsp,
+                        area_restriction: area_restriction.clone(),
+                    })
                     .is_ok() =>
             {
                 info!(%supi, "AM policy update (UpdateNotify) delivered to the association");
-                axum::http::StatusCode::NO_CONTENT
+                return axum::http::StatusCode::NO_CONTENT;
             }
-            _ => axum::http::StatusCode::NOT_FOUND,
+            _ => {}
+        }
+        // Not CM-CONNECTED — a retained CM-IDLE context instead? Hold the change
+        // there (latest wins) and page the UE (network-triggered Service Request,
+        // TS 23.502 §4.2.3.3); the resume path applies it. Same paging fan-out as
+        // the downlink-data path.
+        let tmsi = {
+            let mut retained = RETAINED.lock().unwrap();
+            let entry =
+                retained.iter_mut().find(|(_, c)| c.suci.as_deref() == Some(supi.as_str()));
+            entry.map(|(tmsi, ctx)| {
+                ctx.pending_am_policy =
+                    Some(PendingAmPolicy { ue_ambr: (dl, ul), rfsp, area_restriction });
+                *tmsi
+            })
+        };
+        match tmsi {
+            Some(tmsi) => {
+                let mut links = GNB_LINKS.lock().unwrap();
+                links.retain(|tx| tx.send(UeCmd::Page(tmsi)).is_ok());
+                info!(
+                    %supi, gnbs = links.len(),
+                    "AM policy update held for CM-IDLE UE — paging (applied on resume)"
+                );
+                axum::http::StatusCode::ACCEPTED
+            }
+            None => axum::http::StatusCode::NOT_FOUND,
         }
     }
 
@@ -1040,6 +1085,9 @@ async fn on_service_request(
     ctx.ran_ue_id = ran_ue_id;
     ctx.cm_state = CmState::Connected;
     ctx.retained_at = None; // resumed — the mobile-reachable timer stops
+    // An AM policy change that arrived while the UE was CM-IDLE — applied below,
+    // once the context is back in the association map.
+    let pending_am_policy = ctx.pending_am_policy.take();
     let supi = ctx.suci.clone();
     let sm_refs: Vec<(u8, (String, String))> =
         ctx.sm_refs.iter().map(|(psi, v)| (*psi, v.clone())).collect();
@@ -1094,6 +1142,15 @@ async fn on_service_request(
             }
             Err(e) => warn!("UE {amf_ue_id}: PDU session {psi} reactivation failed: {e}"),
         }
+    }
+
+    // Apply an AM policy change that arrived while the UE was idle: the same
+    // signalling as a CM-CONNECTED UpdateNotify (UE Context Modification to the RAN
+    // + a Configuration Update Command, with the Mobility Restriction List when the
+    // policy carries a service area).
+    if let Some(p) = pending_am_policy {
+        info!("UE {amf_ue_id}: applying the AM policy change held while CM-IDLE");
+        downlinks.extend(on_am_policy_update(ues, amf_ue_id, p.ue_ambr, p.rfsp, p.area_restriction));
     }
     downlinks
 }
@@ -1217,6 +1274,7 @@ impl UeContext {
             guti_tmsi: None,
             retained_at: None,
             am_policy: None,
+            pending_am_policy: None,
         }
     }
 }
@@ -2624,6 +2682,129 @@ mod tests {
         assert_eq!(status.as_u16(), 404);
 
         RETAINED.lock().unwrap().remove(&tmsi);
+    }
+
+    /// An AM policy change for a CM-IDLE UE: the UpdateNotify is held in the
+    /// retained context (202), the UE is paged, and the change is applied when the
+    /// UE resumes with a Service Request — the resume downlinks carry the UE Context
+    /// Modification (RFSP + UE-AMBR) and the Configuration Update Command with the
+    /// new Mobility Restriction List.
+    #[tokio::test]
+    async fn am_policy_update_for_a_cm_idle_ue_pages_and_applies_on_resume() {
+        let (ki, ke) = ([0x99u8; 16], [0xaau8; 16]);
+        let supi = "imsi-999700000000121";
+        let tmsi = 0x0000_0121u32;
+
+        // A retained CM-IDLE context (no PDU sessions — the policy path is the point).
+        let mut ctx = UeContext::new(0, RegState::Registered, Some(supi.into()));
+        ctx.cm_state = CmState::Idle;
+        ctx.guti_tmsi = Some(tmsi);
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.ue_ambr = Some((2_000_000_000, 1_000_000_000));
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+
+        // A mock gNB association link to observe the page.
+        let (gnb_tx, mut gnb_rx) = tokio::sync::mpsc::unbounded_channel();
+        GNB_LINKS.lock().unwrap().push(gnb_tx);
+
+        // The PCF pushes the UpdateNotify while the UE is idle → 202 (held + paged).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(listener, namf_callback_router()).await.unwrap() });
+        let client = sbi_core::h2c_client();
+        let policy = serde_json::json!({
+            "rfsp": 9,
+            "ueAmbr": { "uplink": "111 Mbps", "downlink": "222 Mbps" },
+            "servAreaRes": { "restrictionType": "ALLOWED_AREAS", "tacs": ["000003"] }
+        });
+        let status = client
+            .post(format!("http://{addr}/npcf-callback/v1/am-policy-notify/{supi}"))
+            .json(&policy)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 202, "held for the CM-IDLE UE");
+        // The gNB link received a Page for this TMSI (tolerate pages broadcast by
+        // parallel tests sharing the global registry).
+        let mut paged = false;
+        for _ in 0..10 {
+            match gnb_rx.recv().await {
+                Some(UeCmd::Page(t)) if t == tmsi => {
+                    paged = true;
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        assert!(paged, "CM-IDLE UE paged for the policy change");
+        // The change is held in the retained context (latest wins).
+        assert_eq!(
+            RETAINED.lock().unwrap().get(&tmsi).unwrap().pending_am_policy,
+            Some(PendingAmPolicy {
+                ue_ambr: (222_000_000, 111_000_000),
+                rfsp: Some(9),
+                area_restriction: Some((vec![[0, 0, 3]], Vec::new())),
+            })
+        );
+        // A completely unknown UE still yields 404.
+        let status = client
+            .post(format!("http://{addr}/npcf-callback/v1/am-policy-notify/imsi-000"))
+            .json(&policy)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 404);
+
+        // The UE answers the page with a protected Service Request; the resume
+        // applies the held policy after the Service Accept.
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let sr = ue_sec.protect(
+            &nas::decode_nas_5gs_message(&nas::service_request(1, 0, tmsi)).unwrap(),
+            nas::sht::INTEGRITY_CIPHERED,
+            0,
+        );
+        let pdu = ngap::initial_ue_message_with_stmsi(4, tmsi, sr);
+        let init = as_initial_ue(&pdu);
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+        let mut ues = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dls = on_service_request(&mut ues, &amf_smf, init, tmsi, &tx).await;
+
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            [
+                "DownlinkNASTransport (ServiceAccept)",
+                "UEContextModificationRequest (RFSP)",
+                "DownlinkNASTransport (ConfigurationUpdateCommand)",
+            ]
+        );
+        let (amf_ue_id, restored) = ues.iter().next().expect("context restored");
+        assert_eq!(restored.ue_ambr, Some((222_000_000, 111_000_000)), "UE-AMBR applied");
+        assert_eq!(restored.rfsp, Some(9), "RFSP applied");
+        assert_eq!(restored.area_restriction, Some((vec![[0, 0, 3]], Vec::new())));
+        assert_eq!(restored.pending_am_policy, None, "pending change consumed");
+        // The RAN sees the new policy: RFSP + UE-AMBR in the UE Context
+        // Modification, the service area on the CUC's transport.
+        assert_eq!(
+            ngap::ue_context_modification_params(&dls[1].0),
+            Some((*amf_ue_id, 4, Some(9), Some((222_000_000, 111_000_000))))
+        );
+        assert_eq!(
+            ngap::area_restriction_from_downlink_nas(&dls[2].0),
+            Some((vec![[0, 0, 3]], Vec::new()))
+        );
+        // The UE verifies the Service Accept then the Configuration Update Command.
+        let accept = ue_sec.unprotect(&downlink_nas_pdu(&dls[0].0).unwrap(), 1).expect("Service Accept");
+        assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::ServiceAccept));
+        let cuc = ue_sec.unprotect(&downlink_nas_pdu(&dls[2].0).unwrap(), 1).expect("CUC");
+        assert_eq!(
+            nas::gmm_message_type(&cuc),
+            Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand)
+        );
+        UE_DIRECTORY.lock().unwrap().remove(supi);
     }
 
     /// Service Request resume: a CM-IDLE UE (retained by 5G-TMSI) comes back with a
