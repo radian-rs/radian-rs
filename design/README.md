@@ -48,6 +48,7 @@ surface of the project and assesses build feasibility.
 | [37-deregistration.md](37-deregistration.md) | UE-initiated deregistration: PFCP Session Deletion, Nsmf ReleaseSMContext, Deregistration Accept (unless switch-off), UEContextReleaseCommand |
 | [38-network-dereg.md](38-network-dereg.md) | Network-initiated dereg: UDR DELETE → AMF callback (namf-callback :8001, UE_DIRECTORY) → Deregistration Request (UE terminated) + full teardown |
 | [39-t3522.md](39-t3522.md) | T3522: dereg accept-wait, 6s retransmissions (5 sends) then abort; DeregCmd channel, stale-expiry no-ops; live-traced vs free-ran-ue |
+| [40-uecm.md](40-uecm.md) | Nudm_UECM serving-AMF tracking: amf-3gpp-access context data in the UDR, withdrawal notifies the stored deregCallbackUri, purge on dereg |
 
 ## One-paragraph summary
 

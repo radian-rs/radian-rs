@@ -61,7 +61,9 @@ pub enum DataSet {
     SmfSelection,
 }
 
-/// Provisioned subscription data as JSON documents keyed by (SUPI, serving PLMN).
+/// Provisioned subscription data as JSON documents keyed by (SUPI, serving PLMN),
+/// plus the dynamic **context data** (TS 29.505 `amf-3gpp-access`): which AMF
+/// currently serves the SUPI (written at registration, purged at deregistration).
 pub trait ProvisionedDataStore: Send + Sync {
     /// Fetch a provisioned document. `None` if not provisioned.
     fn get_provisioned(&self, ds: DataSet, supi: &str, plmn: &str) -> Option<serde_json::Value>;
@@ -73,6 +75,12 @@ pub trait ProvisionedDataStore: Send + Sync {
         plmn: &str,
         doc: &serde_json::Value,
     ) -> Result<(), String>;
+    /// The serving AMF's registration document, if any.
+    fn get_amf_registration(&self, supi: &str) -> Option<serde_json::Value>;
+    /// Record the serving AMF (create or replace).
+    fn put_amf_registration(&self, supi: &str, doc: &serde_json::Value) -> Result<(), String>;
+    /// Purge the serving-AMF registration. Returns whether one existed.
+    fn remove_amf_registration(&self, supi: &str) -> bool;
 }
 
 /// Combined store the UDR holds as `Arc<dyn SubscriberStore>`.
@@ -146,6 +154,7 @@ struct InMemoryInner {
     credentials: HashMap<String, SubscriberKey>,
     sqn: HashMap<String, [u8; 6]>,
     docs: HashMap<(DataSet, String, String), serde_json::Value>,
+    amf_reg: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Default)]
@@ -183,6 +192,7 @@ impl SubscriberDb for InMemoryStore {
         let existed = g.credentials.remove(supi).is_some();
         g.sqn.remove(supi);
         g.docs.retain(|(_, s, _), _| s != supi);
+        g.amf_reg.remove(supi);
         existed
     }
 
@@ -217,6 +227,19 @@ impl ProvisionedDataStore for InMemoryStore {
         self.inner.lock().unwrap().docs.get(&(ds, supi.to_string(), plmn.to_string())).cloned()
     }
 
+    fn get_amf_registration(&self, supi: &str) -> Option<serde_json::Value> {
+        self.inner.lock().unwrap().amf_reg.get(supi).cloned()
+    }
+
+    fn put_amf_registration(&self, supi: &str, doc: &serde_json::Value) -> Result<(), String> {
+        self.inner.lock().unwrap().amf_reg.insert(supi.to_string(), doc.clone());
+        Ok(())
+    }
+
+    fn remove_amf_registration(&self, supi: &str) -> bool {
+        self.inner.lock().unwrap().amf_reg.remove(supi).is_some()
+    }
+
     fn put_provisioned(
         &self,
         ds: DataSet,
@@ -244,6 +267,9 @@ const AM_DATA: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("am_d
 const SM_DATA: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("sm_data");
 const SMF_SELECTION: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("smf_selection");
+/// Dynamic context data: the serving AMF's registration (TS 29.505
+/// `amf-3gpp-access`), keyed by SUPI, JSON value.
+const AMF_3GPP_REG: TableDefinition<&str, &[u8]> = TableDefinition::new("amf_3gpp_reg");
 
 fn doc_table(ds: DataSet) -> TableDefinition<'static, (&'static str, &'static str), &'static [u8]> {
     match ds {
@@ -297,6 +323,7 @@ impl RedbStore {
         w.open_table(AM_DATA)?;
         w.open_table(SM_DATA)?;
         w.open_table(SMF_SELECTION)?;
+        w.open_table(AMF_3GPP_REG)?;
         w.commit()?;
         Ok(Self { db, kek })
     }
@@ -373,6 +400,9 @@ impl SubscriberDb for RedbStore {
             if let Ok(mut t) = w.open_table(AUTH_STATE) {
                 let _ = t.remove(supi);
             }
+            if let Ok(mut t) = w.open_table(AMF_3GPP_REG) {
+                let _ = t.remove(supi);
+            }
             for ds in [DataSet::Am, DataSet::Sm, DataSet::SmfSelection] {
                 if let Ok(mut t) = w.open_table(doc_table(ds)) {
                     // Small tables: collect this SUPI's (supi, plmn) keys, then remove.
@@ -437,6 +467,36 @@ impl ProvisionedDataStore for RedbStore {
         let table = r.open_table(doc_table(ds)).ok()?;
         let guard = table.get((supi, plmn)).ok()??;
         serde_json::from_slice(guard.value()).ok()
+    }
+
+    fn get_amf_registration(&self, supi: &str) -> Option<serde_json::Value> {
+        let r = self.db.begin_read().ok()?;
+        let table = r.open_table(AMF_3GPP_REG).ok()?;
+        let guard = table.get(supi).ok()??;
+        serde_json::from_slice(guard.value()).ok()
+    }
+
+    fn put_amf_registration(&self, supi: &str, doc: &serde_json::Value) -> Result<(), String> {
+        let bytes = serde_json::to_vec(doc).map_err(|e| e.to_string())?;
+        let w = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = w.open_table(AMF_3GPP_REG).map_err(|e| e.to_string())?;
+            table.insert(supi, bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        w.commit().map_err(|e| e.to_string())
+    }
+
+    fn remove_amf_registration(&self, supi: &str) -> bool {
+        let Ok(w) = self.db.begin_write() else {
+            return false;
+        };
+        let mut existed = false;
+        {
+            if let Ok(mut t) = w.open_table(AMF_3GPP_REG) {
+                existed = t.remove(supi).map(|old| old.is_some()).unwrap_or(false);
+            }
+        }
+        w.commit().is_ok() && existed
     }
 
     fn put_provisioned(
@@ -534,6 +594,29 @@ mod tests {
     }
 
     #[test]
+    fn amf_registration_crud_and_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.redb");
+        let reg = json!({"amfInstanceId": "amf-1", "deregCallbackUri": "http://a/cb"});
+        {
+            let store = RedbStore::open(&path, KEK).unwrap();
+            assert!(store.get_amf_registration("imsi-1").is_none());
+            store.put_amf_registration("imsi-1", &reg).unwrap();
+            assert_eq!(store.get_amf_registration("imsi-1"), Some(reg.clone()));
+        }
+        // Survives reopen; purge removes it.
+        let store = RedbStore::open(&path, KEK).unwrap();
+        assert_eq!(store.get_amf_registration("imsi-1"), Some(reg.clone()));
+        assert!(store.remove_amf_registration("imsi-1"));
+        assert!(!store.remove_amf_registration("imsi-1"), "second purge is a no-op");
+
+        let mem = InMemoryStore::new();
+        mem.put_amf_registration("imsi-1", &reg).unwrap();
+        assert_eq!(mem.get_amf_registration("imsi-1"), Some(reg));
+        assert!(mem.remove_amf_registration("imsi-1"));
+    }
+
+    #[test]
     fn remove_subscriber_withdraws_everything() {
         let dir = tempfile::tempdir().unwrap();
         let store = RedbStore::open(dir.path().join("s.redb"), KEK).unwrap();
@@ -545,8 +628,13 @@ mod tests {
             .put_provisioned(DataSet::Sm, "imsi-1", "00101", &json!({"b": 2}))
             .unwrap();
 
+        store
+            .put_amf_registration("imsi-1", &json!({"amfInstanceId": "amf-1"}))
+            .unwrap();
+
         assert!(store.remove_subscriber("imsi-1"), "existed");
         assert!(!store.exists("imsi-1"));
+        assert!(store.get_amf_registration("imsi-1").is_none(), "context data wiped too");
         assert_eq!(store.next_sqn("imsi-1"), None);
         assert!(store.get_provisioned(DataSet::Am, "imsi-1", "99970").is_none());
         assert!(store.get_provisioned(DataSet::Sm, "imsi-1", "00101").is_none());
