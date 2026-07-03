@@ -58,6 +58,10 @@ pub fn router(udr: Arc<UdrClient>) -> Router {
             "/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access",
             axum::routing::put(uecm_register_amf).delete(uecm_deregister_amf),
         )
+        .route(
+            "/nudm-uecm/v1/{supi}/registrations/smf-registrations/{pdu_session_id}",
+            axum::routing::put(uecm_register_smf).delete(uecm_deregister_smf),
+        )
         .route("/nudm-sdm/v2/{supi}/am-data", get(sdm_am_data))
         .route("/nudm-sdm/v2/{supi}/sm-data", get(sdm_sm_data))
         .route("/nudm-sdm/v2/{supi}/smf-select-data", get(sdm_smf_select_data))
@@ -103,6 +107,46 @@ async fn uecm_deregister_amf(
     })?;
     if existed {
         tracing::info!(%supi, "serving AMF purged (UECM)");
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+/// `Nudm_UECM` `SmfRegistration` (TS 29.503 §6.2.6.2.6), trimmed: the serving SMF
+/// for a PDU session — stored as UDR context data keyed by `(SUPI, pduSessionId)`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmfRegistration {
+    pub smf_instance_id: String,
+    pub pdu_session_id: u8,
+    pub dnn: String,
+}
+
+async fn uecm_register_smf(
+    State(udr): State<Arc<UdrClient>>,
+    Path((supi, psi)): Path<(String, u8)>,
+    Json(reg): Json<SmfRegistration>,
+) -> Result<StatusCode, StatusCode> {
+    let doc = serde_json::to_value(&reg).map_err(|_| StatusCode::BAD_REQUEST)?;
+    udr.put_smf_registration(&supi, psi, &doc).await.map_err(|e| {
+        tracing::warn!("UDR smf-registrations put failed: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+    tracing::info!(%supi, psi, smf = %reg.smf_instance_id, "serving SMF registered (UECM)");
+    Ok(StatusCode::CREATED)
+}
+
+async fn uecm_deregister_smf(
+    State(udr): State<Arc<UdrClient>>,
+    Path((supi, psi)): Path<(String, u8)>,
+) -> Result<StatusCode, StatusCode> {
+    let existed = udr.delete_smf_registration(&supi, psi).await.map_err(|e| {
+        tracing::warn!("UDR smf-registrations delete failed: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+    if existed {
+        tracing::info!(%supi, psi, "serving SMF purged (UECM)");
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -251,6 +295,41 @@ impl NudmClient {
         let resp = self
             .http
             .delete(format!("{}/nudm-uecm/v1/{}/registrations/amf-3gpp-access", self.base, supi))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        resp.error_for_status()?;
+        Ok(true)
+    }
+
+    /// Nudm_UECM — register as the serving SMF for a PDU session.
+    pub async fn uecm_register_smf(&self, supi: &str, reg: &SmfRegistration) -> Result<(), SbiError> {
+        self.http
+            .put(format!(
+                "{}/nudm-uecm/v1/{}/registrations/smf-registrations/{}",
+                self.base, supi, reg.pdu_session_id
+            ))
+            .json(reg)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Nudm_UECM — purge a serving-SMF registration. `Ok(false)` when none existed.
+    pub async fn uecm_deregister_smf(
+        &self,
+        supi: &str,
+        pdu_session_id: u8,
+    ) -> Result<bool, SbiError> {
+        let resp = self
+            .http
+            .delete(format!(
+                "{}/nudm-uecm/v1/{}/registrations/smf-registrations/{}",
+                self.base, supi, pdu_session_id
+            ))
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {

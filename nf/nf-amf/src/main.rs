@@ -69,6 +69,16 @@ static NEXT_AMF_UE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// SBI port the AMF's callback surface listens on (namf-callback).
 const SBI_PORT: u16 = 8001;
+/// Address other NFs use to reach this AMF's SBI surface — advertised in the NRF
+/// profile and baked into the deregistration callback URI. `RADIAN_AMF_ADVERTISE_ADDR`
+/// overrides the loopback default for multi-host deployments.
+const ADVERTISE_ENV: &str = "RADIAN_AMF_ADVERTISE_ADDR";
+const DEFAULT_ADVERTISE_ADDR: &str = "127.0.0.1";
+
+/// The advertised SBI address (host only), from `RADIAN_AMF_ADVERTISE_ADDR`.
+static ADVERTISE_ADDR: LazyLock<String> = LazyLock::new(|| {
+    std::env::var(ADVERTISE_ENV).unwrap_or_else(|_| DEFAULT_ADVERTISE_ADDR.to_string())
+});
 
 /// T3522 (TS 24.501 §10.2): the Deregistration Request (UE terminated) is
 /// retransmitted on each expiry, up to [`T3522_MAX_SENDS`] total transmissions,
@@ -97,7 +107,8 @@ fn spawn_uecm_register(supi: String) {
         let reg = sbi_core::nudm::Amf3GppAccessRegistration {
             amf_instance_id: AMF_INSTANCE_ID.clone(),
             dereg_callback_uri: format!(
-                "http://127.0.0.1:{SBI_PORT}/namf-callback/v1/{supi}/dereg-notify"
+                "http://{}:{SBI_PORT}/namf-callback/v1/{supi}/dereg-notify",
+                &*ADVERTISE_ADDR
             ),
         };
         match discover_nf(NRF_BASE, "UDM").await {
@@ -202,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
             error!("AMF SBI server failed: {e}");
         }
     });
-    match register_with_nrf(NRF_BASE, std::net::Ipv4Addr::LOCALHOST, SBI_PORT).await {
+    match register_with_nrf(NRF_BASE, &ADVERTISE_ADDR, SBI_PORT).await {
         Ok(()) => info!(nrf = NRF_BASE, "registered AMF with NRF"),
         Err(e) => warn!("NRF registration failed (continuing without callbacks): {e}"),
     }
@@ -291,19 +302,15 @@ fn namf_callback_router() -> axum::Router {
 }
 
 /// Register the AMF's callback surface with the NRF and keep it alive.
-async fn register_with_nrf(
-    nrf_base: &str,
-    ip: std::net::Ipv4Addr,
-    sbi_port: u16,
-) -> anyhow::Result<()> {
+async fn register_with_nrf(nrf_base: &str, host: &str, sbi_port: u16) -> anyhow::Result<()> {
     use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService};
-    let mut profile = NfProfile::new(AMF_INSTANCE_ID.clone(), "AMF", ip.to_string());
+    let mut profile = NfProfile::new(AMF_INSTANCE_ID.clone(), "AMF", host.to_string());
     profile.nf_services = Some(vec![NfService {
         service_instance_id: "namf-callback-1".into(),
         service_name: "namf-callback".into(),
         scheme: "http".into(),
         ip_end_points: vec![IpEndPoint {
-            ipv4_address: Some(ip.to_string()),
+            ipv4_address: Some(host.to_string()),
             port: Some(sbi_port),
         }],
     }]);
