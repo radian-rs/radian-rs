@@ -323,16 +323,40 @@ fn fiveg_s_tmsi(tmsi: u32) -> FiveG_S_TMSI {
 /// Build a `Paging` (TS 38.413 §9.2.5.4) — a **non-UE-associated** message the AMF
 /// broadcasts to gNBs to page a CM-IDLE UE by its 5G-S-TMSI, restricted to the
 /// tracking-area list. The UE answers with a Service Request.
-pub fn paging(tmsi: u32, mcc: &str, mnc: &str, tac: &[u8]) -> NGAP_PDU {
-    let tai_list = TAIListForPaging(vec![TAIListForPagingItem {
-        tai: helpers::tai(plmn(mcc, mnc), tac),
-        ie_extensions: None,
-    }]);
+pub fn paging(tmsi: u32, mcc: &str, mnc: &str, tacs: &[[u8; 3]]) -> NGAP_PDU {
+    let tai_list = TAIListForPaging(
+        tacs.iter()
+            .map(|tac| TAIListForPagingItem {
+                tai: helpers::tai(plmn(mcc, mnc), tac),
+                ie_extensions: None,
+            })
+            .collect(),
+    );
     build_ngap!(InitiatingMessage, Paging,
         IGNORE, Paging,
         IGNORE UEPagingIdentity(UEPagingIdentity::FiveG_S_TMSI(fiveg_s_tmsi(tmsi))),
         IGNORE TAIListForPaging(tai_list),
     )
+}
+
+/// The tracking areas a `Paging` message targets (TAI List for Paging) — the gNB
+/// side / tests.
+pub fn tacs_from_paging(pdu: &NGAP_PDU) -> Option<Vec<[u8; 3]>> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_Paging(paging) = value else {
+        return None;
+    };
+    paging.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        PagingProtocolIEs_EntryValue::Id_TAIListForPaging(list) => Some(
+            list.0
+                .iter()
+                .filter_map(|item| <[u8; 3]>::try_from(item.tai.tac.0.as_slice()).ok())
+                .collect(),
+        ),
+        _ => None,
+    })
 }
 
 /// Extract the paged UE's **5G-TMSI** from a `Paging` message (gNB side / tests).
@@ -1051,14 +1075,18 @@ mod release_tests {
 
     #[test]
     fn paging_roundtrips() {
-        let pdu = paging(0x00A1_B2C3, "999", "70", &[0x00, 0x00, 0x01]);
+        // A multi-TAI registration area rides the TAI List for Paging.
+        let area = [[0x00, 0x00, 0x01], [0x00, 0x00, 0x02]];
+        let pdu = paging(0x00A1_B2C3, "999", "70", &area);
         let mut data = PerCodecData::new_aper();
         pdu.aper_encode(&mut data).expect("APER encode");
         let bytes = data.get_inner().expect("bytes");
         let back = NGAP_PDU::decode(&bytes).expect("APER decode");
         assert_eq!(tmsi_from_paging(&back), Some(0x00A1_B2C3));
+        assert_eq!(tacs_from_paging(&back), Some(area.to_vec()));
         // A non-Paging message has no paged TMSI.
         assert_eq!(tmsi_from_paging(&initial_ue_message_with_nas(1, vec![1])), None);
+        assert_eq!(tacs_from_paging(&initial_ue_message_with_nas(1, vec![1])), None);
     }
 
     #[test]
