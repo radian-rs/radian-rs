@@ -599,10 +599,16 @@ fn masked_supi(supi: &str) -> String {
     }
 }
 
-/// Register this SMF's `nsmf-pdusession` service with the NRF so the AMF can
-/// discover it, and keep it alive via the NRF-assigned heartbeat.
+/// The `(sst, optional SD, DNN)` triples this SMF serves — advertised in its NRF
+/// profile so the AMF can select it by `(S-NSSAI, DNN)`. Config in production;
+/// here the demo slice + DNN, matching the UDR's smf-selection provisioning.
+const SERVED_SLICES: &[(u8, Option<&str>, &str)] = &[(1, Some("010203"), "internet")];
+
+/// Register this SMF's `nsmf-pdusession` service with the NRF (advertising the
+/// slices/DNNs it serves so the AMF can select it), keeping it alive via the
+/// NRF-assigned heartbeat.
 pub async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> anyhow::Result<()> {
-    use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService};
+    use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService, SmfInfo};
     let mut profile = NfProfile::new(SMF_INSTANCE_ID.clone(), "SMF", ip.to_string());
     profile.nf_services = Some(vec![NfService {
         service_instance_id: "nsmf-pdusession-1".into(),
@@ -613,6 +619,7 @@ pub async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> a
             port: Some(sbi_port),
         }],
     }]);
+    profile.smf_info = Some(SmfInfo::from_served(SERVED_SLICES));
     sbi_core::nnrf::register_and_maintain(nrf_base, profile).await?;
     Ok(())
 }

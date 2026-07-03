@@ -52,6 +52,7 @@ surface of the project and assesses build feasibility.
 | [41-smf-uecm.md](41-smf-uecm.md) | SMF-side Nudm_UECM (smf-registrations per PDU session, register on create / purge on release) + config-derived AMF callback advertise address |
 | [42-uecm-expiry.md](42-uecm-expiry.md) | UECM stale-registration expiry: UDR sweep evicts context data whose serving NF is gone from the NRF (reuses NRF heartbeat), fail-safe on unreachable NRF |
 | [43-multi-pdu-ue-ambr.md](43-multi-pdu-ue-ambr.md) | Multiple PDU sessions per UE (sm_refs keyed by psi, release all on dereg) + UE-AMBR from am-data → NGAP UEAggregateMaximumBitRate IE |
+| [44-smf-selection.md](44-smf-selection.md) | AMF-side SMF selection by (S-NSSAI, DNN): NRF profile smfInfo + filtered discovery, AMF stores the selected SMF base per session (modify/release hit the same one) |
 
 ## One-paragraph summary
 

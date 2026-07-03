@@ -78,12 +78,12 @@ impl AmfSmf {
     /// slice was requested).
     pub async fn create_sm_context(
         &self,
+        smf_base: &str,
         supi: &str,
         pdu_session_id: u8,
         dnn: &str,
         snssai: Option<(u8, Option<[u8; 3]>)>,
     ) -> Result<SmContextCreated, CreateSmError> {
-        let smf_base = self.discover_smf().await?;
         let mut body = serde_json::json!({
             "supi": supi,
             "pduSessionId": pdu_session_id,
@@ -150,8 +150,7 @@ impl AmfSmf {
 
     /// Release an SM context (TS 29.502) — the SMF tears the N4 session down at
     /// the UPF. Driven by deregistration.
-    pub async fn release_sm_context(&self, sm_ref: &str) -> Result<(), String> {
-        let smf_base = self.discover_smf().await?;
+    pub async fn release_sm_context(&self, smf_base: &str, sm_ref: &str) -> Result<(), String> {
         let resp = sbi_core::h2c_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release"))
             .send()
@@ -167,11 +166,11 @@ impl AmfSmf {
     /// driving the SMF's N4 Session Modification (the downlink path).
     pub async fn update_sm_context(
         &self,
+        smf_base: &str,
         sm_ref: &str,
         gnb_teid: u32,
         gnb_addr: Ipv4Addr,
     ) -> Result<(), String> {
-        let smf_base = self.discover_smf().await?;
         let resp = sbi_core::h2c_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
             .json(&serde_json::json!({
@@ -187,15 +186,25 @@ impl AmfSmf {
         Ok(())
     }
 
-    async fn discover_smf(&self) -> Result<String, String> {
+    /// Select an SMF that serves `(snssai, dnn)` (TS 23.501 §6.3.2) — NRF
+    /// discovery filtered by the slice/DNN the UE requested. Returns its base
+    /// URL, which the caller stores per session so UpdateSMContext /
+    /// ReleaseSMContext reach the *same* SMF.
+    pub async fn select_smf(
+        &self,
+        snssai: Option<(u8, Option<[u8; 3]>)>,
+        dnn: &str,
+    ) -> Result<String, String> {
+        let sd_hex = snssai.and_then(|(_, sd)| sd.map(hex::encode));
+        let filter = snssai.map(|(sst, _)| (sst, sd_hex.as_deref()));
         let profile = self
             .nrf
-            .discover("SMF", "AMF")
+            .discover_for("SMF", "AMF", filter, Some(dnn))
             .await
             .map_err(|e| format!("NRF discovery failed: {e}"))?
             .into_iter()
             .next()
-            .ok_or("no SMF registered with the NRF")?;
+            .ok_or_else(|| format!("no SMF serves (snssai={snssai:?}, dnn={dnn})"))?;
         let endpoint = profile
             .nf_services
             .and_then(|s| s.into_iter().next())
@@ -267,32 +276,39 @@ mod tests {
                 port: Some(smf_addr.port()),
             }],
         }]);
+        // The mock SMF advertises the slice/DNN it serves so selection finds it.
+        profile.smf_info = Some(sbi_core::nnrf::SmfInfo::from_served(&[(1, Some("010203"), "internet")]));
         NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
 
         let amf_smf = AmfSmf::new(nrf_base, "999", "70");
         let requested = Some((1, Some([1, 2, 3])));
+
+        // Select an SMF by (slice, DNN), then create against that base.
+        let smf_base = amf_smf.select_smf(requested, "internet").await.expect("SMF selected");
+        assert_eq!(smf_base, format!("http://{smf_addr}"), "the advertised SMF was selected");
         let created = amf_smf
-            .create_sm_context("imsi-999700000000001", 5, "internet", requested)
+            .create_sm_context(&smf_base, "imsi-999700000000001", 5, "internet", requested)
             .await
-            .expect("AMF creates SM context via discovered SMF");
+            .expect("AMF creates SM context via the selected SMF");
         assert_eq!(created.up_n3_teid, 1, "UPF N3 F-TEID parsed from the response");
-        // Subscribed session parameters parsed for the N1 accept.
         assert_eq!((created.snssai_sst, created.snssai_sd), (1, Some([1, 2, 3])));
         assert_eq!(
             created.ambr,
             nas::SessionAmbr { dl_unit: 0x0B, dl: 2, ul_unit: 0x0B, ul: 1 }
         );
 
-        // The gNB F-TEID (from N2 setup) drives UpdateSMContext.
+        // The gNB F-TEID (from N2 setup) drives UpdateSMContext at the same SMF.
         amf_smf
-            .update_sm_context(&created.sm_ref, 0x5678, Ipv4Addr::new(10, 0, 0, 9))
+            .update_sm_context(&smf_base, &created.sm_ref, 0x5678, Ipv4Addr::new(10, 0, 0, 9))
             .await
             .expect("AMF updates SM context with the gNB F-TEID");
 
-        // An SMF 403 (denied pair) surfaces as the typed Forbidden error — the
-        // signal for the AMF to send a 5GSM reject (#27, or #70 with a slice).
+        // No SMF serves an unknown DNN → selection fails (→ the AMF rejects the session).
+        assert!(amf_smf.select_smf(requested, "corporate").await.is_err(), "no SMF for that DNN");
+
+        // An SMF 403 (denied pair) surfaces as the typed Forbidden error.
         let err = amf_smf
-            .create_sm_context("imsi-999700000000001", 5, "corporate", requested)
+            .create_sm_context(&smf_base, "imsi-999700000000001", 5, "corporate", requested)
             .await
             .expect_err("unsubscribed DNN must be refused");
         assert!(matches!(err, CreateSmError::Forbidden), "got {err:?}");
