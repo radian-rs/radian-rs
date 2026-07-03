@@ -70,11 +70,35 @@ static NEXT_AMF_UE_ID: AtomicU64 = AtomicU64::new(1);
 /// SBI port the AMF's callback surface listens on (namf-callback).
 const SBI_PORT: u16 = 8001;
 
+/// T3522 (TS 24.501 §10.2): the Deregistration Request (UE terminated) is
+/// retransmitted on each expiry, up to [`T3522_MAX_SENDS`] total transmissions,
+/// then the procedure is aborted and the contexts released anyway (§5.5.2.3.4).
+const T3522_SECS: u64 = 6;
+const T3522_MAX_SENDS: u8 = 5; // initial + 4 retransmissions
+
+/// A command for a gNB association's deregistration channel.
+#[derive(Debug, Clone, Copy)]
+enum DeregCmd {
+    /// Begin network-initiated deregistration for this UE (subscription withdrawn).
+    Start(u64),
+    /// T3522 fired for this UE — retransmit or abort.
+    T3522Expiry(u64),
+}
+
 /// Directory of served UEs: SUPI → (AMF-UE-NGAP-ID, the owning association's
 /// deregistration channel). Lets the SBI callback surface (subscription
 /// withdrawal) reach a UE that lives inside an SCTP association task.
-static UE_DIRECTORY: LazyLock<Mutex<HashMap<String, (u64, UnboundedSender<u64>)>>> =
+static UE_DIRECTORY: LazyLock<Mutex<HashMap<String, (u64, UnboundedSender<DeregCmd>)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Arm T3522: after `secs`, post an expiry for this UE onto its association.
+fn arm_t3522(tx: &UnboundedSender<DeregCmd>, amf_ue_id: u64, secs: u64) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        let _ = tx.send(DeregCmd::T3522Expiry(amf_ue_id));
+    });
+}
 
 /// Where a UE is in the registration flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +129,9 @@ struct UeContext {
     allowed_nssai: Option<Vec<(u8, Option<[u8; 3]>)>>,
     /// The NSSAI the UE requested in its Registration Request (empty = IE omitted).
     requested_nssai: Vec<(u8, Option<[u8; 3]>)>,
+    /// Network-initiated deregistration in progress: how many Deregistration
+    /// Requests have been sent (T3522 governs retransmission). `None` = idle.
+    dereg_attempts: Option<u8>,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
@@ -161,7 +188,7 @@ async fn serve_gnb(
 ) -> anyhow::Result<()> {
     let mut ues: HashMap<u64, UeContext> = HashMap::new();
     // The SBI callback surface reaches this association's UEs through this channel.
-    let (dereg_tx, mut dereg_rx) = unbounded_channel::<u64>();
+    let (dereg_tx, mut dereg_rx) = unbounded_channel::<DeregCmd>();
     let result = loop {
         tokio::select! {
             received = conn.sctp_recv() => match received {
@@ -175,8 +202,14 @@ async fn serve_gnb(
                     handle_ngap(&conn, &mut ues, &amf_auth, &amf_smf, &dereg_tx, &data.payload).await;
                 }
             },
-            Some(amf_ue_id) = dereg_rx.recv() => {
-                for (dl, label) in on_network_deregistration(&mut ues, &amf_smf, amf_ue_id).await {
+            Some(cmd) = dereg_rx.recv() => {
+                let downlinks = match cmd {
+                    DeregCmd::Start(id) => {
+                        on_network_deregistration(&mut ues, &amf_smf, id, &dereg_tx, T3522_SECS).await
+                    }
+                    DeregCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, T3522_SECS),
+                };
+                for (dl, label) in downlinks {
                     send_or_log(&conn, &dl, label).await;
                 }
             }
@@ -198,7 +231,7 @@ fn namf_callback_router() -> axum::Router {
     ) -> axum::http::StatusCode {
         let entry = UE_DIRECTORY.lock().unwrap().get(&supi).cloned();
         match entry {
-            Some((amf_ue_id, tx)) if tx.send(amf_ue_id).is_ok() => {
+            Some((amf_ue_id, tx)) if tx.send(DeregCmd::Start(amf_ue_id)).is_ok() => {
                 info!(%supi, "subscription withdrawn — deregistering UE {amf_ue_id}");
                 axum::http::StatusCode::NO_CONTENT
             }
@@ -234,18 +267,25 @@ async fn register_with_nrf(
 
 /// Network-initiated deregistration (TS 24.501 §5.5.2.3), triggered by a
 /// subscription withdrawal: release the PDU session, send the UE a
-/// Deregistration Request (UE terminated, re-registration not required), then
-/// the UE Context Release Command, and drop the contexts. Deviation: we do not
-/// run T3522 / await the UE's Deregistration Accept — cleanup is immediate.
+/// Deregistration Request (UE terminated, re-registration not required), and
+/// start **T3522** — the contexts stay until the UE's Deregistration Accept
+/// arrives ([`dispatch_uplink_nas`]) or the retransmissions are exhausted
+/// ([`on_t3522_expiry`]).
 async fn on_network_deregistration(
     ues: &mut HashMap<u64, UeContext>,
     amf_smf: &pdu_session::AmfSmf,
     amf_ue_id: u64,
+    dereg_tx: &UnboundedSender<DeregCmd>,
+    t3522_secs: u64,
 ) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
         warn!("network deregistration for unknown UE {amf_ue_id}");
         return Vec::new();
     };
+    if ctx.dereg_attempts.is_some() {
+        info!("UE {amf_ue_id}: deregistration already in progress");
+        return Vec::new();
+    }
     let ran_ue_id = ctx.ran_ue_id;
 
     if let Some(sm_ref) = ctx.sm_ref.take() {
@@ -254,29 +294,77 @@ async fn on_network_deregistration(
             Err(e) => warn!("UE {amf_ue_id}: SM context {sm_ref} release failed: {e}"),
         }
     }
-
-    let mut downlinks = Vec::new();
-    if let Some(sec) = ctx.sec.as_mut() {
-        // Re-registration not required (subscription withdrawn), 3GPP access.
-        let req = nas::deregistration_request_to_ue(0x01);
-        let bytes = sec.protect(&req, nas::sht::INTEGRITY_CIPHERED, 1);
-        downlinks.push((
-            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
-            "DownlinkNASTransport (DeregistrationRequest)",
-        ));
-    } else {
-        warn!("UE {amf_ue_id}: network dereg before NAS security; skipping the NAS request");
-    }
-    downlinks.push((
-        ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
-        "UEContextReleaseCommand",
-    ));
+    // The UE stops being addressable for further withdrawals immediately.
     if let Some(supi) = ctx.suci.clone() {
         UE_DIRECTORY.lock().unwrap().remove(&supi);
     }
+
+    let Some(sec) = ctx.sec.as_mut() else {
+        // Can't NAS-signal an unsecured UE — release the RAN side and be done.
+        warn!("UE {amf_ue_id}: network dereg before NAS security; releasing without a NAS request");
+        ues.remove(&amf_ue_id);
+        return vec![(
+            ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
+            "UEContextReleaseCommand",
+        )];
+    };
+    // Re-registration not required (subscription withdrawn), 3GPP access.
+    let req = nas::deregistration_request_to_ue(0x01);
+    let bytes = sec.protect(&req, nas::sht::INTEGRITY_CIPHERED, 1);
+    ctx.dereg_attempts = Some(1);
+    arm_t3522(dereg_tx, amf_ue_id, t3522_secs);
+    info!("UE {amf_ue_id}: Deregistration Request sent (attempt 1/{T3522_MAX_SENDS}); T3522 armed");
+    vec![(
+        ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
+        "DownlinkNASTransport (DeregistrationRequest)",
+    )]
+}
+
+/// T3522 fired: retransmit the Deregistration Request while attempts remain;
+/// after [`T3522_MAX_SENDS`] transmissions, abort the procedure (§5.5.2.3.4) —
+/// release the RAN-side context and drop ours anyway.
+fn on_t3522_expiry(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_ue_id: u64,
+    dereg_tx: &UnboundedSender<DeregCmd>,
+    t3522_secs: u64,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        return Vec::new(); // accept already completed the procedure
+    };
+    let Some(attempts) = ctx.dereg_attempts else {
+        return Vec::new(); // stale expiry (procedure not running)
+    };
+    let ran_ue_id = ctx.ran_ue_id;
+
+    if attempts < T3522_MAX_SENDS {
+        let Some(sec) = ctx.sec.as_mut() else {
+            return Vec::new();
+        };
+        let req = nas::deregistration_request_to_ue(0x01);
+        let bytes = sec.protect(&req, nas::sht::INTEGRITY_CIPHERED, 1);
+        ctx.dereg_attempts = Some(attempts + 1);
+        arm_t3522(dereg_tx, amf_ue_id, t3522_secs);
+        warn!(
+            "UE {amf_ue_id}: T3522 expired — retransmitting Deregistration Request \
+             (attempt {}/{T3522_MAX_SENDS})",
+            attempts + 1
+        );
+        return vec![(
+            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
+            "DownlinkNASTransport (DeregistrationRequest)",
+        )];
+    }
+
+    warn!(
+        "UE {amf_ue_id}: T3522 exhausted after {T3522_MAX_SENDS} transmissions — \
+         aborting deregistration and releasing the contexts"
+    );
     ues.remove(&amf_ue_id);
-    info!("UE {amf_ue_id}: network-initiated deregistration complete");
-    downlinks
+    vec![(
+        ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
+        "UEContextReleaseCommand",
+    )]
 }
 
 /// Decode one NGAP PDU and dispatch it.
@@ -285,7 +373,7 @@ async fn handle_ngap(
     ues: &mut HashMap<u64, UeContext>,
     amf_auth: &auth::AmfAuth,
     amf_smf: &pdu_session::AmfSmf,
-    dereg_tx: &UnboundedSender<u64>,
+    dereg_tx: &UnboundedSender<DeregCmd>,
     bytes: &[u8],
 ) {
     let pdu = match NGAP_PDU::decode(bytes) {
@@ -382,7 +470,7 @@ fn on_initial_ue(
     ues: &mut HashMap<u64, UeContext>,
     msg: &InitialUEMessage,
     amf_ue_id: u64,
-    dereg_tx: &UnboundedSender<u64>,
+    dereg_tx: &UnboundedSender<DeregCmd>,
 ) -> Option<InitialUeOutcome> {
     let ran_ue_id = initial_ue_ran_id(msg)?;
     let identity = initial_ue_nas_pdu(msg)
@@ -419,6 +507,7 @@ impl UeContext {
             sm_ref: None,
             allowed_nssai: None,
             requested_nssai: Vec::new(),
+            dereg_attempts: None,
         }
     }
 }
@@ -557,6 +646,23 @@ async fn dispatch_uplink_nas(
         Some(Nas5gmmMessageType::AuthenticationResponse) => {
             let res_star = nas::res_star_from_authentication_response(&nas_msg)?.to_vec();
             complete_authentication(ues, amf_auth, amf_ue_id, &res_star).await
+        }
+        Some(Nas5gmmMessageType::DeregistrationAcceptToUe) => {
+            let ctx = ues.get(&amf_ue_id)?;
+            if ctx.dereg_attempts.is_none() {
+                warn!("UE {amf_ue_id}: unexpected Deregistration Accept (no procedure running)");
+                return None;
+            }
+            let ran_ue_id = ctx.ran_ue_id;
+            info!("UE {amf_ue_id}: Deregistration Accept — network-initiated deregistration complete");
+            if let Some(supi) = ctx.suci.clone() {
+                UE_DIRECTORY.lock().unwrap().remove(&supi);
+            }
+            ues.remove(&amf_ue_id);
+            Some((
+                ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
+                "UEContextReleaseCommand",
+            ))
         }
         Some(Nas5gmmMessageType::RegistrationComplete) => {
             let ctx = ues.get_mut(&amf_ue_id)?;
@@ -1120,16 +1226,17 @@ mod tests {
         assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 1, "no session, no extra release");
     }
 
-    /// A subscription-withdrawal callback reaches the UE's association and the
-    /// network-initiated deregistration tears everything down.
+    /// A subscription-withdrawal callback reaches the UE's association; the
+    /// network-initiated deregistration waits on T3522 and completes when the
+    /// UE's Deregistration Accept arrives.
     #[tokio::test]
     async fn subscription_withdrawal_deregisters_the_ue() {
         // Directory entry wired to a test channel (as serve_gnb would).
         let supi = "imsi-999700000000042";
-        let (tx, mut rx) = unbounded_channel::<u64>();
-        UE_DIRECTORY.lock().unwrap().insert(supi.to_string(), (42, tx));
+        let (tx, mut rx) = unbounded_channel::<DeregCmd>();
+        UE_DIRECTORY.lock().unwrap().insert(supi.to_string(), (42, tx.clone()));
 
-        // The callback surface turns the POST into a channel message.
+        // The callback surface turns the POST into a Start command.
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move { sbi_core::run_on(l, namf_callback_router()).await.unwrap() });
@@ -1140,7 +1247,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 204);
-        assert_eq!(rx.recv().await, Some(42), "association told to deregister UE 42");
+        assert!(
+            matches!(rx.recv().await, Some(DeregCmd::Start(42))),
+            "association told to deregister UE 42"
+        );
 
         // Unknown SUPI → 404.
         let resp = sbi_core::h2c_client()
@@ -1151,7 +1261,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 404);
 
-        // The dereg flow itself: secured UE, no session → NAS request + release command.
+        // Start: the request goes out, T3522 is armed, the contexts stay.
         let (ki, ke) = ([0x11u8; 16], [0x22u8; 16]);
         let mut ctx = UeContext::new(9, RegState::Registered, Some(supi.to_string()));
         ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
@@ -1159,17 +1269,16 @@ mod tests {
         ues.insert(42u64, ctx);
         let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70"); // no session → unused
 
-        let downlinks = on_network_deregistration(&mut ues, &amf_smf, 42).await;
+        let downlinks = on_network_deregistration(&mut ues, &amf_smf, 42, &tx, 3600).await;
         assert_eq!(
             downlinks.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
-            ["DownlinkNASTransport (DeregistrationRequest)", "UEContextReleaseCommand"]
+            ["DownlinkNASTransport (DeregistrationRequest)"],
+            "no release yet — waiting on the accept"
         );
-        assert!(!ues.contains_key(&42), "AMF context dropped");
+        assert_eq!(ues.get(&42).and_then(|c| c.dereg_attempts), Some(1), "context kept, armed");
         assert!(!UE_DIRECTORY.lock().unwrap().contains_key(supi), "directory entry dropped");
-        assert_eq!(
-            ngap::parse_ue_context_release_command(&downlinks[1].0),
-            Some((42, 9, Some(ngap::CauseNas::DEREGISTER)))
-        );
+        // A duplicate Start is ignored while the procedure runs.
+        assert!(on_network_deregistration(&mut ues, &amf_smf, 42, &tx, 3600).await.is_empty());
         // UE side: the request verifies and is the UE-terminated variant.
         let nas_bytes = downlink_nas_pdu(&downlinks[0].0).expect("NAS PDU");
         let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
@@ -1178,6 +1287,59 @@ mod tests {
             nas::gmm_message_type(&msg),
             Some(nas::Nas5gmmMessageType::DeregistrationRequestToUe)
         );
+
+        // The UE's Deregistration Accept completes the procedure.
+        let amf_auth = auth::AmfAuth::new("http://127.0.0.1:1", "999", "70");
+        let done =
+            dispatch_uplink_nas(&mut ues, &amf_auth, &amf_smf, 42, nas::deregistration_accept_to_ue())
+                .await
+                .expect("a release to send");
+        assert_eq!(done.1, "UEContextReleaseCommand");
+        assert_eq!(
+            ngap::parse_ue_context_release_command(&done.0),
+            Some((42, 9, Some(ngap::CauseNas::DEREGISTER)))
+        );
+        assert!(!ues.contains_key(&42), "AMF context dropped on accept");
+
+        // A stale T3522 expiry after completion is a no-op.
+        assert!(on_t3522_expiry(&mut ues, 42, &tx, 3600).is_empty());
+    }
+
+    /// A UE that never answers: T3522 retransmits the request, then aborts and
+    /// releases the contexts anyway.
+    #[tokio::test]
+    async fn t3522_retransmits_then_aborts() {
+        let supi = "imsi-999700000000043";
+        let (tx, mut rx) = unbounded_channel::<DeregCmd>();
+        let (ki, ke) = ([0x11u8; 16], [0x22u8; 16]);
+        let mut ctx = UeContext::new(11, RegState::Registered, Some(supi.to_string()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        let mut ues = HashMap::new();
+        ues.insert(43u64, ctx);
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+
+        // Start with an instant timer: the expiry lands on the channel.
+        let downlinks = on_network_deregistration(&mut ues, &amf_smf, 43, &tx, 0).await;
+        assert_eq!(downlinks.len(), 1, "initial request");
+        assert!(matches!(rx.recv().await, Some(DeregCmd::T3522Expiry(43))), "T3522 fired");
+
+        // Expiries 2..=T3522_MAX_SENDS retransmit; the next one aborts.
+        for attempt in 2..=T3522_MAX_SENDS {
+            let dls = on_t3522_expiry(&mut ues, 43, &tx, 3600);
+            assert_eq!(
+                dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+                ["DownlinkNASTransport (DeregistrationRequest)"],
+                "retransmission {attempt}"
+            );
+            assert_eq!(ues.get(&43).and_then(|c| c.dereg_attempts), Some(attempt));
+        }
+        let dls = on_t3522_expiry(&mut ues, 43, &tx, 3600);
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["UEContextReleaseCommand"],
+            "exhausted — abort releases the RAN side"
+        );
+        assert!(!ues.contains_key(&43), "context dropped on abort");
     }
 
     /// A UE whose requested slices are all unsubscribed is rejected at registration
