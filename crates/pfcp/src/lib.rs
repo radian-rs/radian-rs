@@ -549,6 +549,19 @@ impl UpfState {
         }
     }
 
+    /// Clear a session's gNB downlink target (AN release / UP deactivation): the
+    /// UPF then has no route for downlink traffic to this UE, so it is dropped
+    /// until a Service Request re-installs the tunnel.
+    fn clear_downlink(&mut self, up_seid: u64) -> bool {
+        match self.sessions.get_mut(&up_seid) {
+            Some(s) => {
+                s.downlink = None;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Set/replace a session's AMBR (from a Create or Update QER), re-rating its
     /// policers to `now_nanos`. Creates the buckets if the session had none.
     fn set_ambr(&mut self, up_seid: u64, ambr: SessionAmbr, now_nanos: u64) -> bool {
@@ -817,6 +830,22 @@ pub fn session_flow_modification_request(
     builder.build().marshal()
 }
 
+/// SMF: build a PFCP Session Modification Request that **deactivates** the downlink
+/// user-plane connection (TS 23.502 §4.2.6 AN release) — an Update FAR that DROPs
+/// downlink and clears its Outer Header Creation, so the UPF stops forwarding to the
+/// (now released) gNB tunnel. The uplink path and the session itself are unchanged;
+/// a later Service Request re-activates via [`session_modification_request`].
+pub fn session_deactivate_request(up_seid: u64, seq: u32, far_id: u32) -> Vec<u8> {
+    let update_far = UpdateFar::builder(FarId::new(far_id))
+        .apply_action(ApplyAction::DROP)
+        .build()
+        .expect("build deactivate Update FAR");
+    SessionModificationRequestBuilder::new(up_seid, seq)
+        .update_fars(vec![update_far.to_ie()])
+        .build()
+        .marshal()
+}
+
 /// SMF: build a PFCP Session Modification Request that installs the downlink path —
 /// an Update FAR carrying Outer Header Creation (GTP-U/IPv4) to the gNB's N3 F-TEID
 /// (learned from the N2 PDU Session Resource Setup Response). Addressed by UP-SEID.
@@ -923,16 +952,27 @@ pub fn handle_n4(
         MsgType::SessionModificationRequest => {
             // Addressed by UP-SEID (the header SEID the UPF handed out at establishment).
             let up_seid = u64::from(msg.seid()?);
-            // Install the gNB downlink target from the Update FAR's Outer Header Creation.
-            if let Some((gnb_teid, gnb_ip)) = msg
+            // A downlink Update FAR either installs the gNB tunnel (Outer Header
+            // Creation → activate) or DROPs downlink (AN release → deactivate).
+            if let Some(uf) = msg
                 .ies(IeType::UpdateFar)
-                .next()
-                .and_then(|ie| UpdateFar::unmarshal(&ie.payload).ok())
-                .and_then(|uf| uf.update_forwarding_parameters)
-                .and_then(|ufp| ufp.outer_header_creation)
-                .and_then(|ohc| Some((u32::from(ohc.teid?), ohc.ipv4_address?)))
+                .filter_map(|ie| UpdateFar::unmarshal(&ie.payload).ok())
+                .find(|uf| uf.update_forwarding_parameters.is_some() || uf.apply_action.is_some())
             {
-                state.set_downlink(up_seid, gnb_teid, gnb_ip);
+                let ohc = uf
+                    .update_forwarding_parameters
+                    .and_then(|ufp| ufp.outer_header_creation)
+                    .and_then(|ohc| Some((u32::from(ohc.teid?), ohc.ipv4_address?)));
+                match ohc {
+                    Some((gnb_teid, gnb_ip)) => {
+                        state.set_downlink(up_seid, gnb_teid, gnb_ip);
+                    }
+                    // No OHC + a DROP action → deactivate the downlink (AN release).
+                    None if uf.apply_action.is_some_and(|a| a.contains(ApplyAction::DROP)) => {
+                        state.clear_downlink(up_seid);
+                    }
+                    None => {}
+                }
             }
             // Per-flow QoS changes (order matters: remove → create → update, so a
             // re-provisioned QFI ends up as its new flow).
@@ -1237,6 +1277,28 @@ mod tests {
             "N6 downlink routes by UE IP to the gNB target"
         );
         assert_eq!(state.route_downlink(Ipv4Addr::new(10, 45, 0, 3)), None, "unknown UE IP: no route");
+
+        // AN release: a deactivate modification DROPs downlink and clears the route.
+        handle_n4(&session_deactivate_request(up_seid, 3, 1), node_ip, &mut state, 0)
+            .expect("deactivate response");
+        assert_eq!(state.downlink_for(up_seid), None, "downlink target cleared on deactivation");
+        assert_eq!(state.route_downlink(UE_IP), None, "no N6 route while the UE is idle");
+
+        // The session and its uplink TEID survive — a Service Request can re-activate.
+        assert_eq!(state.session_count(), 1, "session retained across deactivation");
+        let resp = handle_n4(
+            &session_modification_request(up_seid, 4, 1, 0x9ABC, gnb_ip),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("re-activation response");
+        assert!(response_accepted(&resp));
+        assert_eq!(
+            state.route_downlink(UE_IP),
+            Some((0x9ABC, gnb_ip)),
+            "re-activation re-installs the downlink route to the new gNB tunnel"
+        );
     }
 
     #[test]

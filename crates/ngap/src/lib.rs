@@ -123,6 +123,41 @@ pub fn parse_ue_context_release_command(pdu: &NGAP_PDU) -> Option<(u64, u32, Opt
     Some((amf_ue_id, ran_ue_id, cause))
 }
 
+/// Build a `UEContextReleaseRequest` (TS 38.413 §9.2.2.3) — the **gNB-initiated**
+/// request to release a UE's context (e.g. on RAN user inactivity). Carries the
+/// UE-NGAP-ID pair + a RadioNetwork cause. Mainly for a gNB simulator / tests.
+pub fn ue_context_release_request(amf_ue_id: u64, ran_ue_id: u32, radio_cause: u8) -> NGAP_PDU {
+    build_ngap!(InitiatingMessage, UEContextReleaseRequest,
+        REJECT, UEContextReleaseRequest,
+        REJECT AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        REJECT RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+        IGNORE Cause(Cause::RadioNetwork(CauseRadioNetwork(radio_cause))),
+    )
+}
+
+/// Extract `(AMF-UE-NGAP-ID, RAN-UE-NGAP-ID)` from a gNB `UEContextReleaseRequest`.
+pub fn parse_ue_context_release_request(pdu: &NGAP_PDU) -> Option<(u64, u32)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_UEContextReleaseRequest(req) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id) = (None, None);
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            UEContextReleaseRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(id) => {
+                amf_ue_id = Some(id.0)
+            }
+            UEContextReleaseRequestProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(id) => {
+                ran_ue_id = Some(id.0)
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?))
+}
+
 // ─── N2 PDU Session Resource Setup (TS 38.413 §9.2.1.1/§9.2.1.2) ───────────────
 //
 // The N2 SM information is carried as separately-APER-encoded `*Transfer` sub-PDUs
@@ -643,5 +678,18 @@ mod release_tests {
             parse_ue_context_release_command(&back),
             Some((42, 7, Some(CauseNas::NORMAL_RELEASE)))
         );
+    }
+
+    #[test]
+    fn ue_context_release_request_roundtrips() {
+        // Cause radioNetwork #20 = user-inactivity.
+        let pdu = ue_context_release_request(99, 3, 20);
+        let mut data = PerCodecData::new_aper();
+        pdu.aper_encode(&mut data).expect("APER encode");
+        let bytes = data.get_inner().expect("bytes");
+        let back = NGAP_PDU::decode(&bytes).expect("APER decode");
+        assert_eq!(parse_ue_context_release_request(&back), Some((99, 3)));
+        // A different message type isn't misread as a release request.
+        assert_eq!(parse_ue_context_release_request(&initial_ue_message_with_nas(1, vec![1])), None);
     }
 }

@@ -336,8 +336,15 @@ struct SessionSubscription {
 #[serde(rename_all = "camelCase")]
 struct SmContextUpdateData {
     /// The gNB's N3 F-TEID from the N2 PDU Session Resource Setup Response (hex).
-    gnb_n3_teid: String,
-    gnb_n3_addr: Ipv4Addr,
+    /// Present on an **activation** (downlink install / Service Request resume).
+    #[serde(default)]
+    gnb_n3_teid: Option<String>,
+    #[serde(default)]
+    gnb_n3_addr: Option<Ipv4Addr>,
+    /// User-plane connection state (TS 29.502): `DEACTIVATED` on AN release tears
+    /// the downlink tunnel down; `ACTIVATING` (with the gNB F-TEID) re-installs it.
+    #[serde(default)]
+    up_cnx_state: Option<String>,
 }
 
 /// The `Nsmf_PDUSession` router.
@@ -746,7 +753,18 @@ async fn update_sm_context(
     Path(sm_ref): Path<String>,
     Json(req): Json<SmContextUpdateData>,
 ) -> StatusCode {
-    let gnb_teid = match u32::from_str_radix(req.gnb_n3_teid.trim_start_matches("0x"), 16) {
+    // AN release (TS 23.502 §4.2.6): deactivate the downlink user-plane connection
+    // — the UPF drops downlink toward the released gNB tunnel; the session persists.
+    if req.up_cnx_state.as_deref() == Some("DEACTIVATED") {
+        return deactivate_up(&smf, &sm_ref).await;
+    }
+    let Some(teid_hex) = req.gnb_n3_teid else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(gnb_addr) = req.gnb_n3_addr else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let gnb_teid = match u32::from_str_radix(teid_hex.trim_start_matches("0x"), 16) {
         Ok(t) => t,
         Err(_) => return StatusCode::BAD_REQUEST,
     };
@@ -754,7 +772,7 @@ async fn update_sm_context(
     // real protection is SBI authorization (only the AMF may call Nsmf) — OAuth2 is
     // deferred (TS 33.501), same posture as the rest of SBI; the gNB F-TEID legitimately
     // comes from the AMF (which learned it from the N2 PDU Session Resource Setup).
-    if !valid_gnb_target(gnb_teid, req.gnb_n3_addr) {
+    if !valid_gnb_target(gnb_teid, gnb_addr) {
         return StatusCode::BAD_REQUEST;
     }
     let up_seid = {
@@ -766,7 +784,7 @@ async fn update_sm_context(
     };
 
     let seq = smf.next_seq();
-    let mod_req = pfcp::session_modification_request(up_seid, seq, FAR_ID, gnb_teid, req.gnb_n3_addr);
+    let mod_req = pfcp::session_modification_request(up_seid, seq, FAR_ID, gnb_teid, gnb_addr);
     let resp = match smf.transact(&mod_req, seq).await {
         Some(r) => r,
         None => return StatusCode::BAD_GATEWAY,
@@ -776,7 +794,7 @@ async fn update_sm_context(
     }
 
     if let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref) {
-        c.gnb = Some((gnb_teid, req.gnb_n3_addr));
+        c.gnb = Some((gnb_teid, gnb_addr));
         tracing::info!(
             %sm_ref,
             ue_ip = %c.ue_ip,
@@ -784,6 +802,33 @@ async fn update_sm_context(
             gnb_teid,
             "updated SM context; N4 downlink installed"
         );
+    }
+    StatusCode::OK
+}
+
+/// Deactivate a session's downlink user-plane connection (AN release): an N4
+/// Session Modification that DROPs downlink at the UPF and clears the stored gNB
+/// target. The session and its uplink path persist for a later Service Request.
+async fn deactivate_up(smf: &Arc<SmfState>, sm_ref: &str) -> StatusCode {
+    let up_seid = {
+        let ctxs = smf.contexts.lock().unwrap();
+        match ctxs.get(sm_ref) {
+            Some(c) => c.up_seid,
+            None => return StatusCode::NOT_FOUND,
+        }
+    };
+    let seq = smf.next_seq();
+    let req = pfcp::session_deactivate_request(up_seid, seq, FAR_ID);
+    let resp = match smf.transact(&req, seq).await {
+        Some(r) => r,
+        None => return StatusCode::BAD_GATEWAY,
+    };
+    if !pfcp::response_accepted(&resp) {
+        return StatusCode::BAD_GATEWAY;
+    }
+    if let Some(c) = smf.contexts.lock().unwrap().get_mut(sm_ref) {
+        c.gnb = None;
+        tracing::info!(%sm_ref, up_seid, "deactivated UP connection (AN release); downlink dropped");
     }
     StatusCode::OK
 }

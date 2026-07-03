@@ -265,6 +265,22 @@ impl AmfSmf {
         Ok(())
     }
 
+    /// Deactivate a PDU session's user-plane connection at the SMF (AN release,
+    /// TS 23.502 §4.2.6): the SMF runs an N4 modification that DROPs downlink at
+    /// the UPF. The session persists — a later Service Request re-activates it.
+    pub async fn deactivate_up(&self, smf_base: &str, sm_ref: &str) -> Result<(), String> {
+        let resp = sbi_core::sbi_client()
+            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
+            .json(&serde_json::json!({ "upCnxState": "DEACTIVATED" }))
+            .send()
+            .await
+            .map_err(|e| format!("Nsmf UpdateSMContext (deactivate) request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Nsmf UpdateSMContext (deactivate) returned {}", resp.status()));
+        }
+        Ok(())
+    }
+
     /// Select an SMF that serves `(snssai, dnn)` (TS 23.501 §6.3.2) — NRF
     /// discovery filtered by the slice/DNN the UE requested. Returns its base
     /// URL, which the caller stores per session so UpdateSMContext /
