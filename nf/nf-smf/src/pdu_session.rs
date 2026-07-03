@@ -711,6 +711,20 @@ async fn refresh_sm_policy(
             }
         }
     }
+    // Propagate per-flow (GBR) changes onto the user plane: add/re-rate/remove the
+    // UPF's per-flow QERs to match the new decision.
+    let (create, update, remove) = diff_flows(&flow_qers(&old_policy), &flow_qers(&decision));
+    if !create.is_empty() || !update.is_empty() || !remove.is_empty() {
+        let seq = smf.next_seq();
+        let req = pfcp::session_flow_modification_request(up_seid, seq, &create, &update, &remove);
+        match smf.transact(&req, seq).await {
+            Some(resp) if pfcp::response_accepted(&resp) => tracing::info!(
+                %sm_ref, up_seid, added = create.len(), updated = update.len(), removed = remove.len(),
+                "N4 per-flow QERs updated"
+            ),
+            _ => tracing::warn!(%sm_ref, up_seid, "N4 per-flow QER update not accepted by the UPF"),
+        }
+    }
     // Refresh the sm-context's authoritative QoS record.
     if let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref) {
         c.policy = decision.clone();
@@ -781,6 +795,33 @@ fn flow_qers(decision: &sbi_core::npcf::SmPolicyDecision) -> Vec<pfcp::FlowQer> 
             })
         })
         .collect()
+}
+
+/// Diff the old vs new per-flow QERs into `(create, update, remove_qfis)` for a
+/// mid-session flow modification: a new/filter-changed QFI is created (and, if the
+/// filter changed, its old flow removed), an MFBR-only change is an update, and a
+/// dropped QFI is removed. The UPF applies remove → create → update.
+fn diff_flows(
+    old: &[pfcp::FlowQer],
+    new: &[pfcp::FlowQer],
+) -> (Vec<pfcp::FlowQer>, Vec<pfcp::FlowQer>, Vec<u8>) {
+    let (mut create, mut update, mut remove) = (Vec::new(), Vec::new(), Vec::new());
+    for n in new {
+        match old.iter().find(|o| o.qfi == n.qfi) {
+            None => create.push(*n),
+            Some(o) if o.filter != n.filter => create.push(*n),
+            Some(o) if (o.mfbr_dl_bps, o.mfbr_ul_bps) != (n.mfbr_dl_bps, n.mfbr_ul_bps) => {
+                update.push(*n)
+            }
+            Some(_) => {}
+        }
+    }
+    for o in old {
+        if !new.iter().any(|n| n.qfi == o.qfi && n.filter == o.filter) {
+            remove.push(o.qfi);
+        }
+    }
+    (create, update, remove)
 }
 
 /// The session AMBR from a policy decision as a `pfcp::SessionAmbr` (bits/sec) for
@@ -1347,15 +1388,21 @@ mod tests {
             Some(pfcp::SessionAmbr { uplink_bps: 200_000_000, downlink_bps: 400_000_000 }),
             "UPF polices the v1 session AMBR"
         );
+        assert!(
+            upf_state.lock().unwrap().flow_qfis(1).is_empty(),
+            "no per-flow QER for the v1 (non-GBR) policy"
+        );
 
-        // Mid-session change: reprovision the UDR policy-data (v2).
+        // Mid-session change: reprovision the UDR policy-data (v2) — new session AMBR
+        // plus a GBR flow (QFI 2) with a classifier.
         let v2 = serde_json::json!({ "default": {
             "sessionAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" },
             "qosFlows": [
                 { "qfi": 1, "fiveQi": 9 },
                 { "qfi": 2, "fiveQi": 1, "gbr": {
                     "gfbrDl": "10 Mbps", "gfbrUl": "10 Mbps",
-                    "mfbrDl": "20 Mbps", "mfbrUl": "20 Mbps" } }
+                    "mfbrDl": "20 Mbps", "mfbrUl": "20 Mbps" },
+                  "filter": { "protocol": 17, "portLow": 5000, "portHigh": 5010 } }
             ] } });
         udr.put_sm_policy_data("imsi-999700000000001", &v2).await.unwrap();
 
@@ -1373,11 +1420,17 @@ mod tests {
         let ambr = updated.session_ambr.as_ref().unwrap();
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("50 Mbps", "100 Mbps"));
         assert_eq!(updated.qos_flows.len(), 2, "the mid-session change added a GBR flow");
-        // The change reached the user plane: the SMF re-rated the UPF's QER.
+        // The change reached the user plane: the SMF re-rated the UPF's QER...
         assert_eq!(
             upf_state.lock().unwrap().ambr_for(1),
             Some(pfcp::SessionAmbr { uplink_bps: 50_000_000, downlink_bps: 100_000_000 }),
             "UPF now polices the v2 session AMBR"
+        );
+        // ...and installed the newly-authorized GBR flow's per-flow QER mid-session.
+        assert_eq!(
+            upf_state.lock().unwrap().flow_qfis(1),
+            vec![2],
+            "the UPF now polices the mid-session-added GBR flow (QFI 2)"
         );
         // And it reached the RAN/UE path: the SMF notified the serving AMF
         // (Namf_Communication) — spawned off the response, so poll briefly.
