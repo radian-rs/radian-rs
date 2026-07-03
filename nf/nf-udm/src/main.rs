@@ -16,6 +16,8 @@ const UDR_ENV: &str = "RADIAN_UDM_UDR";
 const DEFAULT_UDR: &str = "http://127.0.0.1:8005";
 const NRF_ENV: &str = "RADIAN_UDM_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
+/// Directory holding the UDM's mTLS identity (`udm.crt`, `udm.key`, `ca.crt`).
+const TLS_DIR_ENV: &str = "RADIAN_UDM_TLS_DIR";
 
 /// Stable NF instance id — the same value in the NRF profile and in every SBI
 /// access-token request (the NRF issues tokens only to registered NFs).
@@ -26,17 +28,31 @@ async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("udm");
 
-    let udr_base = std::env::var(UDR_ENV).unwrap_or_else(|_| DEFAULT_UDR.to_string());
+    let mut udr_base = std::env::var(UDR_ENV).unwrap_or_else(|_| DEFAULT_UDR.to_string());
     let nrf_base = std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string());
-    info!(%udr_base, "UDM fronting UDR over Nudr");
     // With SBI security on (shared secret or asymmetric), obtain a `UDR` access
     // token from the NRF for each Nudr call; otherwise call the UDR openly.
-    let udr = Arc::new(if sbi_core::oauth::client_tokens_enabled() {
-        let tokens =
-            Arc::new(sbi_core::oauth::TokenSource::new(nrf_base.clone(), UDM_INSTANCE_ID.clone()));
-        sbi_core::nudr::UdrClient::with_tokens(udr_base, tokens)
-    } else {
-        sbi_core::nudr::UdrClient::new(udr_base)
+    let tokens = sbi_core::oauth::client_tokens_enabled().then(|| {
+        Arc::new(sbi_core::oauth::TokenSource::new(nrf_base.clone(), UDM_INSTANCE_ID.clone()))
+    });
+    // Mutual TLS (design/56): with RADIAN_UDM_TLS_DIR set, dial the UDR over mTLS
+    // (presenting the UDM's cert); the UDR base is then https.
+    let udr = Arc::new(match std::env::var(TLS_DIR_ENV) {
+        Ok(dir) => {
+            if let Some(rest) = udr_base.strip_prefix("http://") {
+                udr_base = format!("https://{rest}");
+            }
+            let http = sbi_core::tls::TlsIdentity::load(&dir, "udm")?.client()?;
+            info!(%udr_base, %dir, "UDM dialing UDR over mutual TLS");
+            sbi_core::nudr::UdrClient::with_transport(udr_base, http, tokens)
+        }
+        Err(_) => {
+            info!(%udr_base, "UDM fronting UDR over Nudr");
+            match tokens {
+                Some(t) => sbi_core::nudr::UdrClient::with_tokens(udr_base, t),
+                None => sbi_core::nudr::UdrClient::new(udr_base),
+            }
+        }
     });
 
     // Register with the NRF so the AUSF can discover the Nudm service.

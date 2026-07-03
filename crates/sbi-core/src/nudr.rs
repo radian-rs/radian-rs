@@ -205,6 +205,7 @@ async fn notify_amf_deregistration(callback_uri: &str, supi: &str) -> Result<(),
     if !is_valid_callback_uri(callback_uri) {
         return Err("stored deregCallbackUri is not a valid http(s) URL".to_string());
     }
+    crate::ensure_crypto_provider();
     let client = reqwest::Client::builder()
         .http2_prior_knowledge()
         .redirect(reqwest::redirect::Policy::none())
@@ -404,6 +405,16 @@ impl UdrClient {
         tokens: std::sync::Arc<crate::oauth::TokenSource>,
     ) -> Self {
         Self { base: base_url.into(), http: crate::h2c_client(), tokens: Some(tokens) }
+    }
+
+    /// Use a caller-supplied transport (e.g. an mTLS client from
+    /// [`crate::tls::TlsIdentity::client`]) with an optional token source.
+    pub fn with_transport(
+        base_url: impl Into<String>,
+        http: reqwest::Client,
+        tokens: Option<std::sync::Arc<crate::oauth::TokenSource>>,
+    ) -> Self {
+        Self { base: base_url.into(), http, tokens }
     }
 
     /// Attach a `UDR` Bearer token to a request when a token source is configured.
