@@ -223,6 +223,16 @@ enum RegState {
     Registered,
 }
 
+/// Connection-management state (TS 23.501 §5.3.3): whether the UE has an N2
+/// signalling connection. A registered UE goes **CM-IDLE** on AN release (its
+/// RAN context is gone, the user plane deactivated) and back to **CM-CONNECTED**
+/// on a Service Request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CmState {
+    Connected,
+    Idle,
+}
+
 /// Per-UE context held by the AMF, keyed by AMF-UE-NGAP-ID.
 #[derive(Debug)]
 struct UeContext {
@@ -254,6 +264,10 @@ struct UeContext {
     /// second synch failure aborts (TS 33.501: at most one resync per procedure,
     /// so a persistent mismatch can't loop).
     resync_attempted: bool,
+    /// CM state — `Connected` while an N2 connection exists, `Idle` after AN
+    /// release. A CM-IDLE context is retained (registration + PDU sessions live)
+    /// for a Service Request to resume.
+    cm_state: CmState,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
@@ -656,6 +670,11 @@ async fn handle_ngap(
                     send_or_log(conn, &dl, label).await;
                 }
             }
+            InitiatingMessageValue::Id_UEContextReleaseRequest(_) => {
+                if let Some(dl) = on_ue_context_release_request(ues, amf_smf, &pdu).await {
+                    send_or_log(conn, &dl, "UEContextReleaseCommand").await;
+                }
+            }
             _ => info!("unhandled initiating message: {}", pdu.procedure_name()),
         },
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
@@ -681,6 +700,38 @@ async fn handle_ngap(
         },
         _ => info!("unhandled PDU: {}", pdu.procedure_name()),
     }
+}
+
+/// Handle a gNB-initiated `UEContextReleaseRequest` (TS 23.502 §4.2.6 AN release,
+/// e.g. RAN user inactivity): deactivate every PDU session's user plane at its SMF
+/// (the UPF drops downlink toward the released gNB tunnel), transition the UE to
+/// **CM-IDLE** — keeping its 5GMM registration + PDU sessions for a later Service
+/// Request — and answer with a `UEContextReleaseCommand`. Returns the command, or
+/// `None` if the UE is unknown.
+async fn on_ue_context_release_request(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    pdu: &NGAP_PDU,
+) -> Option<NGAP_PDU> {
+    let (amf_ue_id, ran_ue_id) = ngap::parse_ue_context_release_request(pdu)?;
+    let sessions: Vec<(u8, (String, String))> = ues
+        .get(&amf_ue_id)
+        .map(|c| c.sm_refs.iter().map(|(psi, v)| (*psi, v.clone())).collect())?;
+
+    // Deactivate the user plane for each session (best-effort — the RAN context is
+    // released regardless; a failed SMF call just leaves that session's UPF route
+    // stale until the next activation).
+    for (psi, (sm_ref, smf_base)) in &sessions {
+        match amf_smf.deactivate_up(smf_base, sm_ref).await {
+            Ok(()) => info!("UE {amf_ue_id}: PDU session {psi} user plane deactivated (AN release)"),
+            Err(e) => warn!("UE {amf_ue_id}: PDU session {psi} deactivation failed: {e}"),
+        }
+    }
+    if let Some(ctx) = ues.get_mut(&amf_ue_id) {
+        ctx.cm_state = CmState::Idle;
+    }
+    info!("UE {amf_ue_id}: released RAN context — now CM-IDLE ({} PDU session(s) retained)", sessions.len());
+    Some(ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::NORMAL_RELEASE))
 }
 
 /// Handle a gNB's `PDUSessionResourceSetupResponse`: extract the gNB DL N3 F-TEID and
@@ -796,6 +847,7 @@ impl UeContext {
             requested_nssai: Vec::new(),
             dereg_attempts: None,
             resync_attempted: false,
+            cm_state: CmState::Connected,
         }
     }
 }
@@ -1769,6 +1821,56 @@ mod tests {
         );
         assert!(!ues.contains_key(&2));
         assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 2, "no session, no extra release");
+    }
+
+    /// gNB-initiated AN release: the AMF deactivates each PDU session's user plane
+    /// at the SMF (upCnxState DEACTIVATED), keeps the registered context in
+    /// CM-IDLE, and answers with a UEContextReleaseCommand.
+    #[tokio::test]
+    async fn an_release_deactivates_up_and_goes_cm_idle() {
+        use axum::http::StatusCode;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        // Mock SMF recording deactivation (upCnxState=DEACTIVATED) on /modify.
+        static DEACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
+        async fn mock_modify(axum::Json(body): axum::Json<serde_json::Value>) -> StatusCode {
+            if body.get("upCnxState").and_then(|v| v.as_str()) == Some("DEACTIVATED") {
+                DEACTIVATIONS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            StatusCode::OK
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new().route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
+            axum::routing::post(mock_modify),
+        );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70"); // NRF unused here
+
+        // A registered UE with two active PDU sessions on the mock SMF.
+        let smf_base = format!("http://{smf_addr}");
+        let mut ctx = UeContext::new(7, RegState::Registered, Some("imsi-999700000000081".into()));
+        ctx.sm_refs.insert(5, ("ctx-5".into(), smf_base.clone()));
+        ctx.sm_refs.insert(6, ("ctx-6".into(), smf_base));
+        let mut ues = HashMap::new();
+        ues.insert(1u64, ctx);
+
+        // gNB → UEContextReleaseRequest (cause radioNetwork user-inactivity).
+        let req = ngap::ue_context_release_request(1, 7, 20);
+        let dl = on_ue_context_release_request(&mut ues, &amf_smf, &req).await.expect("release cmd");
+        assert_eq!(
+            ngap::parse_ue_context_release_command(&dl),
+            Some((1, 7, Some(ngap::CauseNas::NORMAL_RELEASE)))
+        );
+        assert_eq!(DEACTIVATIONS.load(AtomicOrdering::Relaxed), 2, "both sessions' UP deactivated");
+        // The context is retained in CM-IDLE with its PDU sessions intact.
+        let ctx = ues.get(&1).expect("context retained (CM-IDLE, not dropped)");
+        assert_eq!(ctx.cm_state, CmState::Idle);
+        assert_eq!(ctx.sm_refs.len(), 2, "PDU sessions kept for a later Service Request");
+
+        // A release request for an unknown UE produces no command.
+        assert!(on_ue_context_release_request(&mut ues, &amf_smf, &ngap::ue_context_release_request(99, 1, 20)).await.is_none());
     }
 
     /// A network-initiated PDU session modification builds the N2 PDU Session
