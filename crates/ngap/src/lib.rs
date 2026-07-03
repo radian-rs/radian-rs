@@ -80,6 +80,49 @@ pub fn uplink_nas_transport(amf_ue_id: u64, ran_ue_id: u32, nas: Vec<u8>) -> NGA
     )
 }
 
+/// Build a `UEContextReleaseCommand` (TS 38.413 §9.2.2.4) addressed by the
+/// AMF/RAN UE-NGAP-ID pair, with a NAS cause (pick from [`CauseNas`]'s
+/// constants). The gNB releases its UE context and answers with a
+/// UE Context Release Complete.
+pub fn ue_context_release_command(amf_ue_id: u64, ran_ue_id: u32, nas_cause: u8) -> NGAP_PDU {
+    let ids = UE_NGAP_IDs::UE_NGAP_ID_pair(UE_NGAP_ID_pair {
+        amf_ue_ngap_id: AMF_UE_NGAP_ID(amf_ue_id),
+        ran_ue_ngap_id: RAN_UE_NGAP_ID(ran_ue_id),
+        ie_extensions: None,
+    });
+    build_ngap!(InitiatingMessage, UEContextRelease,
+        REJECT, UEContextReleaseCommand,
+        REJECT UE_NGAP_IDs(ids),
+        IGNORE Cause(Cause::Nas(CauseNas(nas_cause))),
+    )
+}
+
+/// Extract `(AMF-UE-NGAP-ID, RAN-UE-NGAP-ID, NAS cause)` from a
+/// UEContextReleaseCommand (gNB side / tests).
+pub fn parse_ue_context_release_command(pdu: &NGAP_PDU) -> Option<(u64, u32, Option<u8>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_UEContextRelease(cmd) = value else {
+        return None;
+    };
+    let mut ids = None;
+    let mut cause = None;
+    for ie in &cmd.protocol_i_es.0 {
+        match &ie.value {
+            UEContextReleaseCommandProtocolIEs_EntryValue::Id_UE_NGAP_IDs(
+                UE_NGAP_IDs::UE_NGAP_ID_pair(pair),
+            ) => ids = Some((pair.amf_ue_ngap_id.0, pair.ran_ue_ngap_id.0)),
+            UEContextReleaseCommandProtocolIEs_EntryValue::Id_Cause(Cause::Nas(c)) => {
+                cause = Some(c.0)
+            }
+            _ => {}
+        }
+    }
+    let (amf_ue_id, ran_ue_id) = ids?;
+    Some((amf_ue_id, ran_ue_id, cause))
+}
+
 // ─── N2 PDU Session Resource Setup (TS 38.413 §9.2.1.1/§9.2.1.2) ───────────────
 //
 // The N2 SM information is carried as separately-APER-encoded `*Transfer` sub-PDUs
@@ -297,5 +340,23 @@ mod tests {
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
         assert_eq!(pdu, back);
         assert_eq!(back.procedure_name(), "UplinkNASTransport");
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn ue_context_release_command_roundtrips() {
+        let pdu = ue_context_release_command(42, 7, CauseNas::NORMAL_RELEASE);
+        let mut data = PerCodecData::new_aper();
+        pdu.aper_encode(&mut data).expect("APER encode");
+        let bytes = data.get_inner().expect("bytes");
+        let back = NGAP_PDU::decode(&bytes).expect("APER decode");
+        assert_eq!(
+            parse_ue_context_release_command(&back),
+            Some((42, 7, Some(CauseNas::NORMAL_RELEASE)))
+        );
     }
 }
