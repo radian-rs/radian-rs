@@ -59,6 +59,9 @@ struct SmContext {
     /// The current authorized QoS (session AMBR + flows) — the sm-context's policy
     /// record, refreshed by an Update.
     policy: sbi_core::npcf::SmPolicyDecision,
+    /// GFBR `(downlink, uplink)` bits/sec this session reserved (GFBR admission) —
+    /// released at teardown, adjusted on a mid-session policy change.
+    reserved_gfbr: (u64, u64),
 }
 
 /// SMF runtime: a PFCP client toward one UPF plus the SM-context table.
@@ -74,6 +77,11 @@ pub struct SmfState {
     /// Next UE IPv4 address to hand out (as a host-order u32), from the pool above.
     next_ue_ip: AtomicU32,
     contexts: Mutex<HashMap<String, SmContext>>,
+    /// GFBR admission control: the guaranteed-bit-rate budget `(downlink, uplink)`
+    /// in bits/sec and the currently reserved total. A session whose GBR flows'
+    /// aggregate GFBR would exceed the remaining budget is refused (5GSM #26).
+    gfbr_budget_bps: (u64, u64),
+    reserved_gfbr_bps: Mutex<(u64, u64)>,
 }
 
 impl SmfState {
@@ -94,7 +102,46 @@ impl SmfState {
             next_ref: AtomicU64::new(1),
             next_ue_ip: AtomicU32::new(UE_IP_POOL_START),
             contexts: Mutex::new(HashMap::new()),
+            // Generous default so plain operation isn't gated; override for admission
+            // control (config / tests).
+            gfbr_budget_bps: (u64::MAX, u64::MAX),
+            reserved_gfbr_bps: Mutex::new((0, 0)),
         })
+    }
+
+    /// Set the GFBR admission-control budget `(downlink_bps, uplink_bps)`.
+    pub fn with_gfbr_budget(mut self, downlink_bps: u64, uplink_bps: u64) -> Self {
+        self.gfbr_budget_bps = (downlink_bps, uplink_bps);
+        self
+    }
+
+    /// Try to reserve `(dl, ul)` bits/sec of GFBR against the budget. Returns `false`
+    /// (and reserves nothing) if either direction would exceed it.
+    fn try_reserve_gfbr(&self, (dl, ul): (u64, u64)) -> bool {
+        let mut r = self.reserved_gfbr_bps.lock().unwrap();
+        if r.0.saturating_add(dl) > self.gfbr_budget_bps.0
+            || r.1.saturating_add(ul) > self.gfbr_budget_bps.1
+        {
+            return false;
+        }
+        r.0 += dl;
+        r.1 += ul;
+        true
+    }
+
+    /// Release a session's GFBR reservation.
+    fn release_gfbr(&self, (dl, ul): (u64, u64)) {
+        let mut r = self.reserved_gfbr_bps.lock().unwrap();
+        r.0 = r.0.saturating_sub(dl);
+        r.1 = r.1.saturating_sub(ul);
+    }
+
+    /// Atomically swap a session's GFBR reservation from `old` to `new` (a
+    /// mid-session policy change; not admission-checked — the PCF authorized it).
+    fn adjust_gfbr(&self, old: (u64, u64), new: (u64, u64)) {
+        let mut r = self.reserved_gfbr_bps.lock().unwrap();
+        r.0 = r.0.saturating_sub(old.0).saturating_add(new.0);
+        r.1 = r.1.saturating_sub(old.1).saturating_add(new.1);
     }
 
     fn next_seq(&self) -> u32 {
@@ -322,6 +369,24 @@ async fn create_sm_context(
         ),
     };
 
+    // GFBR admission control (before any N4 state): reserve the session's aggregate
+    // guaranteed bit rate against the budget, refusing it (503 → 5GSM #26) if the
+    // network can't guarantee it.
+    let reserved_gfbr = decision_gfbr(&decision);
+    if !smf.try_reserve_gfbr(reserved_gfbr) {
+        tracing::warn!(
+            supi = %masked_supi(&req.supi),
+            dnn = %req.dnn,
+            gfbr_dl = reserved_gfbr.0, gfbr_ul = reserved_gfbr.1,
+            "PDU session refused: GFBR admission control (insufficient resources)"
+        );
+        return Err(problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "INSUFFICIENT_RESOURCES",
+            "GFBR cannot be guaranteed",
+        ));
+    }
+
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
     let seq = smf.next_seq();
     // The SMF owns UE IP allocation; the address rides into the UPF's downlink PDR so it
@@ -333,12 +398,29 @@ async fn create_sm_context(
     let flows = flow_qers(&decision);
     let est_req =
         pfcp::session_establishment_request(cp_seid, seq, smf.smf_ip, ue_ip, ambr, &flows);
-    let resp = smf.transact(&est_req, seq).await.ok_or_else(|| {
-        problem(StatusCode::BAD_GATEWAY, "UPF_NOT_RESPONDING", "no PFCP response from the UPF")
-    })?;
-    let est = pfcp::parse_session_establishment_response(&resp).ok_or_else(|| {
-        problem(StatusCode::BAD_GATEWAY, "UPF_NOT_RESPONDING", "PFCP establishment rejected")
-    })?;
+    // Release the GFBR reservation if the N4 establishment doesn't complete.
+    let resp = match smf.transact(&est_req, seq).await {
+        Some(r) => r,
+        None => {
+            smf.release_gfbr(reserved_gfbr);
+            return Err(problem(
+                StatusCode::BAD_GATEWAY,
+                "UPF_NOT_RESPONDING",
+                "no PFCP response from the UPF",
+            ));
+        }
+    };
+    let est = match pfcp::parse_session_establishment_response(&resp) {
+        Some(e) => e,
+        None => {
+            smf.release_gfbr(reserved_gfbr);
+            return Err(problem(
+                StatusCode::BAD_GATEWAY,
+                "UPF_NOT_RESPONDING",
+                "PFCP establishment rejected",
+            ));
+        }
+    };
 
     let sm_ref = smf.next_ref.fetch_add(1, Ordering::Relaxed).to_string();
     smf.contexts.lock().unwrap().insert(
@@ -352,6 +434,7 @@ async fn create_sm_context(
             pdu_session_id: req.pdu_session_id,
             sm_policy,
             policy: decision.clone(),
+            reserved_gfbr,
         },
     );
     // Record this SMF as the serving SMF for the session (Nudm_UECM). Best-effort,
@@ -616,10 +699,12 @@ async fn release_sm_context(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<StatusCode, SbiProblem> {
-    let (up_seid, supi, psi, sm_policy) = {
+    let (up_seid, supi, psi, sm_policy, reserved_gfbr) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
-            Some(c) => (c.up_seid, c.supi.clone(), c.pdu_session_id, c.sm_policy.clone()),
+            Some(c) => {
+                (c.up_seid, c.supi.clone(), c.pdu_session_id, c.sm_policy.clone(), c.reserved_gfbr)
+            }
             None => {
                 return Err(problem(
                     StatusCode::NOT_FOUND,
@@ -639,7 +724,14 @@ async fn release_sm_context(
     if !pfcp::response_accepted(&resp) {
         tracing::warn!(%sm_ref, up_seid, "UPF did not accept the N4 deletion (already gone?)");
     }
+    // Final usage report (Nudr/charging stand-in): the UPF returns the session's
+    // measured volume in the deletion response.
+    if let Some((total, ul, dl)) = pfcp::usage_from_deletion_response(&resp) {
+        tracing::info!(%sm_ref, up_seid, total_bytes = total, uplink_bytes = ul, downlink_bytes = dl, "session usage report");
+    }
     smf.contexts.lock().unwrap().remove(&sm_ref);
+    // Free the GFBR admission reservation.
+    smf.release_gfbr(reserved_gfbr);
     // Purge the serving-SMF registration (Nudm_UECM). Best-effort, off the path.
     spawn_uecm_purge(smf.nrf_base.clone(), supi, psi);
     // Delete the PCF SM policy association (Npcf_SMPolicyControl_Delete), if the
@@ -734,8 +826,15 @@ async fn refresh_sm_policy(
         .filter(|o| !new_flows.iter().any(|n| n.qfi == o.qfi))
         .map(|o| o.qfi)
         .collect();
+    // Adjust the GFBR reservation to the new decision (best-effort — the PCF already
+    // authorized it, so a mid-session increase isn't admission-refused here).
+    let new_gfbr = decision_gfbr(&decision);
     // Refresh the sm-context's authoritative QoS record.
     if let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref) {
+        if c.reserved_gfbr != new_gfbr {
+            smf.adjust_gfbr(c.reserved_gfbr, new_gfbr);
+            c.reserved_gfbr = new_gfbr;
+        }
         c.policy = decision.clone();
     }
     // Signal the change to the RAN/UE via the serving AMF (Namf_Communication →
@@ -783,6 +882,18 @@ fn spawn_amf_pdu_modify(
             Err(e) => tracing::warn!(psi, "AMF PDU modify call failed: {e}"),
         }
     });
+}
+
+/// The aggregate GFBR `(downlink_bps, uplink_bps)` a decision's GBR flows require —
+/// the input to GFBR admission control. A flow whose GFBR strings don't parse
+/// contributes 0 (it can't be admission-checked).
+fn decision_gfbr(decision: &sbi_core::npcf::SmPolicyDecision) -> (u64, u64) {
+    decision.qos_flows.iter().filter_map(|f| f.gbr.as_ref()).fold((0u64, 0u64), |(dl, ul), g| {
+        (
+            dl.saturating_add(sbi_core::npcf::bitrate_to_bps(&g.gfbr_dl).unwrap_or(0)),
+            ul.saturating_add(sbi_core::npcf::bitrate_to_bps(&g.gfbr_ul).unwrap_or(0)),
+        )
+    })
 }
 
 /// The per-flow GBR QERs (classifier + MFBR) for the UPF, from a decision's GBR
@@ -1324,6 +1435,82 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(deleted, "PCF SM policy association deleted on release");
+    }
+
+    /// GFBR admission control: a session whose GBR flow's GFBR exceeds the remaining
+    /// budget is refused (503 → 5GSM #26); releasing a session frees the budget.
+    #[tokio::test]
+    async fn gfbr_admission_control_refuses_when_budget_exhausted() {
+        let upf_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let upf_state = Arc::new(Mutex::new(pfcp::UpfState::new()));
+        let upf_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upf_addr = upf_sock.local_addr().unwrap();
+        {
+            let upf_state = upf_state.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let (n, peer) = upf_sock.recv_from(&mut buf).await.unwrap();
+                    let resp = {
+                        let mut s = upf_state.lock().unwrap();
+                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s, 0)
+                    };
+                    if let Some(resp) = resp {
+                        upf_sock.send_to(&resp, peer).await.unwrap();
+                    }
+                }
+            });
+        }
+
+        let (nrf_base, _udr_base) = spin_subscription_backend("imsi-999700000000001", "99970").await;
+        // Local demo PCF: its GBR flow has GFBR 100 Mbps each way.
+        let _pcf = spin_pcf(&nrf_base, None).await;
+        // Budget = exactly one demo GBR flow.
+        let smf = Arc::new(
+            SmfState::connect(upf_addr, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+                .await
+                .unwrap()
+                .with_gfbr_budget(100_000_000, 100_000_000),
+        );
+        smf.associate().await.unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+        let create = |psi: u8| {
+            client
+                .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+                .json(&serde_json::json!({
+                    "supi": "imsi-999700000000001", "pduSessionId": psi, "dnn": "internet",
+                    "servingNetwork": { "mcc": "999", "mnc": "70" },
+                    "sNssai": { "sst": 1, "sd": "010203" }
+                }))
+                .send()
+        };
+
+        // First GBR session fits the budget exactly.
+        let r1 = create(5).await.unwrap();
+        assert_eq!(r1.status().as_u16(), 201, "first GBR session admitted");
+        let created: SmContextCreatedData = r1.json().await.unwrap();
+        // The second would exceed it → refused (GFBR admission control).
+        let r2 = create(6).await.unwrap();
+        assert_eq!(r2.status().as_u16(), 503, "second GBR session refused (insufficient resources)");
+
+        // Releasing the first frees the budget, so a new session is admitted again.
+        let status = client
+            .post(format!(
+                "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
+                created.sm_context_ref
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 204, "release succeeded");
+        let r3 = create(6).await.unwrap();
+        assert_eq!(r3.status().as_u16(), 201, "budget freed on release — new session admitted");
     }
 
     /// A UDR-backed PCF + the SMF's refresh-policy trigger: a mid-session change to

@@ -29,6 +29,14 @@ use rs_pfcp::ie::precedence::Precedence;
 use rs_pfcp::ie::ue_ip_address::UeIpAddress;
 use rs_pfcp::ie::apply_action::ApplyAction;
 use rs_pfcp::ie::create_qer::CreateQer;
+use rs_pfcp::ie::create_urr::CreateUrr;
+use rs_pfcp::ie::measurement_method::MeasurementMethod;
+use rs_pfcp::ie::reporting_triggers::ReportingTriggers;
+use rs_pfcp::ie::sequence_number::SequenceNumber;
+use rs_pfcp::ie::urr_id::UrrId;
+use rs_pfcp::ie::usage_report::UsageReport;
+use rs_pfcp::ie::usage_report_trigger::UsageReportTrigger;
+use rs_pfcp::ie::volume_measurement::VolumeMeasurement;
 use rs_pfcp::ie::mbr::Mbr;
 use rs_pfcp::ie::outer_header_creation::OuterHeaderCreation;
 use rs_pfcp::ie::qer_id::QerId;
@@ -60,6 +68,8 @@ const AMBR_QER_ID: u32 = 1;
 /// session-AMBR QER), and its classifier PDR id is `PER_FLOW_PDR_BASE + index`.
 const PER_FLOW_QER_BASE: u32 = 1000;
 const PER_FLOW_PDR_BASE: u16 = 100;
+/// The session-level volume URR id (usage measurement + final report at deletion).
+const SESSION_URR_ID: u32 = 1;
 
 /// A compact packet classifier for a QoS flow: transport protocol + a port range,
 /// matched against **either** endpoint — a greenfield stand-in for a full TS 29.244
@@ -266,11 +276,15 @@ struct Session {
     dl_bucket: Option<TokenBucket>,
     /// Per-GBR-flow policers (MFBR), checked by classifier before the session AMBR.
     flow_qers: Vec<FlowEnforcer>,
+    /// URR volume measurement: forwarded (admitted) bytes each direction.
+    ul_bytes: u64,
+    dl_bytes: u64,
 }
 
 impl Session {
     /// Admit `pkt` in the given direction: classify it to a GBR flow and police it
     /// against that flow's MFBR, else against the session AMBR. `true` = forward.
+    /// Forwarded bytes are counted for the URR volume measurement.
     fn admit(&mut self, uplink: bool, now_nanos: u64, pkt: &[u8]) -> bool {
         let bytes = pkt.len();
         let flow_idx = transport_key(pkt)
@@ -281,7 +295,15 @@ impl Session {
             None if uplink => self.ul_bucket.as_mut(),
             None => self.dl_bucket.as_mut(),
         };
-        bucket.is_none_or(|b| b.poll(now_nanos, bytes))
+        let admitted = bucket.is_none_or(|b| b.poll(now_nanos, bytes));
+        if admitted {
+            if uplink {
+                self.ul_bytes = self.ul_bytes.saturating_add(bytes as u64);
+            } else {
+                self.dl_bytes = self.dl_bytes.saturating_add(bytes as u64);
+            }
+        }
+        admitted
     }
 }
 
@@ -347,10 +369,11 @@ impl UpfState {
 
     /// Allocate a UP-SEID + N3 TEID for a new session and record it (with the
     /// SMF-allocated UE IP, if the establishment carried one).
-    /// Remove a session (PFCP Session Deletion) — its TEID and UE-IP routes go
-    /// with it. Returns whether the session existed.
-    fn remove(&mut self, up_seid: u64) -> bool {
-        self.sessions.remove(&up_seid).is_some()
+    /// Remove a session (PFCP Session Deletion) — its TEID and UE-IP routes go with
+    /// it. Returns the session's final volume usage `(uplink_bytes, downlink_bytes)`,
+    /// or `None` if it didn't exist.
+    fn remove(&mut self, up_seid: u64) -> Option<(u64, u64)> {
+        self.sessions.remove(&up_seid).map(|s| (s.ul_bytes, s.dl_bytes))
     }
 
     fn establish(
@@ -377,7 +400,17 @@ impl UpfState {
             .collect();
         self.sessions.insert(
             up_seid,
-            Session { n3_teid: teid, ue_ip, downlink: None, ambr, ul_bucket, dl_bucket, flow_qers },
+            Session {
+                n3_teid: teid,
+                ue_ip,
+                downlink: None,
+                ambr,
+                ul_bucket,
+                dl_bucket,
+                flow_qers,
+                ul_bytes: 0,
+                dl_bytes: 0,
+            },
         );
         (up_seid, teid)
     }
@@ -517,7 +550,8 @@ pub fn session_establishment_request(
     let mut ul_pdr = CreatePdrBuilder::new(PdrId::new(1))
         .precedence(Precedence::new(100))
         .pdi(ul_pdi)
-        .far_id(FarId::new(1));
+        .far_id(FarId::new(1))
+        .urr_id(UrrId::new(SESSION_URR_ID)); // measure uplink volume
     if let Some(q) = qer_id {
         ul_pdr = ul_pdr.qer_id(q);
     }
@@ -533,7 +567,8 @@ pub fn session_establishment_request(
     let mut dl_pdr = CreatePdrBuilder::new(PdrId::new(2))
         .precedence(Precedence::new(200))
         .pdi(dl_pdi)
-        .far_id(FarId::new(2));
+        .far_id(FarId::new(2))
+        .urr_id(UrrId::new(SESSION_URR_ID)); // measure downlink volume
     if let Some(q) = qer_id {
         dl_pdr = dl_pdr.qer_id(q);
     }
@@ -560,11 +595,26 @@ pub fn session_establishment_request(
         create_pdrs.push(pdr);
     }
 
+    // A session-level volume URR (measure uplink+downlink bytes; final report at
+    // deletion) — both match-all PDRs reference it by id.
+    let urr = CreateUrr::new(
+        UrrId::new(SESSION_URR_ID),
+        MeasurementMethod::new(false, true, false), // volume
+        ReportingTriggers::new(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
     let mut builder = SessionEstablishmentRequestBuilder::new(0u64, seq) // header SEID 0 — UPF has none yet
         .node_id(smf_ip)
         .fseid(cp_seid, smf_ip) // CP F-SEID
         .create_pdrs(create_pdrs)
-        .create_fars(vec![ul_far.to_ie(), dl_far.to_ie()]);
+        .create_fars(vec![ul_far.to_ie(), dl_far.to_ie()])
+        .create_urrs(vec![urr.to_ie()]);
     if !create_qers.is_empty() {
         builder = builder.create_qers(create_qers);
     }
@@ -778,17 +828,36 @@ pub fn handle_n4(
         }
         MsgType::SessionDeletionRequest => {
             let up_seid = u64::from(msg.seid()?);
-            let cause = if state.remove(up_seid) {
+            let usage = state.remove(up_seid);
+            let cause = if usage.is_some() {
                 CauseValue::RequestAccepted
             } else {
                 CauseValue::SessionContextNotFound
             };
-            Some(
-                SessionDeletionResponseBuilder::new(up_seid, seq)
-                    .cause(cause)
-                    .build()
-                    .marshal(),
-            )
+            let mut builder = SessionDeletionResponseBuilder::new(up_seid, seq).cause(cause);
+            // Final URR usage report: the session's measured volume. Triggered by
+            // the session termination (`0x20` = TERMR).
+            if let Some((ul, dl)) = usage {
+                let vm = VolumeMeasurement::new(
+                    0b0000_0111, // TOVOL | ULVOL | DLVOL present
+                    Some(ul + dl),
+                    Some(ul),
+                    Some(dl),
+                    None,
+                    None,
+                    None,
+                );
+                let mut report = UsageReport::new(
+                    UrrId::new(SESSION_URR_ID),
+                    SequenceNumber::new(1),
+                    UsageReportTrigger::new(0x20),
+                );
+                report.volume_measurement = Some(vm);
+                // The deletion response uses a dedicated usage-report IE type.
+                let ie = Ie::new(IeType::UsageReportWithinSessionDeletionResponse, report.marshal());
+                builder = builder.ies(vec![ie]);
+            }
+            Some(builder.build().marshal())
         }
         _ => None,
     }
@@ -845,6 +914,16 @@ pub fn response_accepted(data: &[u8]) -> bool {
         })
         .map(|v| v == 1)
         .unwrap_or(false)
+}
+
+/// SMF: parse the final URR usage report (volume) from a Session Deletion Response:
+/// `(total_bytes, uplink_bytes, downlink_bytes)`. `None` if the response carries none.
+pub fn usage_from_deletion_response(data: &[u8]) -> Option<(u64, u64, u64)> {
+    let msg = rs_pfcp::message::parse(data).ok()?;
+    let ie = msg.ies(IeType::UsageReportWithinSessionDeletionResponse).next()?;
+    let report = UsageReport::unmarshal(&ie.payload).ok()?;
+    let vm = report.volume_measurement?;
+    Some((vm.total_volume?, vm.uplink_volume?, vm.downlink_volume?))
 }
 
 #[cfg(test)]
@@ -1071,6 +1150,38 @@ mod tests {
         assert_eq!(state.flow_qfis(up_seid), vec![2], "QFI 3 removed");
         let p3 = udp_packet(40000, 6005, 1000);
         assert!(state.admit_uplink(teid, now, &p3), "removed flow's traffic no longer policed per-flow");
+    }
+
+    #[test]
+    fn urr_measures_volume_and_reports_at_deletion() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        handle_n4(
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[]),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("establish");
+        let (up_seid, teid) = (1u64, 1u32);
+
+        // Forward 3×1000-byte uplink + 2×500-byte downlink (no AMBR → all admitted).
+        for _ in 0..3 {
+            assert!(state.admit_uplink(teid, 0, &udp_packet(1, 2, 1000)));
+        }
+        for _ in 0..2 {
+            assert!(state.admit_downlink(UE_IP, 0, &udp_packet(1, 2, 500)));
+        }
+
+        // Deletion returns the final volume usage report.
+        let resp = handle_n4(&session_deletion_request(up_seid, 2), node_ip, &mut state, 0)
+            .expect("delete");
+        assert!(response_accepted(&resp));
+        assert_eq!(
+            usage_from_deletion_response(&resp),
+            Some((4000, 3000, 1000)),
+            "(total, uplink, downlink) bytes"
+        );
     }
 
     #[test]

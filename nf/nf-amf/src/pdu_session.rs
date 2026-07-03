@@ -93,6 +93,8 @@ pub(crate) fn bitrate_to_bps(s: &str) -> Option<u64> {
 pub enum CreateSmError {
     /// The SMF refused the session (`403`): the DNN is not in the subscription.
     Forbidden,
+    /// The SMF refused for lack of resources (`503`): GFBR admission control.
+    InsufficientResources,
     /// Anything else (discovery, transport, upstream failure).
     Other(String),
 }
@@ -101,6 +103,7 @@ impl std::fmt::Display for CreateSmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CreateSmError::Forbidden => write!(f, "SMF refused: DNN not subscribed"),
+            CreateSmError::InsufficientResources => write!(f, "SMF refused: insufficient resources"),
             CreateSmError::Other(e) => write!(f, "{e}"),
         }
     }
@@ -165,6 +168,9 @@ impl AmfSmf {
             .map_err(|e| format!("Nsmf CreateSMContext request failed: {e}"))?;
         if resp.status().as_u16() == 403 {
             return Err(CreateSmError::Forbidden);
+        }
+        if resp.status().as_u16() == 503 {
+            return Err(CreateSmError::InsufficientResources);
         }
         if !resp.status().is_success() {
             return Err(format!("Nsmf CreateSMContext returned {}", resp.status()).into());
