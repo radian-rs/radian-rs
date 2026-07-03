@@ -55,6 +55,7 @@ surface of the project and assesses build feasibility.
 | [44-smf-selection.md](44-smf-selection.md) | AMF-side SMF selection by (S-NSSAI, DNN): NRF profile smfInfo + filtered discovery, AMF stores the selected SMF base per session (modify/release hit the same one) |
 | [45-per-flow-qos.md](45-per-flow-qos.md) | Per-flow QoS (5QI/ARP/GBR): NGAP QosFlow list in the N2 transfer + NAS Authorized QoS flow descriptions IE (0x79) in the N1 accept, subscription-driven; GBR flow live-verified |
 | [46-sbi-oauth.md](46-sbi-oauth.md) | SBI OAuth2 access tokens (TS 33.501): NRF token endpoint, HS256 JWT, UDR enforced via oauth::protect, secretless TokenSource; opt-in via RADIAN_SBI_SECRET |
+| [47-pcf-smpolicy.md](47-pcf-smpolicy.md) | Real PCF — Npcf_SMPolicyControl (TS 29.512): sbi_core::npcf policy engine + PcfClient, SMF sources SM policy (AMBR + QoS flows) from the NRF-discovered PCF, deletes on release, falls back to sm-data when no PCF; shared QosFlowPolicy types |
 
 ## One-paragraph summary
 
