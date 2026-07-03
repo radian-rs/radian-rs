@@ -59,8 +59,8 @@ async fn main() -> anyhow::Result<()> {
     let state = sbi_core::npcf::PcfState::new(sbi_core::npcf::PolicyConfig::demo())
         .with_udr(Arc::new(udr));
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
-    match &tls {
-        Some(id) => sbi_core::tls::run_tls(sbi, sbi_core::npcf::router(state), id.server_config()?).await?,
+    match tls {
+        Some(id) => sbi_core::tls::serve(sbi, sbi_core::npcf::router(state), id).await?,
         None => sbi_core::run(sbi, sbi_core::npcf::router(state)).await?,
     }
     Ok(())

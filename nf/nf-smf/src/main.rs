@@ -55,8 +55,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
-    match &tls {
-        Some(id) => sbi_core::tls::run_tls(sbi, pdu_session::router(smf), id.server_config()?).await?,
+    match tls {
+        Some(id) => sbi_core::tls::serve(sbi, pdu_session::router(smf), id).await?,
         None => sbi_core::run(sbi, pdu_session::router(smf)).await?,
     }
     Ok(())
