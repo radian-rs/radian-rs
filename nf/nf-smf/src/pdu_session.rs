@@ -132,8 +132,11 @@ impl SmfState {
                 loop {
                     let Ok(n) = sock.recv(&mut buf).await else { break };
                     let datagram = buf[..n].to_vec();
-                    // A UPF-initiated usage report — hand it to the report handler.
-                    if pfcp::parse_session_report_request(&datagram).is_some() {
+                    // A UPF-initiated Session Report (usage threshold or downlink
+                    // data) — hand it to the report handler.
+                    if pfcp::parse_session_report_request(&datagram).is_some()
+                        || pfcp::parse_dl_data_report(&datagram).is_some()
+                    {
                         if reports_tx.send(datagram).is_err() {
                             break;
                         }
@@ -858,7 +861,7 @@ async fn deactivate_up(smf: &Arc<SmfState>, sm_ref: &str) -> StatusCode {
     }
     if let Some(c) = smf.contexts.lock().unwrap().get_mut(sm_ref) {
         c.gnb = None;
-        tracing::info!(%sm_ref, up_seid, "deactivated UP connection (AN release); downlink dropped");
+        tracing::info!(%sm_ref, up_seid, "deactivated UP connection (AN release); downlink buffered at the UPF");
     }
     StatusCode::OK
 }
@@ -953,6 +956,12 @@ pub async fn handle_usage_reports(smf: Arc<SmfState>) {
     loop {
         let report = { smf.reports_rx.lock().await.recv().await };
         let Some(report) = report else { break };
+        // A Downlink Data Report: downlink data arrived for a CM-IDLE UE — ack it
+        // and ask the AMF to page the UE (TS 23.502 §4.2.3.3).
+        if let Some((cp_seid, seq)) = pfcp::parse_dl_data_report(&report) {
+            handle_dl_data_report(&smf, cp_seid, seq).await;
+            continue;
+        }
         let Some((cp_seid, seq, usage)) = pfcp::parse_session_report_request(&report) else {
             continue;
         };
@@ -990,6 +999,37 @@ pub async fn handle_usage_reports(smf: Arc<SmfState>) {
                 Err(e) => tracing::warn!("Nchf update failed: {e}"),
             }
         }
+    }
+}
+
+/// Downlink Data Report handling: ack the UPF, then ask the serving AMF to page
+/// the CM-IDLE UE (Namf_Communication_N1N2MessageTransfer). The UE answers with a
+/// Service Request, which re-activates the session — and the UPF flushes the
+/// buffered downlink onto the restored tunnel.
+async fn handle_dl_data_report(smf: &Arc<SmfState>, cp_seid: u64, seq: u32) {
+    let ctx = {
+        let ctxs = smf.contexts.lock().unwrap();
+        ctxs.values().find(|c| c.cp_seid == cp_seid).map(|c| (c.up_seid, c.supi.clone()))
+    };
+    let Some((up_seid, supi)) = ctx else {
+        tracing::warn!(cp_seid, "downlink data report for an unknown session — dropped");
+        return;
+    };
+    if let Err(e) = smf.sock.send(&pfcp::session_report_response(up_seid, seq)).await {
+        tracing::warn!("downlink data report ack send error: {e}");
+    }
+    tracing::info!(up_seid, "downlink data for a CM-IDLE UE — requesting paging at the AMF");
+    // Discover the serving AMF and ask it to page (best-effort, off the path).
+    match discover_endpoint(&smf.nrf_base, "AMF").await {
+        Ok(amf) => {
+            let url = format!("{amf}/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages");
+            match sbi_core::sbi_client().post(url).json(&serde_json::json!({})).send().await {
+                Ok(r) if r.status().is_success() => tracing::info!("AMF paging requested"),
+                Ok(r) => tracing::warn!(status = %r.status(), "AMF paging request refused"),
+                Err(e) => tracing::warn!("AMF paging request failed: {e}"),
+            }
+        }
+        Err(e) => tracing::warn!("no AMF to page ({e})"),
     }
 }
 

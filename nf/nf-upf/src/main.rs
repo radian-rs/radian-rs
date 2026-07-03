@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     // Session Report Requests (threshold usage reports) are sent.
     let smf_addr: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
 
-    let n4_task = tokio::spawn(serve_n4(n4.clone(), node_ip, state.clone(), smf_addr.clone()));
+    let n4_task = tokio::spawn(serve_n4(n4.clone(), n3.clone(), node_ip, state.clone(), smf_addr.clone()));
     let n3_task = tokio::spawn(serve_n3(n3.clone(), state.clone(), tun.clone()));
     tokio::spawn(report_usage(n4, state.clone(), smf_addr));
     // Downlink only runs when N6 is live: it reads packets from the data network.
@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
 /// N4: PFCP control plane (association, heartbeat, session establishment/modification).
 async fn serve_n4(
     socket: Arc<tokio::net::UdpSocket>,
+    n3: Arc<tokio::net::UdpSocket>,
     node_ip: Ipv4Addr,
     state: Upf,
     smf_addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
@@ -129,10 +130,21 @@ async fn serve_n4(
         };
         // Remember the control plane's address for UPF-initiated reports.
         *smf_addr.lock().unwrap() = Some(peer);
-        let resp = {
+        let (resp, flush) = {
             let mut g = state.lock().unwrap();
-            pfcp::handle_n4(&buf[..n], node_ip, &mut g, now_nanos())
+            let resp = pfcp::handle_n4(&buf[..n], node_ip, &mut g, now_nanos());
+            (resp, g.take_flush())
         };
+        // A re-activation (Service Request resume) flushes the packets buffered while
+        // the UE was CM-IDLE onto its restored gNB tunnel.
+        for (gnb_teid, gnb_ip, pkt) in flush {
+            let dst = SocketAddrV4::new(gnb_ip, gtpu::GTPU_PORT);
+            if let Err(e) = n3.send_to(&gtpu::encap(gnb_teid, &pkt), dst).await {
+                warn!(%gnb_ip, "buffered-downlink flush send error: {e}");
+            } else {
+                info!(%gnb_ip, "flushed a buffered downlink packet to the resumed UE");
+            }
+        }
         match resp {
             Some(resp) => {
                 if let Err(e) = socket.send_to(&resp, peer).await {
@@ -183,6 +195,22 @@ async fn report_usage(
                     "usage threshold crossed — Session Report Request sent to the SMF"
                 ),
                 Err(e) => warn!(%smf, "usage report send error: {e}"),
+            }
+        }
+        // Downlink Data Reports: a buffering (CM-IDLE) session got downlink data →
+        // tell the SMF to page the UE (TS 23.502 §4.2.3.3).
+        loop {
+            let cp_seid = { state.lock().unwrap().take_dl_data_report() };
+            let Some(cp_seid) = cp_seid else { break };
+            let Some(smf) = *smf_addr.lock().unwrap() else {
+                warn!("downlink data for an idle UE but no SMF address known");
+                break;
+            };
+            seq = seq.wrapping_add(1);
+            let req = pfcp::session_report_request_dldr(cp_seid, seq);
+            match socket.send_to(&req, smf).await {
+                Ok(_) => info!(cp_seid, "downlink data for a CM-IDLE UE — Downlink Data Report sent (paging)"),
+                Err(e) => warn!(%smf, "downlink data report send error: {e}"),
             }
         }
     }
@@ -258,6 +286,8 @@ async fn serve_n6_downlink(tun: Arc<N6Tun>, n3: Arc<tokio::net::UdpSocket>, stat
                     Err(e) => warn!(%gnb_ip, "N3 downlink send error: {e}"),
                 }
             }
+            // A CM-IDLE session buffered the packet; the reporter task pages the UE.
+            n6::Downlink::Buffered => info!(bytes = n, "N6 downlink buffered for a CM-IDLE UE (paging triggered)"),
             // No session owns this destination / not IPv4 — background DN noise; don't spam.
             n6::Downlink::NoRoute => trace!("N6 downlink with no matching session — dropped"),
             n6::Downlink::NotIpv4 => trace!("N6 downlink not IPv4 — dropped"),
