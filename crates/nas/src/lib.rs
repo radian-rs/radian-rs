@@ -593,6 +593,39 @@ pub fn pdu_session_establishment_accept(
     m
 }
 
+/// Build a 5GSM **PDU Session Modification Command** (TS 24.501 §8.3.5) as the raw
+/// N1 SM container bytes — the network-initiated mid-session QoS change delivered to
+/// the UE. Carries the updated **Session-AMBR** (IEI 0x2A) and the **Authorized QoS
+/// flow descriptions** (IEI 0x79). `pti` is 0 for a network-initiated procedure.
+///
+/// Hand-encoded to the TS 24.501 layout. Note: unlike the establishment accept, this
+/// is not exercised by the live free-ran-ue UE (which does not drive a modification),
+/// so its wire shape is pinned by unit tests rather than interop.
+pub fn pdu_session_modification_command(
+    pdu_session_id: u8,
+    pti: u8,
+    ambr: SessionAmbr,
+    flows: &[QosFlowDesc],
+) -> Vec<u8> {
+    // 5GSM header: EPD, PDU session id, PTI, message type (0xCB = Modification Command).
+    let mut m = vec![0x2e, pdu_session_id, pti, 0xcb];
+    // Session-AMBR (IEI 0x2A, TLV length 6): downlink unit+value then uplink unit+value.
+    m.push(0x2a);
+    m.push(6);
+    m.push(ambr.dl_unit);
+    m.extend_from_slice(&ambr.dl.to_be_bytes());
+    m.push(ambr.ul_unit);
+    m.extend_from_slice(&ambr.ul.to_be_bytes());
+    // Authorized QoS flow descriptions (IEI 0x79, LV-E) — the updated per-flow QoS.
+    if !flows.is_empty() {
+        let desc = qos_flow_descriptions_value(flows);
+        m.push(0x79);
+        m.extend_from_slice(&(desc.len() as u16).to_be_bytes());
+        m.extend_from_slice(&desc);
+    }
+    m
+}
+
 /// 5GSM cause values (TS 24.501 §9.11.4.2) this stack emits.
 pub mod sm_cause {
     /// #27 — the requested DNN is not subscribed / unknown.
@@ -1008,6 +1041,32 @@ mod tests {
         let bare =
             pdu_session_establishment_accept(5, 1, ue_ip, "internet", 1, Some([1, 2, 3]), ambr, &[]);
         assert!(!bare.windows(1).any(|w| w == [0x79]), "no QoS flow descriptions IE when empty");
+    }
+
+    #[test]
+    fn pdu_session_modification_command_layout() {
+        let ambr = session_ambr_from_bitrates("50 Mbps", "100 Mbps").unwrap();
+        let flows = [
+            QosFlowDesc { qfi: 1, five_qi: 9, gbr: None },
+            QosFlowDesc {
+                qfi: 2,
+                five_qi: 1,
+                gbr: Some(GbrFlow {
+                    gfbr: session_ambr_from_bitrates("10 Mbps", "10 Mbps").unwrap(),
+                    mfbr: session_ambr_from_bitrates("20 Mbps", "20 Mbps").unwrap(),
+                }),
+            },
+        ];
+        let cmd = pdu_session_modification_command(5, 0, ambr, &flows);
+        // 5GSM header: EPD, psi, PTI 0 (network-initiated), message type 0xCB.
+        assert_eq!(&cmd[..4], &[0x2e, 5, 0, 0xcb]);
+        // Session-AMBR IEI 0x2A, len 6: dl unit+value, ul unit+value (50/100 Mbps).
+        assert!(
+            cmd.windows(8).any(|w| w == [0x2a, 0x06, 0x06, 0x00, 100, 0x06, 0x00, 50]),
+            "session AMBR TLV (0x2A)"
+        );
+        // Authorized QoS flow descriptions IE (0x79) present with both flows.
+        assert!(cmd.windows(1).any(|w| w == [0x79]), "0x79 QoS flow descriptions IE");
     }
 
     #[test]
