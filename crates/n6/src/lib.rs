@@ -135,7 +135,7 @@ mod tests {
     ) -> (UpfState, u32) {
         let mut state = UpfState::new();
         pfcp::handle_n4(
-            &pfcp::session_establishment_request(0xCAFE, 1, UPF_IP, UE_IP, ambr, flows),
+            &pfcp::session_establishment_request(0xCAFE, 1, UPF_IP, UE_IP, ambr, flows, None),
             UPF_IP,
             &mut state,
             0,

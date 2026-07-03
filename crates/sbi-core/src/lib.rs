@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
 pub mod nausf;
+pub mod nchf;
 pub mod nnrf;
 pub mod npcf;
 pub mod oauth;

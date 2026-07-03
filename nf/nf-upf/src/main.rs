@@ -68,9 +68,11 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(Ipv4Addr::LOCALHOST);
     let bind = std::env::var(BIND_ENV).unwrap_or_else(|_| "0.0.0.0".to_string());
 
-    let n4 = tokio::net::UdpSocket::bind(format!("{bind}:{}", pfcp::N4_PORT))
-        .await
-        .context("bind N4 PFCP")?;
+    let n4 = Arc::new(
+        tokio::net::UdpSocket::bind(format!("{bind}:{}", pfcp::N4_PORT))
+            .await
+            .context("bind N4 PFCP")?,
+    );
     let n3 = Arc::new(
         tokio::net::UdpSocket::bind(format!("{bind}:{}", gtpu::GTPU_PORT))
             .await
@@ -93,8 +95,13 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let n4_task = tokio::spawn(serve_n4(n4, node_ip, state.clone()));
+    // The SMF's N4 address, learned from its PFCP requests — where UPF-initiated
+    // Session Report Requests (threshold usage reports) are sent.
+    let smf_addr: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
+
+    let n4_task = tokio::spawn(serve_n4(n4.clone(), node_ip, state.clone(), smf_addr.clone()));
     let n3_task = tokio::spawn(serve_n3(n3.clone(), state.clone(), tun.clone()));
+    tokio::spawn(report_usage(n4, state.clone(), smf_addr));
     // Downlink only runs when N6 is live: it reads packets from the data network.
     if let Some(tun) = tun {
         tokio::spawn(serve_n6_downlink(tun, n3, state));
@@ -104,7 +111,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// N4: PFCP control plane (association, heartbeat, session establishment/modification).
-async fn serve_n4(socket: tokio::net::UdpSocket, node_ip: Ipv4Addr, state: Upf) {
+async fn serve_n4(
+    socket: Arc<tokio::net::UdpSocket>,
+    node_ip: Ipv4Addr,
+    state: Upf,
+    smf_addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
+) {
     let mut buf = vec![0u8; 2048];
     loop {
         // Per-datagram errors must not tear down the UPF: log and keep serving.
@@ -115,6 +127,8 @@ async fn serve_n4(socket: tokio::net::UdpSocket, node_ip: Ipv4Addr, state: Upf) 
                 continue;
             }
         };
+        // Remember the control plane's address for UPF-initiated reports.
+        *smf_addr.lock().unwrap() = Some(peer);
         let resp = {
             let mut g = state.lock().unwrap();
             pfcp::handle_n4(&buf[..n], node_ip, &mut g, now_nanos())
@@ -128,7 +142,48 @@ async fn serve_n4(socket: tokio::net::UdpSocket, node_ip: Ipv4Addr, state: Upf) 
                     info!(%peer, sessions, "handled N4 PFCP message");
                 }
             }
+            // The SMF's ack to a usage report we sent — nothing to answer.
+            None if pfcp::is_session_report_ack(&buf[..n]) => {
+                trace!(%peer, "usage report acknowledged by the SMF");
+            }
             None => warn!(%peer, "unhandled or malformed N4 PFCP message"),
+        }
+    }
+}
+
+/// Threshold-triggered usage reporting (TS 29.244 §7.5.8): poll the session table
+/// for crossed volume thresholds and send each due report to the SMF as a
+/// **Session Report Request** — the quota-style charging trigger. Best-effort: the
+/// report is sent once (the counters advance regardless); the SMF's ack lands in
+/// the N4 loop.
+async fn report_usage(
+    socket: Arc<tokio::net::UdpSocket>,
+    state: Upf,
+    smf_addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
+) {
+    let mut seq: u32 = 1;
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    loop {
+        tick.tick().await;
+        loop {
+            let due = { state.lock().unwrap().take_due_report() };
+            let Some(due) = due else { break };
+            let Some(smf) = *smf_addr.lock().unwrap() else {
+                warn!("usage threshold crossed but no SMF address known — report dropped");
+                break;
+            };
+            seq = seq.wrapping_add(1);
+            let req = pfcp::session_report_request(&due, seq);
+            match socket.send_to(&req, smf).await {
+                Ok(_) => info!(
+                    cp_seid = due.cp_seid,
+                    total = due.usage.total,
+                    ul = due.usage.uplink,
+                    dl = due.usage.downlink,
+                    "usage threshold crossed — Session Report Request sent to the SMF"
+                ),
+                Err(e) => warn!(%smf, "usage report send error: {e}"),
+            }
         }
     }
 }
@@ -223,7 +278,7 @@ mod tests {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = pfcp::UpfState::new();
         pfcp::handle_n4(
-            &pfcp::session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[]),
+            &pfcp::session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[], None),
             node_ip,
             &mut state,
             0,

@@ -220,6 +220,8 @@ async fn start_core(world: &mut World) {
     world.procs.push(spawn_core(false, &[("RADIAN_AUSF_NRF", nrf)], "ausf").await);
     // PCF serves Npcf_SMPolicyControl; the SMF discovers it for the SM policy.
     world.procs.push(spawn_core(false, &[("RADIAN_PCF_NRF", nrf)], "pcf").await);
+    // CHF serves Nchf_ConvergedCharging; the SMF opens a charging session per PDU session.
+    world.procs.push(spawn_core(false, &[("RADIAN_CHF_NRF", nrf)], "chf").await);
     // UPF needs CAP_NET_ADMIN for its N6 TUN → run under sudo; advertise the host N3 address.
     world.procs.push(spawn_core(true, &[("RADIAN_UPF_N3_ADDR", &HOST_IP.to_string())], "upf").await);
     assert!(wait_until(6, || netns::host_iface_exists("n6upf0")).await, "UPF N6 TUN did not come up");

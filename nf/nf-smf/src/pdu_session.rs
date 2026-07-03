@@ -42,6 +42,9 @@ static SMF_INSTANCE_ID: std::sync::LazyLock<String> =
 struct SmContext {
     /// UP-SEID — addresses the session toward the UPF.
     up_seid: u64,
+    /// CP F-SEID — how a UPF-initiated Session Report Request addresses this
+    /// session back to us.
+    cp_seid: u64,
     /// UPF-allocated uplink N3 F-TEID.
     n3_teid: u32,
     /// The UE's assigned IP (this session's PDU address).
@@ -62,6 +65,10 @@ struct SmContext {
     /// GFBR `(downlink, uplink)` bits/sec this session reserved (GFBR admission) —
     /// released at teardown, adjusted on a mid-session policy change.
     reserved_gfbr: (u64, u64),
+    /// The Nchf charging data session `(chf_base, charging_ref)`, when a CHF was
+    /// discovered at establishment — updated with each relayed usage report,
+    /// released with the final usage at teardown. `None` ⇒ no charging.
+    charging: Option<(String, String)>,
 }
 
 /// SMF runtime: a PFCP client toward one UPF plus the SM-context table.
@@ -69,8 +76,17 @@ pub struct SmfState {
     smf_ip: Ipv4Addr,
     /// NRF base URL — used to discover the UDM for Nudm_SDM subscription fetches.
     nrf_base: String,
-    /// Connected N4 socket. A mutex serializes PFCP request/response transactions.
-    sock: tokio::sync::Mutex<UdpSocket>,
+    /// Connected N4 socket. A dedicated reader task (spawned by [`connect`]) owns
+    /// the receive side: responses are routed to their waiting transaction by
+    /// sequence number, and **UPF-initiated** Session Report Requests (usage
+    /// thresholds, design/59) land on [`reports_rx`].
+    sock: Arc<UdpSocket>,
+    /// In-flight transactions: sequence number → the waiting response channel
+    /// (shared with the reader task).
+    pending: Arc<Mutex<HashMap<u32, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
+    /// UPF-initiated Session Report Requests, consumed by
+    /// [`handle_usage_reports`].
+    reports_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
     seq: AtomicU32,
     cp_seid: AtomicU64,
     next_ref: AtomicU64,
@@ -82,10 +98,17 @@ pub struct SmfState {
     /// aggregate GFBR would exceed the remaining budget is refused (5GSM #26).
     gfbr_budget_bps: (u64, u64),
     reserved_gfbr_bps: Mutex<(u64, u64)>,
+    /// Usage-reporting volume threshold (bytes): provisioned on each session's URR
+    /// so the UPF reports mid-session usage (VOLTH) — the charging trigger.
+    /// `None` ⇒ usage is only reported at session deletion.
+    usage_threshold_bytes: Option<u64>,
 }
 
 impl SmfState {
-    /// Bind an N4 client socket and connect it to the UPF's PFCP endpoint.
+    /// Bind an N4 client socket and connect it to the UPF's PFCP endpoint. Spawns
+    /// the socket's reader task: responses are correlated to their transaction by
+    /// sequence number; UPF-initiated Session Report Requests go to the usage
+    /// channel (nothing else reads the socket).
     pub async fn connect(
         upf_n4: SocketAddr,
         smf_ip: Ipv4Addr,
@@ -93,10 +116,40 @@ impl SmfState {
     ) -> std::io::Result<Self> {
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
         sock.connect(upf_n4).await?;
+        let sock = Arc::new(sock);
+        let pending: Arc<Mutex<HashMap<u32, tokio::sync::oneshot::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (reports_tx, reports_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let (sock, pending) = (sock.clone(), pending.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                loop {
+                    let Ok(n) = sock.recv(&mut buf).await else { break };
+                    let datagram = buf[..n].to_vec();
+                    // A UPF-initiated usage report — hand it to the report handler.
+                    if pfcp::parse_session_report_request(&datagram).is_some() {
+                        if reports_tx.send(datagram).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    // Otherwise a response: wake the transaction waiting on its seq.
+                    // (A stale response — e.g. to a timed-out request — is dropped.)
+                    if let Some(seq) = pfcp::sequence_of(&datagram) {
+                        if let Some(tx) = pending.lock().unwrap().remove(&seq) {
+                            let _ = tx.send(datagram);
+                        }
+                    }
+                }
+            });
+        }
         Ok(Self {
             smf_ip,
             nrf_base: nrf_base.into(),
-            sock: tokio::sync::Mutex::new(sock),
+            sock,
+            pending,
+            reports_rx: tokio::sync::Mutex::new(reports_rx),
             seq: AtomicU32::new(1),
             cp_seid: AtomicU64::new(1),
             next_ref: AtomicU64::new(1),
@@ -106,12 +159,21 @@ impl SmfState {
             // control (config / tests).
             gfbr_budget_bps: (u64::MAX, u64::MAX),
             reserved_gfbr_bps: Mutex::new((0, 0)),
+            usage_threshold_bytes: None,
         })
     }
 
     /// Set the GFBR admission-control budget `(downlink_bps, uplink_bps)`.
     pub fn with_gfbr_budget(mut self, downlink_bps: u64, uplink_bps: u64) -> Self {
         self.gfbr_budget_bps = (downlink_bps, uplink_bps);
+        self
+    }
+
+    /// Provision a volume threshold (bytes) on every session's URR: the UPF then
+    /// reports usage mid-session whenever the threshold is crossed (the charging
+    /// trigger toward the CHF).
+    pub fn with_usage_threshold(mut self, bytes: u64) -> Self {
+        self.usage_threshold_bytes = Some(bytes);
         self
     }
 
@@ -154,25 +216,22 @@ impl SmfState {
     }
 
     /// Send one PFCP request and await *its* response — correlated by sequence number
-    /// (PFCP responses echo the request's), discarding any stale/mismatched datagram
-    /// (e.g. a late response to a previously timed-out request). 2s overall.
+    /// (PFCP responses echo the request's) via the reader task. 2s overall; on
+    /// timeout the pending entry is withdrawn (a late response is then dropped).
     async fn transact(&self, req: &[u8], expect_seq: u32) -> Option<Vec<u8>> {
-        let sock = self.sock.lock().await;
-        sock.send(req).await.ok()?;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let mut buf = vec![0u8; 2048];
-                let n = sock.recv(&mut buf).await.ok()?;
-                buf.truncate(n);
-                if pfcp::sequence_of(&buf) == Some(expect_seq) {
-                    return Some(buf);
-                }
-                // Sequence mismatch — not the response to this request; drop it.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending.lock().unwrap().insert(expect_seq, tx);
+        if self.sock.send(req).await.is_err() {
+            self.pending.lock().unwrap().remove(&expect_seq);
+            return None;
+        }
+        match tokio::time::timeout(Duration::from_secs(2), rx).await {
+            Ok(Ok(resp)) => Some(resp),
+            _ => {
+                self.pending.lock().unwrap().remove(&expect_seq);
+                None
             }
-        })
-        .await
-        .ok()
-        .flatten()
+        }
     }
 
     /// PFCP Association Setup toward the UPF — required before any session.
@@ -397,7 +456,15 @@ async fn create_sm_context(
     let ambr = ambr_bps(&decision);
     let flows = flow_qers(&decision);
     let est_req =
-        pfcp::session_establishment_request(cp_seid, seq, smf.smf_ip, ue_ip, ambr, &flows);
+        pfcp::session_establishment_request(
+            cp_seid,
+            seq,
+            smf.smf_ip,
+            ue_ip,
+            ambr,
+            &flows,
+            smf.usage_threshold_bytes,
+        );
     // Release the GFBR reservation if the N4 establishment doesn't complete.
     let resp = match smf.transact(&est_req, seq).await {
         Some(r) => r,
@@ -422,11 +489,44 @@ async fn create_sm_context(
         }
     };
 
+    // Open an Nchf charging data session at the NRF-discovered CHF (the SMF acting
+    // as CTF, TS 32.290). Best-effort: no CHF (or a failed create) ⇒ the session
+    // runs unbilled, mirroring the PCF fallback.
+    let charging = match discover_endpoint(&smf.nrf_base, "CHF").await {
+        Ok(chf_base) => {
+            let create = sbi_core::nchf::ChargingDataRequest {
+                subscriber_identifier: req.supi.clone(),
+                pdu_session_charging_information: Some(
+                    sbi_core::nchf::PduSessionChargingInformation {
+                        pdu_session_id: req.pdu_session_id,
+                        dnn: req.dnn.clone(),
+                    },
+                ),
+                used_unit_containers: vec![],
+            };
+            match sbi_core::nchf::ChfClient::new(chf_base.clone()).create(&create).await {
+                Ok(charging_ref) => {
+                    tracing::info!(charging_ref = %charging_ref, "charging session opened at the CHF");
+                    Some((chf_base, charging_ref))
+                }
+                Err(e) => {
+                    tracing::warn!("Nchf create failed (session runs unbilled): {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!("no CHF discovered (session runs unbilled): {e}");
+            None
+        }
+    };
+
     let sm_ref = smf.next_ref.fetch_add(1, Ordering::Relaxed).to_string();
     smf.contexts.lock().unwrap().insert(
         sm_ref.clone(),
         SmContext {
             up_seid: est.up_seid,
+            cp_seid,
             n3_teid: est.n3_teid,
             ue_ip,
             gnb: None,
@@ -435,6 +535,7 @@ async fn create_sm_context(
             sm_policy,
             policy: decision.clone(),
             reserved_gfbr,
+            charging,
         },
     );
     // Record this SMF as the serving SMF for the session (Nudm_UECM). Best-effort,
@@ -693,12 +794,17 @@ async fn release_sm_context(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<StatusCode, SbiProblem> {
-    let (up_seid, supi, psi, sm_policy, reserved_gfbr) = {
+    let (up_seid, supi, psi, sm_policy, reserved_gfbr, charging) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
-            Some(c) => {
-                (c.up_seid, c.supi.clone(), c.pdu_session_id, c.sm_policy.clone(), c.reserved_gfbr)
-            }
+            Some(c) => (
+                c.up_seid,
+                c.supi.clone(),
+                c.pdu_session_id,
+                c.sm_policy.clone(),
+                c.reserved_gfbr,
+                c.charging.clone(),
+            ),
             None => {
                 return Err(problem(
                     StatusCode::NOT_FOUND,
@@ -718,10 +824,25 @@ async fn release_sm_context(
     if !pfcp::response_accepted(&resp) {
         tracing::warn!(%sm_ref, up_seid, "UPF did not accept the N4 deletion (already gone?)");
     }
-    // Final usage report (Nudr/charging stand-in): the UPF returns the session's
-    // measured volume in the deletion response.
+    // Final usage reports: the session URR plus each per-flow URR. Logged, and —
+    // when the session has a charging session — released toward the CHF with the
+    // final used-unit containers (best-effort, off the path).
+    let usages = pfcp::usages_from_deletion_response(&resp);
     if let Some((total, ul, dl)) = pfcp::usage_from_deletion_response(&resp) {
-        tracing::info!(%sm_ref, up_seid, total_bytes = total, uplink_bytes = ul, downlink_bytes = dl, "session usage report");
+        tracing::info!(%sm_ref, up_seid, total_bytes = total, uplink_bytes = ul, downlink_bytes = dl, urrs = usages.len(), "session usage report");
+    }
+    if let Some((chf_base, charging_ref)) = charging {
+        let release = sbi_core::nchf::ChargingDataRequest {
+            subscriber_identifier: supi.clone(),
+            pdu_session_charging_information: None,
+            used_unit_containers: usages.iter().map(container_for).collect(),
+        };
+        tokio::spawn(async move {
+            match sbi_core::nchf::ChfClient::new(chf_base).release(&charging_ref, &release).await {
+                Ok(()) => tracing::info!(charging_ref = %charging_ref, "charging session released at the CHF"),
+                Err(e) => tracing::warn!("Nchf release failed: {e}"),
+            }
+        });
     }
     smf.contexts.lock().unwrap().remove(&sm_ref);
     // Free the GFBR admission reservation.
@@ -735,6 +856,66 @@ async fn release_sm_context(
     }
     tracing::info!(%sm_ref, up_seid, "released SM context; N4 session deleted");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Map one URR usage volume to an Nchf used-unit container. Rating-group
+/// convention (see `sbi_core::nchf`): the session-level URR is rating group `0`;
+/// a per-flow URR (`PER_FLOW_URR_BASE + qfi`) is rating group `qfi`.
+fn container_for(u: &pfcp::UsageVolume) -> sbi_core::nchf::UsedUnitContainer {
+    sbi_core::nchf::UsedUnitContainer {
+        rating_group: u.urr_id.checked_sub(pfcp::PER_FLOW_URR_BASE).unwrap_or(0),
+        uplink_volume: u.uplink,
+        downlink_volume: u.downlink,
+        total_volume: u.total,
+    }
+}
+
+/// Consume **UPF-initiated Session Report Requests** (volume-threshold usage
+/// reports, design/59): ack each toward the UPF and relay the usage to the CHF as
+/// an Nchf update (the mid-session charging trigger). Spawned once alongside the
+/// SBI server; ends if the N4 reader closes.
+pub async fn handle_usage_reports(smf: Arc<SmfState>) {
+    loop {
+        let report = { smf.reports_rx.lock().await.recv().await };
+        let Some(report) = report else { break };
+        let Some((cp_seid, seq, usage)) = pfcp::parse_session_report_request(&report) else {
+            continue;
+        };
+        // The report addresses the session by OUR (CP) F-SEID.
+        let ctx = {
+            let ctxs = smf.contexts.lock().unwrap();
+            ctxs.values()
+                .find(|c| c.cp_seid == cp_seid)
+                .map(|c| (c.up_seid, c.supi.clone(), c.charging.clone()))
+        };
+        let Some((up_seid, supi, charging)) = ctx else {
+            tracing::warn!(cp_seid, "usage report for an unknown session — dropped");
+            continue;
+        };
+        // Ack toward the UPF (the usage stands measured either way).
+        if let Err(e) = smf.sock.send(&pfcp::session_report_response(up_seid, seq)).await {
+            tracing::warn!("session report ack send error: {e}");
+        }
+        tracing::info!(
+            up_seid,
+            total_bytes = usage.total,
+            uplink_bytes = usage.uplink,
+            downlink_bytes = usage.downlink,
+            "usage threshold report from the UPF"
+        );
+        // Relay to the CHF (Nchf update) when the session is billed.
+        if let Some((chf_base, charging_ref)) = charging {
+            let update = sbi_core::nchf::ChargingDataRequest {
+                subscriber_identifier: supi,
+                pdu_session_charging_information: None,
+                used_unit_containers: vec![container_for(&usage)],
+            };
+            match sbi_core::nchf::ChfClient::new(chf_base).update(&charging_ref, &update).await {
+                Ok(()) => tracing::info!(charging_ref = %charging_ref, "usage relayed to the CHF"),
+                Err(e) => tracing::warn!("Nchf update failed: {e}"),
+            }
+        }
+    }
 }
 
 /// Re-authorize this session's policy at the PCF (`Npcf_SMPolicyControl_Update`)
@@ -1162,6 +1343,30 @@ mod tests {
         state
     }
 
+    /// Spin a real CHF (the `sbi_core::nchf` router), registered with the NRF as
+    /// nf-type `CHF`. Returns the shared CDR store the test can inspect.
+    async fn spin_chf(nrf_base: &str) -> sbi_core::nchf::ChfState {
+        let state = sbi_core::nchf::ChfState::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = state.clone();
+        tokio::spawn(async move {
+            sbi_core::run_on(listener, sbi_core::nchf::router(served)).await.unwrap()
+        });
+        let mut profile = sbi_core::nnrf::NfProfile::new("chf-1", "CHF", addr.ip().to_string());
+        profile.nf_services = Some(vec![sbi_core::nnrf::NfService {
+            service_instance_id: "nchf-convergedcharging-1".into(),
+            service_name: "nchf-convergedcharging".into(),
+            scheme: "http".into(),
+            ip_end_points: vec![sbi_core::nnrf::IpEndPoint {
+                ipv4_address: Some(addr.ip().to_string()),
+                port: Some(addr.port()),
+            }],
+        }]);
+        sbi_core::nnrf::NrfClient::new(nrf_base.to_string()).register(&profile).await.unwrap();
+        state
+    }
+
     /// Spin a mock AMF that records `Namf_Communication` PDU-modify posts, registered
     /// with the NRF as nf-type `AMF`. Returns the shared record of received bodies.
     async fn spin_mock_amf(nrf_base: &str) -> Arc<Mutex<Vec<serde_json::Value>>> {
@@ -1505,6 +1710,134 @@ mod tests {
         assert_eq!(status.as_u16(), 204, "release succeeded");
         let r3 = create(6).await.unwrap();
         assert_eq!(r3.status().as_u16(), 201, "budget freed on release — new session admitted");
+    }
+
+    /// The full charging loop (design/59): CreateSMContext opens an Nchf charging
+    /// session at the NRF-discovered CHF; a UPF volume-threshold Session Report
+    /// Request is acked and relayed as an Nchf update; release closes the CDR with
+    /// the unreported remainder — the CDR totals exactly what moved, no
+    /// double-billing.
+    #[tokio::test]
+    async fn charging_bills_threshold_reports_and_final_usage() {
+        let upf_ip = Ipv4Addr::new(127, 0, 0, 1);
+
+        // In-process UPF whose socket the test keeps a handle on, so it can play
+        // the nf-upf reporter (send a UPF-initiated Session Report Request).
+        let upf_state = Arc::new(Mutex::new(pfcp::UpfState::new()));
+        let upf_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let upf_addr = upf_sock.local_addr().unwrap();
+        let smf_peer: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        {
+            let upf_state = upf_state.clone();
+            let upf_sock = upf_sock.clone();
+            let smf_peer = smf_peer.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let (n, peer) = upf_sock.recv_from(&mut buf).await.unwrap();
+                    *smf_peer.lock().unwrap() = Some(peer);
+                    let resp = {
+                        let mut s = upf_state.lock().unwrap();
+                        pfcp::handle_n4(&buf[..n], upf_ip, &mut s, 0)
+                    };
+                    if let Some(resp) = resp {
+                        upf_sock.send_to(&resp, peer).await.unwrap();
+                    }
+                }
+            });
+        }
+
+        let (nrf_base, _udr) = spin_subscription_backend("imsi-999700000000001", "99970").await;
+        let chf = spin_chf(&nrf_base).await;
+
+        // SMF with a 1000-byte usage threshold + the usage-report handler running.
+        let smf = Arc::new(
+            SmfState::connect(upf_addr, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+                .await
+                .unwrap()
+                .with_usage_threshold(1000),
+        );
+        smf.associate().await.unwrap();
+        tokio::spawn(handle_usage_reports(smf.clone()));
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+
+        // CreateSMContext → the SMF opened a charging data session at the CHF.
+        let created: SmContextCreatedData = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(chf.open_sessions(), 1, "charging session opened with the PDU session");
+        let cdr_ref = "0"; // the CHF's first charging-data allocation
+        let cdr = chf.cdr(cdr_ref).expect("CDR opened");
+        assert_eq!(cdr.subscriber_identifier, "imsi-999700000000001");
+        assert_eq!(
+            cdr.pdu_session_charging_information.as_ref().map(|p| (p.pdu_session_id, p.dnn.as_str())),
+            Some((5, "internet"))
+        );
+
+        // 1500 uplink bytes cross the 1000-byte threshold: the UPF flags a report;
+        // the test sends it from the UPF socket (what nf-upf's reporter task does).
+        assert!(upf_state.lock().unwrap().admit_uplink(1, 0, &[0u8; 1500]));
+        let due = upf_state.lock().unwrap().take_due_report().expect("threshold crossed");
+        let peer = smf_peer.lock().unwrap().expect("SMF's N4 address learned");
+        upf_sock.send_to(&pfcp::session_report_request(&due, 99), peer).await.unwrap();
+
+        // The SMF acks and relays: the CDR accumulates the mid-session usage.
+        let mut billed = None;
+        for _ in 0..50 {
+            billed = chf.cdr(cdr_ref).and_then(|c| c.usage.get(&0).copied());
+            if billed.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let billed = billed.expect("mid-session usage billed at the CHF");
+        assert_eq!((billed.uplink_volume, billed.total_volume), (1500, 1500));
+
+        // 400 more bytes (under the threshold), then release: the deletion report
+        // carries only the unreported remainder.
+        assert!(upf_state.lock().unwrap().admit_uplink(1, 0, &[0u8; 400]));
+        let status = client
+            .post(format!(
+                "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
+                created.sm_context_ref
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 204, "release succeeded");
+
+        // The Nchf release is spawned off the path — poll for the closed CDR.
+        let mut closed = None;
+        for _ in 0..50 {
+            closed = chf.cdr(cdr_ref).filter(|c| c.released);
+            if closed.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let closed = closed.expect("CDR closed at release");
+        assert_eq!(
+            closed.usage[&0].total_volume,
+            1900,
+            "threshold report (1500) + final remainder (400) = the true total — no double-billing"
+        );
+        assert_eq!(chf.open_sessions(), 0);
     }
 
     /// A UDR-backed PCF + the SMF's refresh-policy trigger: a mid-session change to
