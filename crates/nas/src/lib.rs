@@ -312,6 +312,7 @@ pub fn registration_accept(
     tmsi: u32,
     allowed_nssai: &[(u8, Option<[u8; 3]>)],
     rejected_nssai: &[(u8, Option<[u8; 3]>)],
+    t3512_secs: u32,
 ) -> Nas5gsMessage {
     let guti = NasFGsMobileIdentity::from_guti(&Guti {
         mcc: mcc_digits(mcc),
@@ -321,8 +322,12 @@ pub fn registration_accept(
         amf_pointer: 0x00,
         tmsi,
     });
+    // T3512 (IEI 0x5E): the periodic-registration timer — the UE re-registers when
+    // it expires, so the AMF knows a UE that goes silent is unreachable (its
+    // retained CM-IDLE context can be implicitly deregistered).
     let mut accept = messages::NasRegistrationAccept::new(NasFGsRegistrationResult::new(vec![0x01]))
-        .set_fg_guti(guti);
+        .set_fg_guti(guti)
+        .set_t3512_value(NasGprsTimer3::new(vec![GprsTimer3::from_secs(t3512_secs).octet()]));
     if !allowed_nssai.is_empty() {
         accept = accept.set_allowed_nssai(NasNssai::new(nssai_value(allowed_nssai)));
     }
@@ -344,6 +349,15 @@ pub fn allowed_nssai_from_registration_accept(msg: &Nas5gsMessage) -> Vec<(u8, O
         return Vec::new();
     };
     accept.allowed_nssai.as_ref().map(|n| parse_nssai_value(&n.value)).unwrap_or_default()
+}
+
+/// The T3512 (periodic-registration) timer octet from a decoded Registration
+/// Accept, if present (UE side / tests) — compare against [`GprsTimer3::octet`].
+pub fn t3512_octet_from_registration_accept(msg: &Nas5gsMessage) -> Option<u8> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationAccept(accept)) = msg else {
+        return None;
+    };
+    accept.t3512_value.as_ref()?.value.first().copied()
 }
 
 /// Extract the rejected NSSAI (with causes) from a decoded Registration Accept
@@ -1405,7 +1419,7 @@ mod tests {
     fn registration_accept_builds_and_decodes() {
         let allowed = [(1u8, Some([1u8, 2, 3])), (2, None)];
         let rejected = [(9u8, Some([9u8, 9, 9]))];
-        let msg = registration_accept("999", "70", 0x01020304, &allowed, &rejected);
+        let msg = registration_accept("999", "70", 0x01020304, &allowed, &rejected, 3240);
         let bytes = encode_nas_5gs_message(&msg).unwrap();
         let back = decode_nas_5gs_message(&bytes).unwrap();
         assert_eq!(
@@ -1418,9 +1432,14 @@ mod tests {
             rejected_nssai_from_registration_accept(&back),
             vec![((9, Some([9, 9, 9])), nssai_cause::NOT_AVAILABLE_IN_PLMN)]
         );
+        // T3512 (IEI 0x5E) rides along — 3240s = 54min = 54 × 1min.
+        assert_eq!(
+            t3512_octet_from_registration_accept(&back),
+            Some(GprsTimer3::from_secs(3240).octet())
+        );
 
         // No slices → no IE.
-        let bare = registration_accept("999", "70", 0x01020304, &[], &[]);
+        let bare = registration_accept("999", "70", 0x01020304, &[], &[], 3240);
         let back = decode_nas_5gs_message(&encode_nas_5gs_message(&bare).unwrap()).unwrap();
         assert!(allowed_nssai_from_registration_accept(&back).is_empty());
         assert!(rejected_nssai_from_registration_accept(&back).is_empty());
@@ -1565,7 +1584,7 @@ mod tests {
         );
 
         // Integrity-protected + ciphered Registration Accept, downlink.
-        let accept = registration_accept("999", "70", 0xDEAD_BEEF, &[], &[]);
+        let accept = registration_accept("999", "70", 0xDEAD_BEEF, &[], &[], 3240);
         let protected = amf.protect(&accept, sht::INTEGRITY_CIPHERED, 1);
         let decoded = ue.unprotect(&protected, 1).expect("UE verifies + deciphers Accept");
         assert_eq!(

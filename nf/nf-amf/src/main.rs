@@ -57,6 +57,16 @@ const REJECT_BACKOFF_SECS: u32 = 600;
 const REG_REJECT_BACKOFF_SECS: u32 = 600;
 /// UE-AMBR sent to the gNB when am-data carried none (fail-open) — 1 Gbps each way.
 const DEFAULT_UE_AMBR_BPS: (u64, u64) = (1_000_000_000, 1_000_000_000);
+/// T3512 — the UE's periodic-registration timer, sent in the Registration Accept
+/// (default 54 min, TS 24.501 default). The UE re-registers when it expires.
+const T3512_SECS: u32 = 54 * 60;
+/// After a UE goes CM-IDLE, how long its retained context lingers before the AMF
+/// **implicitly deregisters** it (mobile-reachable T3512 + implicit-dereg margin,
+/// TS 24.501 §5.3.7). A UE that neither resumes nor periodically re-registers
+/// within this window is evicted (PDU sessions released, UECM purged).
+const IMPLICIT_DEREG_SECS: u64 = T3512_SECS as u64 + 4 * 60;
+/// How often to sweep the retained store for contexts past the deadline.
+const RETAINED_SWEEP_SECS: u64 = 60;
 /// NRF the AMF uses to discover the AUSF/UDM. Its scheme follows the SBI transport
 /// (`https` under mutual TLS) — resolved once the transport is configured in `main`.
 const RAW_NRF_BASE: &str = "http://127.0.0.1:8000";
@@ -294,6 +304,10 @@ struct UeContext {
     /// retained-context store is keyed by it (stable across CM-IDLE / resume,
     /// unlike the per-N2-connection AMF-UE-NGAP-ID).
     guti_tmsi: Option<u32>,
+    /// When this context entered CM-IDLE (moved to `RETAINED`). The eviction sweep
+    /// implicitly deregisters a UE that lingers past the mobile-reachable /
+    /// implicit-deregistration deadline. `None` while CM-CONNECTED.
+    retained_at: Option<std::time::Instant>,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
@@ -331,6 +345,26 @@ async fn main() -> anyhow::Result<()> {
     match register_with_nrf(&NRF_BASE, &ADVERTISE_ADDR, SBI_PORT).await {
         Ok(()) => info!(nrf = %*NRF_BASE, "registered AMF with NRF"),
         Err(e) => warn!("NRF registration failed (continuing without callbacks): {e}"),
+    }
+
+    // Implicitly deregister retained CM-IDLE UEs that stay silent past the
+    // mobile-reachable / implicit-dereg deadline (TS 24.501 §5.3.7). The deadline
+    // is `RADIAN_AMF_IMPLICIT_DEREG_SECS` (default T3512 + 4 min).
+    {
+        let amf_smf = amf_smf.clone();
+        let secs = std::env::var("RADIAN_AMF_IMPLICIT_DEREG_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(IMPLICIT_DEREG_SECS);
+        let max_idle = std::time::Duration::from_secs(secs);
+        info!(implicit_dereg_secs = secs, "CM-IDLE implicit-deregistration sweep armed");
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(RETAINED_SWEEP_SECS));
+            loop {
+                tick.tick().await;
+                evict_stale_retained(&amf_smf, max_idle).await;
+            }
+        });
     }
 
     let addr: SocketAddr = format!("0.0.0.0:{N2_PORT}").parse()?;
@@ -803,6 +837,7 @@ async fn on_ue_context_release_request(
     // are dropped (the UE is unreachable over N2 until it comes back).
     if let Some(mut ctx) = ues.remove(&amf_ue_id) {
         ctx.cm_state = CmState::Idle;
+        ctx.retained_at = Some(std::time::Instant::now()); // start the mobile-reachable timer
         if let Some(supi) = &ctx.suci {
             UE_DIRECTORY.lock().unwrap().remove(supi);
         }
@@ -817,6 +852,42 @@ async fn on_ue_context_release_request(
         }
     }
     Some(ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::NORMAL_RELEASE))
+}
+
+/// Implicit-deregistration sweep (TS 24.501 §5.3.7): evict retained CM-IDLE
+/// contexts whose mobile-reachable / implicit-deregistration deadline
+/// (`max_idle`) has passed — the UE neither resumed (Service Request) nor
+/// periodically re-registered. Each evicted session's PDU sessions are released
+/// at the SMF (freeing the UPF session + any buffered downlink) and its UECM
+/// serving-AMF registration is purged. Runs off the N2 path.
+async fn evict_stale_retained(amf_smf: &pdu_session::AmfSmf, max_idle: std::time::Duration) {
+    // Collect the expired entries under the lock, then release off-lock.
+    let expired: Vec<(u32, UeContext)> = {
+        let mut retained = RETAINED.lock().unwrap();
+        let stale: Vec<u32> = retained
+            .iter()
+            .filter(|(_, c)| c.retained_at.is_some_and(|t| t.elapsed() >= max_idle))
+            .map(|(tmsi, _)| *tmsi)
+            .collect();
+        stale.into_iter().filter_map(|tmsi| retained.remove(&tmsi).map(|c| (tmsi, c))).collect()
+    };
+    for (tmsi, ctx) in expired {
+        let supi = ctx.suci.clone();
+        info!(
+            "implicit deregistration: 5G-TMSI {tmsi:#010x} idle past the deadline — evicting ({} PDU session(s))",
+            ctx.sm_refs.len()
+        );
+        for (psi, (sm_ref, smf_base)) in &ctx.sm_refs {
+            match amf_smf.release_sm_context(smf_base, sm_ref).await {
+                Ok(()) => info!("evicted UE: released PDU session {psi} ({sm_ref})"),
+                Err(e) => warn!("evicted UE: PDU session {psi} release failed: {e}"),
+            }
+        }
+        if let Some(supi) = supi {
+            GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
+            spawn_uecm_purge(supi);
+        }
+    }
 }
 
 /// Handle a **Service Request** (TS 23.502 §4.2.3.2) — a CM-IDLE UE resuming.
@@ -856,6 +927,7 @@ async fn on_service_request(
     let amf_ue_id = NEXT_AMF_UE_ID.fetch_add(1, Ordering::Relaxed);
     ctx.ran_ue_id = ran_ue_id;
     ctx.cm_state = CmState::Connected;
+    ctx.retained_at = None; // resumed — the mobile-reachable timer stops
     let supi = ctx.suci.clone();
     let sm_refs: Vec<(u8, (String, String))> =
         ctx.sm_refs.iter().map(|(psi, v)| (*psi, v.clone())).collect();
@@ -1029,6 +1101,7 @@ impl UeContext {
             resync_attempted: false,
             cm_state: CmState::Connected,
             guti_tmsi: None,
+            retained_at: None,
         }
     }
 }
@@ -1669,7 +1742,7 @@ async fn on_security_mode_complete(
         gutis.retain(|_, s| s != supi);
         gutis.insert(tmsi, supi.clone());
     }
-    let accept = nas::registration_accept(PLMN_MCC, PLMN_MNC, tmsi, &allowed, &rejected);
+    let accept = nas::registration_accept(PLMN_MCC, PLMN_MNC, tmsi, &allowed, &rejected, T3512_SECS);
     let bytes = sec.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1);
     info!(
         "UE {amf_ue_id}: SecurityModeComplete — sending Registration Accept \
@@ -2059,6 +2132,53 @@ mod tests {
 
         // A release request for an unknown UE produces no command.
         assert!(on_ue_context_release_request(&mut ues, &amf_smf, &ngap::ue_context_release_request(99, 1, 20)).await.is_none());
+    }
+
+    /// Implicit deregistration: a retained CM-IDLE context idle past the deadline is
+    /// evicted — its PDU sessions released at the SMF — while a fresh one survives.
+    #[tokio::test]
+    async fn stale_retained_context_is_implicitly_deregistered() {
+        use axum::http::StatusCode;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::time::{Duration, Instant};
+
+        static RELEASES: AtomicUsize = AtomicUsize::new(0);
+        async fn mock_release() -> StatusCode {
+            RELEASES.fetch_add(1, AtomicOrdering::Relaxed);
+            StatusCode::NO_CONTENT
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new().route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release",
+            axum::routing::post(mock_release),
+        );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+        let smf_base = format!("http://{smf_addr}");
+
+        // A stale idle context (retained long ago) with one PDU session…
+        let stale_tmsi = 0x0000_1201u32;
+        let mut stale = UeContext::new(0, RegState::Registered, Some("imsi-999700000001201".into()));
+        stale.guti_tmsi = Some(stale_tmsi);
+        stale.retained_at = Some(Instant::now() - Duration::from_secs(3600));
+        stale.sm_refs.insert(5, ("ctx-5".into(), smf_base));
+        RETAINED.lock().unwrap().insert(stale_tmsi, stale);
+
+        // …and a freshly idle one that must survive.
+        let fresh_tmsi = 0x0000_1202u32;
+        let mut fresh = UeContext::new(0, RegState::Registered, Some("imsi-999700000001202".into()));
+        fresh.guti_tmsi = Some(fresh_tmsi);
+        fresh.retained_at = Some(Instant::now());
+        RETAINED.lock().unwrap().insert(fresh_tmsi, fresh);
+
+        // Sweep with a 5-minute deadline: only the stale one is evicted.
+        evict_stale_retained(&amf_smf, Duration::from_secs(300)).await;
+        assert!(RETAINED.lock().unwrap().get(&stale_tmsi).is_none(), "stale context evicted");
+        assert!(RETAINED.lock().unwrap().get(&fresh_tmsi).is_some(), "fresh context kept");
+        assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 1, "the stale UE's PDU session released");
+
+        RETAINED.lock().unwrap().remove(&fresh_tmsi);
     }
 
     /// Network-initiated paging: the SMF's N1N2 message transfer (downlink data)
@@ -2836,7 +2956,7 @@ mod tests {
         let allowed = [(1u8, Some([0x01, 0x02, 0x03]))];
         let rejected = [(5u8, None)];
         let dl = amf_sec.protect(
-            &nas::registration_accept("999", "70", 1, &allowed, &rejected),
+            &nas::registration_accept("999", "70", 1, &allowed, &rejected, T3512_SECS),
             nas::sht::INTEGRITY_CIPHERED,
             1,
         );
