@@ -89,6 +89,8 @@ struct UeContext {
     /// The allowed NSSAI granted at registration (from am-data). `None` = the fetch
     /// failed or hasn't happened — slice admission then falls back to the SMF's check.
     allowed_nssai: Option<Vec<(u8, Option<[u8; 3]>)>>,
+    /// The NSSAI the UE requested in its Registration Request (empty = IE omitted).
+    requested_nssai: Vec<(u8, Option<[u8; 3]>)>,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
@@ -248,9 +250,10 @@ fn on_initial_ue(
         .and_then(registration_identity);
 
     match identity {
-        Some((supi, ue_sec_cap)) => {
+        Some((supi, ue_sec_cap, requested_nssai)) => {
             let mut ctx = UeContext::new(ran_ue_id, RegState::Identified, Some(supi.clone()));
             ctx.replayed_ue_sec_cap = ue_sec_cap;
+            ctx.requested_nssai = requested_nssai;
             ues.insert(amf_ue_id, ctx);
             Some(InitialUeOutcome::Identified { ran_ue_id, supi })
         }
@@ -273,6 +276,7 @@ impl UeContext {
             replayed_ue_sec_cap: None,
             sm_ref: None,
             allowed_nssai: None,
+            requested_nssai: Vec::new(),
         }
     }
 }
@@ -563,29 +567,36 @@ fn establish_security(
     Some((sec, bytes))
 }
 
-/// On Security Mode Complete, fetch the subscriber's am-data (allowed NSSAI) and
-/// build the protected Registration Accept (assigning a 5G-GUTI) to send to the UE.
+/// On Security Mode Complete, fetch the subscriber's am-data, intersect it with
+/// the UE's requested NSSAI, and build the protected Registration Accept
+/// (assigning a 5G-GUTI, granting the allowed NSSAI, listing the rejected one).
 async fn on_security_mode_complete(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
 ) -> Option<(NGAP_PDU, &'static str)> {
     // Fetch before taking the mutable borrow (the fetch awaits).
     let supi = ues.get(&amf_ue_id)?.suci.clone();
-    let allowed = match &supi {
-        Some(supi) => fetch_allowed_nssai(supi).await,
+    let subscribed = match &supi {
+        Some(supi) => fetch_subscribed_nssai(supi).await,
         None => None,
     };
 
     let ctx = ues.get_mut(&amf_ue_id)?;
     let ran_ue_id = ctx.ran_ue_id;
     let tmsi = amf_ue_id as u32;
-    ctx.allowed_nssai = allowed;
-    let allowed_slices = ctx.allowed_nssai.clone().unwrap_or_default();
+    // Fail-open when the subscription is unreachable: no NSSAI IEs, and slice
+    // admission falls back to the SMF's check.
+    let (allowed, rejected) = match &subscribed {
+        Some(subscribed) => compute_nssai(&ctx.requested_nssai, subscribed),
+        None => (Vec::new(), Vec::new()),
+    };
+    ctx.allowed_nssai = subscribed.is_some().then(|| allowed.clone());
     let sec = ctx.sec.as_mut()?;
-    let accept = nas::registration_accept(PLMN_MCC, PLMN_MNC, tmsi, &allowed_slices);
+    let accept = nas::registration_accept(PLMN_MCC, PLMN_MNC, tmsi, &allowed, &rejected);
     let bytes = sec.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1);
     info!(
-        "UE {amf_ue_id}: SecurityModeComplete — sending Registration Accept (allowed NSSAI: {allowed_slices:?})"
+        "UE {amf_ue_id}: SecurityModeComplete — sending Registration Accept \
+         (allowed NSSAI: {allowed:?}, rejected: {rejected:?})"
     );
     Some((
         ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
@@ -593,11 +604,25 @@ async fn on_security_mode_complete(
     ))
 }
 
-/// Fetch the subscriber's allowed NSSAI from am-data via the NRF-discovered UDM
+/// Intersect the UE's requested NSSAI with the subscribed one (TS 23.501 slice
+/// admission, simplified): allowed = requested ∩ subscribed, rejected =
+/// requested \ subscribed. A UE that requested nothing is granted the
+/// subscribed defaults and nothing is rejected.
+fn compute_nssai(
+    requested: &[(u8, Option<[u8; 3]>)],
+    subscribed: &[(u8, Option<[u8; 3]>)],
+) -> (Vec<(u8, Option<[u8; 3]>)>, Vec<(u8, Option<[u8; 3]>)>) {
+    if requested.is_empty() {
+        return (subscribed.to_vec(), Vec::new());
+    }
+    requested.iter().partition(|slice| subscribed.contains(slice))
+}
+
+/// Fetch the subscriber's subscribed NSSAI from am-data via the NRF-discovered UDM
 /// (Nudm_SDM): the subscribed default S-NSSAIs (`nssai.defaultSingleNssais`).
 /// `None` on any failure — registration proceeds without the IE (fail-open; the
 /// SMF's subscription check still gates session establishment).
-async fn fetch_allowed_nssai(supi: &str) -> Option<Vec<(u8, Option<[u8; 3]>)>> {
+async fn fetch_subscribed_nssai(supi: &str) -> Option<Vec<(u8, Option<[u8; 3]>)>> {
     let udm = discover_nf("UDM").await.map_err(|e| warn!("UDM discovery failed: {e}")).ok()?;
     let plmn = format!("{PLMN_MCC}{PLMN_MNC}");
     let am = sbi_core::nudm::NudmClient::new(udm)
@@ -644,7 +669,10 @@ async fn discover_nf(nf_type: &str) -> Result<String, String> {
 /// From a decoded NAS RegistrationRequest, extract the identity the AMF needs: the
 /// **SUPI** (deconcealed from the SUCI, TS 33.501) and the UE's advertised 5GS security
 /// capabilities `[EA, IA]` (to replay in the Security Mode Command).
-fn registration_identity(msg: Nas5gsMessage) -> Option<(String, Option<[u8; 2]>)> {
+fn registration_identity(
+    msg: Nas5gsMessage,
+) -> Option<(String, Option<[u8; 2]>, Vec<(u8, Option<[u8; 3]>)>)> {
+    let requested_nssai = nas::requested_nssai_from_registration_request(&msg);
     let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationRequest(reg)) = msg else {
         return None;
     };
@@ -653,7 +681,7 @@ fn registration_identity(msg: Nas5gsMessage) -> Option<(String, Option<[u8; 2]>)
         .ue_security_capability
         .as_ref()
         .map(|c| [c.ea_byte(), c.ia_byte()]);
-    Some((supi, ue_sec_cap))
+    Some((supi, ue_sec_cap, requested_nssai))
 }
 
 fn initial_ue_nas_pdu(msg: &InitialUEMessage) -> Option<&[u8]> {
@@ -718,6 +746,19 @@ mod tests {
 
     fn registration_request() -> Vec<u8> {
         hex::decode(REG_REQUEST_HEX).unwrap()
+    }
+
+    #[test]
+    fn nssai_intersection() {
+        let sub: Vec<(u8, Option<[u8; 3]>)> = vec![(1, Some([1, 2, 3])), (2, None)];
+        // No request → the subscribed defaults, nothing rejected.
+        assert_eq!(compute_nssai(&[], &sub), (sub.clone(), vec![]));
+        // Partial overlap → intersection allowed, the rest rejected.
+        let req = vec![(1, Some([1, 2, 3])), (7, None)];
+        assert_eq!(compute_nssai(&req, &sub), (vec![(1, Some([1, 2, 3]))], vec![(7, None)]));
+        // No overlap → everything rejected, nothing allowed.
+        let req = vec![(9, None)];
+        assert_eq!(compute_nssai(&req, &sub), (vec![], vec![(9, None)]));
     }
 
     fn initial_ue_message(ran_ue_id: u32) -> NGAP_PDU {
@@ -876,13 +917,22 @@ mod tests {
         let got = amf_sec.unprotect(&up, 0).expect("AMF verifies SMC Complete");
         assert_eq!(nas::gmm_message_type(&got), Some(nas::Nas5gmmMessageType::SecurityModeComplete));
 
-        // ── AMF → Registration Accept (protected, with the allowed NSSAI); UE decodes ──
+        // ── AMF → Registration Accept (protected, with allowed + rejected NSSAIs);
+        // UE decodes ──
         let allowed = [(1u8, Some([0x01, 0x02, 0x03]))];
-        let dl = amf_sec
-            .protect(&nas::registration_accept("999", "70", 1, &allowed), nas::sht::INTEGRITY_CIPHERED, 1);
+        let rejected = [(5u8, None)];
+        let dl = amf_sec.protect(
+            &nas::registration_accept("999", "70", 1, &allowed, &rejected),
+            nas::sht::INTEGRITY_CIPHERED,
+            1,
+        );
         let accept = ue_sec.unprotect(&dl, 1).expect("UE decodes Registration Accept");
         assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::RegistrationAccept));
         assert_eq!(nas::allowed_nssai_from_registration_accept(&accept), allowed.to_vec());
+        assert_eq!(
+            nas::rejected_nssai_from_registration_accept(&accept),
+            vec![((5, None), nas::nssai_cause::NOT_AVAILABLE_IN_PLMN)]
+        );
 
         // ── UE → Registration Complete; AMF verifies ──
         let up = ue_sec.protect(&nas::registration_complete(), nas::sht::INTEGRITY_CIPHERED, 0);

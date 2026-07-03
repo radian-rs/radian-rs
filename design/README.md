@@ -41,6 +41,7 @@ surface of the project and assesses build feasibility.
 | [30-reject-backoff-timer.md](30-reject-backoff-timer.md) | T3396 back-off IE on the reject: GprsTimer3 encoding (finest-fitting unit, round up), 600s on cause #27, none on #31 |
 | [31-requested-snssai.md](31-requested-snssai.md) | UE-requested S-NSSAI: parse the 0x22 IE, slice-keyed subscription validation (403 SNSSAI_DENIED/DNN_DENIED ProblemDetails), 5GSM cause #70 |
 | [32-allowed-nssai.md](32-allowed-nssai.md) | Allowed NSSAI at registration: Nudm_SDM am-data, 0x15 IE in the Registration Accept (fail-open), local slice admission at PDU establishment |
+| [33-nssai-intersection.md](33-nssai-intersection.md) | Requested-NSSAI intersection: 0x2F IE parsed, allowed = requested ∩ subscribed, rejected NSSAI IE 0x11 (cause: not available in PLMN) |
 
 ## One-paragraph summary
 
