@@ -54,6 +54,7 @@ pub fn router(udr: Arc<UdrClient>) -> Router {
             "/nudm-ueau/v1/{supi_or_suci}/security-information/generate-auth-data",
             post(generate_auth_data),
         )
+        .route("/nudm-sdm/v2/{supi}/am-data", get(sdm_am_data))
         .route("/nudm-sdm/v2/{supi}/sm-data", get(sdm_sm_data))
         .route("/nudm-sdm/v2/{supi}/smf-select-data", get(sdm_smf_select_data))
         .with_state(udr)
@@ -65,6 +66,14 @@ pub fn router(udr: Arc<UdrClient>) -> Router {
 struct SdmQuery {
     #[serde(rename = "plmn-id")]
     plmn_id: String,
+}
+
+async fn sdm_am_data(
+    State(udr): State<Arc<UdrClient>>,
+    Path(supi): Path<String>,
+    Query(q): Query<SdmQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    sdm_fetch(udr, DataSet::Am, supi, q.plmn_id).await
 }
 
 async fn sdm_sm_data(
@@ -173,6 +182,16 @@ impl NudmClient {
         Ok(resp.json().await?)
     }
 
+    /// Nudm_SDM — Access and Mobility Subscription data (subscribed S-NSSAIs,
+    /// UE-AMBR). `Ok(None)` if not provisioned.
+    pub async fn get_am_data(
+        &self,
+        supi: &str,
+        plmn: &str,
+    ) -> Result<Option<serde_json::Value>, SbiError> {
+        self.sdm_get("am-data", supi, plmn).await
+    }
+
     /// Nudm_SDM — Session Management Subscription data. `Ok(None)` if not provisioned.
     pub async fn get_sm_data(
         &self,
@@ -207,5 +226,37 @@ impl NudmClient {
             return Ok(None);
         }
         Ok(Some(resp.error_for_status()?.json().await?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use subscriber_db::{InMemoryStore, ProvisionedDataStore, SubscriberStore};
+
+    /// The UDM proxies Nudm_SDM am-data from the UDR verbatim; absent → 404/None.
+    #[tokio::test]
+    async fn sdm_am_data_proxies_the_udr_document() {
+        let store = Arc::new(InMemoryStore::new());
+        let am = serde_json::json!({
+            "nssai": { "defaultSingleNssais": [{ "sst": 1, "sd": "010203" }] },
+            "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" }
+        });
+        store.put_provisioned(DataSet::Am, "imsi-1", "99970", &am).unwrap();
+        let store: Arc<dyn SubscriberStore> = store;
+
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udr_l, crate::nudr::router(store)).await.unwrap() });
+
+        let udr = Arc::new(UdrClient::new(format!("http://{udr_addr}")));
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udm_l, router(udr)).await.unwrap() });
+
+        let sdm = NudmClient::new(format!("http://{udm_addr}"));
+        assert_eq!(sdm.get_am_data("imsi-1", "99970").await.unwrap(), Some(am));
+        assert_eq!(sdm.get_am_data("imsi-1", "00101").await.unwrap(), None, "other PLMN");
+        assert_eq!(sdm.get_am_data("imsi-2", "99970").await.unwrap(), None, "unknown SUPI");
     }
 }

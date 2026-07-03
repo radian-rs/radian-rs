@@ -86,6 +86,9 @@ struct UeContext {
     replayed_ue_sec_cap: Option<[u8; 2]>,
     /// SM context ref of an in-progress PDU session, to address its UpdateSMContext.
     sm_ref: Option<String>,
+    /// The allowed NSSAI granted at registration (from am-data). `None` = the fetch
+    /// failed or hasn't happened — slice admission then falls back to the SMF's check.
+    allowed_nssai: Option<Vec<(u8, Option<[u8; 3]>)>>,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
@@ -261,7 +264,16 @@ fn on_initial_ue(
 
 impl UeContext {
     fn new(ran_ue_id: u32, state: RegState, suci: Option<String>) -> Self {
-        Self { ran_ue_id, state, suci, auth: None, sec: None, replayed_ue_sec_cap: None, sm_ref: None }
+        Self {
+            ran_ue_id,
+            state,
+            suci,
+            auth: None,
+            sec: None,
+            replayed_ue_sec_cap: None,
+            sm_ref: None,
+            allowed_nssai: None,
+        }
     }
 }
 
@@ -328,7 +340,9 @@ async fn on_uplink_nas(
             let res_star = nas::res_star_from_authentication_response(&nas_msg)?.to_vec();
             complete_authentication(ues, amf_auth, amf_ue_id, &res_star).await
         }
-        Some(Nas5gmmMessageType::SecurityModeComplete) => on_security_mode_complete(ues, amf_ue_id),
+        Some(Nas5gmmMessageType::SecurityModeComplete) => {
+            on_security_mode_complete(ues, amf_ue_id).await
+        }
         Some(Nas5gmmMessageType::RegistrationComplete) => {
             let ctx = ues.get_mut(&amf_ue_id)?;
             ctx.state = RegState::Registered;
@@ -368,6 +382,41 @@ async fn on_uplink_nas(
                 .unwrap_or_else(|| DEFAULT_DNN.to_string());
             let snssai = nas::requested_snssai_from_ul_nas_transport(&nas_msg);
             let pti = container.get(2).copied().unwrap_or(1);
+
+            // Slice admission (TS 23.501): a requested slice outside the allowed NSSAI
+            // granted at registration is rejected locally — no SMF round trip. An
+            // unknown allowed NSSAI (am-data fetch failed) falls through to the SMF's
+            // subscription check (fail-open).
+            let outside_allowed = match (
+                snssai,
+                ues.get(&amf_ue_id).and_then(|c| c.allowed_nssai.as_deref()),
+            ) {
+                (Some(requested), Some(allowed)) => !allowed.contains(&requested),
+                _ => false,
+            };
+            if outside_allowed {
+                warn!(
+                    "UE {amf_ue_id}: PDU session {psi} requested slice {snssai:?} outside the \
+                     allowed NSSAI; sending Establishment Reject (5GSM cause #70)"
+                );
+                let reject = nas::pdu_session_establishment_reject(
+                    psi,
+                    pti,
+                    nas::sm_cause::MISSING_OR_UNKNOWN_DNN_IN_SLICE,
+                    Some(nas::GprsTimer3::from_secs(REJECT_BACKOFF_SECS)),
+                );
+                let dl = nas::dl_nas_transport_sm(psi, reject);
+                let Some(sec) = ues.get_mut(&amf_ue_id).and_then(|c| c.sec.as_mut()) else {
+                    warn!("UE {amf_ue_id}: cannot NAS-protect the reject (no security context)");
+                    return None;
+                };
+                let protected = sec.protect(&dl, nas::sht::INTEGRITY_CIPHERED, 1);
+                return Some((
+                    ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, protected),
+                    "DownlinkNASTransport (PDUSessionEstablishmentReject)",
+                ));
+            }
+
             match amf_smf.create_sm_context(&supi, psi, &dnn, snssai).await {
                 Ok(created) => {
                     // Build the N1 PDU Session Establishment Accept (UE IP from the SMF,
@@ -514,23 +563,82 @@ fn establish_security(
     Some((sec, bytes))
 }
 
-/// On Security Mode Complete, build the protected Registration Accept (assigning a
-/// 5G-GUTI) to send to the UE.
-fn on_security_mode_complete(
+/// On Security Mode Complete, fetch the subscriber's am-data (allowed NSSAI) and
+/// build the protected Registration Accept (assigning a 5G-GUTI) to send to the UE.
+async fn on_security_mode_complete(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
 ) -> Option<(NGAP_PDU, &'static str)> {
+    // Fetch before taking the mutable borrow (the fetch awaits).
+    let supi = ues.get(&amf_ue_id)?.suci.clone();
+    let allowed = match &supi {
+        Some(supi) => fetch_allowed_nssai(supi).await,
+        None => None,
+    };
+
     let ctx = ues.get_mut(&amf_ue_id)?;
     let ran_ue_id = ctx.ran_ue_id;
     let tmsi = amf_ue_id as u32;
+    ctx.allowed_nssai = allowed;
+    let allowed_slices = ctx.allowed_nssai.clone().unwrap_or_default();
     let sec = ctx.sec.as_mut()?;
-    let accept = nas::registration_accept(PLMN_MCC, PLMN_MNC, tmsi);
+    let accept = nas::registration_accept(PLMN_MCC, PLMN_MNC, tmsi, &allowed_slices);
     let bytes = sec.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1);
-    info!("UE {amf_ue_id}: SecurityModeComplete — sending Registration Accept");
+    info!(
+        "UE {amf_ue_id}: SecurityModeComplete — sending Registration Accept (allowed NSSAI: {allowed_slices:?})"
+    );
     Some((
         ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
         "DownlinkNASTransport (RegistrationAccept)",
     ))
+}
+
+/// Fetch the subscriber's allowed NSSAI from am-data via the NRF-discovered UDM
+/// (Nudm_SDM): the subscribed default S-NSSAIs (`nssai.defaultSingleNssais`).
+/// `None` on any failure — registration proceeds without the IE (fail-open; the
+/// SMF's subscription check still gates session establishment).
+async fn fetch_allowed_nssai(supi: &str) -> Option<Vec<(u8, Option<[u8; 3]>)>> {
+    let udm = discover_nf("UDM").await.map_err(|e| warn!("UDM discovery failed: {e}")).ok()?;
+    let plmn = format!("{PLMN_MCC}{PLMN_MNC}");
+    let am = sbi_core::nudm::NudmClient::new(udm)
+        .get_am_data(supi, &plmn)
+        .await
+        .map_err(|e| warn!("Nudm_SDM am-data fetch failed: {e}"))
+        .ok()??;
+    let slices: Vec<(u8, Option<[u8; 3]>)> = am
+        .pointer("/nssai/defaultSingleNssais")?
+        .as_array()?
+        .iter()
+        .filter_map(|s| {
+            let sst = u8::try_from(s.get("sst")?.as_u64()?).ok()?;
+            let sd = s
+                .get("sd")
+                .and_then(|v| v.as_str())
+                .and_then(|sd| hex::decode(sd).ok())
+                .and_then(|b| <[u8; 3]>::try_from(b).ok());
+            Some((sst, sd))
+        })
+        .collect();
+    (!slices.is_empty()).then_some(slices)
+}
+
+/// Discover an NF's first service endpoint via the NRF.
+async fn discover_nf(nf_type: &str) -> Result<String, String> {
+    let profile = sbi_core::nnrf::NrfClient::new(NRF_BASE)
+        .discover(nf_type, "AMF")
+        .await
+        .map_err(|e| format!("NRF discovery failed: {e}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no {nf_type} registered with the NRF"))?;
+    let endpoint = profile
+        .nf_services
+        .and_then(|s| s.into_iter().next())
+        .and_then(|svc| svc.ip_end_points.into_iter().next())
+        .ok_or("profile has no service endpoint")?;
+    let ip = endpoint.ipv4_address.ok_or("endpoint missing IP")?;
+    let port = endpoint.port.ok_or("endpoint missing port")?;
+    Ok(format!("http://{ip}:{port}"))
 }
 
 /// From a decoded NAS RegistrationRequest, extract the identity the AMF needs: the
@@ -768,10 +876,13 @@ mod tests {
         let got = amf_sec.unprotect(&up, 0).expect("AMF verifies SMC Complete");
         assert_eq!(nas::gmm_message_type(&got), Some(nas::Nas5gmmMessageType::SecurityModeComplete));
 
-        // ── AMF → Registration Accept (protected); UE decodes ──
-        let dl = amf_sec.protect(&nas::registration_accept("999", "70", 1), nas::sht::INTEGRITY_CIPHERED, 1);
+        // ── AMF → Registration Accept (protected, with the allowed NSSAI); UE decodes ──
+        let allowed = [(1u8, Some([0x01, 0x02, 0x03]))];
+        let dl = amf_sec
+            .protect(&nas::registration_accept("999", "70", 1, &allowed), nas::sht::INTEGRITY_CIPHERED, 1);
         let accept = ue_sec.unprotect(&dl, 1).expect("UE decodes Registration Accept");
         assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::RegistrationAccept));
+        assert_eq!(nas::allowed_nssai_from_registration_accept(&accept), allowed.to_vec());
 
         // ── UE → Registration Complete; AMF verifies ──
         let up = ue_sec.protect(&nas::registration_complete(), nas::sht::INTEGRITY_CIPHERED, 0);
