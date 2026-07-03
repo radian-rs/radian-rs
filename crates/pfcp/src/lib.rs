@@ -28,9 +28,13 @@ use rs_pfcp::ie::pdr_id::PdrId;
 use rs_pfcp::ie::precedence::Precedence;
 use rs_pfcp::ie::ue_ip_address::UeIpAddress;
 use rs_pfcp::ie::apply_action::ApplyAction;
+use rs_pfcp::ie::create_qer::CreateQer;
+use rs_pfcp::ie::mbr::Mbr;
 use rs_pfcp::ie::outer_header_creation::OuterHeaderCreation;
+use rs_pfcp::ie::qer_id::QerId;
 use rs_pfcp::ie::update_far::UpdateFar;
 use rs_pfcp::ie::update_forwarding_parameters::UpdateForwardingParameters;
+use rs_pfcp::ie::update_qer::UpdateQer;
 use rs_pfcp::message::association_setup_request::AssociationSetupRequestBuilder;
 use rs_pfcp::message::association_setup_response::AssociationSetupResponseBuilder;
 use rs_pfcp::message::heartbeat_request::HeartbeatRequestBuilder;
@@ -46,6 +50,73 @@ use rs_pfcp::message::Message;
 /// Default N4 PFCP UDP port (TS 29.244).
 pub const N4_PORT: u16 = 8805;
 
+/// The QER id the session-AMBR QER carries (one session-level QER per session).
+const AMBR_QER_ID: u32 = 1;
+
+/// A session's aggregate maximum bit rate (uplink/downlink), bits per second — the
+/// value the UPF enforces via a per-session [`TokenBucket`] (TS 23.501 §5.7.2.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAmbr {
+    pub uplink_bps: u64,
+    pub downlink_bps: u64,
+}
+
+/// A token-bucket rate limiter (bits), used to police a session's AMBR. Pure and
+/// clock-injected (the caller passes `now_nanos`) so the policing is unit-testable
+/// without real time. `rate_bps == 0` means *unlimited* (always admit).
+#[derive(Debug, Clone)]
+struct TokenBucket {
+    rate_bps: u64,
+    /// Bucket capacity in bits — the largest burst admitted after an idle period.
+    burst_bits: u64,
+    /// Current tokens (bits) available.
+    level_bits: u64,
+    /// Timestamp of the last refill.
+    last_nanos: u64,
+}
+
+impl TokenBucket {
+    /// A bucket for `rate_bps`, starting full at `now_nanos`. Capacity is ~1s of
+    /// rate, floored at one jumbo frame so a single packet can always eventually
+    /// pass.
+    fn new(rate_bps: u64, now_nanos: u64) -> Self {
+        // ~one oversized MTU in bits — a packet must never exceed the capacity.
+        const MIN_BURST_BITS: u64 = 8 * 4096;
+        let burst_bits = rate_bps.max(MIN_BURST_BITS);
+        Self { rate_bps, burst_bits, level_bits: burst_bits, last_nanos: now_nanos }
+    }
+
+    /// Refill for the elapsed time, then admit `bytes` if enough tokens remain.
+    /// `rate_bps == 0` ⇒ unlimited.
+    fn poll(&mut self, now_nanos: u64, bytes: usize) -> bool {
+        if self.rate_bps == 0 {
+            return true;
+        }
+        let elapsed = now_nanos.saturating_sub(self.last_nanos);
+        self.last_nanos = now_nanos;
+        let refill = (u128::from(self.rate_bps) * u128::from(elapsed) / 1_000_000_000u128) as u64;
+        self.level_bits = self.level_bits.saturating_add(refill).min(self.burst_bits);
+        let need = (bytes as u64).saturating_mul(8);
+        if self.level_bits >= need {
+            self.level_bits -= need;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Re-rate the bucket (a mid-session AMBR change): refill to now under the old
+    /// rate, then adopt the new rate/capacity, clamping the level to the new cap.
+    fn set_rate(&mut self, rate_bps: u64, now_nanos: u64) {
+        self.poll(now_nanos, 0); // refill to `now` under the old rate
+        let fresh = TokenBucket::new(rate_bps, now_nanos);
+        self.rate_bps = fresh.rate_bps;
+        self.burst_bits = fresh.burst_bits;
+        self.level_bits = self.level_bits.min(fresh.burst_bits);
+        self.last_nanos = now_nanos;
+    }
+}
+
 /// One PFCP session's UPF state: the uplink N3 F-TEID, the SMF-allocated **UE IP**
 /// (how the UPF routes a downlink packet arriving from N6 to this session), and —
 /// once the SMF runs a Session Modification after N2 setup — the gNB downlink target
@@ -54,6 +125,11 @@ struct Session {
     n3_teid: u32,
     ue_ip: Option<Ipv4Addr>,
     downlink: Option<(u32, Ipv4Addr)>,
+    /// Session AMBR (from a Create/Update QER), when provisioned.
+    ambr: Option<SessionAmbr>,
+    /// Per-direction AMBR policers. `None` ⇒ that direction is unlimited.
+    ul_bucket: Option<TokenBucket>,
+    dl_bucket: Option<TokenBucket>,
 }
 
 /// Minimal UPF state: the N3 F-TEID and UP-SEID allocators plus a session table
@@ -124,13 +200,20 @@ impl UpfState {
         self.sessions.remove(&up_seid).is_some()
     }
 
-    fn establish(&mut self, ue_ip: Option<Ipv4Addr>) -> (u64, u32) {
+    fn establish(
+        &mut self,
+        ue_ip: Option<Ipv4Addr>,
+        ambr: Option<SessionAmbr>,
+        now_nanos: u64,
+    ) -> (u64, u32) {
         let up_seid = self.next_seid;
         let teid = self.next_teid;
         self.next_seid += 1;
         self.next_teid += 1;
+        let ul_bucket = ambr.map(|a| TokenBucket::new(a.uplink_bps, now_nanos));
+        let dl_bucket = ambr.map(|a| TokenBucket::new(a.downlink_bps, now_nanos));
         self.sessions
-            .insert(up_seid, Session { n3_teid: teid, ue_ip, downlink: None });
+            .insert(up_seid, Session { n3_teid: teid, ue_ip, downlink: None, ambr, ul_bucket, dl_bucket });
         (up_seid, teid)
     }
 
@@ -142,6 +225,50 @@ impl UpfState {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Set/replace a session's AMBR (from a Create or Update QER), re-rating its
+    /// policers to `now_nanos`. Creates the buckets if the session had none.
+    fn set_ambr(&mut self, up_seid: u64, ambr: SessionAmbr, now_nanos: u64) -> bool {
+        match self.sessions.get_mut(&up_seid) {
+            Some(s) => {
+                match &mut s.ul_bucket {
+                    Some(b) => b.set_rate(ambr.uplink_bps, now_nanos),
+                    None => s.ul_bucket = Some(TokenBucket::new(ambr.uplink_bps, now_nanos)),
+                }
+                match &mut s.dl_bucket {
+                    Some(b) => b.set_rate(ambr.downlink_bps, now_nanos),
+                    None => s.dl_bucket = Some(TokenBucket::new(ambr.downlink_bps, now_nanos)),
+                }
+                s.ambr = Some(ambr);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The session AMBR the UPF is enforcing for `up_seid`, if any.
+    pub fn ambr_for(&self, up_seid: u64) -> Option<SessionAmbr> {
+        self.sessions.get(&up_seid).and_then(|s| s.ambr)
+    }
+
+    /// Admit an uplink packet of `bytes` on `teid` against the session's uplink
+    /// AMBR policer. `true` (admit) when the TEID is unknown here (the caller's
+    /// TEID check handles that) or the direction is unlimited.
+    pub fn admit_uplink(&mut self, teid: u32, now_nanos: u64, bytes: usize) -> bool {
+        match self.sessions.values_mut().find(|s| s.n3_teid == teid) {
+            Some(s) => s.ul_bucket.as_mut().is_none_or(|b| b.poll(now_nanos, bytes)),
+            None => true,
+        }
+    }
+
+    /// Admit a downlink packet of `bytes` destined to UE IP `dst` against the
+    /// session's downlink AMBR policer.
+    pub fn admit_downlink(&mut self, dst: Ipv4Addr, now_nanos: u64, bytes: usize) -> bool {
+        match self.sessions.values_mut().find(|s| s.ue_ip == Some(dst)) {
+            Some(s) => s.dl_bucket.as_mut().is_none_or(|b| b.poll(now_nanos, bytes)),
+            None => true,
         }
     }
 }
@@ -173,17 +300,24 @@ pub fn session_establishment_request(
     seq: u32,
     smf_ip: Ipv4Addr,
     ue_ip: Ipv4Addr,
+    ambr: Option<SessionAmbr>,
 ) -> Vec<u8> {
+    // When a session AMBR is authorized, provision a session-level QER (open gate +
+    // MBR) and bind both PDRs to it, so the UPF polices the aggregate rate.
+    let qer_id = ambr.map(|_| QerId::new(AMBR_QER_ID));
+
     let ul_pdi = PdiBuilder::uplink_access()
         .f_teid(Fteid::ipv4(0, smf_ip)) // placeholder; the UPF allocates the real N3 F-TEID
         .build()
         .expect("build uplink PDI");
-    let ul_pdr = CreatePdrBuilder::new(PdrId::new(1))
+    let mut ul_pdr = CreatePdrBuilder::new(PdrId::new(1))
         .precedence(Precedence::new(100))
         .pdi(ul_pdi)
-        .far_id(FarId::new(1))
-        .build()
-        .expect("build uplink Create PDR");
+        .far_id(FarId::new(1));
+    if let Some(q) = qer_id {
+        ul_pdr = ul_pdr.qer_id(q);
+    }
+    let ul_pdr = ul_pdr.build().expect("build uplink Create PDR");
     let ul_far = CreateFar::builder(FarId::new(1))
         .forward_to(Interface::Core)
         .build()
@@ -192,24 +326,44 @@ pub fn session_establishment_request(
     // Downlink: match packets destined to the UE's IP; its FAR (id 2) is where the
     // Session Modification installs Outer Header Creation toward the gNB.
     let dl_pdi = Pdi::downlink_core_with_ue_ip(UeIpAddress::new(Some(ue_ip), None));
-    let dl_pdr = CreatePdrBuilder::new(PdrId::new(2))
+    let mut dl_pdr = CreatePdrBuilder::new(PdrId::new(2))
         .precedence(Precedence::new(200))
         .pdi(dl_pdi)
-        .far_id(FarId::new(2))
-        .build()
-        .expect("build downlink Create PDR");
+        .far_id(FarId::new(2));
+    if let Some(q) = qer_id {
+        dl_pdr = dl_pdr.qer_id(q);
+    }
+    let dl_pdr = dl_pdr.build().expect("build downlink Create PDR");
     let dl_far = CreateFar::builder(FarId::new(2))
         .forward_to(Interface::Access)
         .build()
         .expect("build downlink Create FAR");
 
-    SessionEstablishmentRequestBuilder::new(0u64, seq) // header SEID 0 — UPF has none yet
+    let mut builder = SessionEstablishmentRequestBuilder::new(0u64, seq) // header SEID 0 — UPF has none yet
         .node_id(smf_ip)
         .fseid(cp_seid, smf_ip) // CP F-SEID
         .create_pdrs(vec![ul_pdr.to_ie(), dl_pdr.to_ie()])
-        .create_fars(vec![ul_far.to_ie(), dl_far.to_ie()])
+        .create_fars(vec![ul_far.to_ie(), dl_far.to_ie()]);
+    if let Some(a) = ambr {
+        let qer = CreateQer::builder(QerId::new(AMBR_QER_ID))
+            .rate_limit(a.uplink_bps, a.downlink_bps)
+            .build()
+            .expect("build session-AMBR Create QER");
+        builder = builder.create_qers(vec![qer.to_ie()]);
+    }
+    builder.build().expect("build Session Establishment Request").marshal()
+}
+
+/// SMF: build a PFCP Session Modification Request that re-rates the session-AMBR
+/// QER (a mid-session policy change) — an Update QER carrying the new MBR.
+pub fn session_qer_update_request(up_seid: u64, seq: u32, ambr: SessionAmbr) -> Vec<u8> {
+    let update_qer = UpdateQer::builder(QerId::new(AMBR_QER_ID))
+        .mbr(Mbr::new(ambr.uplink_bps, ambr.downlink_bps))
         .build()
-        .expect("build Session Establishment Request")
+        .expect("build Update QER");
+    SessionModificationRequestBuilder::new(up_seid, seq)
+        .update_qers(vec![update_qer.to_ie()])
+        .build()
         .marshal()
 }
 
@@ -244,7 +398,15 @@ pub fn session_deletion_request(up_seid: u64, seq: u32) -> Vec<u8> {
 }
 
 /// UPF: handle an inbound N4 message, returning the response to send (if any).
-pub fn handle_n4(data: &[u8], node_ip: Ipv4Addr, state: &mut UpfState) -> Option<Vec<u8>> {
+/// `now_nanos` is the UPF's monotonic clock, used to base a session's AMBR
+/// policers (must share the clock the datapath [`UpfState::admit_uplink`] /
+/// [`UpfState::admit_downlink`] polls with).
+pub fn handle_n4(
+    data: &[u8],
+    node_ip: Ipv4Addr,
+    state: &mut UpfState,
+    now_nanos: u64,
+) -> Option<Vec<u8>> {
     let msg = rs_pfcp::message::parse(data).ok()?;
     let seq = msg.sequence();
     match msg.msg_type() {
@@ -274,7 +436,13 @@ pub fn handle_n4(data: &[u8], node_ip: Ipv4Addr, state: &mut UpfState) -> Option
                 .ies(IeType::CreatePdr)
                 .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
                 .find_map(|pdr| pdr.pdi.ue_ip_address.and_then(|u| u.ipv4_address));
-            let (up_seid, teid) = state.establish(ue_ip);
+            // A session-AMBR Create QER (if any) carries the MBR the UPF polices.
+            let ambr = msg
+                .ies(IeType::CreateQer)
+                .filter_map(|ie| CreateQer::unmarshal(&ie.payload).ok())
+                .find_map(|q| q.mbr)
+                .map(|m| SessionAmbr { uplink_bps: m.uplink, downlink_bps: m.downlink });
+            let (up_seid, teid) = state.establish(ue_ip, ambr, now_nanos);
             let created_pdr = CreatedPdr::new(PdrId::new(1), Fteid::ipv4(teid, node_ip)).to_ie();
             Some(
                 SessionEstablishmentResponseBuilder::new(
@@ -303,6 +471,20 @@ pub fn handle_n4(data: &[u8], node_ip: Ipv4Addr, state: &mut UpfState) -> Option
                 .and_then(|ohc| Some((u32::from(ohc.teid?), ohc.ipv4_address?)))
             {
                 state.set_downlink(up_seid, gnb_teid, gnb_ip);
+            }
+            // Re-rate the session-AMBR policer from an Update QER's MBR (a
+            // mid-session policy change from the SMF).
+            if let Some(mbr) = msg
+                .ies(IeType::UpdateQer)
+                .next()
+                .and_then(|ie| UpdateQer::unmarshal(&ie.payload).ok())
+                .and_then(|uq| uq.mbr)
+            {
+                state.set_ambr(
+                    up_seid,
+                    SessionAmbr { uplink_bps: mbr.uplink, downlink_bps: mbr.downlink },
+                    now_nanos,
+                );
             }
             Some(
                 SessionModificationResponseBuilder::new(up_seid, seq)
@@ -392,8 +574,8 @@ mod tests {
     fn session_establishment_allocates_and_tracks() {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
-        let req = session_establishment_request(0xCAFE, 1, node_ip, UE_IP);
-        let resp = handle_n4(&req, node_ip, &mut state).expect("session response");
+        let req = session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None);
+        let resp = handle_n4(&req, node_ip, &mut state, 0).expect("session response");
 
         assert_eq!(state.session_count(), 1, "UPF tracks the session");
         // The UPF learned the UE IP from the establishment (for N6 downlink routing).
@@ -408,13 +590,13 @@ mod tests {
     fn session_deletion_removes_the_session() {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
-        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP), node_ip, &mut state)
+        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None), node_ip, &mut state, 0)
             .expect("establish");
         let up_seid = 1; // first allocation
         assert_eq!(state.session_count(), 1);
 
         // SMF deletes the session — TEID and N6 route go with it.
-        let resp = handle_n4(&session_deletion_request(up_seid, 2), node_ip, &mut state)
+        let resp = handle_n4(&session_deletion_request(up_seid, 2), node_ip, &mut state, 0)
             .expect("deletion response");
         assert!(response_accepted(&resp), "deletion accepted");
         assert_eq!(state.session_count(), 0, "session removed");
@@ -422,7 +604,7 @@ mod tests {
         assert_eq!(state.route_downlink(UE_IP), None, "N6 route gone");
 
         // Deleting an unknown session answers, but not with 'accepted'.
-        let resp = handle_n4(&session_deletion_request(99, 3), node_ip, &mut state)
+        let resp = handle_n4(&session_deletion_request(99, 3), node_ip, &mut state, 0)
             .expect("response for unknown session");
         assert!(!response_accepted(&resp), "unknown session is not 'accepted'");
     }
@@ -431,7 +613,7 @@ mod tests {
     fn session_modification_installs_downlink() {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
-        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP), node_ip, &mut state)
+        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None), node_ip, &mut state, 0)
             .expect("establish");
         let up_seid = 1; // first allocation
         assert_eq!(state.downlink_for(up_seid), None, "no downlink before modification");
@@ -443,6 +625,7 @@ mod tests {
             &session_modification_request(up_seid, 2, 1, 0x5678, gnb_ip),
             node_ip,
             &mut state,
+            0,
         )
         .expect("modification response");
 
@@ -462,6 +645,45 @@ mod tests {
         assert_eq!(state.route_downlink(Ipv4Addr::new(10, 45, 0, 3)), None, "unknown UE IP: no route");
     }
 
+    #[test]
+    fn establishment_qer_sets_session_ambr_and_update_re_rates_it() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        let ambr = SessionAmbr { uplink_bps: 1_000_000_000, downlink_bps: 2_000_000_000 };
+        handle_n4(
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, Some(ambr)),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("establish");
+        let up_seid = 1;
+        assert_eq!(
+            state.ambr_for(up_seid),
+            Some(ambr),
+            "UPF recorded the session AMBR from the Create QER"
+        );
+
+        // A mid-session Update QER re-rates it (a PCF-driven policy change).
+        let new = SessionAmbr { uplink_bps: 50_000_000, downlink_bps: 100_000_000 };
+        handle_n4(&session_qer_update_request(up_seid, 2, new), node_ip, &mut state, 0)
+            .expect("qer update");
+        assert_eq!(state.ambr_for(up_seid), Some(new), "Update QER re-rated the session AMBR");
+    }
+
+    #[test]
+    fn token_bucket_admits_burst_then_throttles_then_refills() {
+        let mut b = TokenBucket::new(80_000, 0); // 80 kbps → 80_000-bit burst
+        assert!(b.poll(0, 10_000), "10_000 bytes = 80_000 bits = the full burst");
+        assert!(!b.poll(0, 1), "bucket now empty");
+        // 100 ms later, 8_000 bits (1000 bytes) refill.
+        assert!(b.poll(100_000_000, 1000));
+        assert!(!b.poll(100_000_000, 1), "and no more");
+        // rate 0 means unlimited.
+        let mut u = TokenBucket::new(0, 0);
+        assert!(u.poll(0, 1_000_000));
+    }
+
     /// Full N4 round-trip over real UDP: associate, heartbeat, establish a session.
     #[tokio::test]
     async fn n4_exchange_over_udp() {
@@ -473,7 +695,7 @@ mod tests {
             let mut buf = [0u8; 2048];
             loop {
                 let (n, peer) = upf.recv_from(&mut buf).await.unwrap();
-                if let Some(resp) = handle_n4(&buf[..n], upf_ip, &mut state) {
+                if let Some(resp) = handle_n4(&buf[..n], upf_ip, &mut state, 0) {
                     upf.send_to(&resp, peer).await.unwrap();
                 }
             }
@@ -498,7 +720,7 @@ mod tests {
             MsgType::HeartbeatResponse
         );
         assert_eq!(
-            round_trip(&smf, &mut buf, session_establishment_request(0x1234, 3, upf_ip, UE_IP)).await,
+            round_trip(&smf, &mut buf, session_establishment_request(0x1234, 3, upf_ip, UE_IP, None)).await,
             MsgType::SessionEstablishmentResponse
         );
     }

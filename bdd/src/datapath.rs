@@ -91,7 +91,8 @@ pub async fn establish_session(
     let assoc = transact(&sock, &pfcp::association_setup_request(smf_ip, 1)).await?;
     anyhow::ensure!(pfcp::response_accepted(&assoc), "UPF rejected PFCP association");
 
-    let est_resp = transact(&sock, &pfcp::session_establishment_request(0xCAFE, 2, smf_ip, ue_ip)).await?;
+    let est_resp =
+        transact(&sock, &pfcp::session_establishment_request(0xCAFE, 2, smf_ip, ue_ip, None)).await?;
     let est = pfcp::parse_session_establishment_response(&est_resp)
         .context("parse session establishment response")?;
 

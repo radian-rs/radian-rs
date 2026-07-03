@@ -57,6 +57,7 @@ surface of the project and assesses build feasibility.
 | [46-sbi-oauth.md](46-sbi-oauth.md) | SBI OAuth2 access tokens (TS 33.501): NRF token endpoint, HS256 JWT, UDR enforced via oauth::protect, secretless TokenSource; opt-in via RADIAN_SBI_SECRET |
 | [47-pcf-smpolicy.md](47-pcf-smpolicy.md) | Real PCF — Npcf_SMPolicyControl (TS 29.512): sbi_core::npcf policy engine + PcfClient, SMF sources SM policy (AMBR + QoS flows) from the NRF-discovered PCF, deletes on release, falls back to sm-data when no PCF; shared QosFlowPolicy types |
 | [48-pcf-udr-policy.md](48-pcf-udr-policy.md) | PCF policy from the UDR (Nudr policy-data, TS 29.519 — DataSet::Policy, per-subscriber, PolicyConfig-shaped doc, local fallback) + Npcf_SMPolicyControl_Update: PCF re-reads UDR on update, SMF refresh-policy trigger re-authorizes a live session; UPF/RAN propagation deferred |
+| [49-upf-ambr-qer.md](49-upf-ambr-qer.md) | Session AMBR onto the user plane: SMF installs it as an N4 QER (Create at establishment, Update QER on refresh); UPF polices uplink+downlink with a clock-injected token bucket in the n6 datapath (RateLimited drop); a mid-session change re-rates the policer live. Per-flow GBR + N2/N1 modify still deferred |
 
 ## One-paragraph summary
 
