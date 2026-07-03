@@ -32,10 +32,13 @@ use rs_pfcp::ie::create_qer::CreateQer;
 use rs_pfcp::ie::mbr::Mbr;
 use rs_pfcp::ie::outer_header_creation::OuterHeaderCreation;
 use rs_pfcp::ie::qer_id::QerId;
+use rs_pfcp::ie::remove_pdr::RemovePdr;
+use rs_pfcp::ie::remove_qer::RemoveQer;
 use rs_pfcp::ie::sdf_filter::SdfFilter;
 use rs_pfcp::ie::update_far::UpdateFar;
 use rs_pfcp::ie::update_forwarding_parameters::UpdateForwardingParameters;
 use rs_pfcp::ie::update_qer::UpdateQer;
+use rs_pfcp::ie::Ie;
 use rs_pfcp::message::association_setup_request::AssociationSetupRequestBuilder;
 use rs_pfcp::message::association_setup_response::AssociationSetupResponseBuilder;
 use rs_pfcp::message::heartbeat_request::HeartbeatRequestBuilder;
@@ -137,6 +140,51 @@ fn transport_key(pkt: &[u8]) -> Option<(u8, u16, u16)> {
         _ => (0, 0),
     };
     Some((protocol, src_port, dst_port))
+}
+
+/// The Create QER + classifier Create PDR (SDF filter) IEs for one per-flow QER —
+/// used at establishment and in a mid-session flow modification. The QER id is
+/// `PER_FLOW_QER_BASE + qfi` and the PDR id `PER_FLOW_PDR_BASE + qfi` (both stable
+/// per QFI, so a later modification can update or remove them).
+fn flow_create_ies(f: &FlowQer) -> (Ie, Ie) {
+    let flow_qer_id = QerId::new(PER_FLOW_QER_BASE + u32::from(f.qfi));
+    let qer = CreateQer::builder(flow_qer_id)
+        .rate_limit(f.mfbr_ul_bps, f.mfbr_dl_bps)
+        .build()
+        .expect("build per-flow Create QER");
+    let flow_pdi = PdiBuilder::uplink_access()
+        .sdf_filter(SdfFilter::new(&f.filter.to_flow_description()))
+        .build()
+        .expect("build per-flow PDI");
+    let pdr = CreatePdrBuilder::new(PdrId::new(PER_FLOW_PDR_BASE + u16::from(f.qfi)))
+        .precedence(Precedence::new(50)) // higher precedence than the match-all PDRs
+        .pdi(flow_pdi)
+        .far_id(FarId::new(1))
+        .qer_id(flow_qer_id)
+        .build()
+        .expect("build per-flow Create PDR");
+    (qer.to_ie(), pdr.to_ie())
+}
+
+/// Parse the per-flow QERs a message provisions: each classifier PDR (SDF filter)
+/// linked by `qer_id` to a Create QER's MBR. Used at establishment and when a
+/// mid-session modification adds flows.
+fn parse_created_flows(msg: &dyn rs_pfcp::message::Message) -> Vec<FlowQer> {
+    let qer_mbrs: HashMap<u32, Mbr> = msg
+        .ies(IeType::CreateQer)
+        .filter_map(|ie| CreateQer::unmarshal(&ie.payload).ok())
+        .filter_map(|q| q.mbr.map(|m| (q.qer_id.value, m)))
+        .collect();
+    msg.ies(IeType::CreatePdr)
+        .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
+        .filter_map(|pdr| {
+            let filter = FlowFilter::from_flow_description(&pdr.pdi.sdf_filter?.flow_description)?;
+            let qer_id = pdr.qer_id?.value;
+            let mbr = qer_mbrs.get(&qer_id)?;
+            let qfi = qer_id.saturating_sub(PER_FLOW_QER_BASE) as u8;
+            Some(FlowQer { qfi, filter, mfbr_dl_bps: mbr.downlink, mfbr_ul_bps: mbr.uplink })
+        })
+        .collect()
 }
 
 /// A session's aggregate maximum bit rate (uplink/downlink), bits per second — the
@@ -365,6 +413,37 @@ impl UpfState {
         }
     }
 
+    /// Install (or replace, by QFI) a per-flow GBR policer — from a Create QER +
+    /// classifier PDR, at establishment or a mid-session flow modification.
+    fn add_flow(&mut self, up_seid: u64, f: FlowQer, now_nanos: u64) {
+        if let Some(s) = self.sessions.get_mut(&up_seid) {
+            s.flow_qers.retain(|e| e.qfi != f.qfi);
+            s.flow_qers.push(FlowEnforcer {
+                qfi: f.qfi,
+                filter: f.filter,
+                ul_bucket: TokenBucket::new(f.mfbr_ul_bps, now_nanos),
+                dl_bucket: TokenBucket::new(f.mfbr_dl_bps, now_nanos),
+            });
+        }
+    }
+
+    /// Re-rate a per-flow policer's MFBR (a mid-session Update QER).
+    fn update_flow_rate(&mut self, up_seid: u64, qfi: u8, mfbr_dl_bps: u64, mfbr_ul_bps: u64, now_nanos: u64) {
+        if let Some(e) =
+            self.sessions.get_mut(&up_seid).and_then(|s| s.flow_qers.iter_mut().find(|e| e.qfi == qfi))
+        {
+            e.ul_bucket.set_rate(mfbr_ul_bps, now_nanos);
+            e.dl_bucket.set_rate(mfbr_dl_bps, now_nanos);
+        }
+    }
+
+    /// Drop a per-flow policer (a mid-session Remove QER).
+    fn remove_flow(&mut self, up_seid: u64, qfi: u8) {
+        if let Some(s) = self.sessions.get_mut(&up_seid) {
+            s.flow_qers.retain(|e| e.qfi != qfi);
+        }
+    }
+
     /// The session AMBR the UPF is enforcing for `up_seid`, if any.
     pub fn ambr_for(&self, up_seid: u64) -> Option<SessionAmbr> {
         self.sessions.get(&up_seid).and_then(|s| s.ambr)
@@ -475,25 +554,10 @@ pub fn session_establishment_request(
     }
     // Per-GBR-flow QoS: a Create QER (MFBR) + a classifier PDR (SDF filter) per flow.
     // The UPF links them by QER id and polices matched packets against the flow MFBR.
-    for (i, f) in flows.iter().enumerate() {
-        let flow_qer_id = QerId::new(PER_FLOW_QER_BASE + u32::from(f.qfi));
-        let qer = CreateQer::builder(flow_qer_id)
-            .rate_limit(f.mfbr_ul_bps, f.mfbr_dl_bps)
-            .build()
-            .expect("build per-flow Create QER");
-        create_qers.push(qer.to_ie());
-        let flow_pdi = PdiBuilder::uplink_access()
-            .sdf_filter(SdfFilter::new(&f.filter.to_flow_description()))
-            .build()
-            .expect("build per-flow PDI");
-        let flow_pdr = CreatePdrBuilder::new(PdrId::new(PER_FLOW_PDR_BASE + i as u16))
-            .precedence(Precedence::new(50)) // higher precedence than the match-all PDRs
-            .pdi(flow_pdi)
-            .far_id(FarId::new(1))
-            .qer_id(flow_qer_id)
-            .build()
-            .expect("build per-flow Create PDR");
-        create_pdrs.push(flow_pdr.to_ie());
+    for f in flows {
+        let (qer, pdr) = flow_create_ies(f);
+        create_qers.push(qer);
+        create_pdrs.push(pdr);
     }
 
     let mut builder = SessionEstablishmentRequestBuilder::new(0u64, seq) // header SEID 0 — UPF has none yet
@@ -518,6 +582,53 @@ pub fn session_qer_update_request(up_seid: u64, seq: u32, ambr: SessionAmbr) -> 
         .update_qers(vec![update_qer.to_ie()])
         .build()
         .marshal()
+}
+
+/// SMF: build a PFCP Session Modification Request for a **mid-session per-flow QoS
+/// change** — `create` new GBR flows (Create QER + classifier PDR), `update`
+/// existing flows' MFBR (Update QER), and `remove` flows by QFI (Remove QER + PDR).
+pub fn session_flow_modification_request(
+    up_seid: u64,
+    seq: u32,
+    create: &[FlowQer],
+    update: &[FlowQer],
+    remove_qfis: &[u8],
+) -> Vec<u8> {
+    let mut builder = SessionModificationRequestBuilder::new(up_seid, seq);
+    if !create.is_empty() {
+        let (mut qers, mut pdrs) = (Vec::new(), Vec::new());
+        for f in create {
+            let (qer, pdr) = flow_create_ies(f);
+            qers.push(qer);
+            pdrs.push(pdr);
+        }
+        builder = builder.create_qers(qers).create_pdrs(pdrs);
+    }
+    if !update.is_empty() {
+        let uqers = update
+            .iter()
+            .map(|f| {
+                UpdateQer::builder(QerId::new(PER_FLOW_QER_BASE + u32::from(f.qfi)))
+                    .mbr(Mbr::new(f.mfbr_ul_bps, f.mfbr_dl_bps))
+                    .build()
+                    .expect("build per-flow Update QER")
+                    .to_ie()
+            })
+            .collect();
+        builder = builder.update_qers(uqers);
+    }
+    if !remove_qfis.is_empty() {
+        let rqers = remove_qfis
+            .iter()
+            .map(|q| RemoveQer::new(QerId::new(PER_FLOW_QER_BASE + u32::from(*q))).to_ie())
+            .collect();
+        let rpdrs = remove_qfis
+            .iter()
+            .map(|q| RemovePdr::new(PdrId::new(PER_FLOW_PDR_BASE + u16::from(*q))).to_ie())
+            .collect();
+        builder = builder.remove_qers(rqers).remove_pdrs(rpdrs);
+    }
+    builder.build().marshal()
 }
 
 /// SMF: build a PFCP Session Modification Request that installs the downlink path —
@@ -589,27 +700,15 @@ pub fn handle_n4(
                 .ies(IeType::CreatePdr)
                 .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
                 .find_map(|pdr| pdr.pdi.ue_ip_address.and_then(|u| u.ipv4_address));
-            // Create QERs by id → MBR: the session-AMBR QER + one per GBR flow.
-            let qer_mbrs: HashMap<u32, Mbr> = msg
+            // The session-AMBR Create QER carries the aggregate MBR the UPF polices.
+            let ambr = msg
                 .ies(IeType::CreateQer)
                 .filter_map(|ie| CreateQer::unmarshal(&ie.payload).ok())
-                .filter_map(|q| q.mbr.map(|m| (q.qer_id.value, m)))
-                .collect();
-            let ambr = qer_mbrs
-                .get(&AMBR_QER_ID)
+                .find(|q| q.qer_id.value == AMBR_QER_ID)
+                .and_then(|q| q.mbr)
                 .map(|m| SessionAmbr { uplink_bps: m.uplink, downlink_bps: m.downlink });
             // Per-flow policers: a classifier PDR (SDF filter) linked by QER id to its MFBR.
-            let flows: Vec<FlowQer> = msg
-                .ies(IeType::CreatePdr)
-                .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
-                .filter_map(|pdr| {
-                    let filter = FlowFilter::from_flow_description(&pdr.pdi.sdf_filter?.flow_description)?;
-                    let qer_id = pdr.qer_id?.value;
-                    let mbr = qer_mbrs.get(&qer_id)?;
-                    let qfi = qer_id.saturating_sub(PER_FLOW_QER_BASE) as u8;
-                    Some(FlowQer { qfi, filter, mfbr_dl_bps: mbr.downlink, mfbr_ul_bps: mbr.uplink })
-                })
-                .collect();
+            let flows = parse_created_flows(msg.as_ref());
             let (up_seid, teid) = state.establish(ue_ip, ambr, &flows, now_nanos);
             let created_pdr = CreatedPdr::new(PdrId::new(1), Fteid::ipv4(teid, node_ip)).to_ie();
             Some(
@@ -640,19 +739,35 @@ pub fn handle_n4(
             {
                 state.set_downlink(up_seid, gnb_teid, gnb_ip);
             }
-            // Re-rate the session-AMBR policer from an Update QER's MBR (a
-            // mid-session policy change from the SMF).
-            if let Some(mbr) = msg
-                .ies(IeType::UpdateQer)
-                .next()
-                .and_then(|ie| UpdateQer::unmarshal(&ie.payload).ok())
-                .and_then(|uq| uq.mbr)
+            // Per-flow QoS changes (order matters: remove → create → update, so a
+            // re-provisioned QFI ends up as its new flow).
+            for rq in msg
+                .ies(IeType::RemoveQer)
+                .filter_map(|ie| RemoveQer::unmarshal(&ie.payload).ok())
             {
-                state.set_ambr(
-                    up_seid,
-                    SessionAmbr { uplink_bps: mbr.uplink, downlink_bps: mbr.downlink },
-                    now_nanos,
-                );
+                if rq.qer_id.value != AMBR_QER_ID {
+                    state.remove_flow(up_seid, rq.qer_id.value.saturating_sub(PER_FLOW_QER_BASE) as u8);
+                }
+            }
+            for f in parse_created_flows(msg.as_ref()) {
+                state.add_flow(up_seid, f, now_nanos);
+            }
+            // Update QERs re-rate the session AMBR (id 1) or a per-flow MFBR.
+            for uq in msg
+                .ies(IeType::UpdateQer)
+                .filter_map(|ie| UpdateQer::unmarshal(&ie.payload).ok())
+            {
+                let Some(mbr) = uq.mbr else { continue };
+                if uq.qer_id.value == AMBR_QER_ID {
+                    state.set_ambr(
+                        up_seid,
+                        SessionAmbr { uplink_bps: mbr.uplink, downlink_bps: mbr.downlink },
+                        now_nanos,
+                    );
+                } else {
+                    let qfi = uq.qer_id.value.saturating_sub(PER_FLOW_QER_BASE) as u8;
+                    state.update_flow_rate(up_seid, qfi, mbr.downlink, mbr.uplink, now_nanos);
+                }
             }
             Some(
                 SessionModificationResponseBuilder::new(up_seid, seq)
@@ -895,6 +1010,67 @@ mod tests {
         // exhausted per-flow bucket.
         let other = udp_packet(40000, 9999, 1000);
         assert!(state.admit_uplink(teid, 0, &other), "non-GBR traffic still admitted on the session AMBR");
+    }
+
+    #[test]
+    fn mid_session_per_flow_create_update_remove() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        let (up_seid, teid) = (1u64, 1u32);
+        // Establish with one GBR flow (QFI 2, UDP 5000–5010, 80 kbps).
+        let f2 = FlowQer {
+            qfi: 2,
+            filter: FlowFilter { protocol: 17, port_low: 5000, port_high: 5010 },
+            mfbr_dl_bps: 80_000,
+            mfbr_ul_bps: 80_000,
+        };
+        handle_n4(
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[f2]),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("establish");
+        assert_eq!(state.flow_qfis(up_seid), vec![2]);
+
+        // Mid-session: add QFI 3 and re-rate QFI 2 up to 800 kbps.
+        let f3 = FlowQer {
+            qfi: 3,
+            filter: FlowFilter { protocol: 17, port_low: 6000, port_high: 6010 },
+            mfbr_dl_bps: 160_000,
+            mfbr_ul_bps: 160_000,
+        };
+        let f2_fast = FlowQer { mfbr_dl_bps: 800_000, mfbr_ul_bps: 800_000, ..f2 };
+        handle_n4(
+            &session_flow_modification_request(up_seid, 2, &[f3], &[f2_fast], &[]),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("modify");
+        let mut qfis = state.flow_qfis(up_seid);
+        qfis.sort();
+        assert_eq!(qfis, vec![2, 3], "QFI 3 added");
+
+        // QFI 2 now polices at 800 kbps: at t=1s a 50-packet (400_000-bit) burst
+        // passes — impossible under the old 80 kbps rate (≤10 packets).
+        let p2 = udp_packet(40000, 5005, 1000);
+        let now = 1_000_000_000;
+        for i in 0..50 {
+            assert!(state.admit_uplink(teid, now, &p2), "re-rated flow admits packet {i}");
+        }
+
+        // Remove QFI 3; its traffic then falls through to the (unset) session AMBR.
+        handle_n4(
+            &session_flow_modification_request(up_seid, 3, &[], &[], &[3]),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("remove");
+        assert_eq!(state.flow_qfis(up_seid), vec![2], "QFI 3 removed");
+        let p3 = udp_packet(40000, 6005, 1000);
+        assert!(state.admit_uplink(teid, now, &p3), "removed flow's traffic no longer policed per-flow");
     }
 
     #[test]
