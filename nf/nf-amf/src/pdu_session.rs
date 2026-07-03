@@ -160,7 +160,7 @@ impl AmfSmf {
             }
             body["sNssai"] = slice;
         }
-        let resp = sbi_core::h2c_client()
+        let resp = sbi_core::sbi_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts"))
             .json(&body)
             .send()
@@ -230,7 +230,7 @@ impl AmfSmf {
     /// Release an SM context (TS 29.502) — the SMF tears the N4 session down at
     /// the UPF. Driven by deregistration.
     pub async fn release_sm_context(&self, smf_base: &str, sm_ref: &str) -> Result<(), String> {
-        let resp = sbi_core::h2c_client()
+        let resp = sbi_core::sbi_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release"))
             .send()
             .await
@@ -250,7 +250,7 @@ impl AmfSmf {
         gnb_teid: u32,
         gnb_addr: Ipv4Addr,
     ) -> Result<(), String> {
-        let resp = sbi_core::h2c_client()
+        let resp = sbi_core::sbi_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
             .json(&serde_json::json!({
                 "gnbN3Teid": format!("{gnb_teid:08x}"),
@@ -284,14 +284,8 @@ impl AmfSmf {
             .into_iter()
             .next()
             .ok_or_else(|| format!("no SMF serves (snssai={snssai:?}, dnn={dnn})"))?;
-        let endpoint = profile
-            .nf_services
-            .and_then(|s| s.into_iter().next())
-            .and_then(|svc| svc.ip_end_points.into_iter().next())
-            .ok_or("SMF profile has no service endpoint")?;
-        let ip = endpoint.ipv4_address.ok_or("SMF endpoint missing IP")?;
-        let port = endpoint.port.ok_or("SMF endpoint missing port")?;
-        Ok(format!("http://{ip}:{port}"))
+        // Dial the SMF on the transport it advertises (`https` under mTLS).
+        profile.service_base().ok_or_else(|| "SMF profile has no service endpoint".to_string())
     }
 }
 

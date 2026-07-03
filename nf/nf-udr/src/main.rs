@@ -24,8 +24,6 @@ const DB_ENV: &str = "RADIAN_UDR_DB";
 const KEK_ENV: &str = "RADIAN_UDR_MASTER_KEY";
 const NRF_ENV: &str = "RADIAN_UDR_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
-/// Directory holding the UDR's mTLS identity (`udr.crt`, `udr.key`, `ca.crt`).
-const TLS_DIR_ENV: &str = "RADIAN_UDR_TLS_DIR";
 /// How often to sweep UECM registrations for NFs that have left the NRF.
 const SWEEP_ENV: &str = "RADIAN_UDR_UECM_SWEEP_SECS";
 const DEFAULT_SWEEP_SECS: u64 = 30;
@@ -34,6 +32,12 @@ const DEFAULT_SWEEP_SECS: u64 = 30;
 async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("udr");
+
+    // Mutual TLS (design/57): with RADIAN_SBI_TLS_DIR set, serve Nudr over mTLS (every
+    // client must present a core-CA-signed cert) and dial the NRF / AMF-callback over
+    // mTLS; `sbi_scheme()` then yields `https`.
+    let tls = sbi_core::tls::TlsIdentity::from_env("udr")?;
+    sbi_core::configure_transport(tls.as_ref());
 
     let db_path = std::env::var(DB_ENV).unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
     let store = RedbStore::open(&db_path, master_key()?)
@@ -50,7 +54,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Register with the NRF so front-ends can discover the Nudr service.
-    let nrf_base = std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string());
+    let nrf_base =
+        sbi_core::sbi_base(std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string()));
     match register_with_nrf(&nrf_base, Ipv4Addr::LOCALHOST, SBI_PORT).await {
         Ok(()) => info!(%nrf_base, "registered UDR with NRF"),
         Err(e) => warn!("NRF registration failed (continuing without discovery): {e}"),
@@ -91,17 +96,13 @@ async fn main() -> anyhow::Result<()> {
         info!("Nudr protected by OAuth2 (audience UDR)");
     }
     // Subscription withdrawals notify the serving AMF recorded in the UECM
-    // context data (its deregCallbackUri).
-    //
-    // Mutual TLS (design/56): with RADIAN_UDR_TLS_DIR set, serve over mTLS with the
-    // UDR's certificate — every client must present a core-CA-signed certificate.
-    match std::env::var(TLS_DIR_ENV) {
-        Ok(dir) => {
-            let cfg = sbi_core::tls::TlsIdentity::load(&dir, "udr")?.server_config()?;
-            info!(%dir, "Nudr served over mutual TLS");
-            sbi_core::tls::run_tls(sbi, router, cfg).await?;
+    // context data (its deregCallbackUri) — over the same transport (mTLS when on).
+    match &tls {
+        Some(id) => {
+            info!("Nudr served over mutual TLS");
+            sbi_core::tls::run_tls(sbi, router, id.server_config()?).await?;
         }
-        Err(_) => sbi_core::run(sbi, router).await?,
+        None => sbi_core::run(sbi, router).await?,
     }
     Ok(())
 }
@@ -183,7 +184,7 @@ async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> anyho
     profile.nf_services = Some(vec![NfService {
         service_instance_id: "nudr-dr-1".into(),
         service_name: "nudr-dr".into(),
-        scheme: "http".into(),
+        scheme: sbi_core::sbi_scheme().into(),
         ip_end_points: vec![IpEndPoint {
             ipv4_address: Some(ip.to_string()),
             port: Some(sbi_port),

@@ -8,6 +8,12 @@ async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("nrf");
 
+    // Mutual TLS (design/57): with RADIAN_SBI_TLS_DIR set, serve Nnrf (registration,
+    // discovery, and the OAuth2 token/JWKS endpoints) over mTLS — every NF must
+    // present a core-CA-signed certificate to register, discover, or fetch a token.
+    let tls = sbi_core::tls::TlsIdentity::from_env("nrf")?;
+    sbi_core::configure_transport(tls.as_ref());
+
     // Nnrf_NFManagement + Nnrf_NFDiscovery (TS 29.510) over the SBI. Registrations
     // are soft state: NFs heartbeat at the assigned interval or get evicted.
     let store = match std::env::var("RADIAN_NRF_HEARTBEAT_SECS") {
@@ -33,6 +39,9 @@ async fn main() -> anyhow::Result<()> {
         store
     };
     let sbi: SocketAddr = "0.0.0.0:8000".parse()?;
-    sbi_core::run(sbi, sbi_core::nnrf::router(store)).await?;
+    match &tls {
+        Some(id) => sbi_core::tls::run_tls(sbi, sbi_core::nnrf::router(store), id.server_config()?).await?,
+        None => sbi_core::run(sbi, sbi_core::nnrf::router(store)).await?,
+    }
     Ok(())
 }

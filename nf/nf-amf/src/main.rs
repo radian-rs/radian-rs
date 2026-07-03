@@ -55,8 +55,10 @@ const REJECT_BACKOFF_SECS: u32 = 600;
 const REG_REJECT_BACKOFF_SECS: u32 = 600;
 /// UE-AMBR sent to the gNB when am-data carried none (fail-open) — 1 Gbps each way.
 const DEFAULT_UE_AMBR_BPS: (u64, u64) = (1_000_000_000, 1_000_000_000);
-/// NRF the AMF uses to discover the AUSF.
-const NRF_BASE: &str = "http://127.0.0.1:8000";
+/// NRF the AMF uses to discover the AUSF/UDM. Its scheme follows the SBI transport
+/// (`https` under mutual TLS) — resolved once the transport is configured in `main`.
+const RAW_NRF_BASE: &str = "http://127.0.0.1:8000";
+static NRF_BASE: LazyLock<String> = LazyLock::new(|| sbi_core::sbi_base(RAW_NRF_BASE));
 
 // NAS security parameters the AMF selects.
 const NAS_NEA: u8 = 2; // 128-NEA2 (AES-CTR)
@@ -129,11 +131,12 @@ fn spawn_uecm_register(supi: String) {
         let reg = sbi_core::nudm::Amf3GppAccessRegistration {
             amf_instance_id: AMF_INSTANCE_ID.clone(),
             dereg_callback_uri: format!(
-                "http://{}:{SBI_PORT}/namf-callback/v1/{supi}/dereg-notify",
+                "{}://{}:{SBI_PORT}/namf-callback/v1/{supi}/dereg-notify",
+                sbi_core::sbi_scheme(),
                 &*ADVERTISE_ADDR
             ),
         };
-        match discover_nf(NRF_BASE, "UDM").await {
+        match discover_nf(&NRF_BASE, "UDM").await {
             Ok(udm) => {
                 if let Err(e) =
                     sbi_core::nudm::NudmClient::new(udm).uecm_register_amf(&supi, &reg).await
@@ -152,7 +155,7 @@ fn spawn_uecm_register(supi: String) {
 /// Best-effort, off the signaling path.
 fn spawn_uecm_purge(supi: String) {
     tokio::spawn(async move {
-        match discover_nf(NRF_BASE, "UDM").await {
+        match discover_nf(&NRF_BASE, "UDM").await {
             Ok(udm) => match sbi_core::nudm::NudmClient::new(udm).uecm_deregister_amf(&supi).await
             {
                 Ok(true) => info!(%supi, "UECM: serving-AMF registration purged"),
@@ -229,19 +232,29 @@ async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("amf");
 
-    let amf_auth = Arc::new(auth::AmfAuth::new(NRF_BASE, PLMN_MCC, PLMN_MNC));
-    let amf_smf = Arc::new(pdu_session::AmfSmf::new(NRF_BASE, PLMN_MCC, PLMN_MNC));
+    // Mutual TLS (design/57): with RADIAN_SBI_TLS_DIR set, dial every NF over mTLS
+    // and serve the callback surface over mTLS; `sbi_scheme()` then yields `https`.
+    let tls = sbi_core::tls::TlsIdentity::from_env("amf")?;
+    sbi_core::configure_transport(tls.as_ref());
+
+    let amf_auth = Arc::new(auth::AmfAuth::new(NRF_BASE.as_str(), PLMN_MCC, PLMN_MNC));
+    let amf_smf = Arc::new(pdu_session::AmfSmf::new(NRF_BASE.as_str(), PLMN_MCC, PLMN_MNC));
 
     // SBI callback surface (namf-callback): the UDR notifies subscription
     // withdrawals here (design/38). Registered with the NRF so it can be found.
     let sbi_addr: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
+    let sbi_tls = tls.as_ref().map(|id| id.server_config()).transpose()?;
     tokio::spawn(async move {
-        if let Err(e) = sbi_core::run(sbi_addr, namf_callback_router()).await {
+        let serve = match sbi_tls {
+            Some(cfg) => sbi_core::tls::run_tls(sbi_addr, namf_callback_router(), cfg).await,
+            None => sbi_core::run(sbi_addr, namf_callback_router()).await,
+        };
+        if let Err(e) = serve {
             error!("AMF SBI server failed: {e}");
         }
     });
-    match register_with_nrf(NRF_BASE, &ADVERTISE_ADDR, SBI_PORT).await {
-        Ok(()) => info!(nrf = NRF_BASE, "registered AMF with NRF"),
+    match register_with_nrf(&NRF_BASE, &ADVERTISE_ADDR, SBI_PORT).await {
+        Ok(()) => info!(nrf = %*NRF_BASE, "registered AMF with NRF"),
         Err(e) => warn!("NRF registration failed (continuing without callbacks): {e}"),
     }
 
@@ -249,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
     let socket = Socket::new_v4(SocketToAssociation::OneToOne).context("create SCTP socket")?;
     socket.bind(addr).context("bind N2 SCTP")?;
     let listener = socket.listen(64).context("listen N2 SCTP")?;
-    info!(%addr, ppid = NGAP_PPID, nrf = NRF_BASE, "N2 (NGAP/SCTP) listener up");
+    info!(%addr, ppid = NGAP_PPID, nrf = %*NRF_BASE, "N2 (NGAP/SCTP) listener up");
 
     loop {
         let (conn, peer) = listener.accept().await.context("accept SCTP association")?;
@@ -401,7 +414,7 @@ async fn register_with_nrf(nrf_base: &str, host: &str, sbi_port: u16) -> anyhow:
     profile.nf_services = Some(vec![NfService {
         service_instance_id: "namf-callback-1".into(),
         service_name: "namf-callback".into(),
-        scheme: "http".into(),
+        scheme: sbi_core::sbi_scheme().into(),
         ip_end_points: vec![IpEndPoint {
             ipv4_address: Some(host.to_string()),
             port: Some(sbi_port),
@@ -784,7 +797,7 @@ async fn on_uplink_nas(
     // UE Context Release Command) and Deregistration (Accept + Release Command).
     match nas::gmm_message_type(&nas_msg) {
         Some(Nas5gmmMessageType::SecurityModeComplete) => {
-            return on_security_mode_complete(ues, amf_ue_id, NRF_BASE).await;
+            return on_security_mode_complete(ues, amf_ue_id, &NRF_BASE).await;
         }
         Some(Nas5gmmMessageType::DeregistrationRequestFromUe) => {
             return on_deregistration(ues, amf_smf, amf_ue_id, &nas_msg).await;

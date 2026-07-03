@@ -339,7 +339,7 @@ pub struct PcfClient {
 
 impl PcfClient {
     pub fn new(base: impl Into<String>) -> Self {
-        Self { base: base.into(), http: crate::h2c_client() }
+        Self { base: base.into(), http: crate::sbi_client() }
     }
 
     /// Create an SM policy association; returns the id (from `Location`) + decision.

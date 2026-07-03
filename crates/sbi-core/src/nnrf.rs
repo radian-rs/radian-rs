@@ -146,6 +146,18 @@ impl NfProfile {
             smf_info: None,
         }
     }
+
+    /// Base URL of this profile's first service, honouring its advertised `scheme`
+    /// (`https` under mTLS, else `http`) — e.g. `https://127.0.0.1:8005`. So a
+    /// discovering NF dials the transport the target actually serves.
+    pub fn service_base(&self) -> Option<String> {
+        let svc = self.nf_services.as_ref()?.first()?;
+        let ep = svc.ip_end_points.first()?;
+        let ip = ep.ipv4_address.as_deref()?;
+        let port = ep.port?;
+        let scheme = if svc.scheme.is_empty() { "http" } else { &svc.scheme };
+        Some(format!("{scheme}://{ip}:{port}"))
+    }
 }
 
 /// A service exposed by an NF (TS 29.510 §6.1.6.2.3), trimmed.
@@ -427,7 +439,7 @@ impl NrfClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base: base_url.into(),
-            http: crate::h2c_client(),
+            http: crate::sbi_client(),
         }
     }
 
@@ -576,6 +588,36 @@ mod tests {
         nrf.heartbeat("ausf-1").await.unwrap();
         nrf.deregister("ausf-1").await.unwrap();
         assert!(nrf.discover("AUSF", "AMF").await.unwrap().is_empty());
+    }
+
+    /// `service_base` honours the advertised scheme so a discovering NF dials the
+    /// transport (http/https) the target actually serves — the mTLS mesh (design/57).
+    #[test]
+    fn service_base_follows_advertised_scheme() {
+        let mut profile = NfProfile::new("udr-1", "UDR", "127.0.0.1");
+        let svc = |scheme: &str| NfService {
+            service_instance_id: "nudr-dr-1".into(),
+            service_name: "nudr-dr".into(),
+            scheme: scheme.into(),
+            ip_end_points: vec![IpEndPoint {
+                ipv4_address: Some("127.0.0.1".into()),
+                port: Some(8005),
+            }],
+        };
+
+        profile.nf_services = Some(vec![svc("https")]);
+        assert_eq!(profile.service_base().as_deref(), Some("https://127.0.0.1:8005"));
+
+        profile.nf_services = Some(vec![svc("http")]);
+        assert_eq!(profile.service_base().as_deref(), Some("http://127.0.0.1:8005"));
+
+        // An empty scheme (older profile) defaults to http, not an empty scheme.
+        profile.nf_services = Some(vec![svc("")]);
+        assert_eq!(profile.service_base().as_deref(), Some("http://127.0.0.1:8005"));
+
+        // No service → no base.
+        profile.nf_services = None;
+        assert_eq!(profile.service_base(), None);
     }
 
     #[tokio::test]
