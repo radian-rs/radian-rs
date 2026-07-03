@@ -113,6 +113,8 @@ struct ModifyPolicy {
     session_ambr_ul_bps: u64,
     ngap_flows: Vec<ngap::QosFlow>,
     nas_flows: Vec<nas::QosFlowDesc>,
+    /// QFIs the SMF released — torn down toward the gNB (N2) and UE (N1).
+    released_qfis: Vec<u8>,
 }
 
 /// This AMF's stable NF instance id — used for the NRF profile and every UECM
@@ -354,6 +356,11 @@ fn namf_callback_router() -> axum::Router {
             return axum::http::StatusCode::BAD_REQUEST;
         };
         let (ngap_flows, nas_flows) = pdu_session::parse_qos_flows(&body);
+        let released_qfis: Vec<u8> = body
+            .get("releasedQfis")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_u64()?.try_into().ok()).collect())
+            .unwrap_or_default();
 
         let entry = UE_DIRECTORY.lock().unwrap().get(&supi).cloned();
         match entry {
@@ -366,6 +373,7 @@ fn namf_callback_router() -> axum::Router {
                     session_ambr_ul_bps: ul_bps,
                     ngap_flows,
                     nas_flows,
+                    released_qfis,
                 }));
                 if tx.send(cmd).is_ok() {
                     info!(%supi, psi, "PDU session modification requested by the SMF");
@@ -481,27 +489,29 @@ fn on_network_modification(
         warn!("UE {}: PDU session modification before NAS security — skipped", m.amf_ue_id);
         return Vec::new();
     };
-    // N1: the PDU Session Modification Command (network-initiated ⇒ PTI 0), wrapped
-    // in a DL NAS Transport and NAS-protected.
-    let cmd = nas::pdu_session_modification_command(m.psi, 0, m.ambr_nas, &m.nas_flows);
+    // N1: the PDU Session Modification Command (network-initiated ⇒ PTI 0) — the
+    // current flows plus a delete for each released QFI — protected in a DL NAS Transport.
+    let cmd =
+        nas::pdu_session_modification_command(m.psi, 0, m.ambr_nas, &m.nas_flows, &m.released_qfis);
     let dl = nas::dl_nas_transport_sm(m.psi, cmd);
     let nas_bytes = sec.protect(&dl, nas::sht::INTEGRITY_CIPHERED, 1);
-    // N2: the PDU Session Resource Modify Request (new session AMBR + flows + the N1).
-    let flows = if m.ngap_flows.is_empty() {
-        vec![ngap::QosFlow::default_non_gbr()]
-    } else {
-        m.ngap_flows.clone()
-    };
+    // N2: the PDU Session Resource Modify Request (new session AMBR + the add-or-modify
+    // flows + the released flows + the N1). Pass the flows through as-is (may be empty
+    // when the change is only a release or a session-AMBR re-rate).
     let modify = ngap::pdu_session_resource_modify_request(
         m.amf_ue_id,
         ran_ue_id,
         m.psi,
-        &flows,
+        &m.ngap_flows,
         m.session_ambr_dl_bps,
         m.session_ambr_ul_bps,
+        &m.released_qfis,
         nas_bytes,
     );
-    info!("UE {}: PDU Session Resource Modify sent (psi {})", m.amf_ue_id, m.psi);
+    info!(
+        "UE {}: PDU Session Resource Modify sent (psi {}, released {:?})",
+        m.amf_ue_id, m.psi, m.released_qfis
+    );
     vec![(modify, "PDUSessionResourceModifyRequest")]
 }
 
@@ -1555,6 +1565,7 @@ mod tests {
             session_ambr_ul_bps: 50_000_000,
             ngap_flows,
             nas_flows,
+            released_qfis: vec![3], // release QFI 3 toward the RAN/UE
         };
         let downlinks = on_network_modification(&mut ues, &m);
         assert_eq!(
@@ -1565,7 +1576,8 @@ mod tests {
         // The N2 PDU decodes as a PDU Session Resource Modify...
         let back = NGAP_PDU::decode(&downlinks[0].0.encode().unwrap()).unwrap();
         assert_eq!(back.procedure_name(), "PDUSessionResourceModify");
-        // ...and the UE verifies its embedded N1 PDU Session Modification Command (0xCB).
+        // ...and the UE verifies its embedded N1 PDU Session Modification Command (0xCB)
+        // carrying a delete for the released QFI 3.
         let (psi, nas_bytes) = ngap::nas_pdu_from_modify_request(&back).expect("N1 in the modify");
         assert_eq!(psi, 5);
         let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
@@ -1574,6 +1586,7 @@ mod tests {
             nas::sm_container_from_dl_nas_transport(&msg).expect("N1 SM container");
         assert_eq!(sm_psi, 5);
         assert_eq!(container[3], 0xcb, "5GSM PDU Session Modification Command");
+        assert!(container.windows(3).any(|w| w == [3, 0x40, 0x00]), "N1 deletes released QFI 3");
 
         // A psi the UE has no session for is a no-op.
         let m_bad = ModifyPolicy { psi: 9, ..m.clone() };

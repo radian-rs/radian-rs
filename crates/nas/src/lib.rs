@@ -596,7 +596,9 @@ pub fn pdu_session_establishment_accept(
 /// Build a 5GSM **PDU Session Modification Command** (TS 24.501 §8.3.5) as the raw
 /// N1 SM container bytes — the network-initiated mid-session QoS change delivered to
 /// the UE. Carries the updated **Session-AMBR** (IEI 0x2A) and the **Authorized QoS
-/// flow descriptions** (IEI 0x79). `pti` is 0 for a network-initiated procedure.
+/// flow descriptions** (IEI 0x79): `flows` are created/modified (opcode 1) and each
+/// QFI in `released` gets a **delete** operation (opcode 2). `pti` is 0 for a
+/// network-initiated procedure.
 ///
 /// Hand-encoded to the TS 24.501 layout. Note: unlike the establishment accept, this
 /// is not exercised by the live free-ran-ue UE (which does not drive a modification),
@@ -606,6 +608,7 @@ pub fn pdu_session_modification_command(
     pti: u8,
     ambr: SessionAmbr,
     flows: &[QosFlowDesc],
+    released: &[u8],
 ) -> Vec<u8> {
     // 5GSM header: EPD, PDU session id, PTI, message type (0xCB = Modification Command).
     let mut m = vec![0x2e, pdu_session_id, pti, 0xcb];
@@ -616,9 +619,13 @@ pub fn pdu_session_modification_command(
     m.extend_from_slice(&ambr.dl.to_be_bytes());
     m.push(ambr.ul_unit);
     m.extend_from_slice(&ambr.ul.to_be_bytes());
-    // Authorized QoS flow descriptions (IEI 0x79, LV-E) — the updated per-flow QoS.
-    if !flows.is_empty() {
-        let desc = qos_flow_descriptions_value(flows);
+    // Authorized QoS flow descriptions (IEI 0x79, LV-E): create/modify the given
+    // flows, then delete (operation code 2, no parameters) each released QFI.
+    let mut desc = qos_flow_descriptions_value(flows);
+    for qfi in released {
+        desc.extend_from_slice(&[*qfi, 0x02 << 5, 0x00]);
+    }
+    if !desc.is_empty() {
         m.push(0x79);
         m.extend_from_slice(&(desc.len() as u16).to_be_bytes());
         m.extend_from_slice(&desc);
@@ -1057,7 +1064,8 @@ mod tests {
                 }),
             },
         ];
-        let cmd = pdu_session_modification_command(5, 0, ambr, &flows);
+        // Release QFI 3 alongside the created/modified flows.
+        let cmd = pdu_session_modification_command(5, 0, ambr, &flows, &[3]);
         // 5GSM header: EPD, psi, PTI 0 (network-initiated), message type 0xCB.
         assert_eq!(&cmd[..4], &[0x2e, 5, 0, 0xcb]);
         // Session-AMBR IEI 0x2A, len 6: dl unit+value, ul unit+value (50/100 Mbps).
@@ -1067,6 +1075,8 @@ mod tests {
         );
         // Authorized QoS flow descriptions IE (0x79) present with both flows.
         assert!(cmd.windows(1).any(|w| w == [0x79]), "0x79 QoS flow descriptions IE");
+        // The released QFI 3 has a delete op (opcode 2 = 0x40, no parameters).
+        assert!(cmd.windows(3).any(|w| w == [3, 0x40, 0x00]), "delete QoS flow description for QFI 3");
     }
 
     #[test]
