@@ -31,6 +31,18 @@ pub struct Ambr {
     pub downlink: String,
 }
 
+/// A service area restriction (TS 29.571 `ServiceAreaRestriction`) — the tracking
+/// areas the UE is allowed (or forbidden) to be served in. `restriction_type` is
+/// `ALLOWED_AREAS` or `NOT_ALLOWED_AREAS`; `tacs` are hex TAC strings ("000001").
+/// The AMF signals this to the RAN as an NGAP Mobility Restriction List.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceAreaRestriction {
+    pub restriction_type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tacs: Vec<String>,
+}
+
 /// `PolicyAssociationRequest` (TS 29.507 §5.6.2.2), trimmed — what the AMF tells
 /// the PCF when creating the association.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -55,6 +67,10 @@ pub struct PolicyAssociation {
     /// The UE-AMBR the AMF enforces at the gNB (policy override of the subscribed one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ue_ambr: Option<Ambr>,
+    /// The UE's service area restriction (TS 29.507 `servAreaRes`) — signalled to the
+    /// RAN as a Mobility Restriction List.
+    #[serde(rename = "servAreaRes", default, skip_serializing_if = "Option::is_none")]
+    pub serv_area_res: Option<ServiceAreaRestriction>,
     /// Policy control request triggers (informational here).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<String>,
@@ -68,15 +84,22 @@ pub struct AmPolicyConfig {
     pub rfsp: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ue_ambr: Option<Ambr>,
+    #[serde(rename = "servAreaRes", default, skip_serializing_if = "Option::is_none")]
+    pub serv_area_res: Option<ServiceAreaRestriction>,
 }
 
 impl AmPolicyConfig {
     /// A demo AM policy: an RFSP index + a policy UE-AMBR (tighter than the
-    /// subscribed 1/2 Gbps, so the override is observable end to end).
+    /// subscribed 1/2 Gbps, so the override is observable end to end) + a service
+    /// area restriction allowing only the serving tracking area (TAC 000001).
     pub fn demo() -> Self {
         Self {
             rfsp: Some(3),
             ue_ambr: Some(Ambr { uplink: "500 Mbps".into(), downlink: "1 Gbps".into() }),
+            serv_area_res: Some(ServiceAreaRestriction {
+                restriction_type: "ALLOWED_AREAS".into(),
+                tacs: vec!["000001".into()],
+            }),
         }
     }
 
@@ -84,6 +107,7 @@ impl AmPolicyConfig {
         PolicyAssociation {
             rfsp: self.rfsp,
             ue_ambr: self.ue_ambr.clone(),
+            serv_area_res: self.serv_area_res.clone(),
             triggers: Vec::new(),
         }
     }
@@ -293,6 +317,10 @@ mod tests {
         assert_eq!(created.policy.rfsp, Some(3));
         let ambr = created.policy.ue_ambr.as_ref().expect("policy UE-AMBR");
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("500 Mbps", "1 Gbps"));
+        // The service area restriction survives the h2c round trip (servAreaRes).
+        let sar = created.policy.serv_area_res.as_ref().expect("policy servAreaRes");
+        assert_eq!(sar.restriction_type, "ALLOWED_AREAS");
+        assert_eq!(sar.tacs, ["000001"]);
 
         client.delete(&created.assoc_id).await.expect("delete AM policy");
         assert_eq!(state.association_count(), 0);

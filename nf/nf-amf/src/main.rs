@@ -290,6 +290,10 @@ struct UeContext {
     /// §5.3.4.3) from the PCF — signalled to the RAN in a UE Context Modification.
     /// `None` when the PCF provided no RFSP.
     rfsp: Option<u16>,
+    /// The AM policy service area restriction from the PCF as
+    /// `(allowed_tacs, non_allowed_tacs)` (3-octet TACs) — signalled to the RAN as a
+    /// Mobility Restriction List on the Registration Accept. `None` = unrestricted.
+    area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
     /// The allowed NSSAI granted at registration (from am-data). `None` = the fetch
     /// failed or hasn't happened — slice admission then falls back to the SMF's check.
     allowed_nssai: Option<Vec<(u8, Option<[u8; 3]>)>>,
@@ -1193,6 +1197,7 @@ impl UeContext {
             sm_refs: HashMap::new(),
             ue_ambr: None,
             rfsp: None,
+            area_restriction: None,
             allowed_nssai: None,
             requested_nssai: Vec::new(),
             dereg_attempts: None,
@@ -1805,6 +1810,12 @@ async fn on_security_mode_complete(
             }
         }
         ctx.rfsp = policy.rfsp;
+        ctx.area_restriction = policy.serv_area_res.as_ref().and_then(area_restriction_tacs);
+        if let Some((allowed, not_allowed)) = &ctx.area_restriction {
+            info!(
+                "UE {amf_ue_id}: AM policy service area restriction — allowed TACs {allowed:?}, non-allowed {not_allowed:?}"
+            );
+        }
         ctx.am_policy = Some((pcf_base, assoc_id));
     }
     ctx.ue_ambr = effective_ambr;
@@ -1874,10 +1885,22 @@ async fn on_security_mode_complete(
         "UE {amf_ue_id}: SecurityModeComplete — sending Registration Accept \
          (allowed NSSAI: {allowed:?}, rejected: {rejected:?})"
     );
-    let mut dl = vec![(
-        ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
-        "DownlinkNASTransport (RegistrationAccept)",
-    )];
+    // Carry the service area restriction (if any) to the RAN as a Mobility
+    // Restriction List on the Registration Accept's DownlinkNASTransport
+    // (TS 38.413 §9.2.5.3) — the gNB then enforces the UE's allowed tracking areas.
+    let accept_dl = match &ctx.area_restriction {
+        Some((allowed_tacs, not_allowed_tacs)) => ngap::downlink_nas_transport_with_area_restriction(
+            amf_ue_id,
+            ran_ue_id,
+            bytes,
+            PLMN_MCC,
+            PLMN_MNC,
+            allowed_tacs,
+            not_allowed_tacs,
+        ),
+        None => ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
+    };
+    let mut dl = vec![(accept_dl, "DownlinkNASTransport (RegistrationAccept)")];
     // Signal the AM policy (RFSP + UE-AMBR) to the RAN at the UE-context level
     // (TS 38.413 §9.2.2.7). RFSP has no other N2 home, so this is where the gNB
     // learns the UE's RAT/frequency-selection priority. Skipped when the PCF
@@ -1905,6 +1928,33 @@ fn compute_nssai(
         return (subscribed.to_vec(), Vec::new());
     }
     requested.iter().partition(|slice| subscribed.contains(slice))
+}
+
+/// A 6-hex-digit tracking area code ("000001") to its 3 octets. `None` if malformed.
+fn parse_tac(s: &str) -> Option<[u8; 3]> {
+    if s.len() != 6 {
+        return None;
+    }
+    let v = u32::from_str_radix(s, 16).ok()?;
+    Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+}
+
+/// Split a PCF service area restriction into `(allowed_tacs, non_allowed_tacs)` for
+/// the NGAP Mobility Restriction List. `ALLOWED_AREAS` fills the allowed list,
+/// anything else (e.g. `NOT_ALLOWED_AREAS`) the non-allowed list. Malformed TACs are
+/// dropped; the result is `None` only when nothing usable remains.
+fn area_restriction_tacs(
+    sar: &sbi_core::npcf_am::ServiceAreaRestriction,
+) -> Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)> {
+    let tacs: Vec<[u8; 3]> = sar.tacs.iter().filter_map(|t| parse_tac(t)).collect();
+    if tacs.is_empty() {
+        return None;
+    }
+    if sar.restriction_type == "ALLOWED_AREAS" {
+        Some((tacs, Vec::new()))
+    } else {
+        Some((Vec::new(), tacs))
+    }
 }
 
 /// Convert a TS 29.571 `BitRate` string ("2 Gbps") to bits/sec (integer values).
@@ -2358,6 +2408,45 @@ mod tests {
         assert!(on_am_policy_update(&mut ues, 999, (1, 1), None).is_empty());
     }
 
+    /// Service area restriction: the PCF policy's `servAreaRes` is parsed into
+    /// allowed / non-allowed TACs and rides the Registration Accept's
+    /// DownlinkNASTransport to the RAN as a Mobility Restriction List.
+    #[test]
+    fn service_area_restriction_reaches_the_ran() {
+        use sbi_core::npcf_am::ServiceAreaRestriction;
+        let allowed = ServiceAreaRestriction {
+            restriction_type: "ALLOWED_AREAS".into(),
+            tacs: vec!["000001".into(), "00000a".into(), "bad".into()], // "bad" dropped
+        };
+        assert_eq!(
+            area_restriction_tacs(&allowed),
+            Some((vec![[0, 0, 1], [0, 0, 0x0a]], Vec::new())),
+            "ALLOWED_AREAS → allowed TACs, malformed dropped"
+        );
+        let forbidden = ServiceAreaRestriction {
+            restriction_type: "NOT_ALLOWED_AREAS".into(),
+            tacs: vec!["000002".into()],
+        };
+        assert_eq!(area_restriction_tacs(&forbidden), Some((Vec::new(), vec![[0, 0, 2]])));
+        // No usable TAC → nothing to signal.
+        assert_eq!(
+            area_restriction_tacs(&ServiceAreaRestriction {
+                restriction_type: "ALLOWED_AREAS".into(),
+                tacs: vec!["zz".into()],
+            }),
+            None
+        );
+
+        // The AMF builds the Registration Accept DL NAS with the restriction, and the
+        // RAN reads it back out of the Mobility Restriction List.
+        let (a, na) = area_restriction_tacs(&allowed).unwrap();
+        let dl = ngap::downlink_nas_transport_with_area_restriction(1, 2, vec![9, 9], "999", "70", &a, &na);
+        assert_eq!(
+            ngap::area_restriction_from_downlink_nas(&dl),
+            Some((vec![[0, 0, 1], [0, 0, 0x0a]], Vec::new()))
+        );
+    }
+
     /// AM policy: the AMF discovers the PCF and creates an AM policy association at
     /// registration; the PCF's UE-AMBR overrides the subscribed one (verified by the
     /// `on_security_mode_complete` override math in production).
@@ -2400,6 +2489,9 @@ mod tests {
             (Some(1_000_000_000), Some(500_000_000)),
             "policy UE-AMBR overrides the subscribed one"
         );
+        // The PCF policy carries a service area restriction the AMF signals to the RAN.
+        let sar = policy.serv_area_res.as_ref().expect("policy servAreaRes");
+        assert_eq!(area_restriction_tacs(sar), Some((vec![[0, 0, 1]], Vec::new())));
 
         // Deletion (deregistration) closes it.
         spawn_am_policy_delete(Some((pcf_base, assoc_id)));
