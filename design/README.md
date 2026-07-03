@@ -51,6 +51,7 @@ surface of the project and assesses build feasibility.
 | [40-uecm.md](40-uecm.md) | Nudm_UECM serving-AMF tracking: amf-3gpp-access context data in the UDR, withdrawal notifies the stored deregCallbackUri, purge on dereg |
 | [41-smf-uecm.md](41-smf-uecm.md) | SMF-side Nudm_UECM (smf-registrations per PDU session, register on create / purge on release) + config-derived AMF callback advertise address |
 | [42-uecm-expiry.md](42-uecm-expiry.md) | UECM stale-registration expiry: UDR sweep evicts context data whose serving NF is gone from the NRF (reuses NRF heartbeat), fail-safe on unreachable NRF |
+| [43-multi-pdu-ue-ambr.md](43-multi-pdu-ue-ambr.md) | Multiple PDU sessions per UE (sm_refs keyed by psi, release all on dereg) + UE-AMBR from am-data → NGAP UEAggregateMaximumBitRate IE |
 
 ## One-paragraph summary
 

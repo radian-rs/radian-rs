@@ -226,6 +226,8 @@ pub fn pdu_session_resource_setup_request(
     qfi: u8,
     upf_teid: u32,
     upf_addr: Ipv4Addr,
+    ue_ambr_dl_bps: u64,
+    ue_ambr_ul_bps: u64,
     nas: Vec<u8>,
 ) -> NGAP_PDU {
     let transfer = encode_aper(&setup_request_transfer(qfi, upf_teid, upf_addr));
@@ -233,6 +235,13 @@ pub fn pdu_session_resource_setup_request(
         REJECT, PDUSessionResourceSetupRequest,
         REJECT AMF_UE_NGAP_ID(amf_ue_id),
         REJECT RAN_UE_NGAP_ID(ran_ue_id),
+        // UE Aggregate Maximum Bit Rate (TS 38.413 §9.3.1.58) — the subscribed
+        // UE-AMBR from am-data, so the gNB enforces the non-GBR rate cap.
+        IGNORE UEAggregateMaximumBitRate(UEAggregateMaximumBitRate {
+            ue_aggregate_maximum_bit_rate_dl: BitRate(ue_ambr_dl_bps),
+            ue_aggregate_maximum_bit_rate_ul: BitRate(ue_ambr_ul_bps),
+            ie_extensions: None,
+        }),
         REJECT PDUSessionResourceSetupListSUReq(PDUSessionResourceSetupListSUReq(vec![
             PDUSessionResourceSetupItemSUReq {
                 pdu_session_id: PDUSessionID(psi),
@@ -299,10 +308,18 @@ mod tests {
     #[test]
     fn pdu_session_resource_setup_request_roundtrips() {
         let pdu = pdu_session_resource_setup_request(
-            1, 2, 5, 1, 0x1111, Ipv4Addr::new(127, 0, 0, 1), vec![0x2e, 0x05, 0x01, 0xc2],
+            1,
+            2,
+            5,
+            1,
+            0x1111,
+            Ipv4Addr::new(127, 0, 0, 1),
+            2_000_000_000,
+            1_000_000_000,
+            vec![0x2e, 0x05, 0x01, 0xc2],
         );
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
-        assert_eq!(pdu, back);
+        assert_eq!(pdu, back, "the UE-AMBR IE survives the APER round trip");
         assert_eq!(back.procedure_name(), "PDUSessionResourceSetup");
         assert!(back.is_initiating());
     }
