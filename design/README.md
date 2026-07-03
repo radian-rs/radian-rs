@@ -44,6 +44,7 @@ surface of the project and assesses build feasibility.
 | [33-nssai-intersection.md](33-nssai-intersection.md) | Requested-NSSAI intersection: 0x2F IE parsed, allowed = requested ∩ subscribed, rejected NSSAI IE 0x11 (cause: not available in PLMN) |
 | [34-registration-reject-62.md](34-registration-reject-62.md) | Registration Reject 5GMM cause #62 when no requested slice is subscribed: rejected NSSAI (0x69) attached, UE context released |
 | [35-ue-context-release.md](35-ue-context-release.md) | NGAP UE Context Release Command after the #62 reject (UE-NGAP-IDs pair + NAS cause); multi-PDU downlink answers |
+| [36-reg-reject-t3346.md](36-reg-reject-t3346.md) | T3346 back-off IE on the Registration Reject: GprsTimer2 encoding (2s/1min/decihour units), 600s on cause #62 |
 
 ## One-paragraph summary
 

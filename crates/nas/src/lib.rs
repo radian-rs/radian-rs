@@ -255,12 +255,49 @@ pub mod mm_cause {
     pub const NO_NETWORK_SLICES_AVAILABLE: u8 = 62;
 }
 
+/// GPRS Timer 2 (TS 24.008 §10.5.7.4): one octet holding a 3-bit unit (bits 6-8)
+/// and a 5-bit multiple (bits 1-5) — coarser than [`GprsTimer3`] (units 2s /
+/// 1min / decihour). Carried as the **T3346 value** IE in 5GMM rejects: the UE
+/// must not re-attempt registration until it expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GprsTimer2(u8);
+
+impl GprsTimer2 {
+    /// Encode a duration, choosing the finest unit whose 5-bit multiple fits and
+    /// rounding up — the UE backs off *at least* `secs`. Durations beyond the
+    /// encodable maximum (31 decihours) clamp to it.
+    pub fn from_secs(secs: u32) -> Self {
+        // (unit bits, seconds per step): 2s, 1min, decihour (6min).
+        const UNITS: [(u8, u32); 3] = [(0b000, 2), (0b001, 60), (0b010, 360)];
+        for (unit, step) in UNITS {
+            let multiple = secs.div_ceil(step);
+            if multiple <= 31 {
+                return Self((unit << 5) | multiple as u8);
+            }
+        }
+        Self((0b010 << 5) | 31)
+    }
+
+    /// The timer-deactivated encoding (unit 0b111).
+    pub fn deactivated() -> Self {
+        Self(0b111_00000)
+    }
+
+    /// The raw value octet as it appears on the wire.
+    pub fn octet(self) -> u8 {
+        self.0
+    }
+}
+
 /// Build a 5GMM **Registration Reject** (TS 24.501 §8.2.9) with `cause` (pick from
-/// [`mm_cause`]) and, when non-empty, the **rejected NSSAI** (IEI 0x69, cause *not
-/// available in the current PLMN*) so the UE learns which slices were refused.
+/// [`mm_cause`]), the **rejected NSSAI** when non-empty (IEI 0x69, cause *not
+/// available in the current PLMN*) so the UE learns which slices were refused,
+/// and optionally the **T3346 value** IE (IEI 0x5F) holding the UE off from an
+/// immediate re-registration.
 pub fn registration_reject(
     cause: u8,
     rejected_nssai: &[(u8, Option<[u8; 3]>)],
+    backoff: Option<GprsTimer2>,
 ) -> Nas5gsMessage {
     let mut reject = messages::NasRegistrationReject::new(NasFGmmCause::new(cause));
     if !rejected_nssai.is_empty() {
@@ -269,23 +306,27 @@ pub fn registration_reject(
             nssai_cause::NOT_AVAILABLE_IN_PLMN,
         )));
     }
+    if let Some(t) = backoff {
+        reject = reject.set_t3346_value(NasGprsTimer2::new(vec![t.octet()]));
+    }
     Nas5gsMessage::new_5gmm(
         Nas5gmmMessageType::RegistrationReject,
         Nas5gmmMessage::RegistrationReject(reject),
     )
 }
 
-/// Extract `(5GMM cause, rejected NSSAI)` from a decoded Registration Reject
-/// (UE side / tests).
+/// Extract `(5GMM cause, rejected NSSAI, T3346 value octet)` from a decoded
+/// Registration Reject (UE side / tests).
 pub fn parse_registration_reject(
     msg: &Nas5gsMessage,
-) -> Option<(u8, Vec<((u8, Option<[u8; 3]>), u8)>)> {
+) -> Option<(u8, Vec<((u8, Option<[u8; 3]>), u8)>, Option<u8>)> {
     let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationReject(rej)) = msg else {
         return None;
     };
     let rejected =
         rej.rejected_nssai.as_ref().map(|n| parse_rejected_nssai_value(&n.value)).unwrap_or_default();
-    Some((rej.fgmm_cause.value, rejected))
+    let t3346 = rej.t3346_value.as_ref().and_then(|t| t.value.first().copied());
+    Some((rej.fgmm_cause.value, rejected, t3346))
 }
 
 /// Build a minimal 5GMM **Configuration Update Command** (TS 24.501 §8.2.19). The AMF
@@ -942,18 +983,37 @@ mod tests {
     #[test]
     fn registration_reject_roundtrips() {
         let rejected = [(9u8, Some([9u8, 9, 9]))];
-        let msg = registration_reject(mm_cause::NO_NETWORK_SLICES_AVAILABLE, &rejected);
+        let msg = registration_reject(
+            mm_cause::NO_NETWORK_SLICES_AVAILABLE,
+            &rejected,
+            Some(GprsTimer2::from_secs(600)),
+        );
         let back = decode_nas_5gs_message(&encode_nas_5gs_message(&msg).unwrap()).unwrap();
         assert_eq!(gmm_message_type(&back), Some(Nas5gmmMessageType::RegistrationReject));
         assert_eq!(
             parse_registration_reject(&back),
-            Some((62, vec![((9, Some([9, 9, 9])), nssai_cause::NOT_AVAILABLE_IN_PLMN)]))
+            Some((
+                62,
+                vec![((9, Some([9, 9, 9])), nssai_cause::NOT_AVAILABLE_IN_PLMN)],
+                Some(0b001_01010), // 600s = 10 x 1min
+            ))
         );
 
-        // Without rejected slices, only the cause rides.
-        let bare = registration_reject(mm_cause::NO_NETWORK_SLICES_AVAILABLE, &[]);
+        // Without rejected slices or back-off, only the cause rides.
+        let bare = registration_reject(mm_cause::NO_NETWORK_SLICES_AVAILABLE, &[], None);
         let back = decode_nas_5gs_message(&encode_nas_5gs_message(&bare).unwrap()).unwrap();
-        assert_eq!(parse_registration_reject(&back), Some((62, vec![])));
+        assert_eq!(parse_registration_reject(&back), Some((62, vec![], None)));
+    }
+
+    #[test]
+    fn gprs_timer2_unit_selection() {
+        assert_eq!(GprsTimer2::from_secs(60).octet(), 0b000_11110, "60s = 30 x 2s");
+        assert_eq!(GprsTimer2::from_secs(63).octet(), 0b001_00010, "63s rounds up to 2 x 1min");
+        assert_eq!(GprsTimer2::from_secs(600).octet(), 0b001_01010, "10min = 10 x 1min");
+        assert_eq!(GprsTimer2::from_secs(3_600).octet(), 0b010_01010, "1h = 10 x 6min");
+        // Beyond the encodable range: clamp to 31 decihours.
+        assert_eq!(GprsTimer2::from_secs(u32::MAX).octet(), 0b010_11111);
+        assert_eq!(GprsTimer2::deactivated().octet(), 0b111_00000);
     }
 
     #[test]
