@@ -194,6 +194,85 @@ pub fn requested_nssai_from_registration_request(msg: &Nas5gsMessage) -> Vec<(u8
     reg.requested_nssai.as_ref().map(|n| parse_nssai_value(&n.value)).unwrap_or_default()
 }
 
+/// The 5G-TMSI when a Registration Request identifies the UE by **5G-GUTI**
+/// (TS 24.501 §5.5.1.2: a UE holding a valid GUTI registers with it, not its
+/// SUCI). `None` when the mobile identity is another type.
+pub fn guti_tmsi_from_registration_request(msg: &Nas5gsMessage) -> Option<u32> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationRequest(reg)) = msg else {
+        return None;
+    };
+    reg.fgs_mobile_identity.as_guti().map(|g| g.tmsi)
+}
+
+/// Build the null-protection-scheme SUCI mobile identity for `mcc`/`mnc`/`msin`
+/// (TS 24.501 §9.11.3.4) — the inverse of what [`suci_to_supi`] deconceals.
+fn suci_mobile_identity(mcc: &str, mnc: &str, msin: &str) -> NasFGsMobileIdentity {
+    let plmn = PlmnId { mcc: mcc_digits(mcc), mnc: mnc_digits(mnc) };
+    let mut value = vec![0x01]; // SUPI format IMSI, type SUCI
+    value.extend_from_slice(&plmn.to_tbcd());
+    value.extend_from_slice(&[0x00, 0x00]); // routing indicator "0000"
+    value.push(0x00); // protection scheme: null
+    value.push(0x00); // home network public key id
+    // MSIN in BCD: low nibble first, 0xF filler on an odd digit count.
+    let digits: Vec<u8> = msin.bytes().map(|b| b.wrapping_sub(b'0')).collect();
+    for pair in digits.chunks(2) {
+        let hi = pair.get(1).copied().unwrap_or(0x0F);
+        value.push((hi << 4) | pair[0]);
+    }
+    NasFGsMobileIdentity::new(value)
+}
+
+/// Build and encode a 5GMM **Registration Request** identifying by 5G-GUTI
+/// (UE side / tests): a returning UE re-registers with the GUTI a previous
+/// Registration Accept assigned instead of exposing its SUCI.
+pub fn registration_request_with_guti(
+    mcc: &str,
+    mnc: &str,
+    tmsi: u32,
+    ue_sec_cap: &[u8],
+) -> Vec<u8> {
+    let guti = NasFGsMobileIdentity::from_guti(&Guti {
+        mcc: mcc_digits(mcc),
+        mnc: mnc_digits(mnc),
+        amf_region_id: 0x01,
+        amf_set_id: 0x001,
+        amf_pointer: 0x00,
+        tmsi,
+    });
+    let reg = messages::NasRegistrationRequest::new(
+        // Initial registration, ngKSI 7 (no key), no follow-on request.
+        NasFGsRegistrationType::from_parts(RegistrationType::InitialRegistration, false, 7, false),
+        guti,
+    )
+    .set_ue_security_capability(NasUeSecurityCapability::new(ue_sec_cap.to_vec()));
+    let msg = Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::RegistrationRequest,
+        Nas5gmmMessage::RegistrationRequest(reg),
+    );
+    encode_nas_5gs_message(&msg).expect("encode 5GMM RegistrationRequest (GUTI)")
+}
+
+/// Build and encode a 5GMM **Identity Response** (TS 24.501 §8.2.22) carrying the
+/// UE's null-scheme SUCI — the answer to an Identity Request. UE side / tests.
+pub fn identity_response_suci(mcc: &str, mnc: &str, msin: &str) -> Vec<u8> {
+    let msg = Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::IdentityResponse,
+        Nas5gmmMessage::IdentityResponse(messages::NasIdentityResponse::new(
+            suci_mobile_identity(mcc, mnc, msin),
+        )),
+    );
+    encode_nas_5gs_message(&msg).expect("encode 5GMM IdentityResponse")
+}
+
+/// The SUPI (deconcealed null-scheme SUCI) from an Identity Response — how the
+/// AMF resumes a registration it paused on an Identity Request.
+pub fn supi_from_identity_response(msg: &Nas5gsMessage) -> Option<String> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::IdentityResponse(resp)) = msg else {
+        return None;
+    };
+    resp.mobile_identity.as_suci().map(|s| suci_to_supi(&s))
+}
+
 /// Build a 5GMM **Registration Accept** (TS 24.501 §8.2.7) assigning a 5G-GUTI,
 /// with the **allowed NSSAI** (IEI 0x15) when the network grants any slices and
 /// the **rejected NSSAI** (IEI 0x11, cause *not available in the current PLMN*)
@@ -1101,6 +1180,47 @@ mod tests {
         let bytes = encode_nas_5gs_message(&configuration_update_command()).expect("encode");
         let msg = decode_nas_5gs_message(&bytes).expect("decode");
         assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::ConfigurationUpdateCommand));
+    }
+
+    #[test]
+    fn guti_registration_request_round_trips() {
+        // A returning UE registers with its 5G-GUTI; the AMF reads the 5G-TMSI
+        // back (and still sees the UE's security capabilities).
+        let bytes = registration_request_with_guti("999", "70", 0x0000_002A, &[0x20, 0x20]);
+        let msg = decode_nas_5gs_message(&bytes).unwrap();
+        assert_eq!(guti_tmsi_from_registration_request(&msg), Some(0x2A));
+        let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationRequest(reg)) = &msg else {
+            panic!("not a RegistrationRequest");
+        };
+        assert!(reg.fgs_mobile_identity.as_suci().is_none(), "identity is a GUTI, not a SUCI");
+        assert_eq!(
+            reg.ue_security_capability.as_ref().map(|c| [c.ea_byte(), c.ia_byte()]),
+            Some([0x20, 0x20])
+        );
+        // A SUCI-bearing request has no GUTI TMSI.
+        let suci_req = Nas5gsMessage::new_5gmm(
+            Nas5gmmMessageType::RegistrationRequest,
+            Nas5gmmMessage::RegistrationRequest(messages::NasRegistrationRequest::new(
+                NasFGsRegistrationType::from_parts(
+                    RegistrationType::InitialRegistration,
+                    false,
+                    7,
+                    false,
+                ),
+                suci_mobile_identity("999", "70", "0000000001"),
+            )),
+        );
+        assert_eq!(guti_tmsi_from_registration_request(&suci_req), None);
+    }
+
+    #[test]
+    fn identity_response_carries_the_suci() {
+        let bytes = identity_response_suci("999", "70", "0000000001");
+        let msg = decode_nas_5gs_message(&bytes).unwrap();
+        assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::IdentityResponse));
+        assert_eq!(supi_from_identity_response(&msg).as_deref(), Some("imsi-999700000000001"));
+        // Any other message yields nothing.
+        assert_eq!(supi_from_identity_response(&deregistration_accept()), None);
     }
 
     #[test]
