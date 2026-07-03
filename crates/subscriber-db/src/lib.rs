@@ -30,6 +30,9 @@ pub trait SubscriberDb: Send + Sync {
     fn exists(&self, supi: &str) -> bool;
     /// Atomically take the next SQN for an authentication (post-increment).
     fn next_sqn(&self, supi: &str) -> Option<[u8; 6]>;
+    /// Withdraw the subscription: remove credentials, auth state, and every
+    /// provisioned document for this SUPI. Returns whether anything existed.
+    fn remove_subscriber(&self, supi: &str) -> bool;
 }
 
 /// The ARPF credential boundary. Holds K/OPc and computes authentication vectors
@@ -173,6 +176,14 @@ impl InMemoryStore {
 impl SubscriberDb for InMemoryStore {
     fn exists(&self, supi: &str) -> bool {
         self.inner.lock().unwrap().credentials.contains_key(supi)
+    }
+
+    fn remove_subscriber(&self, supi: &str) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let existed = g.credentials.remove(supi).is_some();
+        g.sqn.remove(supi);
+        g.docs.retain(|(_, s, _), _| s != supi);
+        existed
     }
 
     fn next_sqn(&self, supi: &str) -> Option<[u8; 6]> {
@@ -350,6 +361,39 @@ impl SubscriberDb for RedbStore {
         self.read_key(supi).is_some()
     }
 
+    fn remove_subscriber(&self, supi: &str) -> bool {
+        let Ok(w) = self.db.begin_write() else {
+            return false;
+        };
+        let mut existed = false;
+        {
+            if let Ok(mut t) = w.open_table(CREDENTIALS) {
+                existed = t.remove(supi).map(|old| old.is_some()).unwrap_or(false);
+            }
+            if let Ok(mut t) = w.open_table(AUTH_STATE) {
+                let _ = t.remove(supi);
+            }
+            for ds in [DataSet::Am, DataSet::Sm, DataSet::SmfSelection] {
+                if let Ok(mut t) = w.open_table(doc_table(ds)) {
+                    // Small tables: collect this SUPI's (supi, plmn) keys, then remove.
+                    let keys: Vec<String> = t
+                        .iter()
+                        .map(|it| {
+                            it.filter_map(|kv| kv.ok())
+                                .filter(|(k, _)| k.value().0 == supi)
+                                .map(|(k, _)| k.value().1.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for plmn in keys {
+                        let _ = t.remove((supi, plmn.as_str()));
+                    }
+                }
+            }
+        }
+        w.commit().is_ok() && existed
+    }
+
     fn next_sqn(&self, supi: &str) -> Option<[u8; 6]> {
         // A subscriber is only usable if its credentials decrypt under our KEK —
         // don't advance SQNs for records we can't authenticate against.
@@ -487,6 +531,34 @@ mod tests {
         let store = RedbStore::open(&path, KEK).unwrap();
         assert_eq!(store.get_provisioned(DataSet::Sm, "imsi-1", "99970"), Some(sm));
         assert!(store.get_provisioned(DataSet::SmfSelection, "imsi-1", "99970").is_none());
+    }
+
+    #[test]
+    fn remove_subscriber_withdraws_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(dir.path().join("s.redb"), KEK).unwrap();
+        store.provision_hex("imsi-1", K, OPC, "8000").unwrap();
+        store
+            .put_provisioned(DataSet::Am, "imsi-1", "99970", &json!({"a": 1}))
+            .unwrap();
+        store
+            .put_provisioned(DataSet::Sm, "imsi-1", "00101", &json!({"b": 2}))
+            .unwrap();
+
+        assert!(store.remove_subscriber("imsi-1"), "existed");
+        assert!(!store.exists("imsi-1"));
+        assert_eq!(store.next_sqn("imsi-1"), None);
+        assert!(store.get_provisioned(DataSet::Am, "imsi-1", "99970").is_none());
+        assert!(store.get_provisioned(DataSet::Sm, "imsi-1", "00101").is_none());
+        assert!(!store.remove_subscriber("imsi-1"), "second removal is a no-op");
+
+        // In-memory behaves the same.
+        let mem = InMemoryStore::new();
+        mem.provision_hex("imsi-1", K, OPC, "8000").unwrap();
+        mem.put_provisioned(DataSet::Am, "imsi-1", "99970", &json!({"a": 1})).unwrap();
+        assert!(mem.remove_subscriber("imsi-1"));
+        assert!(!mem.exists("imsi-1"));
+        assert!(mem.get_provisioned(DataSet::Am, "imsi-1", "99970").is_none());
     }
 
     #[test]

@@ -19,7 +19,9 @@ mod pdu_session;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
+
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use anyhow::Context;
 use nas::{Nas5gmmMessage, Nas5gmmMessageType, Nas5gsMessage};
@@ -64,6 +66,15 @@ const UE_SEC_CAP: [u8; 2] = [0xE0, 0xE0];
 
 /// Allocator for AMF-UE-NGAP-IDs (one per UE the AMF takes context of).
 static NEXT_AMF_UE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// SBI port the AMF's callback surface listens on (namf-callback).
+const SBI_PORT: u16 = 8001;
+
+/// Directory of served UEs: SUPI → (AMF-UE-NGAP-ID, the owning association's
+/// deregistration channel). Lets the SBI callback surface (subscription
+/// withdrawal) reach a UE that lives inside an SCTP association task.
+static UE_DIRECTORY: LazyLock<Mutex<HashMap<String, (u64, UnboundedSender<u64>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Where a UE is in the registration flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +121,19 @@ async fn main() -> anyhow::Result<()> {
     let amf_auth = Arc::new(auth::AmfAuth::new(NRF_BASE, PLMN_MCC, PLMN_MNC));
     let amf_smf = Arc::new(pdu_session::AmfSmf::new(NRF_BASE, PLMN_MCC, PLMN_MNC));
 
+    // SBI callback surface (namf-callback): the UDR notifies subscription
+    // withdrawals here (design/38). Registered with the NRF so it can be found.
+    let sbi_addr: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
+    tokio::spawn(async move {
+        if let Err(e) = sbi_core::run(sbi_addr, namf_callback_router()).await {
+            error!("AMF SBI server failed: {e}");
+        }
+    });
+    match register_with_nrf(NRF_BASE, std::net::Ipv4Addr::LOCALHOST, SBI_PORT).await {
+        Ok(()) => info!(nrf = NRF_BASE, "registered AMF with NRF"),
+        Err(e) => warn!("NRF registration failed (continuing without callbacks): {e}"),
+    }
+
     let addr: SocketAddr = format!("0.0.0.0:{N2_PORT}").parse()?;
     let socket = Socket::new_v4(SocketToAssociation::OneToOne).context("create SCTP socket")?;
     socket.bind(addr).context("bind N2 SCTP")?;
@@ -136,18 +160,123 @@ async fn serve_gnb(
     amf_smf: Arc<pdu_session::AmfSmf>,
 ) -> anyhow::Result<()> {
     let mut ues: HashMap<u64, UeContext> = HashMap::new();
-    loop {
-        match conn.sctp_recv().await? {
-            NotificationOrData::Notification(n) => info!("SCTP notification: {n:?}"),
-            NotificationOrData::Data(data) => {
-                if data.payload.is_empty() {
-                    info!("gNB association closed");
-                    return Ok(());
+    // The SBI callback surface reaches this association's UEs through this channel.
+    let (dereg_tx, mut dereg_rx) = unbounded_channel::<u64>();
+    let result = loop {
+        tokio::select! {
+            received = conn.sctp_recv() => match received {
+                Err(e) => break Err(e.into()),
+                Ok(NotificationOrData::Notification(n)) => info!("SCTP notification: {n:?}"),
+                Ok(NotificationOrData::Data(data)) => {
+                    if data.payload.is_empty() {
+                        info!("gNB association closed");
+                        break Ok(());
+                    }
+                    handle_ngap(&conn, &mut ues, &amf_auth, &amf_smf, &dereg_tx, &data.payload).await;
                 }
-                handle_ngap(&conn, &mut ues, &amf_auth, &amf_smf, &data.payload).await;
+            },
+            Some(amf_ue_id) = dereg_rx.recv() => {
+                for (dl, label) in on_network_deregistration(&mut ues, &amf_smf, amf_ue_id).await {
+                    send_or_log(&conn, &dl, label).await;
+                }
             }
         }
+    };
+    // This association is gone — drop its UEs from the directory (their senders
+    // are now closed) so withdrawals for them answer 404 instead of queueing.
+    drop(dereg_rx);
+    UE_DIRECTORY.lock().unwrap().retain(|_, (_, tx)| !tx.is_closed());
+    result
+}
+
+/// The AMF's SBI callback router: the UDR posts subscription withdrawals here
+/// (`DeregistrationData`), which we turn into a network-initiated deregistration
+/// on the UE's owning association.
+fn namf_callback_router() -> axum::Router {
+    async fn dereg_notify(
+        axum::extract::Path(supi): axum::extract::Path<String>,
+    ) -> axum::http::StatusCode {
+        let entry = UE_DIRECTORY.lock().unwrap().get(&supi).cloned();
+        match entry {
+            Some((amf_ue_id, tx)) if tx.send(amf_ue_id).is_ok() => {
+                info!(%supi, "subscription withdrawn — deregistering UE {amf_ue_id}");
+                axum::http::StatusCode::NO_CONTENT
+            }
+            _ => axum::http::StatusCode::NOT_FOUND,
+        }
     }
+    axum::Router::new().route(
+        "/namf-callback/v1/{supi}/dereg-notify",
+        axum::routing::post(dereg_notify),
+    )
+}
+
+/// Register the AMF's callback surface with the NRF and keep it alive.
+async fn register_with_nrf(
+    nrf_base: &str,
+    ip: std::net::Ipv4Addr,
+    sbi_port: u16,
+) -> anyhow::Result<()> {
+    use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService};
+    let mut profile = NfProfile::new(sbi_core::new_nf_instance_id(), "AMF", ip.to_string());
+    profile.nf_services = Some(vec![NfService {
+        service_instance_id: "namf-callback-1".into(),
+        service_name: "namf-callback".into(),
+        scheme: "http".into(),
+        ip_end_points: vec![IpEndPoint {
+            ipv4_address: Some(ip.to_string()),
+            port: Some(sbi_port),
+        }],
+    }]);
+    sbi_core::nnrf::register_and_maintain(nrf_base, profile).await?;
+    Ok(())
+}
+
+/// Network-initiated deregistration (TS 24.501 §5.5.2.3), triggered by a
+/// subscription withdrawal: release the PDU session, send the UE a
+/// Deregistration Request (UE terminated, re-registration not required), then
+/// the UE Context Release Command, and drop the contexts. Deviation: we do not
+/// run T3522 / await the UE's Deregistration Accept — cleanup is immediate.
+async fn on_network_deregistration(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    amf_ue_id: u64,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        warn!("network deregistration for unknown UE {amf_ue_id}");
+        return Vec::new();
+    };
+    let ran_ue_id = ctx.ran_ue_id;
+
+    if let Some(sm_ref) = ctx.sm_ref.take() {
+        match amf_smf.release_sm_context(&sm_ref).await {
+            Ok(()) => info!("UE {amf_ue_id}: released SM context {sm_ref} (network dereg)"),
+            Err(e) => warn!("UE {amf_ue_id}: SM context {sm_ref} release failed: {e}"),
+        }
+    }
+
+    let mut downlinks = Vec::new();
+    if let Some(sec) = ctx.sec.as_mut() {
+        // Re-registration not required (subscription withdrawn), 3GPP access.
+        let req = nas::deregistration_request_to_ue(0x01);
+        let bytes = sec.protect(&req, nas::sht::INTEGRITY_CIPHERED, 1);
+        downlinks.push((
+            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
+            "DownlinkNASTransport (DeregistrationRequest)",
+        ));
+    } else {
+        warn!("UE {amf_ue_id}: network dereg before NAS security; skipping the NAS request");
+    }
+    downlinks.push((
+        ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
+        "UEContextReleaseCommand",
+    ));
+    if let Some(supi) = ctx.suci.clone() {
+        UE_DIRECTORY.lock().unwrap().remove(&supi);
+    }
+    ues.remove(&amf_ue_id);
+    info!("UE {amf_ue_id}: network-initiated deregistration complete");
+    downlinks
 }
 
 /// Decode one NGAP PDU and dispatch it.
@@ -156,6 +285,7 @@ async fn handle_ngap(
     ues: &mut HashMap<u64, UeContext>,
     amf_auth: &auth::AmfAuth,
     amf_smf: &pdu_session::AmfSmf,
+    dereg_tx: &UnboundedSender<u64>,
     bytes: &[u8],
 ) {
     let pdu = match NGAP_PDU::decode(bytes) {
@@ -175,7 +305,7 @@ async fn handle_ngap(
             }
             InitiatingMessageValue::Id_InitialUEMessage(msg) => {
                 let amf_ue_id = NEXT_AMF_UE_ID.fetch_add(1, Ordering::Relaxed);
-                match on_initial_ue(ues, msg, amf_ue_id) {
+                match on_initial_ue(ues, msg, amf_ue_id, dereg_tx) {
                     Some(InitialUeOutcome::NeedIdentity(dl)) => {
                         send_or_log(conn, &dl, "DownlinkNASTransport (IdentityRequest)").await;
                     }
@@ -252,6 +382,7 @@ fn on_initial_ue(
     ues: &mut HashMap<u64, UeContext>,
     msg: &InitialUEMessage,
     amf_ue_id: u64,
+    dereg_tx: &UnboundedSender<u64>,
 ) -> Option<InitialUeOutcome> {
     let ran_ue_id = initial_ue_ran_id(msg)?;
     let identity = initial_ue_nas_pdu(msg)
@@ -264,6 +395,8 @@ fn on_initial_ue(
             ctx.replayed_ue_sec_cap = ue_sec_cap;
             ctx.requested_nssai = requested_nssai;
             ues.insert(amf_ue_id, ctx);
+            // Make the UE reachable from the SBI callback surface (withdrawals).
+            UE_DIRECTORY.lock().unwrap().insert(supi.clone(), (amf_ue_id, dereg_tx.clone()));
             Some(InitialUeOutcome::Identified { ran_ue_id, supi })
         }
         None => {
@@ -405,6 +538,9 @@ async fn on_deregistration(
         ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
         "UEContextReleaseCommand",
     ));
+    if let Some(supi) = ues.get(&amf_ue_id).and_then(|c| c.suci.clone()) {
+        UE_DIRECTORY.lock().unwrap().remove(&supi);
+    }
     ues.remove(&amf_ue_id);
     downlinks
 }
@@ -690,6 +826,9 @@ async fn on_security_mode_complete(
             "UE {amf_ue_id}: no requested slice is subscribed ({rejected:?}); sending \
              Registration Reject (5GMM cause #62) + UE Context Release Command"
         );
+        if let Some(supi) = supi {
+            UE_DIRECTORY.lock().unwrap().remove(&supi);
+        }
         ues.remove(&amf_ue_id);
         return vec![
             (
@@ -981,6 +1120,66 @@ mod tests {
         assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 1, "no session, no extra release");
     }
 
+    /// A subscription-withdrawal callback reaches the UE's association and the
+    /// network-initiated deregistration tears everything down.
+    #[tokio::test]
+    async fn subscription_withdrawal_deregisters_the_ue() {
+        // Directory entry wired to a test channel (as serve_gnb would).
+        let supi = "imsi-999700000000042";
+        let (tx, mut rx) = unbounded_channel::<u64>();
+        UE_DIRECTORY.lock().unwrap().insert(supi.to_string(), (42, tx));
+
+        // The callback surface turns the POST into a channel message.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(l, namf_callback_router()).await.unwrap() });
+        let resp = sbi_core::h2c_client()
+            .post(format!("http://{addr}/namf-callback/v1/{supi}/dereg-notify"))
+            .json(&serde_json::json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 204);
+        assert_eq!(rx.recv().await, Some(42), "association told to deregister UE 42");
+
+        // Unknown SUPI → 404.
+        let resp = sbi_core::h2c_client()
+            .post(format!("http://{addr}/namf-callback/v1/imsi-000/dereg-notify"))
+            .json(&serde_json::json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 404);
+
+        // The dereg flow itself: secured UE, no session → NAS request + release command.
+        let (ki, ke) = ([0x11u8; 16], [0x22u8; 16]);
+        let mut ctx = UeContext::new(9, RegState::Registered, Some(supi.to_string()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        let mut ues = HashMap::new();
+        ues.insert(42u64, ctx);
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70"); // no session → unused
+
+        let downlinks = on_network_deregistration(&mut ues, &amf_smf, 42).await;
+        assert_eq!(
+            downlinks.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["DownlinkNASTransport (DeregistrationRequest)", "UEContextReleaseCommand"]
+        );
+        assert!(!ues.contains_key(&42), "AMF context dropped");
+        assert!(!UE_DIRECTORY.lock().unwrap().contains_key(supi), "directory entry dropped");
+        assert_eq!(
+            ngap::parse_ue_context_release_command(&downlinks[1].0),
+            Some((42, 9, Some(ngap::CauseNas::DEREGISTER)))
+        );
+        // UE side: the request verifies and is the UE-terminated variant.
+        let nas_bytes = downlink_nas_pdu(&downlinks[0].0).expect("NAS PDU");
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let msg = ue_sec.unprotect(&nas_bytes, 1).expect("UE verifies the request");
+        assert_eq!(
+            nas::gmm_message_type(&msg),
+            Some(nas::Nas5gmmMessageType::DeregistrationRequestToUe)
+        );
+    }
+
     /// A UE whose requested slices are all unsubscribed is rejected at registration
     /// with 5GMM cause #62 (rejected NSSAI attached) and its context is released.
     #[tokio::test]
@@ -1099,7 +1298,7 @@ mod tests {
     fn registration_with_suci_is_identified() {
         let mut ues = HashMap::new();
         let pdu = initial_ue_message(7);
-        match on_initial_ue(&mut ues, as_initial_ue(&pdu), 100) {
+        match on_initial_ue(&mut ues, as_initial_ue(&pdu), 100, &unbounded_channel().0) {
             Some(InitialUeOutcome::Identified { ran_ue_id, supi }) => {
                 assert_eq!(ran_ue_id, 7);
                 // The SUCI is deconcealed (null scheme) to an `imsi-<MCC><MNC>…` SUPI —
@@ -1118,7 +1317,7 @@ mod tests {
     fn unidentified_initial_ue_needs_identity() {
         let mut ues = HashMap::new();
         let pdu = ngap::initial_ue_message_with_nas(8, nas::identity_request_suci());
-        match on_initial_ue(&mut ues, as_initial_ue(&pdu), 200) {
+        match on_initial_ue(&mut ues, as_initial_ue(&pdu), 200, &unbounded_channel().0) {
             Some(InitialUeOutcome::NeedIdentity(dl)) => {
                 assert_eq!(dl.procedure_name(), "DownlinkNASTransport");
             }
@@ -1130,7 +1329,7 @@ mod tests {
     #[test]
     fn uplink_correlates_by_amf_ue_id() {
         let mut ues = HashMap::new();
-        on_initial_ue(&mut ues, as_initial_ue(&initial_ue_message(7)), 100);
+        on_initial_ue(&mut ues, as_initial_ue(&initial_ue_message(7)), 100, &unbounded_channel().0);
         let known = ngap::uplink_nas_transport(100, 7, registration_request());
         assert_eq!(uplink_amf_ue_id(as_uplink(&known)), Some(100));
         assert!(ues.contains_key(&100));

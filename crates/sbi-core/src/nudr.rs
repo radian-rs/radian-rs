@@ -18,12 +18,20 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use subscriber_db::{DataSet, SubscriberStore};
 
 use crate::SbiError;
+
+/// Router state: the store plus (optionally) the NRF used to notify the AMF of
+/// subscription withdrawals.
+#[derive(Clone)]
+struct NudrState {
+    store: Arc<dyn SubscriberStore>,
+    notify_nrf: Option<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,11 +52,21 @@ pub struct HeAv {
 
 /// Build the UDR router (Nudr_DataRepository) over the subscriber store.
 pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
+    router_with_notify(store, None)
+}
+
+/// Like [`router`], but a subscription withdrawal (`DELETE …/subscription-data/
+/// {ueId}`) also notifies the serving AMF — discovered via the NRF at `nrf_base` —
+/// with a `DeregistrationData` callback (deviation: TS 23.502 mediates this
+/// through UDM data-change subscriptions; we collapse UDR→UDM→AMF to UDR→AMF).
+pub fn router_with_notify(store: Arc<dyn SubscriberStore>, notify_nrf: Option<String>) -> Router {
+    let state = NudrState { store, notify_nrf };
     Router::new()
         .route(
             "/nudr-dr/v2/subscription-data/{ue_id}/authentication-data/generate-av",
             post(generate_av),
         )
+        .route("/nudr-dr/v2/subscription-data/{ue_id}", delete(delete_subscription))
         .route(
             "/nudr-dr/v2/subscription-data/{ue_id}/{serving_plmn_id}/provisioned-data/am-data",
             get(get_am_data).put(put_am_data),
@@ -61,17 +79,67 @@ pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
             "/nudr-dr/v2/subscription-data/{ue_id}/{serving_plmn_id}/provisioned-data/smf-selection-subscription-data",
             get(get_smf_sel).put(put_smf_sel),
         )
-        .with_state(store)
+        .with_state(state)
+}
+
+/// Withdraw a subscription: remove everything stored for the SUPI, then (when
+/// configured) notify the serving AMF so it network-deregisters the UE.
+async fn delete_subscription(
+    State(st): State<NudrState>,
+    Path(ue_id): Path<String>,
+) -> StatusCode {
+    if !st.store.remove_subscriber(&ue_id) {
+        return StatusCode::NOT_FOUND;
+    }
+    tracing::info!(supi = %ue_id, "subscription withdrawn");
+    if let Some(nrf) = st.notify_nrf.clone() {
+        // Best-effort, off the request path: the withdrawal stands even if the
+        // AMF is unreachable (the UE is simply not chased off until it returns).
+        tokio::spawn(async move {
+            if let Err(e) = notify_amf_deregistration(&nrf, &ue_id).await {
+                tracing::warn!(supi = %ue_id, "AMF deregistration notify failed: {e}");
+            }
+        });
+    }
+    StatusCode::NO_CONTENT
+}
+
+/// POST a `DeregistrationData` (TS 29.503-shaped) to the NRF-discovered AMF.
+async fn notify_amf_deregistration(nrf_base: &str, supi: &str) -> Result<(), String> {
+    let profile = crate::nnrf::NrfClient::new(nrf_base.to_string())
+        .discover("AMF", "UDR")
+        .await
+        .map_err(|e| format!("NRF discovery failed: {e}"))?
+        .into_iter()
+        .next()
+        .ok_or("no AMF registered with the NRF")?;
+    let ep = profile
+        .nf_services
+        .and_then(|s| s.into_iter().next())
+        .and_then(|svc| svc.ip_end_points.into_iter().next())
+        .ok_or("AMF profile has no service endpoint")?;
+    let (ip, port) = (ep.ipv4_address.ok_or("no IP")?, ep.port.ok_or("no port")?);
+    let resp = crate::h2c_client()
+        .post(format!("http://{ip}:{port}/namf-callback/v1/{supi}/dereg-notify"))
+        .json(&serde_json::json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN" }))
+        .send()
+        .await
+        .map_err(|e| format!("callback failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("AMF answered {}", resp.status()));
+    }
+    tracing::info!(supi = %supi, "AMF notified of subscription withdrawal");
+    Ok(())
 }
 
 async fn generate_av(
-    State(store): State<Arc<dyn SubscriberStore>>,
+    State(st): State<NudrState>,
     Path(ue_id): Path<String>,
     Json(req): Json<GenerateAvRequest>,
 ) -> Result<Json<HeAv>, StatusCode> {
-    let sqn = store.next_sqn(&ue_id).ok_or(StatusCode::NOT_FOUND)?;
+    let sqn = st.store.next_sqn(&ue_id).ok_or(StatusCode::NOT_FOUND)?;
     let rand = crate::random_rand();
-    let av = store
+    let av = st.store
         .generate_he_av(&ue_id, &sqn, &rand, &req.mcc, &req.mnc)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(HeAv {
@@ -110,17 +178,17 @@ async fn put_doc(
 macro_rules! doc_handlers {
     ($get:ident, $put:ident, $ds:expr) => {
         async fn $get(
-            State(store): State<Arc<dyn SubscriberStore>>,
+            State(st): State<NudrState>,
             Path((ue_id, plmn)): Path<(String, String)>,
         ) -> Result<Json<serde_json::Value>, StatusCode> {
-            get_doc(store, $ds, ue_id, plmn).await
+            get_doc(st.store, $ds, ue_id, plmn).await
         }
         async fn $put(
-            State(store): State<Arc<dyn SubscriberStore>>,
+            State(st): State<NudrState>,
             Path((ue_id, plmn)): Path<(String, String)>,
             Json(doc): Json<serde_json::Value>,
         ) -> StatusCode {
-            put_doc(store, $ds, ue_id, plmn, doc).await
+            put_doc(st.store, $ds, ue_id, plmn, doc).await
         }
     };
 }
@@ -190,6 +258,21 @@ impl UdrClient {
         Ok(Some(resp.error_for_status()?.json().await?))
     }
 
+    /// Withdraw a subscription (`DELETE …/subscription-data/{ueId}`). `Ok(true)`
+    /// if it existed, `Ok(false)` on 404.
+    pub async fn delete_subscriber(&self, supi: &str) -> Result<bool, SbiError> {
+        let resp = self
+            .http
+            .delete(format!("{}/nudr-dr/v2/subscription-data/{}", self.base, supi))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        resp.error_for_status()?;
+        Ok(true)
+    }
+
     /// Store (create or replace) a provisioned-data document.
     pub async fn put_provisioned(
         &self,
@@ -255,6 +338,77 @@ mod tests {
         }
 
         assert!(udr.generate_av("imsi-unknown", "999", "70").await.unwrap().is_none());
+    }
+
+    /// A DELETE withdraws the subscription and (when configured) notifies the
+    /// NRF-discovered AMF with a DeregistrationData callback.
+    #[tokio::test]
+    async fn subscription_withdrawal_notifies_the_amf() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NOTIFIED: AtomicUsize = AtomicUsize::new(0);
+
+        // Mock AMF callback endpoint.
+        async fn notify() -> axum::http::StatusCode {
+            NOTIFIED.fetch_add(1, Ordering::Relaxed);
+            axum::http::StatusCode::NO_CONTENT
+        }
+        let amf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let amf_addr = amf_l.local_addr().unwrap();
+        let amf_router = axum::Router::new().route(
+            "/namf-callback/v1/{supi}/dereg-notify",
+            axum::routing::post(notify),
+        );
+        tokio::spawn(async move { crate::run_on(amf_l, amf_router).await.unwrap() });
+
+        // NRF with the mock AMF registered.
+        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nrf_addr = nrf_l.local_addr().unwrap();
+        let store = crate::nnrf::NrfStore::default();
+        tokio::spawn(async move { crate::run_on(nrf_l, crate::nnrf::router(store)).await.unwrap() });
+        let nrf_base = format!("http://{nrf_addr}");
+        let mut profile =
+            crate::nnrf::NfProfile::new("amf-1", "AMF", amf_addr.ip().to_string());
+        profile.nf_services = Some(vec![crate::nnrf::NfService {
+            service_instance_id: "namf-callback-1".into(),
+            service_name: "namf-callback".into(),
+            scheme: "http".into(),
+            ip_end_points: vec![crate::nnrf::IpEndPoint {
+                ipv4_address: Some(amf_addr.ip().to_string()),
+                port: Some(amf_addr.port()),
+            }],
+        }]);
+        crate::nnrf::NrfClient::new(nrf_base.clone()).register(&profile).await.unwrap();
+
+        // UDR with notification enabled and one provisioned subscriber.
+        let store = Arc::new(InMemoryStore::new());
+        store
+            .provision_hex(
+                "imsi-1",
+                "465b5ce8b199b49faa5f0a2ee238a6bc",
+                "cd63cb71954a9f4e48a5994e37a02baf",
+                "8000",
+            )
+            .unwrap();
+        let store: Arc<dyn SubscriberStore> = store;
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move {
+            crate::run_on(udr_l, router_with_notify(store, Some(nrf_base))).await.unwrap()
+        });
+        let udr = UdrClient::new(format!("http://{udr_addr}"));
+
+        assert_eq!(udr.delete_subscriber("imsi-1").await.unwrap(), true);
+        assert!(udr.generate_av("imsi-1", "999", "70").await.unwrap().is_none(), "withdrawn");
+        assert_eq!(udr.delete_subscriber("imsi-1").await.unwrap(), false, "second delete 404s");
+
+        // The notification is spawned off the request path — poll briefly.
+        for _ in 0..50 {
+            if NOTIFIED.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(NOTIFIED.load(Ordering::Relaxed), 1, "AMF notified exactly once");
     }
 
     #[tokio::test]

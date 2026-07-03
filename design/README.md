@@ -46,6 +46,7 @@ surface of the project and assesses build feasibility.
 | [35-ue-context-release.md](35-ue-context-release.md) | NGAP UE Context Release Command after the #62 reject (UE-NGAP-IDs pair + NAS cause); multi-PDU downlink answers |
 | [36-reg-reject-t3346.md](36-reg-reject-t3346.md) | T3346 back-off IE on the Registration Reject: GprsTimer2 encoding (2s/1min/decihour units), 600s on cause #62 |
 | [37-deregistration.md](37-deregistration.md) | UE-initiated deregistration: PFCP Session Deletion, Nsmf ReleaseSMContext, Deregistration Accept (unless switch-off), UEContextReleaseCommand |
+| [38-network-dereg.md](38-network-dereg.md) | Network-initiated dereg: UDR DELETE → AMF callback (namf-callback :8001, UE_DIRECTORY) → Deregistration Request (UE terminated) + full teardown |
 
 ## One-paragraph summary
 

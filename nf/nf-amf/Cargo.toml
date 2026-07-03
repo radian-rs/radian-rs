@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+axum = "0.8.9"
 common.workspace = true
 sbi-core.workspace = true
 ngap.workspace = true
@@ -22,4 +23,3 @@ sctp-rs = "0.3"
 [dev-dependencies]
 hex-literal = "0.4"
 subscriber-db.workspace = true
-axum = "0.8.9"

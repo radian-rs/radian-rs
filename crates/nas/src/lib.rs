@@ -296,6 +296,18 @@ pub fn deregistration_request_from_ue(dereg_type: u8, mcc: &str, mnc: &str, tmsi
     )
 }
 
+/// Build a 5GMM **Deregistration Request (UE terminated)** (TS 24.501 §8.2.14) —
+/// network-initiated. `dereg_type` is the §9.11.3.20 half-octet; for a
+/// subscription withdrawal use `0x01` (re-registration not required, 3GPP access).
+pub fn deregistration_request_to_ue(dereg_type: u8) -> Nas5gsMessage {
+    let req =
+        messages::NasDeregistrationRequestToUe::new(NasDeRegistrationType::new(dereg_type));
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::DeregistrationRequestToUe,
+        Nas5gmmMessage::DeregistrationRequestToUe(req),
+    )
+}
+
 /// GPRS Timer 2 (TS 24.008 §10.5.7.4): one octet holding a 3-bit unit (bits 6-8)
 /// and a 5-bit multiple (bits 1-5) — coarser than [`GprsTimer3`] (units 2s /
 /// 1min / decihour). Carried as the **T3346 value** IE in 5GMM rejects: the UE
@@ -1058,6 +1070,11 @@ mod tests {
         let req = deregistration_request_from_ue(0x09, "999", "70", 1);
         let back = decode_nas_5gs_message(&encode_nas_5gs_message(&req).unwrap()).unwrap();
         assert_eq!(deregistration_is_switch_off(&back), Some(true));
+
+        // Network-initiated request (UE terminated) round-trips.
+        let req = deregistration_request_to_ue(0x01);
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&req).unwrap()).unwrap();
+        assert_eq!(gmm_message_type(&back), Some(Nas5gmmMessageType::DeregistrationRequestToUe));
 
         // The accept is header-only and round-trips.
         let acc = deregistration_accept();
