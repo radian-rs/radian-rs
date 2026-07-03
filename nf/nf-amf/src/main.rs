@@ -137,7 +137,12 @@ enum UeCmd {
     Page(u32),
     /// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify):
     /// the new UE-AMBR `(downlink, uplink)` bits/sec for this UE.
-    UpdateAmPolicy { amf_ue_id: u64, ue_ambr: (u64, u64), rfsp: Option<u16> },
+    UpdateAmPolicy {
+        amf_ue_id: u64,
+        ue_ambr: (u64, u64),
+        rfsp: Option<u16>,
+        area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
+    },
 }
 
 /// A network-initiated PDU-session modification for one UE — the parsed QoS the
@@ -432,8 +437,8 @@ async fn serve_gnb(
                     }
                     UeCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, T3522_SECS),
                     UeCmd::ModifyPolicy(m) => on_network_modification(&mut ues, &m),
-                    UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr, rfsp } => {
-                        on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp)
+                    UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr, rfsp, area_restriction } => {
+                        on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp, area_restriction)
                     }
                     // Page a CM-IDLE UE on this gNB (non-UE-associated NGAP Paging).
                     UeCmd::Page(tmsi) => {
@@ -565,8 +570,8 @@ fn namf_callback_router() -> axum::Router {
         axum::extract::Path(supi): axum::extract::Path<String>,
         axum::Json(policy): axum::Json<sbi_core::npcf_am::PolicyAssociation>,
     ) -> axum::http::StatusCode {
-        // The UE-AMBR (enforced at the gNB) + the RFSP (RAT/frequency steering) are
-        // applied; service-area application is deferred.
+        // The UE-AMBR (enforced at the gNB), the RFSP (RAT/frequency steering), and
+        // the service area restriction (allowed/non-allowed TACs) are all applied.
         let Some(ambr) = policy.ue_ambr.as_ref() else {
             return axum::http::StatusCode::NO_CONTENT; // nothing actionable
         };
@@ -576,9 +581,12 @@ fn namf_callback_router() -> axum::Router {
             return axum::http::StatusCode::BAD_REQUEST;
         };
         let rfsp = policy.rfsp;
+        let area_restriction = policy.serv_area_res.as_ref().and_then(area_restriction_tacs);
         match UE_DIRECTORY.lock().unwrap().get(&supi).cloned() {
             Some((amf_ue_id, tx))
-                if tx.send(UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr: (dl, ul), rfsp }).is_ok() =>
+                if tx
+                    .send(UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr: (dl, ul), rfsp, area_restriction })
+                    .is_ok() =>
             {
                 info!(%supi, "AM policy update (UpdateNotify) delivered to the association");
                 axum::http::StatusCode::NO_CONTENT
@@ -675,22 +683,18 @@ async fn on_network_deregistration(
     )]
 }
 
-/// Push a mid-session **PDU-session QoS change** to the RAN/UE (SMF-initiated, via
-/// the SBI callback). Builds the N1 **PDU Session Modification Command** (protected
-/// with the UE's NAS security context) and the N2 **PDU Session Resource Modify
-/// Request** carrying the new session AMBR + QoS flows, for the gNB to apply and
-/// relay to the UE. No-ops (empty) for an unknown UE, an unsecured UE, or a psi the
-/// UE has no session for.
 /// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify): store
-/// the new RFSP + UE-AMBR, signal them to the **RAN** in a UE Context Modification
-/// Request (TS 38.413 §9.2.2.7), and run the Generic UE Configuration Update
-/// procedure toward the **UE** (TS 24.501 §5.4.4) — a protected Configuration
-/// Update Command telling the UE its config changed.
+/// the new RFSP + UE-AMBR + service area restriction, signal RFSP + UE-AMBR to the
+/// **RAN** in a UE Context Modification Request (TS 38.413 §9.2.2.7), and run the
+/// Generic UE Configuration Update procedure toward the **UE** (TS 24.501 §5.4.4) —
+/// a protected Configuration Update Command that also carries the updated service
+/// area restriction to the RAN as a Mobility Restriction List (TS 38.413 §9.2.5.3).
 fn on_am_policy_update(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
     ue_ambr: (u64, u64),
     rfsp: Option<u16>,
+    area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
 ) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
         warn!("AM policy update for unknown UE {amf_ue_id}");
@@ -698,9 +702,11 @@ fn on_am_policy_update(
     };
     ctx.ue_ambr = Some(ue_ambr);
     ctx.rfsp = rfsp;
+    ctx.area_restriction = area_restriction.clone();
     let ran_ue_id = ctx.ran_ue_id;
     info!(
-        "UE {amf_ue_id}: AM policy updated — signalling RFSP {rfsp:?}, UE-AMBR {}/{} (dl/ul) bps to the RAN",
+        "UE {amf_ue_id}: AM policy updated — signalling RFSP {rfsp:?}, UE-AMBR {}/{} (dl/ul) bps, \
+         service area {area_restriction:?} to the RAN",
         ue_ambr.0, ue_ambr.1
     );
     // Tell the RAN the new UE-context policy (RFSP + UE-AMBR).
@@ -708,13 +714,18 @@ fn on_am_policy_update(
         ngap::ue_context_modification_request(amf_ue_id, ran_ue_id, rfsp, Some(ue_ambr)),
         "UEContextModificationRequest (RFSP)",
     )];
-    // Tell the UE its configuration changed (Generic UE Configuration Update).
+    // Tell the UE its configuration changed (Generic UE Configuration Update),
+    // carrying the updated service area restriction (Mobility Restriction List) to
+    // the RAN on the same DownlinkNASTransport when the policy has one.
     if let Some(sec) = ctx.sec.as_mut() {
         let cuc = sec.protect(&nas::configuration_update_command(), nas::sht::INTEGRITY_CIPHERED, 1);
-        dl.push((
-            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
-            "DownlinkNASTransport (ConfigurationUpdateCommand)",
-        ));
+        let cuc_dl = match &area_restriction {
+            Some((allowed, not_allowed)) => ngap::downlink_nas_transport_with_area_restriction(
+                amf_ue_id, ran_ue_id, cuc, PLMN_MCC, PLMN_MNC, allowed, not_allowed,
+            ),
+            None => ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
+        };
+        dl.push((cuc_dl, "DownlinkNASTransport (ConfigurationUpdateCommand)"));
     }
     dl
 }
@@ -2381,7 +2392,9 @@ mod tests {
         let mut ues = HashMap::new();
         ues.insert(1u64, ctx);
 
-        let dls = on_am_policy_update(&mut ues, 1, (600_000_000, 300_000_000), Some(9));
+        // The changed policy also moves the UE to a new service area (allow TAC 000002).
+        let dls =
+            on_am_policy_update(&mut ues, 1, (600_000_000, 300_000_000), Some(9), Some((vec![[0, 0, 2]], Vec::new())));
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             [
@@ -2391,10 +2404,21 @@ mod tests {
         );
         assert_eq!(ues.get(&1).unwrap().ue_ambr, Some((600_000_000, 300_000_000)), "UE-AMBR updated");
         assert_eq!(ues.get(&1).unwrap().rfsp, Some(9), "RFSP updated");
+        assert_eq!(
+            ues.get(&1).unwrap().area_restriction,
+            Some((vec![[0, 0, 2]], Vec::new())),
+            "service area updated"
+        );
         // The RAN sees the new RFSP + UE-AMBR in the UE Context Modification.
         assert_eq!(
             ngap::ue_context_modification_params(&dls[0].0),
             Some((1, 9, Some(9), Some((600_000_000, 300_000_000))))
+        );
+        // The RAN sees the new service area (Mobility Restriction List) on the same
+        // DownlinkNASTransport that carries the Configuration Update Command.
+        assert_eq!(
+            ngap::area_restriction_from_downlink_nas(&dls[1].0),
+            Some((vec![[0, 0, 2]], Vec::new()))
         );
         // The UE decodes the Configuration Update Command under its context.
         let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
@@ -2404,8 +2428,12 @@ mod tests {
             nas::gmm_message_type(&cuc),
             Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand)
         );
+        // A change with no service area falls back to the plain transport (no MRL).
+        let dls = on_am_policy_update(&mut ues, 1, (1, 1), None, None);
+        assert_eq!(ngap::area_restriction_from_downlink_nas(&dls[1].0), None);
+        assert_eq!(ues.get(&1).unwrap().area_restriction, None, "service area cleared");
         // Unknown UE → no downlinks.
-        assert!(on_am_policy_update(&mut ues, 999, (1, 1), None).is_empty());
+        assert!(on_am_policy_update(&mut ues, 999, (1, 1), None, None).is_empty());
     }
 
     /// Service area restriction: the PCF policy's `servAreaRes` is parsed into
