@@ -32,6 +32,57 @@ pub struct SmContextCreated {
     pub nas_flows: Vec<nas::QosFlowDesc>,
 }
 
+/// Parse an Nsmf SM-context response body (from CreateSMContext or an activate
+/// UpdateSMContext — same shape) into the N2/N1 parameters the AMF needs. `sm_ref`
+/// is supplied by the caller (create reads it from the body; activate knows it).
+fn parse_sm_context_created(
+    sm_ref: String,
+    body: &serde_json::Value,
+) -> Result<SmContextCreated, String> {
+    let field = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+    let teid_hex = field("upN3Teid").ok_or("response missing upN3Teid")?;
+    let up_n3_teid = u32::from_str_radix(&teid_hex, 16).map_err(|e| format!("bad upN3Teid: {e}"))?;
+    let up_n3_addr =
+        field("upN3Addr").ok_or("response missing upN3Addr")?.parse().map_err(|_| "bad upN3Addr")?;
+    let ue_ip =
+        field("ueIpv4Addr").ok_or("response missing ueIpv4Addr")?.parse().map_err(|_| "bad ueIpv4Addr")?;
+
+    // Subscribed session parameters for the N1 accept. Tolerate their absence
+    // (defaults match the pre-subscription behaviour) so an older SMF still works.
+    let snssai_sst = body
+        .pointer("/sNssai/sst")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u8::try_from(v).ok())
+        .unwrap_or(1);
+    let snssai_sd = body
+        .pointer("/sNssai/sd")
+        .and_then(|v| v.as_str())
+        .and_then(|sd| hex::decode(sd).ok())
+        .and_then(|b| <[u8; 3]>::try_from(b).ok());
+    let ambr = body
+        .get("sessionAmbr")
+        .and_then(|a| {
+            let ul = a.get("uplink")?.as_str()?;
+            let dl = a.get("downlink")?.as_str()?;
+            nas::session_ambr_from_bitrates(ul, dl)
+        })
+        .unwrap_or(nas::SessionAmbr::TEN_MBPS);
+
+    // Authorized QoS flows → NGAP (bits/sec GBR) + NAS (unit/value GBR) forms.
+    let (ngap_flows, nas_flows) = parse_qos_flows(body);
+    Ok(SmContextCreated {
+        sm_ref,
+        up_n3_teid,
+        up_n3_addr,
+        ue_ip,
+        snssai_sst,
+        snssai_sd,
+        ambr,
+        ngap_flows,
+        nas_flows,
+    })
+}
+
 /// Parse the CreateSMContext response's `qosFlows` into NGAP + NAS flow lists.
 /// Empty → the AMF falls back to the default non-GBR flow for the N2 transfer and
 /// omits the N1 QoS flow descriptions IE (single-flow accept stays minimal).
@@ -177,54 +228,32 @@ impl AmfSmf {
         }
         let body: serde_json::Value =
             resp.json().await.map_err(|e| format!("CreateSMContext body: {e}"))?;
-        let field = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_owned);
-        let sm_ref = field("smContextRef").ok_or("response missing smContextRef")?;
-        let teid_hex = field("upN3Teid").ok_or("response missing upN3Teid")?;
-        let up_n3_teid =
-            u32::from_str_radix(&teid_hex, 16).map_err(|e| format!("bad upN3Teid: {e}"))?;
-        let up_n3_addr = field("upN3Addr")
-            .ok_or("response missing upN3Addr")?
-            .parse()
-            .map_err(|_| "bad upN3Addr")?;
-        let ue_ip = field("ueIpv4Addr")
-            .ok_or("response missing ueIpv4Addr")?
-            .parse()
-            .map_err(|_| "bad ueIpv4Addr")?;
+        let sm_ref =
+            body.get("smContextRef").and_then(|v| v.as_str()).ok_or("response missing smContextRef")?;
+        parse_sm_context_created(sm_ref.to_string(), &body).map_err(CreateSmError::from)
+    }
 
-        // Subscribed session parameters for the N1 accept. Tolerate their absence
-        // (defaults match the pre-subscription behaviour) so an older SMF still works.
-        let snssai_sst = body
-            .pointer("/sNssai/sst")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u8::try_from(v).ok())
-            .unwrap_or(1);
-        let snssai_sd = body
-            .pointer("/sNssai/sd")
-            .and_then(|v| v.as_str())
-            .and_then(|sd| hex::decode(sd).ok())
-            .and_then(|b| <[u8; 3]>::try_from(b).ok());
-        let ambr = body
-            .get("sessionAmbr")
-            .and_then(|a| {
-                let ul = a.get("uplink")?.as_str()?;
-                let dl = a.get("downlink")?.as_str()?;
-                nas::session_ambr_from_bitrates(ul, dl)
-            })
-            .unwrap_or(nas::SessionAmbr::TEN_MBPS);
-
-        // Authorized QoS flows → NGAP (bits/sec GBR) + NAS (unit/value GBR) forms.
-        let (ngap_flows, nas_flows) = parse_qos_flows(&body);
-        Ok(SmContextCreated {
-            sm_ref,
-            up_n3_teid,
-            up_n3_addr,
-            ue_ip,
-            snssai_sst,
-            snssai_sd,
-            ambr,
-            ngap_flows,
-            nas_flows,
-        })
+    /// Re-activate a PDU session's user-plane connection (Service Request resume,
+    /// TS 23.502 §4.2.3.2): the SMF returns the session's N2 info (the retained UPF
+    /// N3 F-TEID + current QoS) so the AMF can rebuild the N2 PDU Session Resource
+    /// Setup. Nsmf UpdateSMContext with `upCnxState=ACTIVATING`.
+    pub async fn activate_up_connection(
+        &self,
+        smf_base: &str,
+        sm_ref: &str,
+    ) -> Result<SmContextCreated, String> {
+        let resp = sbi_core::sbi_client()
+            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
+            .json(&serde_json::json!({ "upCnxState": "ACTIVATING" }))
+            .send()
+            .await
+            .map_err(|e| format!("Nsmf UpdateSMContext (activate) request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Nsmf UpdateSMContext (activate) returned {}", resp.status()));
+        }
+        let body: serde_json::Value =
+            resp.json().await.map_err(|e| format!("activate response body: {e}"))?;
+        parse_sm_context_created(sm_ref.to_string(), &body)
     }
 
     /// Release an SM context (TS 29.502) — the SMF tears the N4 session down at

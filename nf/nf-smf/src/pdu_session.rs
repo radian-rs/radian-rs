@@ -45,11 +45,16 @@ struct SmContext {
     /// CP F-SEID — how a UPF-initiated Session Report Request addresses this
     /// session back to us.
     cp_seid: u64,
-    /// UPF-allocated uplink N3 F-TEID.
+    /// UPF-allocated uplink N3 F-TEID + its node address — carried to the gNB in the
+    /// N2 SM info at establishment and again on a Service Request re-activation.
     n3_teid: u32,
+    n3_addr: Ipv4Addr,
     /// The UE's assigned IP (this session's PDU address).
     ue_ip: Ipv4Addr,
-    /// gNB downlink target, once `UpdateSMContext` installs it.
+    /// The slice serving this session — re-sent in the activate response.
+    snssai: Snssai,
+    /// gNB downlink target, once `UpdateSMContext` installs it. Cleared on AN
+    /// release (deactivation).
     gnb: Option<(u32, Ipv4Addr)>,
     /// Subscriber + session identity, for the UECM smf-registration teardown.
     supi: String,
@@ -267,7 +272,7 @@ struct SmContextCreateData {
     s_nssai: Option<Snssai>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Snssai {
     sst: u8,
@@ -535,7 +540,9 @@ async fn create_sm_context(
             up_seid: est.up_seid,
             cp_seid,
             n3_teid: est.n3_teid,
+            n3_addr: est.n3_addr,
             ue_ip,
+            snssai: sub.snssai.clone(),
             gnb: None,
             supi: req.supi.clone(),
             pdu_session_id: req.pdu_session_id,
@@ -747,39 +754,62 @@ async fn fetch_sm_policy(
     }
 }
 
-/// `Nsmf_PDUSession_UpdateSMContext`: install the downlink path with the gNB's F-TEID.
+/// `Nsmf_PDUSession_UpdateSMContext`: install the downlink path with the gNB's
+/// F-TEID (activation), deactivate the UP (AN release), or return the N2 info to
+/// re-activate on a Service Request (`upCnxState=ACTIVATING`).
 async fn update_sm_context(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
     Json(req): Json<SmContextUpdateData>,
-) -> StatusCode {
+) -> axum::response::Response {
     // AN release (TS 23.502 §4.2.6): deactivate the downlink user-plane connection
     // — the UPF drops downlink toward the released gNB tunnel; the session persists.
     if req.up_cnx_state.as_deref() == Some("DEACTIVATED") {
-        return deactivate_up(&smf, &sm_ref).await;
+        return deactivate_up(&smf, &sm_ref).await.into_response();
+    }
+    // Service Request resume (TS 23.502 §4.2.3.2): return the session's N2 info (the
+    // retained UPF N3 F-TEID + current QoS) so the AMF rebuilds the N2 setup. The N4
+    // downlink is re-installed by the follow-up activation (gNB F-TEID) below.
+    if req.up_cnx_state.as_deref() == Some("ACTIVATING") {
+        return match smf.contexts.lock().unwrap().get(&sm_ref) {
+            Some(c) => (
+                StatusCode::OK,
+                Json(SmContextCreatedData {
+                    sm_context_ref: sm_ref.clone(),
+                    up_n3_teid: format!("{:08x}", c.n3_teid),
+                    up_n3_addr: c.n3_addr,
+                    ue_ipv4_addr: c.ue_ip,
+                    s_nssai: c.snssai.clone(),
+                    session_ambr: c.policy.session_ambr.clone(),
+                    qos_flows: c.policy.qos_flows.clone(),
+                }),
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
     }
     let Some(teid_hex) = req.gnb_n3_teid else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
     let Some(gnb_addr) = req.gnb_n3_addr else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
     let gnb_teid = match u32::from_str_radix(teid_hex.trim_start_matches("0x"), 16) {
         Ok(t) => t,
-        Err(_) => return StatusCode::BAD_REQUEST,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     // Defense-in-depth on the downlink sink: reject an obviously bogus gNB target. The
     // real protection is SBI authorization (only the AMF may call Nsmf) — OAuth2 is
     // deferred (TS 33.501), same posture as the rest of SBI; the gNB F-TEID legitimately
     // comes from the AMF (which learned it from the N2 PDU Session Resource Setup).
     if !valid_gnb_target(gnb_teid, gnb_addr) {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
     let up_seid = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
             Some(c) => c.up_seid,
-            None => return StatusCode::NOT_FOUND,
+            None => return StatusCode::NOT_FOUND.into_response(),
         }
     };
 
@@ -787,10 +817,10 @@ async fn update_sm_context(
     let mod_req = pfcp::session_modification_request(up_seid, seq, FAR_ID, gnb_teid, gnb_addr);
     let resp = match smf.transact(&mod_req, seq).await {
         Some(r) => r,
-        None => return StatusCode::BAD_GATEWAY,
+        None => return StatusCode::BAD_GATEWAY.into_response(),
     };
     if !pfcp::response_accepted(&resp) {
-        return StatusCode::BAD_GATEWAY;
+        return StatusCode::BAD_GATEWAY.into_response();
     }
 
     if let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref) {
@@ -803,7 +833,7 @@ async fn update_sm_context(
             "updated SM context; N4 downlink installed"
         );
     }
-    StatusCode::OK
+    StatusCode::OK.into_response()
 }
 
 /// Deactivate a session's downlink user-plane connection (AN release): an N4

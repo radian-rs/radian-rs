@@ -404,6 +404,48 @@ pub fn deregistration_request_from_ue(dereg_type: u8, mcc: &str, mnc: &str, tmsi
     )
 }
 
+/// Build a 5GMM **Service Request** (TS 24.501 §8.2.16) — a CM-IDLE UE resuming
+/// its N2 connection. `service_type` (§9.11.3.50: 0 signalling, 1 data) and `ngksi`
+/// share octet 4 (service type in the high nibble); the UE is identified by its
+/// **5G-S-TMSI**. UE side / tests. (This message is integrity-protected in flight.)
+pub fn service_request(service_type: u8, ngksi: u8, tmsi: u32) -> Vec<u8> {
+    let stmsi = NasFGsMobileIdentity::from_s_tmsi(&STmsi {
+        amf_set_id: 0x001,
+        amf_pointer: 0x00,
+        tmsi,
+    });
+    let req = messages::NasServiceRequest::new(
+        NasKeySetIdentifier::new(((service_type & 0x07) << 4) | (ngksi & 0x07)),
+        stmsi,
+    );
+    let msg = Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::ServiceRequest,
+        Nas5gmmMessage::ServiceRequest(req),
+    );
+    encode_nas_5gs_message(&msg).expect("encode ServiceRequest")
+}
+
+/// From a decoded **Service Request**, the `(service_type, 5G-TMSI)`. The AMF uses
+/// the 5G-TMSI to find the UE's retained CM-IDLE context.
+pub fn service_request_info(msg: &Nas5gsMessage) -> Option<(u8, u32)> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::ServiceRequest(req)) = msg else {
+        return None;
+    };
+    let service_type = (req.ngksi.value >> 4) & 0x07;
+    let tmsi = req.fg_s_tmsi.tmsi()?;
+    Some((service_type, tmsi))
+}
+
+/// Build a 5GMM **Service Accept** (TS 24.501 §8.2.17) — the AMF's answer resuming
+/// the UE's connection. Minimal (no PDU-session status IE): the reactivated PDU
+/// sessions are re-established over N2 alongside it.
+pub fn service_accept() -> Nas5gsMessage {
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::ServiceAccept,
+        Nas5gmmMessage::ServiceAccept(messages::NasServiceAccept::new()),
+    )
+}
+
 /// Build a 5GMM **Deregistration Accept (UE terminated)** (TS 24.501 §8.2.15) —
 /// the UE's answer to a network-initiated deregistration. UE side / tests.
 pub fn deregistration_accept_to_ue() -> Nas5gsMessage {
@@ -1209,6 +1251,22 @@ mod tests {
         let bytes = encode_nas_5gs_message(&configuration_update_command()).expect("encode");
         let msg = decode_nas_5gs_message(&bytes).expect("decode");
         assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::ConfigurationUpdateCommand));
+    }
+
+    #[test]
+    fn service_request_round_trips() {
+        // service type 1 (data), ngKSI 3, 5G-TMSI 0x00A1B2C3.
+        let bytes = service_request(1, 3, 0x00A1_B2C3);
+        let msg = decode_nas_5gs_message(&bytes).unwrap();
+        assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::ServiceRequest));
+        assert_eq!(service_request_info(&msg), Some((1, 0x00A1_B2C3)));
+        // A non-ServiceRequest yields nothing.
+        assert_eq!(service_request_info(&deregistration_accept()), None);
+        // Service Accept round-trips.
+        assert_eq!(
+            gmm_message_type(&service_accept()),
+            Some(Nas5gmmMessageType::ServiceAccept)
+        );
     }
 
     #[test]
