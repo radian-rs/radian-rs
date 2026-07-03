@@ -53,7 +53,8 @@ async fn main() -> anyhow::Result<()> {
 
     let store: Arc<dyn SubscriberStore> = Arc::new(store);
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
-    sbi_core::run(sbi, sbi_core::nudr::router(store)).await?;
+    // Subscription withdrawals notify the serving AMF (discovered via this NRF).
+    sbi_core::run(sbi, sbi_core::nudr::router_with_notify(store, Some(nrf_base))).await?;
     Ok(())
 }
 
