@@ -368,27 +368,51 @@ pub fn gnb_fteid_from_setup_response(pdu: &NGAP_PDU) -> Option<(u8, u32, Ipv4Add
     Some((item.pdu_session_id.0, teid, addr))
 }
 
-/// The N2 SM info for a modification: the session AMBR + the add-or-modified QoS flows.
+/// The N2 SM info for a modification: the session AMBR, the add-or-modified QoS
+/// flows, and the released QoS flows (`released_qfis`).
 fn modify_request_transfer(
     flows: &[QosFlow],
     session_ambr_dl_bps: u64,
     session_ambr_ul_bps: u64,
+    released_qfis: &[u8],
 ) -> PDUSessionResourceModifyRequestTransfer {
+    let mut ies = vec![
+        build_ngap_ie!(PDUSessionResourceModifyRequestTransfer, IGNORE PDUSessionAggregateMaximumBitRate(PDUSessionAggregateMaximumBitRate {
+            pdu_session_aggregate_maximum_bit_rate_dl: BitRate(session_ambr_dl_bps),
+            pdu_session_aggregate_maximum_bit_rate_ul: BitRate(session_ambr_ul_bps),
+            ie_extensions: None,
+        })),
+    ];
+    // The add-or-modify list must have ≥1 item (APER sz_lb=1) — include it only
+    // when there are flows to add or modify.
+    if !flows.is_empty() {
+        ies.push(build_ngap_ie!(PDUSessionResourceModifyRequestTransfer, REJECT QosFlowAddOrModifyRequestList(qos_flow_add_or_modify_list(flows))));
+    }
+    // Released flows: tell the gNB to tear each down (5GC-generated reason).
+    if !released_qfis.is_empty() {
+        let list = QosFlowListWithCause(
+            released_qfis
+                .iter()
+                .map(|q| QosFlowWithCauseItem {
+                    qos_flow_identifier: QosFlowIdentifier(*q),
+                    cause: Cause::RadioNetwork(CauseRadioNetwork(
+                        CauseRadioNetwork::RELEASE_DUE_TO_5GC_GENERATED_REASON,
+                    )),
+                    ie_extensions: None,
+                })
+                .collect(),
+        );
+        ies.push(build_ngap_ie!(PDUSessionResourceModifyRequestTransfer, REJECT QosFlowToReleaseList(list)));
+    }
     PDUSessionResourceModifyRequestTransfer {
-        protocol_i_es: PDUSessionResourceModifyRequestTransferProtocolIEs(vec![
-            build_ngap_ie!(PDUSessionResourceModifyRequestTransfer, IGNORE PDUSessionAggregateMaximumBitRate(PDUSessionAggregateMaximumBitRate {
-                pdu_session_aggregate_maximum_bit_rate_dl: BitRate(session_ambr_dl_bps),
-                pdu_session_aggregate_maximum_bit_rate_ul: BitRate(session_ambr_ul_bps),
-                ie_extensions: None,
-            })),
-            build_ngap_ie!(PDUSessionResourceModifyRequestTransfer, REJECT QosFlowAddOrModifyRequestList(qos_flow_add_or_modify_list(flows))),
-        ]),
+        protocol_i_es: PDUSessionResourceModifyRequestTransferProtocolIEs(ies),
     }
 }
 
 /// Build a `PDUSessionResourceModifyRequest` (AMF→gNB) for a **mid-session QoS
 /// change**: the N1 SM container (`nas`, a PDU Session Modification Command) for the
-/// UE, plus the N2 SM info carrying the new session AMBR + the updated QoS flows.
+/// UE, plus the N2 SM info carrying the new session AMBR, the updated QoS flows, and
+/// the released QoS flows (`released_qfis`).
 pub fn pdu_session_resource_modify_request(
     amf_ue_id: u64,
     ran_ue_id: u32,
@@ -396,9 +420,11 @@ pub fn pdu_session_resource_modify_request(
     flows: &[QosFlow],
     session_ambr_dl_bps: u64,
     session_ambr_ul_bps: u64,
+    released_qfis: &[u8],
     nas: Vec<u8>,
 ) -> NGAP_PDU {
-    let transfer = encode_aper(&modify_request_transfer(flows, session_ambr_dl_bps, session_ambr_ul_bps));
+    let transfer =
+        encode_aper(&modify_request_transfer(flows, session_ambr_dl_bps, session_ambr_ul_bps, released_qfis));
     build_ngap!(InitiatingMessage, PDUSessionResourceModify,
         REJECT, PDUSessionResourceModifyRequest,
         REJECT AMF_UE_NGAP_ID(amf_ue_id),
@@ -558,10 +584,11 @@ mod tests {
             ],
             100_000_000,
             50_000_000,
+            &[3], // release QFI 3
             vec![0x2e, 0x05, 0x00, 0xcb],
         );
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
-        assert_eq!(pdu, back, "the session AMBR + add-or-modify flows survive the APER round trip");
+        assert_eq!(pdu, back, "the AMBR + add-or-modify + release lists survive the APER round trip");
         assert_eq!(back.procedure_name(), "PDUSessionResourceModify");
         assert!(back.is_initiating());
     }

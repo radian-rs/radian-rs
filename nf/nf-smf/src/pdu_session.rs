@@ -713,7 +713,9 @@ async fn refresh_sm_policy(
     }
     // Propagate per-flow (GBR) changes onto the user plane: add/re-rate/remove the
     // UPF's per-flow QERs to match the new decision.
-    let (create, update, remove) = diff_flows(&flow_qers(&old_policy), &flow_qers(&decision));
+    let old_flows = flow_qers(&old_policy);
+    let new_flows = flow_qers(&decision);
+    let (create, update, remove) = diff_flows(&old_flows, &new_flows);
     if !create.is_empty() || !update.is_empty() || !remove.is_empty() {
         let seq = smf.next_seq();
         let req = pfcp::session_flow_modification_request(up_seid, seq, &create, &update, &remove);
@@ -725,6 +727,13 @@ async fn refresh_sm_policy(
             _ => tracing::warn!(%sm_ref, up_seid, "N4 per-flow QER update not accepted by the UPF"),
         }
     }
+    // GBR flows fully gone from the new policy — released toward the RAN/UE (distinct
+    // from the N4 `remove` above, which also covers filter-changed/re-provisioned QFIs).
+    let released_qfis: Vec<u8> = old_flows
+        .iter()
+        .filter(|o| !new_flows.iter().any(|n| n.qfi == o.qfi))
+        .map(|o| o.qfi)
+        .collect();
     // Refresh the sm-context's authoritative QoS record.
     if let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref) {
         c.policy = decision.clone();
@@ -733,21 +742,23 @@ async fn refresh_sm_policy(
     // N2 PDU Session Resource Modify + N1 PDU Session Modification Command).
     // Best-effort, off the response path — only when the QoS actually changed.
     if changed {
-        tracing::info!(%sm_ref, flows = decision.qos_flows.len(), "SM policy refreshed from PCF (QoS changed)");
-        spawn_amf_pdu_modify(smf.nrf_base.clone(), supi, psi, decision.clone());
+        tracing::info!(%sm_ref, flows = decision.qos_flows.len(), released = ?released_qfis, "SM policy refreshed from PCF (QoS changed)");
+        spawn_amf_pdu_modify(smf.nrf_base.clone(), supi, psi, decision.clone(), released_qfis);
     }
     Ok((StatusCode::OK, Json(decision)).into_response())
 }
 
 /// Push a mid-session QoS change to the serving AMF (Namf_Communication), which
 /// signals the RAN/UE (N2 PDU Session Resource Modify + N1 PDU Session Modification
-/// Command). Best-effort, spawned off the refresh path; the AMF is discovered via
-/// the NRF (single-AMF demo — a real deployment would use the UECM serving AMF).
+/// Command), including any `released_qfis` (GBR flows to tear down). Best-effort,
+/// spawned off the refresh path; the AMF is discovered via the NRF (single-AMF demo
+/// — a real deployment would use the UECM serving AMF).
 fn spawn_amf_pdu_modify(
     nrf_base: String,
     supi: String,
     psi: u8,
     decision: sbi_core::npcf::SmPolicyDecision,
+    released_qfis: Vec<u8>,
 ) {
     tokio::spawn(async move {
         let amf = match discover_endpoint(&nrf_base, "AMF").await {
@@ -761,6 +772,7 @@ fn spawn_amf_pdu_modify(
             "pduSessionId": psi,
             "sessionAmbr": decision.session_ambr,
             "qosFlows": decision.qos_flows,
+            "releasedQfis": released_qfis,
         });
         let url = format!("{amf}/namf-comm/v1/ue-contexts/{supi}/modify");
         match sbi_core::h2c_client().post(url).json(&body).send().await {
@@ -1449,6 +1461,47 @@ mod tests {
             Some("100 Mbps")
         );
         assert_eq!(body.get("qosFlows").and_then(|v| v.as_array()).map(|a| a.len()), Some(2));
+        assert_eq!(
+            body.get("releasedQfis").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(0),
+            "nothing released when a flow is added"
+        );
+
+        // Second mid-session change: v3 removes the GBR flow (back to non-GBR only).
+        let v3 = serde_json::json!({ "default": {
+            "sessionAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" },
+            "qosFlows": [ { "qfi": 1, "fiveQi": 9 } ] } });
+        udr.put_sm_policy_data("imsi-999700000000001", &v3).await.unwrap();
+        let status = client
+            .post(format!(
+                "{base}/nsmf-pdusession/v1/sm-contexts/{}/refresh-policy",
+                created.sm_context_ref
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 200, "second refresh succeeded");
+        // The UPF dropped the per-flow QER...
+        assert!(
+            upf_state.lock().unwrap().flow_qfis(1).is_empty(),
+            "the UPF removed the GBR flow's per-flow QER"
+        );
+        // ...and the AMF was told to release QFI 2 toward the RAN/UE.
+        let mut released = None;
+        for _ in 0..50 {
+            if let Some(b) = amf_modifies.lock().unwrap().get(1).cloned() {
+                released = Some(b);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let body = released.expect("SMF notified the AMF of the flow removal");
+        assert_eq!(
+            body.get("releasedQfis").and_then(|v| v.as_array()),
+            Some(&vec![serde_json::json!(2)]),
+            "QFI 2 released toward the RAN/UE"
+        );
 
         // refresh-policy on an unknown context → 404.
         let status = client
