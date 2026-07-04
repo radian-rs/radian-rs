@@ -291,13 +291,43 @@ pub fn registration_request_with_guti(
     encode_nas_5gs_message(&msg).expect("encode 5GMM RegistrationRequest (GUTI)")
 }
 
+/// Encode an **Uplink Data Status** IE value (TS 24.501 §9.11.3.57): a bitmap where
+/// bit `n` of the two-octet value marks PDU session `n` as having pending uplink
+/// data (octet 3 = PSI 0–7, octet 4 = PSI 8–15). PSI 0 is spare.
+fn uplink_data_status_value(psis: &[u8]) -> Vec<u8> {
+    let mut bits = [0u8; 2];
+    for &psi in psis {
+        if psi < 16 {
+            bits[(psi / 8) as usize] |= 1 << (psi % 8);
+        }
+    }
+    bits.to_vec()
+}
+
+/// The PDU session ids set in an **Uplink Data Status** bitmap value (ascending).
+fn psis_from_uplink_data_status(value: &[u8]) -> Vec<u8> {
+    let mut psis = Vec::new();
+    for (byte, &b) in value.iter().take(2).enumerate() {
+        for bit in 0..8u8 {
+            if b & (1 << bit) != 0 {
+                psis.push((byte as u8) * 8 + bit);
+            }
+        }
+    }
+    psis
+}
+
 /// Build a 5GMM **Registration Request** of `reg_type`, identifying by 5G-GUTI,
-/// integrity-protected under the current security context (ngKSI 0). UE side / tests.
+/// integrity-protected under the current security context (ngKSI 0). When
+/// `uplink_data_psis` is non-empty, the **Uplink Data Status** IE lists the PDU
+/// sessions with pending uplink data (the network reactivates their user plane).
+/// UE side / tests.
 fn registration_request_of_type(
     reg_type: RegistrationType,
     mcc: &str,
     mnc: &str,
     tmsi: u32,
+    uplink_data_psis: &[u8],
 ) -> Nas5gsMessage {
     let guti = NasFGsMobileIdentity::from_guti(&Guti {
         mcc: mcc_digits(mcc),
@@ -307,10 +337,15 @@ fn registration_request_of_type(
         amf_pointer: 0x00,
         tmsi,
     });
-    let reg = messages::NasRegistrationRequest::new(
+    let mut reg = messages::NasRegistrationRequest::new(
         NasFGsRegistrationType::from_parts(reg_type, false, 0, false),
         guti,
     );
+    if !uplink_data_psis.is_empty() {
+        reg = reg.set_uplink_data_status(NasUplinkDataStatus::new(uplink_data_status_value(
+            uplink_data_psis,
+        )));
+    }
     Nas5gsMessage::new_5gmm(
         Nas5gmmMessageType::RegistrationRequest,
         Nas5gmmMessage::RegistrationRequest(reg),
@@ -321,14 +356,39 @@ fn registration_request_of_type(
 /// (TS 24.501 §5.5.1.3) — what a UE sends when it enters a tracking area outside
 /// its registration area (UE side / tests).
 pub fn registration_request_mobility(mcc: &str, mnc: &str, tmsi: u32) -> Nas5gsMessage {
-    registration_request_of_type(RegistrationType::MobilityRegistrationUpdate, mcc, mnc, tmsi)
+    registration_request_of_type(RegistrationType::MobilityRegistrationUpdate, mcc, mnc, tmsi, &[])
 }
 
 /// A 5GMM Registration Request of type *periodic registration updating*
 /// (TS 24.501 §5.5.1.3.2) — what a UE sends when T3512 expires to prove it is still
 /// reachable, without moving (UE side / tests).
 pub fn registration_request_periodic(mcc: &str, mnc: &str, tmsi: u32) -> Nas5gsMessage {
-    registration_request_of_type(RegistrationType::PeriodicRegistrationUpdate, mcc, mnc, tmsi)
+    registration_request_of_type(RegistrationType::PeriodicRegistrationUpdate, mcc, mnc, tmsi, &[])
+}
+
+/// A registration update carrying an **Uplink Data Status** IE listing the PDU
+/// sessions the UE has pending uplink data for (UE side / tests).
+pub fn registration_request_with_uplink_data(
+    reg_type: RegistrationType,
+    mcc: &str,
+    mnc: &str,
+    tmsi: u32,
+    psis: &[u8],
+) -> Nas5gsMessage {
+    registration_request_of_type(reg_type, mcc, mnc, tmsi, psis)
+}
+
+/// The PDU sessions the UE flagged in a Registration Request's **Uplink Data
+/// Status** IE (TS 24.501 §9.11.3.57) — the network reactivates their user plane.
+/// Empty when the IE is absent.
+pub fn uplink_data_status_from_registration_request(msg: &Nas5gsMessage) -> Vec<u8> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationRequest(reg)) = msg else {
+        return Vec::new();
+    };
+    reg.uplink_data_status
+        .as_ref()
+        .map(|u| psis_from_uplink_data_status(&u.value))
+        .unwrap_or_default()
 }
 
 /// The registration type of a decoded Registration Request (TS 24.501 §9.11.3.7) —
@@ -1574,6 +1634,29 @@ mod tests {
             Some(RegistrationType::PeriodicRegistrationUpdate)
         );
         assert_eq!(guti_tmsi_from_registration_request(&back), Some(0x0000_00AB));
+        // No Uplink Data Status IE → no reactivation requested.
+        assert!(uplink_data_status_from_registration_request(&back).is_empty());
+
+        // An Uplink Data Status IE (PSI 5 + PSI 9) round-trips to its PSI list.
+        let msg = registration_request_with_uplink_data(
+            RegistrationType::MobilityRegistrationUpdate,
+            "999",
+            "70",
+            0x0000_00AB,
+            &[5, 9],
+        );
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&msg).unwrap()).unwrap();
+        assert_eq!(uplink_data_status_from_registration_request(&back), vec![5, 9]);
+    }
+
+    #[test]
+    fn uplink_data_status_bitmap_encoding() {
+        // PSI 5 → octet 3 bit 5 (0x20); PSI 8 → octet 4 bit 0 (0x01).
+        assert_eq!(uplink_data_status_value(&[5, 8]), vec![0x20, 0x01]);
+        assert_eq!(psis_from_uplink_data_status(&[0x20, 0x01]), vec![5, 8]);
+        // Out-of-range PSIs are dropped; an empty set is all-zero.
+        assert_eq!(uplink_data_status_value(&[]), vec![0, 0]);
+        assert!(psis_from_uplink_data_status(&[0, 0]).is_empty());
     }
 
     #[test]

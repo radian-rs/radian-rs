@@ -1438,15 +1438,30 @@ async fn on_service_request(
         }
     }
 
-    // Re-activate each PDU session (Service Request only: a mobility update leaves
-    // the user plane deactivated): the SMF returns the retained UPF N3 F-TEID +
-    // QoS, and the AMF re-sends the N2 PDU Session Resource Setup. The gNB's
-    // F-TEID comes back in the setup response (existing path) → UpdateSMContext
-    // re-installs the UPF downlink that AN release had dropped.
-    // A registration update (mobility or periodic) leaves the user plane
-    // deactivated; only a Service Request reactivates the PDU sessions.
-    let reactivate: &[(u8, (String, String))] = if is_registration_update { &[] } else { &sm_refs };
-    for (psi, (sm_ref, smf_base)) in reactivate {
+    // Re-activate the PDU sessions whose user plane should come back: the SMF
+    // returns the retained UPF N3 F-TEID + QoS, and the AMF re-sends the N2 PDU
+    // Session Resource Setup. The gNB's F-TEID comes back in the setup response
+    // (existing path) → UpdateSMContext re-installs the UPF downlink that AN
+    // release had dropped. A **Service Request** reactivates everything; a
+    // **registration update** reactivates only the sessions the UE listed in its
+    // **Uplink Data Status** IE (TS 24.501 §9.11.3.57 — pending uplink data),
+    // leaving the rest deactivated.
+    let uplink_data_psis =
+        decoded.as_ref().map(nas::uplink_data_status_from_registration_request).unwrap_or_default();
+    let reactivate: Vec<(u8, (String, String))> = if is_service_request {
+        sm_refs.clone()
+    } else if is_registration_update {
+        sm_refs.iter().filter(|(psi, _)| uplink_data_psis.contains(psi)).cloned().collect()
+    } else {
+        Vec::new()
+    };
+    if is_registration_update && !reactivate.is_empty() {
+        info!(
+            "UE {amf_ue_id}: Uplink Data Status — reactivating PDU session(s) {:?}",
+            reactivate.iter().map(|(psi, _)| *psi).collect::<Vec<_>>()
+        );
+    }
+    for (psi, (sm_ref, smf_base)) in &reactivate {
         match amf_smf.activate_up_connection(smf_base, sm_ref).await {
             Ok(created) => {
                 let flows = if created.ngap_flows.is_empty() {
@@ -3792,11 +3807,92 @@ mod tests {
         UE_DIRECTORY.lock().unwrap().remove(supi);
     }
 
+    /// Uplink Data Status (TS 24.501 §9.11.3.57): a registration update whose
+    /// Uplink Data Status IE lists a PDU session reactivates **that** session's
+    /// user plane (unlike a plain registration update), while leaving an unlisted
+    /// session deactivated.
+    #[tokio::test]
+    async fn registration_update_reactivates_uplink_data_status_sessions() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+
+        // Mock SMF: ACTIVATING returns the retained N3 info + counts activations.
+        static ACTS: AtomicUsize = AtomicUsize::new(0);
+        async fn mock_modify(axum::Json(body): axum::Json<serde_json::Value>) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            if body.get("upCnxState").and_then(|v| v.as_str()) == Some("ACTIVATING") {
+                ACTS.fetch_add(1, O::Relaxed);
+                return (
+                    axum::http::StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "upN3Teid": "00000001", "upN3Addr": "127.0.0.1", "ueIpv4Addr": "10.45.0.2"
+                    })),
+                )
+                    .into_response();
+            }
+            axum::http::StatusCode::OK.into_response()
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new().route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
+            axum::routing::post(mock_modify),
+        );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+
+        let (ki, ke) = ([0x41u8; 16], [0x42u8; 16]);
+        let supi = "imsi-999700000000221";
+        let tmsi = 0x0000_0221u32;
+        let mut ctx = UeContext::new(0, RegState::Registered, Some(supi.into()));
+        ctx.cm_state = CmState::Idle;
+        ctx.guti_tmsi = Some(tmsi);
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.kamf = Some([0x43u8; 32]);
+        ctx.tac = Some([0, 0, 1]);
+        ctx.registration_area = vec![[0, 0, 1]];
+        ctx.allowed_nssai = Some(vec![(1, Some([1, 2, 3]))]);
+        // Two retained PDU sessions; only #5 has pending uplink data.
+        ctx.sm_refs.insert(5, ("ctx-5".into(), format!("http://{smf_addr}")));
+        ctx.sm_refs.insert(6, ("ctx-6".into(), format!("http://{smf_addr}")));
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+
+        // A mobility registration update with an Uplink Data Status listing PSI 5.
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let rr = ue_sec.protect(
+            &nas::registration_request_with_uplink_data(
+                nas::RegistrationType::MobilityRegistrationUpdate,
+                "999",
+                "70",
+                tmsi,
+                &[5],
+            ),
+            nas::sht::INTEGRITY_CIPHERED,
+            0,
+        );
+        let pdu = ngap::initial_ue_message_with_stmsi_at(6, tmsi, rr, "999", "70", &[0, 0, 1]);
+        let init = as_initial_ue(&pdu);
+        let (gnb_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ues = HashMap::new();
+        let dls = on_service_request(&mut ues, &amf_smf, init, tmsi, &gnb_tx).await;
+
+        // The accept, then a PDU Session Resource Setup for PSI 5 only.
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            [
+                "InitialContextSetupRequest (RegistrationAccept — mobility update)",
+                "PDUSessionResourceSetupRequest (resume)"
+            ]
+        );
+        assert_eq!(ACTS.load(O::Relaxed), 1, "only the flagged session reactivated");
+        UE_DIRECTORY.lock().unwrap().remove(supi);
+        GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != supi);
+    }
+
     /// Request (type = mobility registration updating, GUTI identity). The AMF
     /// verifies it under the retained security context, **re-assigns** the
     /// registration area around the new serving gNB, and answers with a
     /// Registration Accept carrying the new 5GS TAI list — no user-plane
-    /// reactivation (unlike a Service Request).
+    /// reactivation unless the Uplink Data Status IE requests it.
     #[tokio::test]
     async fn mobility_registration_update_reassigns_the_area() {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
