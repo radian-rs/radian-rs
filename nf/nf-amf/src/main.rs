@@ -1174,9 +1174,16 @@ fn on_sdm_data_change(
                 }
             }
         }
+        let mut narrowed = false;
         if let Some(nssai) = allowed_nssai {
             if ctx.allowed_nssai.as_ref() != Some(&nssai) {
                 info!("UE {amf_ue_id}: subscribed NSSAI updated to {nssai:?} (Nudm_SDM)");
+                // A narrowing = a previously-allowed slice is no longer allowed → tell
+                // the UE to re-register (its allowed slice set changed).
+                narrowed = ctx
+                    .allowed_nssai
+                    .as_ref()
+                    .is_some_and(|old| old.iter().any(|s| !nssai.contains(s)));
                 ctx.allowed_nssai = Some(nssai);
                 nssai_changed = true;
             }
@@ -1218,7 +1225,7 @@ fn on_sdm_data_change(
         // no security context can't be NAS-signalled — skip it (the RAN update lands).
         if let Some(sec) = ctx.sec.as_mut() {
             let cuc_msg = if nssai_changed {
-                nas::configuration_update_command_with_nssai(&allowed)
+                nas::configuration_update_command_with_nssai(&allowed, narrowed)
             } else {
                 nas::configuration_update_command()
             };
@@ -2983,6 +2990,13 @@ async fn dispatch_uplink_nas(
                 ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
                 "DownlinkNASTransport (ConfigurationUpdateCommand)",
             ))
+        }
+        Some(Nas5gmmMessageType::ConfigurationUpdateComplete) => {
+            // The UE acknowledged a Configuration Update Command (TS 24.501 §8.2.20);
+            // no further action (a re-registration it was asked for arrives as its own
+            // Registration Request).
+            info!("UE {amf_ue_id}: Configuration Update Complete");
+            None
         }
         Some(Nas5gmmMessageType::UlNasTransport) => {
             // A UE PDU session request: CreateSMContext at the SMF (N4 establishment),
@@ -5860,22 +5874,30 @@ mod tests {
         let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
         let msg = ue_sec.unprotect(&cuc, 1).expect("UE verifies the Configuration Update Command");
         assert_eq!(nas::gmm_message_type(&msg), Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand));
-        // The command carries the new allowed NSSAI inline.
+        // The command carries the new allowed NSSAI inline; and — the previously-
+        // allowed slice 1/010203 was dropped (a narrowing) — asks the UE to re-register.
         assert_eq!(
             nas::allowed_nssai_from_configuration_update_command(&msg),
             vec![(1, None), (2, None)]
         );
+        assert!(nas::configuration_update_registration_requested(&msg), "narrowing → re-register");
 
-        // An NSSAI-only change (UE-AMBR unchanged) pushes only the UE nudge, carrying
-        // the new allowed NSSAI. (Same UE security context → the DL NAS COUNT advances.)
-        let dls = on_sdm_data_change(&mut ues, amf_ue_id, Some((2_000_000, 500_000)), Some(vec![(1, None)]), &tx);
-        assert_eq!(
-            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
-            ["DownlinkNASTransport (ConfigurationUpdateCommand)"]
+        // A widening (slice 3 added, none removed) carries the new NSSAI but does NOT
+        // request re-registration.
+        let dls = on_sdm_data_change(
+            &mut ues,
+            amf_ue_id,
+            Some((2_000_000, 500_000)),
+            Some(vec![(1, None), (2, None), (3, None)]),
+            &tx,
         );
         let cuc = downlink_nas_pdu(&dls[0].0).expect("N1 in the DL NAS transport");
-        let msg = ue_sec.unprotect(&cuc, 1).expect("UE verifies the second Config Update");
-        assert_eq!(nas::allowed_nssai_from_configuration_update_command(&msg), vec![(1, None)]);
+        let msg = ue_sec.unprotect(&cuc, 1).expect("UE verifies the widening Config Update");
+        assert_eq!(
+            nas::allowed_nssai_from_configuration_update_command(&msg),
+            vec![(1, None), (2, None), (3, None)]
+        );
+        assert!(!nas::configuration_update_registration_requested(&msg), "widening → no re-register");
 
         // A no-op change signals nothing; an unknown UE is a no-op.
         assert!(on_sdm_data_change(&mut ues, amf_ue_id, None, None, &tx).is_empty());
@@ -5920,6 +5942,31 @@ mod tests {
         assert!(ctx.releasing.contains(&6), "session on the removed slice is releasing");
         assert!(!ctx.releasing.contains(&5), "session on a still-allowed slice kept");
         assert_eq!(ctx.allowed_nssai, Some(vec![(1, Some([1, 1, 1]))]));
+    }
+
+    /// The UE's Configuration Update Complete is recognised (acknowledged, no
+    /// downlink) rather than falling through as an unhandled uplink NAS message.
+    #[tokio::test]
+    async fn config_update_complete_is_recognised() {
+        let amf_auth = auth::AmfAuth::new("http://127.0.0.1:1", "999", "70");
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+        let amf_ue_id = 0x91u64;
+        let mut ctx = UeContext::new(5, RegState::Registered, Some("imsi-999700000000091".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new([0x1u8; 16], [0x2u8; 16], NAS_NIA, NAS_NEA));
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
+
+        let out = dispatch_uplink_nas(
+            &mut ues,
+            &amf_auth,
+            &amf_smf,
+            amf_ue_id,
+            nas::configuration_update_complete(),
+            &tx,
+        )
+        .await;
+        assert!(out.is_none(), "acknowledged with no downlink");
     }
 
     /// A subscribed UE-AMBR change (Nudm_SDM) while a PCF AM-policy override is in

@@ -809,16 +809,28 @@ pub fn configuration_update_command() -> Nas5gsMessage {
 /// (equivalent to [`configuration_update_command`]).
 pub fn configuration_update_command_with_nssai(
     allowed: &[(u8, Option<[u8; 3]>)],
+    registration_requested: bool,
 ) -> Nas5gsMessage {
     let mut cuc = messages::NasConfigurationUpdateCommand::new();
     if !allowed.is_empty() {
         cuc = cuc.set_allowed_nssai(NasNssai::new(nssai_value(allowed)));
+    }
+    // Configuration update indication (IEI 0xD0, §9.11.3.18): the **registration
+    // requested** bit (bit 1) tells the UE to re-register — set when the allowed
+    // NSSAI narrows so the UE renegotiates its slices.
+    if registration_requested {
+        cuc = cuc.set_configuration_update_indication(NasConfigurationUpdateIndication::new(
+            CUI_REGISTRATION_REQUESTED,
+        ));
     }
     Nas5gsMessage::new_5gmm(
         Nas5gmmMessageType::ConfigurationUpdateCommand,
         Nas5gmmMessage::ConfigurationUpdateCommand(cuc),
     )
 }
+
+/// Configuration update indication (§9.11.3.18) **registration requested** bit.
+const CUI_REGISTRATION_REQUESTED: u8 = 0x01;
 
 /// The allowed NSSAI carried in a decoded Configuration Update Command (UE side /
 /// tests); empty when the IE is absent.
@@ -829,6 +841,28 @@ pub fn allowed_nssai_from_configuration_update_command(
         return Vec::new();
     };
     cuc.allowed_nssai.as_ref().map(|n| parse_nssai_value(&n.value)).unwrap_or_default()
+}
+
+/// Whether a decoded Configuration Update Command asks the UE to **re-register**
+/// (the registration-requested bit of the Configuration update indication IE).
+pub fn configuration_update_registration_requested(msg: &Nas5gsMessage) -> bool {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::ConfigurationUpdateCommand(cuc)) = msg else {
+        return false;
+    };
+    cuc.configuration_update_indication
+        .as_ref()
+        .is_some_and(|i| i.value & CUI_REGISTRATION_REQUESTED != 0)
+}
+
+/// Build a 5GMM **Configuration Update Complete** (TS 24.501 §8.2.20) — the UE's
+/// acknowledgement of a Configuration Update Command. UE side / tests.
+pub fn configuration_update_complete() -> Nas5gsMessage {
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::ConfigurationUpdateComplete,
+        Nas5gmmMessage::ConfigurationUpdateComplete(
+            messages::NasConfigurationUpdateComplete::new(),
+        ),
+    )
 }
 
 /// Build a 5GMM **Registration Complete** (TS 24.501 §8.2.8). UE side / tests.
@@ -1575,13 +1609,31 @@ mod tests {
         // A plain command carries no allowed NSSAI.
         assert!(allowed_nssai_from_configuration_update_command(&msg).is_empty());
 
-        // A command carrying the Allowed NSSAI round-trips to that slice set.
+        assert!(!configuration_update_registration_requested(&msg));
+
+        // A command carrying the Allowed NSSAI round-trips to that slice set; without
+        // the registration-requested flag.
         let allowed = vec![(1u8, Some([1, 2, 3])), (2, None)];
-        let bytes = encode_nas_5gs_message(&configuration_update_command_with_nssai(&allowed))
-            .expect("encode");
+        let bytes =
+            encode_nas_5gs_message(&configuration_update_command_with_nssai(&allowed, false))
+                .expect("encode");
         let msg = decode_nas_5gs_message(&bytes).expect("decode");
         assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::ConfigurationUpdateCommand));
         assert_eq!(allowed_nssai_from_configuration_update_command(&msg), allowed);
+        assert!(!configuration_update_registration_requested(&msg));
+
+        // With registration requested (a narrowing): the UE is told to re-register.
+        let bytes =
+            encode_nas_5gs_message(&configuration_update_command_with_nssai(&allowed, true))
+                .expect("encode");
+        let msg = decode_nas_5gs_message(&bytes).expect("decode");
+        assert!(configuration_update_registration_requested(&msg), "re-registration requested");
+        assert_eq!(allowed_nssai_from_configuration_update_command(&msg), allowed);
+
+        // The UE's Configuration Update Complete round-trips.
+        let bytes = encode_nas_5gs_message(&configuration_update_complete()).expect("encode");
+        let msg = decode_nas_5gs_message(&bytes).expect("decode");
+        assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::ConfigurationUpdateComplete));
     }
 
     #[test]
