@@ -1153,6 +1153,8 @@ fn on_sdm_data_change(
     let ran_ue_id = ctx.ran_ue_id;
     let rfsp = ctx.rfsp;
     let effective_ambr = ctx.ue_ambr;
+    // Snapshot before the `ctx.sec` mutable borrow below.
+    let allowed = ctx.allowed_nssai.clone().unwrap_or_default();
     let mut dl = Vec::new();
     // A new UE-AMBR → update the RAN's enforcement (RFSP re-sent unchanged).
     if ambr_changed {
@@ -1161,10 +1163,17 @@ fn on_sdm_data_change(
             "UEContextModificationRequest (subscribed UE-AMBR)",
         ));
     }
-    // Any subscription change → tell the UE its configuration changed. A UE with no
+    // Any subscription change → tell the UE its configuration changed (Generic UE
+    // Configuration Update). When the allowed NSSAI changed, the command **carries**
+    // the new set (TS 24.501 §9.11.3.37); otherwise it is a plain nudge. A UE with no
     // security context can't be NAS-signalled — skip it (the RAN update still lands).
     if let Some(sec) = ctx.sec.as_mut() {
-        let cuc = sec.protect(&nas::configuration_update_command(), nas::sht::INTEGRITY_CIPHERED, 1);
+        let cuc_msg = if nssai_changed {
+            nas::configuration_update_command_with_nssai(&allowed)
+        } else {
+            nas::configuration_update_command()
+        };
+        let cuc = sec.protect(&cuc_msg, nas::sht::INTEGRITY_CIPHERED, 1);
         dl.push((
             ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
             "DownlinkNASTransport (ConfigurationUpdateCommand)",
@@ -5741,13 +5750,22 @@ mod tests {
         let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
         let msg = ue_sec.unprotect(&cuc, 1).expect("UE verifies the Configuration Update Command");
         assert_eq!(nas::gmm_message_type(&msg), Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand));
+        // The command carries the new allowed NSSAI inline.
+        assert_eq!(
+            nas::allowed_nssai_from_configuration_update_command(&msg),
+            vec![(1, None), (2, None)]
+        );
 
-        // An NSSAI-only change (UE-AMBR unchanged) pushes only the UE nudge.
+        // An NSSAI-only change (UE-AMBR unchanged) pushes only the UE nudge, carrying
+        // the new allowed NSSAI. (Same UE security context → the DL NAS COUNT advances.)
         let dls = on_sdm_data_change(&mut ues, amf_ue_id, Some((2_000_000, 500_000)), Some(vec![(1, None)]));
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             ["DownlinkNASTransport (ConfigurationUpdateCommand)"]
         );
+        let cuc = downlink_nas_pdu(&dls[0].0).expect("N1 in the DL NAS transport");
+        let msg = ue_sec.unprotect(&cuc, 1).expect("UE verifies the second Config Update");
+        assert_eq!(nas::allowed_nssai_from_configuration_update_command(&msg), vec![(1, None)]);
 
         // A no-op change signals nothing; an unknown UE is a no-op.
         assert!(on_sdm_data_change(&mut ues, amf_ue_id, None, None).is_empty());
