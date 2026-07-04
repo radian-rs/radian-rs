@@ -1470,7 +1470,7 @@ async fn on_handover_required(
     pdu: &NGAP_PDU,
     dereg_tx: &UnboundedSender<UeCmd>,
 ) {
-    let Some((amf_ue_id, ran_ue_id, target_gnb_id, psis, container)) =
+    let Some((amf_ue_id, ran_ue_id, target_gnb_id, psis, direct_forwarding, container)) =
         ngap::handover_required_params(pdu)
     else {
         warn!("HandoverRequired missing mandatory IEs — ignored");
@@ -1532,7 +1532,7 @@ async fn on_handover_required(
     );
     info!(
         "UE {amf_ue_id}: N2 handover to gNB {target_gnb_id} — Handover Request sent \
-         ({} session(s), NCC {fresh_ncc})",
+         ({} session(s), NCC {fresh_ncc}, direct forwarding {direct_forwarding})",
         sessions.len()
     );
     HANDOVERS.lock().unwrap().insert(
@@ -1566,13 +1566,22 @@ fn on_handover_request_ack(pdu: &NGAP_PDU) {
         warn!("HandoverRequestAcknowledge for UE {amf_ue_id} with no handover in flight");
         return;
     };
-    pending.admitted = admitted;
+    // The target's DL forwarding F-TEIDs go back to the source in the Handover
+    // Command — the source forwards in-flight downlink packets there while the
+    // UE moves (TS 23.502 §4.9.1.3.2, direct forwarding).
+    let forwarding: Vec<(u8, u32, std::net::Ipv4Addr)> = admitted
+        .iter()
+        .filter_map(|(psi, _, _, fwd)| fwd.map(|(t, a)| (*psi, t, a)))
+        .collect();
+    pending.admitted = admitted.iter().map(|(psi, teid, addr, _)| (*psi, *teid, *addr)).collect();
     info!(
-        "UE {amf_ue_id}: target admitted {} session(s) (target RAN-UE {target_ran_ue_id}) — \
-         Handover Command to the source",
-        pending.admitted.len()
+        "UE {amf_ue_id}: target admitted {} session(s) (target RAN-UE {target_ran_ue_id}, \
+         {} forwarding tunnel(s)) — Handover Command to the source",
+        pending.admitted.len(),
+        forwarding.len()
     );
-    let command = ngap::handover_command(amf_ue_id, pending.source_ran_ue_id, container);
+    let command =
+        ngap::handover_command(amf_ue_id, pending.source_ran_ue_id, &forwarding, container);
     let _ = pending.source_tx.send(UeCmd::Forward {
         pdu: Box::new(command),
         label: "HandoverCommand",
@@ -3675,9 +3684,10 @@ mod tests {
         }
         UE_DIRECTORY.lock().unwrap().insert(supi.into(), (amf_ue_id, src_tx.clone()));
 
-        // 1. Handover Required arrives on the SOURCE association.
+        // 1. Handover Required arrives on the SOURCE association (direct
+        // forwarding available).
         let required = ngap::handover_required(
-            amf_ue_id, 4, 0x77, "999", "70", &[0, 0, 2], &[5], b"s2t".to_vec(),
+            amf_ue_id, 4, 0x77, "999", "70", &[0, 0, 2], &[5], true, b"s2t".to_vec(),
         );
         on_handover_required(&mut src_ues, &amf_smf, &required, &src_tx).await;
         // The target association received the Handover Request: rotated {NCC, NH},
@@ -3727,11 +3737,17 @@ mod tests {
             }
         });
 
-        // 2. The target acknowledges (its DL F-TEID) → Handover Command to the source.
+        // 2. The target acknowledges: its DL F-TEID plus a DL FORWARDING F-TEID
+        // for the in-flight data → Handover Command to the source.
         let ack = ngap::handover_request_acknowledge(
             amf_ue_id,
             9,
-            &[(5, 0xAA, std::net::Ipv4Addr::new(10, 0, 9, 5))],
+            &[(
+                5,
+                0xAA,
+                std::net::Ipv4Addr::new(10, 0, 9, 5),
+                Some((0xBB, std::net::Ipv4Addr::new(10, 0, 9, 6))),
+            )],
             b"t2s".to_vec(),
         );
         on_handover_request_ack(&ack);
@@ -3742,8 +3758,13 @@ mod tests {
                 if let Some((pdu, _)) = captured.iter().find(|(_, l)| *l == "HandoverCommand") {
                     assert_eq!(
                         ngap::handover_command_params(pdu),
-                        Some((amf_ue_id, 4, b"t2s".to_vec())),
-                        "addressed by the SOURCE RAN-UE-NGAP-ID, relaying the target's container"
+                        Some((
+                            amf_ue_id,
+                            4,
+                            vec![(5, 0xBB, std::net::Ipv4Addr::new(10, 0, 9, 6))],
+                            b"t2s".to_vec()
+                        )),
+                        "old RAN-UE-NGAP-ID, the target's forwarding F-TEID, and its container"
                     );
                     command_seen = true;
                 }

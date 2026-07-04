@@ -850,7 +850,9 @@ pub fn gnb_id_from_ng_setup(pdu: &NGAP_PDU) -> Option<u32> {
 
 /// Build a `HandoverRequired` (TS 38.413 §9.2.3.1) — the source gNB asks the AMF
 /// to prepare an N2 handover to `target_gnb_id`, listing the PDU sessions to move
-/// and the RRC transparent container for the target. For tests / a gNB simulator.
+/// and the RRC transparent container for the target. `direct_forwarding` sets the
+/// per-session *Direct Forwarding Path Availability* (the source can forward
+/// in-flight DL data straight to the target). For tests / a gNB simulator.
 #[allow(clippy::too_many_arguments)]
 pub fn handover_required(
     amf_ue_id: u64,
@@ -860,6 +862,7 @@ pub fn handover_required(
     mnc: &str,
     tac: &[u8; 3],
     psis: &[u8],
+    direct_forwarding: bool,
     container: Vec<u8>,
 ) -> NGAP_PDU {
     let target = TargetID::TargetRANNodeID(TargetRANNodeID {
@@ -874,7 +877,11 @@ pub fn handover_required(
         psis.iter()
             .map(|psi| {
                 let transfer = encode_aper(&HandoverRequiredTransfer {
-                    direct_forwarding_path_availability: None,
+                    direct_forwarding_path_availability: direct_forwarding.then(|| {
+                        DirectForwardingPathAvailability(
+                            DirectForwardingPathAvailability::DIRECT_PATH_AVAILABLE,
+                        )
+                    }),
                     ie_extensions: None,
                 });
                 PDUSessionResourceItemHORqd {
@@ -900,8 +907,10 @@ pub fn handover_required(
 }
 
 /// Parse a `HandoverRequired` — `(amf_ue_id, ran_ue_id, target_gnb_id, psis,
-/// source→target container)`. The AMF side.
-pub fn handover_required_params(pdu: &NGAP_PDU) -> Option<(u64, u32, u32, Vec<u8>, Vec<u8>)> {
+/// direct_forwarding, source→target container)`. The AMF side.
+pub fn handover_required_params(
+    pdu: &NGAP_PDU,
+) -> Option<(u64, u32, u32, Vec<u8>, bool, Vec<u8>)> {
     let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
         return None;
     };
@@ -910,6 +919,7 @@ pub fn handover_required_params(pdu: &NGAP_PDU) -> Option<(u64, u32, u32, Vec<u8
     };
     let (mut amf_ue_id, mut ran_ue_id, mut target, mut container) = (None, None, None, None);
     let mut psis = Vec::new();
+    let mut direct_forwarding = false;
     for ie in &req.protocol_i_es.0 {
         match &ie.value {
             HandoverRequiredProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => amf_ue_id = Some(v.0),
@@ -920,7 +930,16 @@ pub fn handover_required_params(pdu: &NGAP_PDU) -> Option<(u64, u32, u32, Vec<u8
                 }
             }
             HandoverRequiredProtocolIEs_EntryValue::Id_PDUSessionResourceListHORqd(list) => {
-                psis = list.0.iter().map(|i| i.pdu_session_id.0).collect()
+                for item in &list.0 {
+                    psis.push(item.pdu_session_id.0);
+                    let mut codec =
+                        PerCodecData::from_slice_aper(&item.handover_required_transfer.0);
+                    if let Ok(t) = HandoverRequiredTransfer::aper_decode(&mut codec) {
+                        if t.direct_forwarding_path_availability.is_some() {
+                            direct_forwarding = true;
+                        }
+                    }
+                }
             }
             HandoverRequiredProtocolIEs_EntryValue::Id_SourceToTarget_TransparentContainer(c) => {
                 container = Some(c.0.clone())
@@ -928,7 +947,7 @@ pub fn handover_required_params(pdu: &NGAP_PDU) -> Option<(u64, u32, u32, Vec<u8
             _ => {}
         }
     }
-    Some((amf_ue_id?, ran_ue_id?, target?, psis, container?))
+    Some((amf_ue_id?, ran_ue_id?, target?, psis, direct_forwarding, container?))
 }
 
 /// Build a `HandoverRequest` (TS 38.413 §9.2.3.4) — the AMF asks the **target**
@@ -1040,21 +1059,23 @@ pub fn handover_request_params(
 }
 
 /// Build a `HandoverRequestAcknowledge` (TS 38.413 §9.2.3.5) — the target gNB
-/// admits the PDU sessions (each with **its** DL N3 F-TEID) and returns the
-/// target→source RRC container. For tests / a gNB simulator.
+/// admits the PDU sessions, each with **its** DL N3 F-TEID and, when it accepts
+/// data forwarding, a **DL forwarding F-TEID** the source can send in-flight
+/// packets to; plus the target→source RRC container. For tests / a gNB simulator.
 pub fn handover_request_acknowledge(
     amf_ue_id: u64,
     ran_ue_id: u32,
-    admitted: &[(u8, u32, Ipv4Addr)],
+    admitted: &[(u8, u32, Ipv4Addr, Option<(u32, Ipv4Addr)>)],
     container: Vec<u8>,
 ) -> NGAP_PDU {
     let list = PDUSessionResourceAdmittedList(
         admitted
             .iter()
-            .map(|(psi, teid, addr)| {
+            .map(|(psi, teid, addr, forwarding)| {
                 let transfer = encode_aper(&HandoverRequestAcknowledgeTransfer {
                     dl_ngu_up_tnl_information: gtp_tunnel(*teid, *addr),
-                    dl_forwarding_up_tnl_information: None,
+                    dl_forwarding_up_tnl_information: forwarding
+                        .map(|(fwd_teid, fwd_addr)| gtp_tunnel(fwd_teid, fwd_addr)),
                     security_result: None,
                     qos_flow_setup_response_list: QosFlowListWithDataForwarding(vec![
                         QosFlowItemWithDataForwarding {
@@ -1086,10 +1107,11 @@ pub fn handover_request_acknowledge(
 }
 
 /// Parse a `HandoverRequestAcknowledge` — `(amf_ue_id, target_ran_ue_id,
-/// [(psi, target_dl_teid, target_dl_addr)], target→source container)`. The AMF side.
+/// [(psi, target_dl_teid, target_dl_addr, forwarding_fteid)], target→source
+/// container)`. The AMF side.
 pub fn handover_request_ack_params(
     pdu: &NGAP_PDU,
-) -> Option<(u64, u32, Vec<(u8, u32, Ipv4Addr)>, Vec<u8>)> {
+) -> Option<(u64, u32, Vec<(u8, u32, Ipv4Addr, Option<(u32, Ipv4Addr)>)>, Vec<u8>)> {
     let NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome { value, .. }) = pdu else {
         return None;
     };
@@ -1115,7 +1137,11 @@ pub fn handover_request_ack_params(
                     );
                     if let Ok(t) = HandoverRequestAcknowledgeTransfer::aper_decode(&mut codec) {
                         if let Some((teid, addr)) = fteid_from_uptnl(&t.dl_ngu_up_tnl_information) {
-                            admitted.push((item.pdu_session_id.0, teid, addr));
+                            let forwarding = t
+                                .dl_forwarding_up_tnl_information
+                                .as_ref()
+                                .and_then(fteid_from_uptnl);
+                            admitted.push((item.pdu_session_id.0, teid, addr, forwarding));
                         }
                     }
                 }
@@ -1131,20 +1157,60 @@ pub fn handover_request_ack_params(
 
 /// Build a `HandoverCommand` (TS 38.413 §9.2.3.2) — the AMF tells the **source**
 /// gNB to execute the handover, relaying the target's transparent container (the
-/// source forwards it to the UE via RRC).
-pub fn handover_command(amf_ue_id: u64, ran_ue_id: u32, container: Vec<u8>) -> NGAP_PDU {
-    build_ngap!(SuccessfulOutcome, HandoverPreparation,
-        REJECT, HandoverCommand,
-        REJECT AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
-        REJECT RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
-        REJECT HandoverType(HandoverType(HandoverType::INTRA5GS)),
-        REJECT TargetToSource_TransparentContainer(TargetToSource_TransparentContainer(container)),
-    )
+/// source forwards it to the UE via RRC) and, per session accepting **data
+/// forwarding**, the target's DL forwarding F-TEID the source sends in-flight
+/// downlink packets to.
+pub fn handover_command(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    forwarding: &[(u8, u32, Ipv4Addr)],
+    container: Vec<u8>,
+) -> NGAP_PDU {
+    let mut ies = vec![
+        build_ngap_ie!(HandoverCommand, REJECT AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id))),
+        build_ngap_ie!(HandoverCommand, REJECT RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id))),
+        build_ngap_ie!(HandoverCommand, REJECT HandoverType(HandoverType(HandoverType::INTRA5GS))),
+    ];
+    if !forwarding.is_empty() {
+        let list = PDUSessionResourceHandoverList(
+            forwarding
+                .iter()
+                .map(|(psi, teid, addr)| {
+                    let transfer = encode_aper(&HandoverCommandTransfer {
+                        dl_forwarding_up_tnl_information: Some(gtp_tunnel(*teid, *addr)),
+                        qos_flow_to_be_forwarded_list: None,
+                        data_forwarding_response_drb_list: None,
+                        ie_extensions: None,
+                    });
+                    PDUSessionResourceHandoverItem {
+                        pdu_session_id: PDUSessionID(*psi),
+                        handover_command_transfer:
+                            PDUSessionResourceHandoverItemHandoverCommandTransfer(transfer),
+                        ie_extensions: None,
+                    }
+                })
+                .collect(),
+        );
+        ies.push(build_ngap_ie!(HandoverCommand, IGNORE PDUSessionResourceHandoverList(list)));
+    }
+    ies.push(build_ngap_ie!(HandoverCommand, REJECT TargetToSource_TransparentContainer(
+        TargetToSource_TransparentContainer(container)
+    )));
+    // HandoverPreparation = procedure code 12 (the command is its successful outcome).
+    NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode(12),
+        criticality: Criticality(Criticality::REJECT),
+        value: SuccessfulOutcomeValue::Id_HandoverPreparation(HandoverCommand {
+            protocol_i_es: HandoverCommandProtocolIEs(ies),
+        }),
+    })
 }
 
-/// `(amf_ue_id, ran_ue_id, target→source container)` from a decoded
-/// `HandoverCommand` — the source-gNB side / tests.
-pub fn handover_command_params(pdu: &NGAP_PDU) -> Option<(u64, u32, Vec<u8>)> {
+/// `(amf_ue_id, ran_ue_id, [(psi, forwarding F-TEID)], target→source container)`
+/// from a decoded `HandoverCommand` — the source-gNB side / tests.
+pub fn handover_command_params(
+    pdu: &NGAP_PDU,
+) -> Option<(u64, u32, Vec<(u8, u32, Ipv4Addr)>, Vec<u8>)> {
     let NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome { value, .. }) = pdu else {
         return None;
     };
@@ -1152,17 +1218,31 @@ pub fn handover_command_params(pdu: &NGAP_PDU) -> Option<(u64, u32, Vec<u8>)> {
         return None;
     };
     let (mut amf_ue_id, mut ran_ue_id, mut container) = (None, None, None);
+    let mut forwarding = Vec::new();
     for ie in &cmd.protocol_i_es.0 {
         match &ie.value {
             HandoverCommandProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => amf_ue_id = Some(v.0),
             HandoverCommandProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => ran_ue_id = Some(v.0),
+            HandoverCommandProtocolIEs_EntryValue::Id_PDUSessionResourceHandoverList(list) => {
+                for item in &list.0 {
+                    let mut codec =
+                        PerCodecData::from_slice_aper(&item.handover_command_transfer.0);
+                    if let Ok(t) = HandoverCommandTransfer::aper_decode(&mut codec) {
+                        if let Some((teid, addr)) =
+                            t.dl_forwarding_up_tnl_information.as_ref().and_then(fteid_from_uptnl)
+                        {
+                            forwarding.push((item.pdu_session_id.0, teid, addr));
+                        }
+                    }
+                }
+            }
             HandoverCommandProtocolIEs_EntryValue::Id_TargetToSource_TransparentContainer(c) => {
                 container = Some(c.0.clone())
             }
             _ => {}
         }
     }
-    Some((amf_ue_id?, ran_ue_id?, container?))
+    Some((amf_ue_id?, ran_ue_id?, forwarding, container?))
 }
 
 /// Build a `HandoverNotify` (TS 38.413 §9.2.3.6) — the target gNB reports the UE
@@ -1968,10 +2048,18 @@ mod release_tests {
     fn n2_handover_messages_roundtrip() {
         let addr = Ipv4Addr::new(10, 0, 8, 1);
 
-        // Handover Required: source → AMF (target gNB id + sessions + container).
-        let pdu = handover_required(7, 4, 9, "999", "70", &[0, 0, 2], &[5], b"s2t".to_vec());
+        // Handover Required: source → AMF (target gNB id + sessions + direct
+        // forwarding availability + container).
+        let pdu = handover_required(7, 4, 9, "999", "70", &[0, 0, 2], &[5], true, b"s2t".to_vec());
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
-        assert_eq!(handover_required_params(&back), Some((7, 4, 9, vec![5], b"s2t".to_vec())));
+        assert_eq!(
+            handover_required_params(&back),
+            Some((7, 4, 9, vec![5], true, b"s2t".to_vec()))
+        );
+        // Without direct forwarding the flag reads back false.
+        let plain = handover_required(7, 4, 9, "999", "70", &[0, 0, 2], &[5], false, b"s2t".to_vec());
+        let back = NGAP_PDU::decode(&plain.encode().expect("encode")).expect("decode");
+        assert!(matches!(handover_required_params(&back), Some((_, _, _, _, false, _))));
 
         // Handover Request: AMF → target ({NCC, NH} + UL F-TEID per session).
         let nh = [0x6bu8; 32];
@@ -1993,18 +2081,28 @@ mod release_tests {
             Some((7, 1, nh, vec![(5, 0x33, addr)], b"s2t".to_vec()))
         );
 
-        // Handover Request Acknowledge: target → AMF (its DL F-TEIDs + container).
-        let pdu = handover_request_acknowledge(7, 9, &[(5, 0xAA, addr)], b"t2s".to_vec());
+        // Handover Request Acknowledge: target → AMF (its DL F-TEIDs, a DL
+        // forwarding F-TEID for the in-flight data, and the container).
+        let fwd = Ipv4Addr::new(10, 0, 9, 6);
+        let pdu =
+            handover_request_acknowledge(7, 9, &[(5, 0xAA, addr, Some((0xBB, fwd)))], b"t2s".to_vec());
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
         assert_eq!(
             handover_request_ack_params(&back),
-            Some((7, 9, vec![(5, 0xAA, addr)], b"t2s".to_vec()))
+            Some((7, 9, vec![(5, 0xAA, addr, Some((0xBB, fwd)))], b"t2s".to_vec()))
         );
 
-        // Handover Command: AMF → source (relaying the target's container).
-        let pdu = handover_command(7, 4, b"t2s".to_vec());
+        // Handover Command: AMF → source (the target's forwarding F-TEID + container).
+        let pdu = handover_command(7, 4, &[(5, 0xBB, fwd)], b"t2s".to_vec());
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
-        assert_eq!(handover_command_params(&back), Some((7, 4, b"t2s".to_vec())));
+        assert_eq!(
+            handover_command_params(&back),
+            Some((7, 4, vec![(5, 0xBB, fwd)], b"t2s".to_vec()))
+        );
+        // No forwarding → the list IE is omitted and reads back empty.
+        let pdu = handover_command(7, 4, &[], b"t2s".to_vec());
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(handover_command_params(&back), Some((7, 4, Vec::new(), b"t2s".to_vec())));
 
         // Handover Notify: target → AMF (the UE arrived, with its location).
         let pdu = handover_notify(7, 9, "999", "70", &[0, 0, 2]);
