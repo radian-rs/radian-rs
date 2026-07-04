@@ -307,7 +307,7 @@ pub fn tac_from_initial_ue(msg: &InitialUEMessage) -> Option<[u8; 3]> {
 /// Build an `NGSetupRequest` (TS 38.413 §9.2.6.1) advertising the tracking areas
 /// the gNB serves — for tests and a gNB simulator. Mandatory IEs: Global RAN Node
 /// ID, Supported TA List, Default Paging DRX.
-pub fn ng_setup_request(mcc: &str, mnc: &str, tacs: &[[u8; 3]]) -> NGAP_PDU {
+pub fn ng_setup_request(gnb_id: u32, mcc: &str, mnc: &str, tacs: &[[u8; 3]]) -> NGAP_PDU {
     let ta_list = SupportedTAList(
         tacs.iter()
             .map(|tac| SupportedTAItem {
@@ -324,7 +324,7 @@ pub fn ng_setup_request(mcc: &str, mnc: &str, tacs: &[[u8; 3]]) -> NGAP_PDU {
             })
             .collect(),
     );
-    let node_id = GlobalRANNodeID::GlobalGNB_ID(helpers::global_gnb_id(plmn(mcc, mnc), 1));
+    let node_id = GlobalRANNodeID::GlobalGNB_ID(helpers::global_gnb_id(plmn(mcc, mnc), gnb_id));
     build_ngap!(InitiatingMessage, NGSetup,
         REJECT, NGSetupRequest,
         REJECT GlobalRANNodeID(node_id),
@@ -815,6 +815,393 @@ pub fn path_switch_ack_security(pdu: &NGAP_PDU) -> Option<(u8, [u8; 32], Vec<u8>
     }
     let (ncc, nh) = security?;
     Some((ncc, nh, switched))
+}
+
+// ─── N2 handover (TS 38.413 §8.4.1–8.4.3) ──────────────────────────────────────
+//
+// Handover Required (source→AMF) → Handover Request (AMF→target, carrying the
+// rotated {NH, NCC}) → Handover Request Acknowledge (target→AMF, the target's DL
+// F-TEIDs) → Handover Command (AMF→source) → Handover Notify (target→AMF).
+
+/// A `u32` gNB id from a `GNB_ID` bit string (24-bit encoding, [`helpers::global_gnb_id`]).
+fn gnb_id_bits_to_u32(id: &GNB_ID) -> Option<u32> {
+    let GNB_ID::GNB_ID(bits) = id else {
+        return None;
+    };
+    Some(bits.0.iter().fold(0u32, |acc, b| (acc << 1) | (*b as u32)))
+}
+
+/// The gNB id a `NGSetupRequest`'s Global RAN Node ID advertises — the AMF keys
+/// N2-handover target resolution on it.
+pub fn gnb_id_from_ng_setup(pdu: &NGAP_PDU) -> Option<u32> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_NGSetup(req) = value else {
+        return None;
+    };
+    req.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        NGSetupRequestProtocolIEs_EntryValue::Id_GlobalRANNodeID(GlobalRANNodeID::GlobalGNB_ID(
+            g,
+        )) => gnb_id_bits_to_u32(&g.gnb_id),
+        _ => None,
+    })
+}
+
+/// Build a `HandoverRequired` (TS 38.413 §9.2.3.1) — the source gNB asks the AMF
+/// to prepare an N2 handover to `target_gnb_id`, listing the PDU sessions to move
+/// and the RRC transparent container for the target. For tests / a gNB simulator.
+#[allow(clippy::too_many_arguments)]
+pub fn handover_required(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    target_gnb_id: u32,
+    mcc: &str,
+    mnc: &str,
+    tac: &[u8; 3],
+    psis: &[u8],
+    container: Vec<u8>,
+) -> NGAP_PDU {
+    let target = TargetID::TargetRANNodeID(TargetRANNodeID {
+        global_ran_node_id: GlobalRANNodeID::GlobalGNB_ID(helpers::global_gnb_id(
+            plmn(mcc, mnc),
+            target_gnb_id,
+        )),
+        selected_tai: helpers::tai(plmn(mcc, mnc), tac),
+        ie_extensions: None,
+    });
+    let list = PDUSessionResourceListHORqd(
+        psis.iter()
+            .map(|psi| {
+                let transfer = encode_aper(&HandoverRequiredTransfer {
+                    direct_forwarding_path_availability: None,
+                    ie_extensions: None,
+                });
+                PDUSessionResourceItemHORqd {
+                    pdu_session_id: PDUSessionID(*psi),
+                    handover_required_transfer: PDUSessionResourceItemHORqdHandoverRequiredTransfer(
+                        transfer,
+                    ),
+                    ie_extensions: None,
+                }
+            })
+            .collect(),
+    );
+    build_ngap!(InitiatingMessage, HandoverPreparation,
+        REJECT, HandoverRequired,
+        REJECT AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        REJECT RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+        REJECT HandoverType(HandoverType(HandoverType::INTRA5GS)),
+        IGNORE Cause(Cause::RadioNetwork(CauseRadioNetwork(CauseRadioNetwork::HANDOVER_DESIRABLE_FOR_RADIO_REASON))),
+        REJECT TargetID(target),
+        REJECT PDUSessionResourceListHORqd(list),
+        REJECT SourceToTarget_TransparentContainer(SourceToTarget_TransparentContainer(container)),
+    )
+}
+
+/// Parse a `HandoverRequired` — `(amf_ue_id, ran_ue_id, target_gnb_id, psis,
+/// source→target container)`. The AMF side.
+pub fn handover_required_params(pdu: &NGAP_PDU) -> Option<(u64, u32, u32, Vec<u8>, Vec<u8>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_HandoverPreparation(req) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id, mut target, mut container) = (None, None, None, None);
+    let mut psis = Vec::new();
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            HandoverRequiredProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => amf_ue_id = Some(v.0),
+            HandoverRequiredProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => ran_ue_id = Some(v.0),
+            HandoverRequiredProtocolIEs_EntryValue::Id_TargetID(TargetID::TargetRANNodeID(t)) => {
+                if let GlobalRANNodeID::GlobalGNB_ID(g) = &t.global_ran_node_id {
+                    target = gnb_id_bits_to_u32(&g.gnb_id);
+                }
+            }
+            HandoverRequiredProtocolIEs_EntryValue::Id_PDUSessionResourceListHORqd(list) => {
+                psis = list.0.iter().map(|i| i.pdu_session_id.0).collect()
+            }
+            HandoverRequiredProtocolIEs_EntryValue::Id_SourceToTarget_TransparentContainer(c) => {
+                container = Some(c.0.clone())
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, target?, psis, container?))
+}
+
+/// Build a `HandoverRequest` (TS 38.413 §9.2.3.4) — the AMF asks the **target**
+/// gNB to prepare resources: the UE's AMBR / security capabilities / allowed
+/// NSSAI, the **`{NCC, NH}` pair** for vertical key derivation (TS 33.501
+/// §6.9.2.3.2), the PDU sessions to set up (each with the UPF's UL N3 F-TEID +
+/// QoS flows), and the source's transparent container.
+#[allow(clippy::too_many_arguments)]
+pub fn handover_request(
+    amf_ue_id: u64,
+    mcc: &str,
+    mnc: &str,
+    ue_ambr: (u64, u64),
+    ue_sec_cap: &[u8; 2],
+    ncc: u8,
+    nh: &[u8; 32],
+    allowed_nssai: &[(u8, Option<[u8; 3]>)],
+    sessions: &[(u8, Vec<QosFlow>, u32, Ipv4Addr)],
+    container: Vec<u8>,
+) -> NGAP_PDU {
+    let list = PDUSessionResourceSetupListHOReq(
+        sessions
+            .iter()
+            .map(|(psi, flows, ul_teid, ul_addr)| {
+                let transfer = encode_aper(&setup_request_transfer(flows, *ul_teid, *ul_addr));
+                PDUSessionResourceSetupItemHOReq {
+                    pdu_session_id: PDUSessionID(*psi),
+                    s_nssai: s_nssai(1, None),
+                    handover_request_transfer:
+                        PDUSessionResourceSetupItemHOReqHandoverRequestTransfer(transfer),
+                    ie_extensions: None,
+                }
+            })
+            .collect(),
+    );
+    let security = SecurityContext {
+        next_hop_chaining_count: NextHopChainingCount(ncc),
+        next_hop_nh: SecurityKey(BitVec::<u8, Msb0>::from_slice(nh)),
+        ie_extensions: None,
+    };
+    let nssai = AllowedNSSAI(
+        allowed_nssai
+            .iter()
+            .map(|(sst, sd)| AllowedNSSAI_Item { s_nssai: s_nssai(*sst, *sd), ie_extensions: None })
+            .collect(),
+    );
+    build_ngap!(InitiatingMessage, HandoverResourceAllocation,
+        REJECT, HandoverRequest,
+        REJECT AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        REJECT HandoverType(HandoverType(HandoverType::INTRA5GS)),
+        IGNORE Cause(Cause::RadioNetwork(CauseRadioNetwork(CauseRadioNetwork::HANDOVER_DESIRABLE_FOR_RADIO_REASON))),
+        REJECT UEAggregateMaximumBitRate(UEAggregateMaximumBitRate {
+            ue_aggregate_maximum_bit_rate_dl: BitRate(ue_ambr.0),
+            ue_aggregate_maximum_bit_rate_ul: BitRate(ue_ambr.1),
+            ie_extensions: None,
+        }),
+        REJECT UESecurityCapabilities(helpers::ue_security_capabilities(ue_sec_cap)),
+        REJECT SecurityContext(security),
+        REJECT PDUSessionResourceSetupListHOReq(list),
+        REJECT AllowedNSSAI(nssai),
+        REJECT SourceToTarget_TransparentContainer(SourceToTarget_TransparentContainer(container)),
+        REJECT GUAMI(guami(plmn(mcc, mnc), 1, 1, 0)),
+    )
+}
+
+/// Parse a `HandoverRequest` — `(amf_ue_id, ncc, nh, [(psi, ul_teid, ul_addr)],
+/// source→target container)`. The target-gNB side / tests.
+pub fn handover_request_params(
+    pdu: &NGAP_PDU,
+) -> Option<(u64, u8, [u8; 32], Vec<(u8, u32, Ipv4Addr)>, Vec<u8>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_HandoverResourceAllocation(req) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut security, mut container) = (None, None, None);
+    let mut sessions = Vec::new();
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            HandoverRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => amf_ue_id = Some(v.0),
+            HandoverRequestProtocolIEs_EntryValue::Id_SecurityContext(s) => {
+                let nh = <[u8; 32]>::try_from(s.next_hop_nh.0.as_raw_slice()).ok()?;
+                security = Some((s.next_hop_chaining_count.0, nh));
+            }
+            HandoverRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListHOReq(list) => {
+                for item in &list.0 {
+                    let mut codec =
+                        PerCodecData::from_slice_aper(&item.handover_request_transfer.0);
+                    if let Ok(t) = PDUSessionResourceSetupRequestTransfer::aper_decode(&mut codec) {
+                        let fteid = t.protocol_i_es.0.iter().find_map(|e| match &e.value {
+                            PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_UL_NGU_UP_TNLInformation(u) => fteid_from_uptnl(u),
+                            _ => None,
+                        });
+                        if let Some((teid, addr)) = fteid {
+                            sessions.push((item.pdu_session_id.0, teid, addr));
+                        }
+                    }
+                }
+            }
+            HandoverRequestProtocolIEs_EntryValue::Id_SourceToTarget_TransparentContainer(c) => {
+                container = Some(c.0.clone())
+            }
+            _ => {}
+        }
+    }
+    let (ncc, nh) = security?;
+    Some((amf_ue_id?, ncc, nh, sessions, container?))
+}
+
+/// Build a `HandoverRequestAcknowledge` (TS 38.413 §9.2.3.5) — the target gNB
+/// admits the PDU sessions (each with **its** DL N3 F-TEID) and returns the
+/// target→source RRC container. For tests / a gNB simulator.
+pub fn handover_request_acknowledge(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    admitted: &[(u8, u32, Ipv4Addr)],
+    container: Vec<u8>,
+) -> NGAP_PDU {
+    let list = PDUSessionResourceAdmittedList(
+        admitted
+            .iter()
+            .map(|(psi, teid, addr)| {
+                let transfer = encode_aper(&HandoverRequestAcknowledgeTransfer {
+                    dl_ngu_up_tnl_information: gtp_tunnel(*teid, *addr),
+                    dl_forwarding_up_tnl_information: None,
+                    security_result: None,
+                    qos_flow_setup_response_list: QosFlowListWithDataForwarding(vec![
+                        QosFlowItemWithDataForwarding {
+                            qos_flow_identifier: QosFlowIdentifier(1),
+                            data_forwarding_accepted: None,
+                            ie_extensions: None,
+                        },
+                    ]),
+                    qos_flow_failed_to_setup_list: None,
+                    data_forwarding_response_drb_list: None,
+                    ie_extensions: None,
+                });
+                PDUSessionResourceAdmittedItem {
+                    pdu_session_id: PDUSessionID(*psi),
+                    handover_request_acknowledge_transfer:
+                        PDUSessionResourceAdmittedItemHandoverRequestAcknowledgeTransfer(transfer),
+                    ie_extensions: None,
+                }
+            })
+            .collect(),
+    );
+    build_ngap!(SuccessfulOutcome, HandoverResourceAllocation,
+        REJECT, HandoverRequestAcknowledge,
+        IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        IGNORE RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+        IGNORE PDUSessionResourceAdmittedList(list),
+        REJECT TargetToSource_TransparentContainer(TargetToSource_TransparentContainer(container)),
+    )
+}
+
+/// Parse a `HandoverRequestAcknowledge` — `(amf_ue_id, target_ran_ue_id,
+/// [(psi, target_dl_teid, target_dl_addr)], target→source container)`. The AMF side.
+pub fn handover_request_ack_params(
+    pdu: &NGAP_PDU,
+) -> Option<(u64, u32, Vec<(u8, u32, Ipv4Addr)>, Vec<u8>)> {
+    let NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome { value, .. }) = pdu else {
+        return None;
+    };
+    let SuccessfulOutcomeValue::Id_HandoverResourceAllocation(ack) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id, mut container) = (None, None, None);
+    let mut admitted = Vec::new();
+    for ie in &ack.protocol_i_es.0 {
+        match &ie.value {
+            HandoverRequestAcknowledgeProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            HandoverRequestAcknowledgeProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => {
+                ran_ue_id = Some(v.0)
+            }
+            HandoverRequestAcknowledgeProtocolIEs_EntryValue::Id_PDUSessionResourceAdmittedList(
+                list,
+            ) => {
+                for item in &list.0 {
+                    let mut codec = PerCodecData::from_slice_aper(
+                        &item.handover_request_acknowledge_transfer.0,
+                    );
+                    if let Ok(t) = HandoverRequestAcknowledgeTransfer::aper_decode(&mut codec) {
+                        if let Some((teid, addr)) = fteid_from_uptnl(&t.dl_ngu_up_tnl_information) {
+                            admitted.push((item.pdu_session_id.0, teid, addr));
+                        }
+                    }
+                }
+            }
+            HandoverRequestAcknowledgeProtocolIEs_EntryValue::Id_TargetToSource_TransparentContainer(c) => {
+                container = Some(c.0.clone())
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, admitted, container?))
+}
+
+/// Build a `HandoverCommand` (TS 38.413 §9.2.3.2) — the AMF tells the **source**
+/// gNB to execute the handover, relaying the target's transparent container (the
+/// source forwards it to the UE via RRC).
+pub fn handover_command(amf_ue_id: u64, ran_ue_id: u32, container: Vec<u8>) -> NGAP_PDU {
+    build_ngap!(SuccessfulOutcome, HandoverPreparation,
+        REJECT, HandoverCommand,
+        REJECT AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        REJECT RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+        REJECT HandoverType(HandoverType(HandoverType::INTRA5GS)),
+        REJECT TargetToSource_TransparentContainer(TargetToSource_TransparentContainer(container)),
+    )
+}
+
+/// `(amf_ue_id, ran_ue_id, target→source container)` from a decoded
+/// `HandoverCommand` — the source-gNB side / tests.
+pub fn handover_command_params(pdu: &NGAP_PDU) -> Option<(u64, u32, Vec<u8>)> {
+    let NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome { value, .. }) = pdu else {
+        return None;
+    };
+    let SuccessfulOutcomeValue::Id_HandoverPreparation(cmd) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id, mut container) = (None, None, None);
+    for ie in &cmd.protocol_i_es.0 {
+        match &ie.value {
+            HandoverCommandProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => amf_ue_id = Some(v.0),
+            HandoverCommandProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => ran_ue_id = Some(v.0),
+            HandoverCommandProtocolIEs_EntryValue::Id_TargetToSource_TransparentContainer(c) => {
+                container = Some(c.0.clone())
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, container?))
+}
+
+/// Build a `HandoverNotify` (TS 38.413 §9.2.3.6) — the target gNB reports the UE
+/// arrived. For tests / a gNB simulator.
+pub fn handover_notify(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    mcc: &str,
+    mnc: &str,
+    tac: &[u8; 3],
+) -> NGAP_PDU {
+    build_ngap!(InitiatingMessage, HandoverNotification,
+        IGNORE, HandoverNotify,
+        REJECT AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        REJECT RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+        IGNORE UserLocationInformation(nr_user_location(mcc, mnc, tac)),
+    )
+}
+
+/// `(amf_ue_id, target_ran_ue_id, tac)` from a decoded `HandoverNotify` — the AMF side.
+pub fn handover_notify_params(pdu: &NGAP_PDU) -> Option<(u64, u32, Option<[u8; 3]>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_HandoverNotification(msg) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id, mut tac) = (None, None, None);
+    for ie in &msg.protocol_i_es.0 {
+        match &ie.value {
+            HandoverNotifyProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => amf_ue_id = Some(v.0),
+            HandoverNotifyProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => ran_ue_id = Some(v.0),
+            HandoverNotifyProtocolIEs_EntryValue::Id_UserLocationInformation(
+                UserLocationInformation::UserLocationInformationNR(nr),
+            ) => tac = <[u8; 3]>::try_from(nr.tai.tac.0.as_slice()).ok(),
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, tac))
 }
 
 /// Build a `UEContextModificationRequest` (TS 38.413 §9.2.2.7) — the AMF asks the
@@ -1548,9 +1935,11 @@ mod release_tests {
         assert_eq!(tac_from_initial_ue(msg), None);
 
         // The gNB's supported TAs ride the NGSetupRequest.
-        let pdu = ng_setup_request("999", "70", &[[0, 0, 1], [0, 0, 2]]);
+        let pdu = ng_setup_request(7, "999", "70", &[[0, 0, 1], [0, 0, 2]]);
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
         assert_eq!(supported_tacs_from_ng_setup(&back), Some(vec![[0, 0, 1], [0, 0, 2]]));
+        assert_eq!(gnb_id_from_ng_setup(&back), Some(7), "the gNB id parses back");
+        assert_eq!(gnb_id_from_ng_setup(&initial_ue_message_with_nas(1, vec![1])), None);
         assert_eq!(supported_tacs_from_ng_setup(&initial_ue_message_with_nas(1, vec![1])), None);
     }
 
@@ -1573,6 +1962,58 @@ mod release_tests {
         );
         // A plain DownlinkNASTransport has no restriction.
         assert_eq!(area_restriction_from_downlink_nas(&downlink_nas_transport(7, 3, vec![1])), None);
+    }
+
+    #[test]
+    fn n2_handover_messages_roundtrip() {
+        let addr = Ipv4Addr::new(10, 0, 8, 1);
+
+        // Handover Required: source → AMF (target gNB id + sessions + container).
+        let pdu = handover_required(7, 4, 9, "999", "70", &[0, 0, 2], &[5], b"s2t".to_vec());
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(handover_required_params(&back), Some((7, 4, 9, vec![5], b"s2t".to_vec())));
+
+        // Handover Request: AMF → target ({NCC, NH} + UL F-TEID per session).
+        let nh = [0x6bu8; 32];
+        let pdu = handover_request(
+            7,
+            "999",
+            "70",
+            (1_000_000_000, 500_000_000),
+            &[0x20, 0x20],
+            1,
+            &nh,
+            &[(1, Some([1, 2, 3]))],
+            &[(5, vec![QosFlow::default_non_gbr()], 0x33, addr)],
+            b"s2t".to_vec(),
+        );
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(
+            handover_request_params(&back),
+            Some((7, 1, nh, vec![(5, 0x33, addr)], b"s2t".to_vec()))
+        );
+
+        // Handover Request Acknowledge: target → AMF (its DL F-TEIDs + container).
+        let pdu = handover_request_acknowledge(7, 9, &[(5, 0xAA, addr)], b"t2s".to_vec());
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(
+            handover_request_ack_params(&back),
+            Some((7, 9, vec![(5, 0xAA, addr)], b"t2s".to_vec()))
+        );
+
+        // Handover Command: AMF → source (relaying the target's container).
+        let pdu = handover_command(7, 4, b"t2s".to_vec());
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(handover_command_params(&back), Some((7, 4, b"t2s".to_vec())));
+
+        // Handover Notify: target → AMF (the UE arrived, with its location).
+        let pdu = handover_notify(7, 9, "999", "70", &[0, 0, 2]);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(handover_notify_params(&back), Some((7, 9, Some([0, 0, 2]))));
+
+        // Cross-parses fail cleanly.
+        assert_eq!(handover_required_params(&handover_notify(1, 2, "999", "70", &[0, 0, 1])), None);
+        assert_eq!(handover_notify_params(&initial_ue_message_with_nas(1, vec![1])), None);
     }
 
     #[test]
