@@ -24,6 +24,10 @@ const DB_ENV: &str = "RADIAN_UDR_DB";
 const KEK_ENV: &str = "RADIAN_UDR_MASTER_KEY";
 const NRF_ENV: &str = "RADIAN_UDR_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
+/// The UDM to notify on a provisioned-data change (Nudm_SDM change subscriptions,
+/// design/99). Override with `RADIAN_UDR_UDM`.
+const UDM_ENV: &str = "RADIAN_UDR_UDM";
+const DEFAULT_UDM: &str = "http://127.0.0.1:8004";
 /// How often to sweep UECM registrations for NFs that have left the NRF.
 const SWEEP_ENV: &str = "RADIAN_UDR_UECM_SWEEP_SECS";
 const DEFAULT_SWEEP_SECS: u64 = 30;
@@ -87,8 +91,13 @@ async fn main() -> anyhow::Result<()> {
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     // SBI security (design/46/55): require a valid `UDR` access token — HS256 (shared
     // secret) or ES256 (verified against the NRF's JWKS) — when configured, else open.
+    // A provisioned-data (am-data) change notifies the UDM, which fans a
+    // Nudm_SDM_Notification out to subscribed AMFs (design/99 UDR-autonomous trigger).
+    let udm_base =
+        sbi_core::sbi_base(std::env::var(UDM_ENV).unwrap_or_else(|_| DEFAULT_UDM.to_string()));
+    info!(%udm_base, "am-data changes notify the UDM (Nudm_SDM change subscriptions)");
     let router = sbi_core::oauth::protect(
-        sbi_core::nudr::router(store),
+        sbi_core::nudr::router_with_udm(store, Some(udm_base)),
         "UDR",
         sbi_core::oauth::verifier(&nrf_base),
     );

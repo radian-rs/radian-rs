@@ -42,6 +42,33 @@ use crate::SbiError;
 #[derive(Clone)]
 struct NudrState {
     store: Arc<dyn SubscriberStore>,
+    /// The UDM to notify on a provisioned-data change (`None` disables it). A
+    /// change to a subscriber's am-data POSTs the UDM's `Nudm_SDM` data-change
+    /// fan-out, so the UDM relays a `Nudm_SDM_Notification` to subscribed AMFs
+    /// (TS 29.503 §5.3.2 — the proper UDR→UDM→AMF path, vs a manual trigger).
+    udm_base: Option<String>,
+}
+
+impl NudrState {
+    /// Relay a provisioned-data change to the UDM (best-effort, awaited so the
+    /// change is delivered before the PUT returns; a failure never fails the PUT).
+    /// Only **am-data** changes have a subscriber today (the AMF via `Nudm_SDM`).
+    async fn notify_udm_data_change(&self, ds: DataSet, ue_id: &str) {
+        if !matches!(ds, DataSet::Am) {
+            return;
+        }
+        let Some(udm) = self.udm_base.as_deref() else {
+            return;
+        };
+        let url = format!("{udm}/nudm-sdm/v2/{ue_id}/notify-data-change");
+        match crate::sbi_client().post(&url).send().await {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(supi = %ue_id, "am-data change — notified the UDM (Nudm_SDM fan-out)")
+            }
+            Ok(r) => tracing::warn!(supi = %ue_id, status = %r.status(), "UDM data-change notify rejected"),
+            Err(e) => tracing::warn!(supi = %ue_id, "UDM data-change notify failed: {e}"),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,7 +103,14 @@ pub struct HeAv {
 /// (deviation: TS 23.502 mediates this through UDM data-change subscriptions;
 /// we collapse UDR→UDM→AMF to UDR→AMF).
 pub fn router(store: Arc<dyn SubscriberStore>) -> Router {
-    let state = NudrState { store };
+    router_with_udm(store, None)
+}
+
+/// Build the UDR router, additionally notifying `udm_base` (its `Nudm_SDM`
+/// data-change fan-out) when a subscriber's am-data changes — the UDR-autonomous
+/// trigger for `Nudm_SDM` change subscriptions (design/99). `None` disables it.
+pub fn router_with_udm(store: Arc<dyn SubscriberStore>, udm_base: Option<String>) -> Router {
+    let state = NudrState { store, udm_base };
     let router = Router::new()
         .route(
             "/nudr-dr/v2/subscription-data/{ue_id}/authentication-data/generate-av",
@@ -395,7 +429,11 @@ macro_rules! doc_handlers {
             Path((ue_id, plmn)): Path<(String, String)>,
             Json(doc): Json<serde_json::Value>,
         ) -> StatusCode {
-            put_doc(st.store, $ds, ue_id, plmn, doc).await
+            let status = put_doc(st.store.clone(), $ds, ue_id.clone(), plmn, doc).await;
+            if status == StatusCode::NO_CONTENT {
+                st.notify_udm_data_change($ds, &ue_id).await;
+            }
+            status
         }
     };
 }
@@ -1138,5 +1176,100 @@ mod tests {
         // Other data sets and PLMNs stay independent.
         assert!(udr.get_provisioned(DataSet::Sm, "imsi-1", "99970").await.unwrap().is_none());
         assert!(udr.get_provisioned(DataSet::Am, "imsi-1", "00101").await.unwrap().is_none());
+    }
+
+    /// A provisioned am-data change autonomously notifies the UDM's Nudm_SDM
+    /// data-change fan-out (the UDR-autonomous trigger for design/99); other data
+    /// sets don't (no consumer subscribes to them yet).
+    #[tokio::test]
+    async fn am_data_change_notifies_the_udm() {
+        use std::sync::Mutex as StdMutex;
+
+        type Seen = Arc<StdMutex<Vec<String>>>;
+        async fn notify(
+            State(seen): State<Seen>,
+            Path(supi): Path<String>,
+        ) -> StatusCode {
+            seen.lock().unwrap().push(supi);
+            StatusCode::OK
+        }
+        let seen: Seen = Arc::new(StdMutex::new(Vec::new()));
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        let udm_router = Router::new()
+            .route("/nudm-sdm/v2/{supi}/notify-data-change", post(notify))
+            .with_state(seen.clone());
+        tokio::spawn(async move { crate::run_on(udm_l, udm_router).await.unwrap() });
+
+        // A UDR that relays am-data changes to that mock UDM.
+        let store: Arc<dyn SubscriberStore> = Arc::new(InMemoryStore::new());
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        let udm_base = format!("http://{udm_addr}");
+        tokio::spawn(async move {
+            crate::run_on(udr_l, router_with_udm(store, Some(udm_base))).await.unwrap()
+        });
+        let udr = UdrClient::new(format!("http://{udr_addr}"));
+
+        // The put handler awaits the notify, so it is delivered before PUT returns.
+        let am = serde_json::json!({"nssai": {"defaultSingleNssais": [{"sst": 1}]}});
+        udr.put_provisioned(DataSet::Am, "imsi-7", "99970", &am).await.unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), ["imsi-7".to_string()], "am-data change notified");
+
+        // A non-am-data change does not notify (no subscriber for it).
+        udr.put_provisioned(DataSet::Sm, "imsi-7", "99970", &am).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "only am-data changes notify the UDM");
+    }
+
+    /// End to end: an am-data change at the UDR reaches a `Nudm_SDM` subscriber
+    /// through the real UDM (UDR → UDM fan-out → the AMF's callback). Every hop is
+    /// awaited, so the notification has arrived by the time the PUT returns.
+    #[tokio::test]
+    async fn am_data_change_reaches_a_sdm_subscriber() {
+        use std::sync::Mutex as StdMutex;
+
+        type Got = Arc<StdMutex<Vec<crate::nudm::ModificationNotification>>>;
+        async fn cb(
+            State(g): State<Got>,
+            Json(n): Json<crate::nudm::ModificationNotification>,
+        ) -> StatusCode {
+            g.lock().unwrap().push(n);
+            StatusCode::NO_CONTENT
+        }
+        let got: Got = Arc::new(StdMutex::new(Vec::new()));
+        let cb_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cb_addr = cb_l.local_addr().unwrap();
+        let cb_state = got.clone();
+        tokio::spawn(async move {
+            crate::run_on(cb_l, Router::new().route("/cb", post(cb)).with_state(cb_state)).await.unwrap()
+        });
+
+        // The real UDM (its own UDR is unused by the SDM subscription surface).
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        let dummy_udr = Arc::new(UdrClient::new("http://127.0.0.1:1"));
+        tokio::spawn(async move { crate::run_on(udm_l, crate::nudm::router(dummy_udr)).await.unwrap() });
+        let udm_base = format!("http://{udm_addr}");
+
+        // The UDR relays am-data changes to that UDM.
+        let store: Arc<dyn SubscriberStore> = Arc::new(InMemoryStore::new());
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        let udm_for_udr = udm_base.clone();
+        tokio::spawn(async move {
+            crate::run_on(udr_l, router_with_udm(store, Some(udm_for_udr))).await.unwrap()
+        });
+        let udr = UdrClient::new(format!("http://{udr_addr}"));
+
+        // An AMF subscribes to imsi-9's changes at the UDM.
+        let sdm = crate::nudm::NudmClient::new(udm_base);
+        sdm.sdm_subscribe("imsi-9", &format!("http://{cb_addr}/cb")).await.unwrap();
+
+        // Changing imsi-9's am-data flows UDR → UDM → the subscriber.
+        let am = serde_json::json!({"subscribedUeAmbr": {"uplink": "2 Gbps", "downlink": "4 Gbps"}});
+        udr.put_provisioned(DataSet::Am, "imsi-9", "99970", &am).await.unwrap();
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 1, "the subscriber received one notification");
+        assert_eq!(got[0].notify_items[0].resource_id, "am-data");
     }
 }
