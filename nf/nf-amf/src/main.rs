@@ -1445,6 +1445,34 @@ fn on_network_release(
     downlinks
 }
 
+/// Implicitly deregister a UE the network can no longer reach — the escalation shared
+/// by the retransmission procedures that exhaust without a UE response (T3522
+/// deregistration, T3555 configuration update). Purge the UE's GUTI, its Nudm state
+/// (SDM change subscription + UECM registration), and its PCF AM-policy association;
+/// drop the local context; and release the RAN-side context with a
+/// UEContextReleaseCommand (cause deregister). A no-op for an unknown UE.
+fn implicit_deregister(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_ue_id: u64,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        return Vec::new();
+    };
+    let ran_ue_id = ctx.ran_ue_id;
+    if let Some(supi) = ctx.suci.clone() {
+        // The subscription context is gone — its GUTI must not resolve again.
+        GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
+        spawn_sdm_unsubscribe(supi.clone());
+        spawn_uecm_purge(supi);
+    }
+    spawn_am_policy_delete(ctx.am_policy.take());
+    ues.remove(&amf_ue_id);
+    vec![(
+        ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
+        "UEContextReleaseCommand",
+    )]
+}
+
 /// T3522 fired: retransmit the Deregistration Request while attempts remain;
 /// after [`T3522_MAX_SENDS`] transmissions, abort the procedure (§5.5.2.3.4) —
 /// release the RAN-side context and drop ours anyway.
@@ -1485,25 +1513,16 @@ fn on_t3522_expiry(
         "UE {amf_ue_id}: T3522 exhausted after {T3522_MAX_SENDS} transmissions — \
          aborting deregistration and releasing the contexts"
     );
-    if let Some(supi) = ctx.suci.clone() {
-        // The subscription is gone — its GUTI must not resolve again.
-        GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
-        spawn_sdm_unsubscribe(supi.clone());
-        spawn_uecm_purge(supi);
-    }
-    spawn_am_policy_delete(ctx.am_policy.take());
-    ues.remove(&amf_ue_id);
-    vec![(
-        ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
-        "UEContextReleaseCommand",
-    )]
+    implicit_deregister(ues, amf_ue_id)
 }
 
 /// T3555 fired: retransmit the outstanding Configuration Update Command (re-protected
 /// with a fresh NAS COUNT) while transmissions remain; after [`T3555_MAX_SENDS`] the
-/// network abandons the procedure (§5.4.4.3) and drops the pending state. A stale
-/// expiry (the UE already acknowledged, so `pending_config_update` is cleared) is a
-/// no-op.
+/// network abandons the procedure (§5.4.4.3). A UE that never acknowledges over the
+/// full retransmission run is treated as unreachable and **implicitly deregistered**
+/// (the codebase's escalation, mirroring T3522 exhaustion) rather than left in a
+/// half-updated state. A stale expiry (the UE already acknowledged, so
+/// `pending_config_update` is cleared) is a no-op.
 fn on_t3555_expiry(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
@@ -1541,11 +1560,10 @@ fn on_t3555_expiry(
     }
 
     warn!(
-        "UE {amf_ue_id}: T3555 exhausted after {T3555_MAX_SENDS} transmissions — \
-         abandoning the Configuration Update (no acknowledgement from the UE)"
+        "UE {amf_ue_id}: T3555 exhausted after {T3555_MAX_SENDS} transmissions — no \
+         acknowledgement from the UE; implicitly deregistering it (unreachable)"
     );
-    ctx.pending_config_update = None;
-    Vec::new()
+    implicit_deregister(ues, amf_ue_id)
 }
 
 /// Decode one NGAP PDU and dispatch it.
@@ -6220,9 +6238,11 @@ mod tests {
 
     /// T3555: an acknowledgement-requested Configuration Update Command is
     /// retransmitted on each expiry (re-protected with a fresh NAS COUNT) up to
-    /// T3555_MAX_SENDS, then abandoned; a Complete before then stops it.
+    /// T3555_MAX_SENDS; if the UE still never acknowledges, the exhausted procedure
+    /// escalates to an implicit deregistration (the RAN context is released, ours
+    /// dropped).
     #[tokio::test]
-    async fn config_update_retransmits_then_gives_up() {
+    async fn config_update_retransmits_then_deregisters() {
         let (ki, ke) = ([0x63u8; 16], [0x64u8; 16]);
         let amf_ue_id = 0x77u64;
         let mut ctx = UeContext::new(3, RegState::Registered, Some("imsi-999700000000077".into()));
@@ -6259,12 +6279,17 @@ mod tests {
             );
             assert_eq!(ues[&amf_ue_id].pending_config_update.as_ref().unwrap().attempts, attempt);
         }
-        // The cap is reached → the next expiry abandons the procedure (no downlink,
-        // pending cleared) so it stops retransmitting forever.
+        // The cap is reached → the next expiry escalates: the UE is treated as
+        // unreachable and implicitly deregistered — the RAN context is released and the
+        // local context dropped, so it stops retransmitting forever.
         let dls = on_t3555_expiry(&mut ues, amf_ue_id, &tx);
-        assert!(dls.is_empty(), "exhausted → no more retransmissions");
-        assert!(ues[&amf_ue_id].pending_config_update.is_none(), "pending cleared on give-up");
-        // A stale expiry after clearing is a harmless no-op.
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["UEContextReleaseCommand"],
+            "give-up implicitly deregisters the UE (releases the RAN side)"
+        );
+        assert!(!ues.contains_key(&amf_ue_id), "local context dropped on give-up");
+        // A stale expiry after the context is gone is a harmless no-op.
         assert!(on_t3555_expiry(&mut ues, amf_ue_id, &tx).is_empty());
     }
 
