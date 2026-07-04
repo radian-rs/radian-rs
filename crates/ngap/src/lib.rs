@@ -1284,6 +1284,205 @@ pub fn handover_notify_params(pdu: &NGAP_PDU) -> Option<(u64, u32, Option<[u8; 3
     Some((amf_ue_id?, ran_ue_id?, tac))
 }
 
+// ─── Handover failure paths (TS 38.413 §8.4) ───────────────────────────────────
+
+/// Build a `HandoverPreparationFailure` (TS 38.413 §9.2.3.3) — the AMF tells the
+/// **source** gNB the handover preparation failed (unknown target, target
+/// rejection, TNGRELOCprep expiry, …). Radio-network cause.
+pub fn handover_preparation_failure(amf_ue_id: u64, ran_ue_id: u32, radio_cause: u8) -> NGAP_PDU {
+    build_ngap!(UnsuccessfulOutcome, HandoverPreparation,
+        REJECT, HandoverPreparationFailure,
+        IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        IGNORE RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+        IGNORE Cause(Cause::RadioNetwork(CauseRadioNetwork(radio_cause))),
+    )
+}
+
+/// `(amf_ue_id, ran_ue_id, radio cause)` from a decoded
+/// `HandoverPreparationFailure` — the source-gNB side / tests.
+pub fn handover_preparation_failure_params(pdu: &NGAP_PDU) -> Option<(u64, u32, Option<u8>)> {
+    let NGAP_PDU::UnsuccessfulOutcome(UnsuccessfulOutcome { value, .. }) = pdu else {
+        return None;
+    };
+    let UnsuccessfulOutcomeValue::Id_HandoverPreparation(msg) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id, mut cause) = (None, None, None);
+    for ie in &msg.protocol_i_es.0 {
+        match &ie.value {
+            HandoverPreparationFailureProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            HandoverPreparationFailureProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => {
+                ran_ue_id = Some(v.0)
+            }
+            HandoverPreparationFailureProtocolIEs_EntryValue::Id_Cause(Cause::RadioNetwork(c)) => {
+                cause = Some(c.0)
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, cause))
+}
+
+/// Build a `HandoverFailure` (TS 38.413 §9.2.3.5A) — the **target** gNB tells the
+/// AMF it cannot allocate resources for the handover. For tests / a gNB simulator.
+pub fn handover_failure(amf_ue_id: u64, radio_cause: u8) -> NGAP_PDU {
+    build_ngap!(UnsuccessfulOutcome, HandoverResourceAllocation,
+        REJECT, HandoverFailure,
+        IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        IGNORE Cause(Cause::RadioNetwork(CauseRadioNetwork(radio_cause))),
+    )
+}
+
+/// `(amf_ue_id, radio cause)` from a decoded `HandoverFailure` — the AMF side.
+pub fn handover_failure_params(pdu: &NGAP_PDU) -> Option<(u64, Option<u8>)> {
+    let NGAP_PDU::UnsuccessfulOutcome(UnsuccessfulOutcome { value, .. }) = pdu else {
+        return None;
+    };
+    let UnsuccessfulOutcomeValue::Id_HandoverResourceAllocation(msg) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut cause) = (None, None);
+    for ie in &msg.protocol_i_es.0 {
+        match &ie.value {
+            HandoverFailureProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => amf_ue_id = Some(v.0),
+            HandoverFailureProtocolIEs_EntryValue::Id_Cause(Cause::RadioNetwork(c)) => {
+                cause = Some(c.0)
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, cause))
+}
+
+/// Build a `HandoverCancel` (TS 38.413 §9.2.3.7) — the **source** gNB aborts an
+/// in-flight handover. For tests / a gNB simulator.
+pub fn handover_cancel(amf_ue_id: u64, ran_ue_id: u32, radio_cause: u8) -> NGAP_PDU {
+    build_ngap!(InitiatingMessage, HandoverCancel,
+        REJECT, HandoverCancel,
+        REJECT AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        REJECT RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+        IGNORE Cause(Cause::RadioNetwork(CauseRadioNetwork(radio_cause))),
+    )
+}
+
+/// `(amf_ue_id, ran_ue_id)` from a decoded `HandoverCancel` — the AMF side.
+pub fn handover_cancel_params(pdu: &NGAP_PDU) -> Option<(u64, u32)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_HandoverCancel(msg) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id) = (None, None);
+    for ie in &msg.protocol_i_es.0 {
+        match &ie.value {
+            HandoverCancelProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => amf_ue_id = Some(v.0),
+            HandoverCancelProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => ran_ue_id = Some(v.0),
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?))
+}
+
+/// Build a `HandoverCancelAcknowledge` (TS 38.413 §9.2.3.8) — the AMF confirms
+/// the cancellation to the source gNB.
+pub fn handover_cancel_acknowledge(amf_ue_id: u64, ran_ue_id: u32) -> NGAP_PDU {
+    build_ngap!(SuccessfulOutcome, HandoverCancel,
+        REJECT, HandoverCancelAcknowledge,
+        IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        IGNORE RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+    )
+}
+
+/// `(amf_ue_id, ran_ue_id)` from a decoded `HandoverCancelAcknowledge` — the
+/// source-gNB side / tests.
+pub fn handover_cancel_ack_params(pdu: &NGAP_PDU) -> Option<(u64, u32)> {
+    let NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome { value, .. }) = pdu else {
+        return None;
+    };
+    let SuccessfulOutcomeValue::Id_HandoverCancel(msg) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id) = (None, None);
+    for ie in &msg.protocol_i_es.0 {
+        match &ie.value {
+            HandoverCancelAcknowledgeProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            HandoverCancelAcknowledgeProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => {
+                ran_ue_id = Some(v.0)
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?))
+}
+
+/// Build a `PathSwitchRequestFailure` (TS 38.413 §9.2.3.23) — the AMF rejects a
+/// path switch; each requested PDU session is reported released with a
+/// radio-network cause in its unsuccessful transfer.
+pub fn path_switch_request_failure(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    psis: &[u8],
+    radio_cause: u8,
+) -> NGAP_PDU {
+    let list = PDUSessionResourceReleasedListPSFail(
+        psis.iter()
+            .map(|psi| {
+                let transfer = encode_aper(&PathSwitchRequestUnsuccessfulTransfer {
+                    cause: Cause::RadioNetwork(CauseRadioNetwork(radio_cause)),
+                    ie_extensions: None,
+                });
+                PDUSessionResourceReleasedItemPSFail {
+                    pdu_session_id: PDUSessionID(*psi),
+                    path_switch_request_unsuccessful_transfer:
+                        PDUSessionResourceReleasedItemPSFailPathSwitchRequestUnsuccessfulTransfer(
+                            transfer,
+                        ),
+                    ie_extensions: None,
+                }
+            })
+            .collect(),
+    );
+    build_ngap!(UnsuccessfulOutcome, PathSwitchRequest,
+        REJECT, PathSwitchRequestFailure,
+        IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        IGNORE RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+        IGNORE PDUSessionResourceReleasedListPSFail(list),
+    )
+}
+
+/// `(amf_ue_id, ran_ue_id, [released psi])` from a decoded
+/// `PathSwitchRequestFailure` — the gNB side / tests.
+pub fn path_switch_failure_params(pdu: &NGAP_PDU) -> Option<(u64, u32, Vec<u8>)> {
+    let NGAP_PDU::UnsuccessfulOutcome(UnsuccessfulOutcome { value, .. }) = pdu else {
+        return None;
+    };
+    let UnsuccessfulOutcomeValue::Id_PathSwitchRequest(msg) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id) = (None, None);
+    let mut psis = Vec::new();
+    for ie in &msg.protocol_i_es.0 {
+        match &ie.value {
+            PathSwitchRequestFailureProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            PathSwitchRequestFailureProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => {
+                ran_ue_id = Some(v.0)
+            }
+            PathSwitchRequestFailureProtocolIEs_EntryValue::Id_PDUSessionResourceReleasedListPSFail(
+                list,
+            ) => psis = list.0.iter().map(|i| i.pdu_session_id.0).collect(),
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, psis))
+}
+
 /// Build a `UEContextModificationRequest` (TS 38.413 §9.2.2.7) — the AMF asks the
 /// NG-RAN to update the UE context. Only the two UE-NGAP-IDs are mandatory; the
 /// **Index to RAT/Frequency Selection Priority** (RFSP, TS 23.501 §5.3.4.3, steers
@@ -2112,6 +2311,42 @@ mod release_tests {
         // Cross-parses fail cleanly.
         assert_eq!(handover_required_params(&handover_notify(1, 2, "999", "70", &[0, 0, 1])), None);
         assert_eq!(handover_notify_params(&initial_ue_message_with_nas(1, vec![1])), None);
+    }
+
+    #[test]
+    fn handover_failure_messages_roundtrip() {
+        // Preparation failure: AMF → source, radio cause.
+        let pdu = handover_preparation_failure(7, 4, CauseRadioNetwork::TNGRELOCPREP_EXPIRY);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(
+            handover_preparation_failure_params(&back),
+            Some((7, 4, Some(CauseRadioNetwork::TNGRELOCPREP_EXPIRY)))
+        );
+
+        // Handover failure: target → AMF.
+        let pdu = handover_failure(7, CauseRadioNetwork::HO_TARGET_NOT_ALLOWED);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(
+            handover_failure_params(&back),
+            Some((7, Some(CauseRadioNetwork::HO_TARGET_NOT_ALLOWED)))
+        );
+
+        // Cancel + acknowledge.
+        let pdu = handover_cancel(7, 4, CauseRadioNetwork::HANDOVER_CANCELLED);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(handover_cancel_params(&back), Some((7, 4)));
+        let pdu = handover_cancel_acknowledge(7, 4);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(handover_cancel_ack_params(&back), Some((7, 4)));
+
+        // Path switch failure: the requested sessions reported released.
+        let pdu = path_switch_request_failure(7, 9, &[5], CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(path_switch_failure_params(&back), Some((7, 9, vec![5])));
+
+        // Cross-parses fail cleanly.
+        assert_eq!(handover_failure_params(&handover_cancel_acknowledge(1, 2)), None);
+        assert_eq!(handover_cancel_params(&initial_ue_message_with_nas(1, vec![1])), None);
     }
 
     #[test]
