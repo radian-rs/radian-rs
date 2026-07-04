@@ -20,7 +20,7 @@ use rs_pfcp::ie::create_far::CreateFar;
 use rs_pfcp::ie::create_pdr::{CreatePdr, CreatePdrBuilder};
 use rs_pfcp::ie::created_pdr::CreatedPdr;
 use rs_pfcp::ie::destination_interface::{DestinationInterface, Interface};
-use rs_pfcp::ie::f_teid::Fteid;
+use rs_pfcp::ie::f_teid::{Fteid, FteidBuilder};
 use rs_pfcp::ie::far_id::FarId;
 use rs_pfcp::ie::fseid::Fseid;
 use rs_pfcp::ie::pdi::{Pdi, PdiBuilder};
@@ -732,6 +732,21 @@ pub fn heartbeat_request(seq: u32) -> Vec<u8> {
         .marshal()
 }
 
+/// A **CHOOSE** uplink F-TEID (TS 29.244 §8.2.3, CH flag set): the SMF asks the UPF
+/// to allocate the ingress F-TEID (TEID + its own N3 address) and report it back in
+/// the Created PDR — the standard "UPF-assigned F-TEID" signal, rather than the
+/// zero-address placeholder a strict UPF would (correctly) treat as SMF-assigned and
+/// not allocate. (`teid(0)` is a required builder placeholder; the CH flag marks it
+/// as *not* the assignment. Note: rs-pfcp still emits the 4-octet TEID field for a
+/// CHOOSE F-TEID — the CH flag is the signal a peer acts on.)
+fn upf_chooses_fteid() -> Fteid {
+    FteidBuilder::new()
+        .choose_ipv4()
+        .teid(0u32)
+        .build()
+        .expect("build CHOOSE F-TEID")
+}
+
 /// SMF: build a PFCP Session Establishment Request for a basic PDU session. Provisions
 /// two rules: an **uplink** PDR (access → forward to core) whose N3 F-TEID the UPF
 /// allocates, and a **downlink** PDR matching the SMF-allocated `ue_ip` (core → forward
@@ -752,7 +767,7 @@ pub fn session_establishment_request(
     let qer_id = ambr.map(|_| QerId::new(AMBR_QER_ID));
 
     let ul_pdi = PdiBuilder::uplink_access()
-        .f_teid(Fteid::ipv4(0, smf_ip)) // placeholder; the UPF allocates the real N3 F-TEID
+        .f_teid(upf_chooses_fteid()) // CHOOSE: the UPF allocates the real N3 F-TEID
         .build()
         .expect("build uplink PDI");
     let mut ul_pdr = CreatePdrBuilder::new(PdrId::new(1))
@@ -856,7 +871,7 @@ pub fn session_establishment_request_indirect_forwarding(
     target_addr: Ipv4Addr,
 ) -> Vec<u8> {
     let pdi = PdiBuilder::uplink_access()
-        .f_teid(Fteid::ipv4(0, smf_ip)) // placeholder; the UPF allocates the ingress F-TEID
+        .f_teid(upf_chooses_fteid()) // CHOOSE: the UPF allocates the ingress F-TEID
         .build()
         .expect("build forwarding PDI");
     let pdr = CreatePdrBuilder::new(PdrId::new(1))
@@ -1488,6 +1503,38 @@ mod tests {
         assert_eq!(ufp.network_instance.map(|ni| ni.instance), Some("internet".to_string()));
         assert!(ufp.destination_interface.is_some(), "destination interface re-sent (Access)");
         assert!(ufp.outer_header_creation.is_some(), "OHC toward the gNB retained");
+    }
+
+    #[test]
+    fn uplink_fteid_requests_upf_allocation() {
+        use rs_pfcp::ie::create_pdr::CreatePdr;
+        let smf_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let est = session_establishment_request(0xCAFE, 1, smf_ip, UE_IP, "internet", None, &[], None);
+        let msg = rs_pfcp::message::parse(&est).expect("parse establishment");
+
+        // The uplink PDR (id 1) carries a CHOOSE F-TEID: the SMF signals the UPF to
+        // allocate the N3 F-TEID (CH set, no SMF-assigned address) — the standard
+        // "UPF-assigned" request (TS 29.244 §8.2.3), not a zero-address placeholder a
+        // strict UPF would treat as SMF-assigned and decline to allocate.
+        let ul = msg
+            .ies(IeType::CreatePdr)
+            .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
+            .find(|pdr| pdr.pdr_id.value == 1)
+            .expect("uplink Create PDR");
+        let fteid = ul.pdi.f_teid.expect("uplink PDI F-TEID");
+        assert!(fteid.ch, "CHOOSE flag set — the UPF allocates the N3 F-TEID");
+        assert!(fteid.v4, "IPv4 F-TEID requested");
+        assert_eq!(fteid.ipv4_address, None, "no SMF-assigned address (the UPF chooses)");
+
+        // End to end: the UPF still allocates and reports the F-TEID in the Created
+        // PDR, and the SMF reads it back — the handshake is unchanged, now standardly
+        // signalled.
+        let node_ip = Ipv4Addr::new(10, 0, 0, 8);
+        let mut state = UpfState::new();
+        let resp = handle_n4(&est, node_ip, &mut state, 0).expect("establish");
+        let session = parse_session_establishment_response(&resp).expect("parse response");
+        assert_eq!(session.n3_addr, node_ip, "the UPF reported its chosen N3 address");
+        assert_ne!(session.n3_teid, 0, "the UPF allocated a non-zero N3 TEID");
     }
 
     #[test]
