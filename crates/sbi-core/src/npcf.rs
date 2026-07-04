@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::SbiError;
 use crate::nudr::UdrClient;
+use crate::policy::{FieldUpdate, de_field_update, ser_field_update};
 
 /// A GBR flow's rates (TS 29.571 BitRate strings).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,6 +124,66 @@ pub struct SmPolicyDecision {
     pub session_ambr: Option<SessionAmbrPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub qos_flows: Vec<QosFlowPolicy>,
+}
+
+/// A **partial** SM policy decision — the Npcf_SMPolicyControl Update response is a
+/// delta, not a full replacement (TS 29.512 §5.6.2.5): the session AMBR as a
+/// three-way [`FieldUpdate`], and the QoS flows keyed by QFI where a present flow is
+/// installed/modified and a `null` one removed (a QFI absent from the map is kept).
+/// Built by [`SmPolicyDecision::diff`], merged by [`SmPolicyDecision::apply`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SmPolicyUpdate {
+    #[serde(
+        default,
+        skip_serializing_if = "FieldUpdate::is_keep",
+        serialize_with = "ser_field_update",
+        deserialize_with = "de_field_update"
+    )]
+    pub session_ambr: FieldUpdate<SessionAmbrPolicy>,
+    /// QFI → `Some(flow)` to install/modify, `null` to remove; QFIs absent from the
+    /// map are kept unchanged.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub qos_flows: HashMap<u8, Option<QosFlowPolicy>>,
+}
+
+impl SmPolicyDecision {
+    /// The partial Update delta from `self` (the previous decision) to `next`: the
+    /// session AMBR as a `FieldUpdate`, plus per-QFI flow changes — a new or changed
+    /// flow as `Some`, a removed one as `None` (JSON `null`); unchanged flows omitted.
+    /// `None` when nothing changed.
+    pub fn diff(&self, next: &SmPolicyDecision) -> Option<SmPolicyUpdate> {
+        let session_ambr = FieldUpdate::diff(&self.session_ambr, &next.session_ambr);
+        let mut qos_flows = HashMap::new();
+        // New or changed flows → install (Some); unchanged QFIs omitted.
+        for nf in &next.qos_flows {
+            if self.qos_flows.iter().find(|of| of.qfi == nf.qfi) != Some(nf) {
+                qos_flows.insert(nf.qfi, Some(nf.clone()));
+            }
+        }
+        // Flows gone from `next` → remove (None / null).
+        for of in &self.qos_flows {
+            if !next.qos_flows.iter().any(|nf| nf.qfi == of.qfi) {
+                qos_flows.insert(of.qfi, None);
+            }
+        }
+        (!session_ambr.is_keep() || !qos_flows.is_empty())
+            .then_some(SmPolicyUpdate { session_ambr, qos_flows })
+    }
+
+    /// Merge a partial Update onto this decision: set/clear the session AMBR, and for
+    /// each QFI in the delta install/replace (`Some`) or remove (`None`) the flow;
+    /// flows the delta doesn't mention are kept. Flows stay QFI-ordered.
+    pub fn apply(&mut self, update: &SmPolicyUpdate) {
+        self.session_ambr = update.session_ambr.clone().apply(self.session_ambr.take());
+        for (qfi, change) in &update.qos_flows {
+            self.qos_flows.retain(|f| f.qfi != *qfi);
+            if let Some(flow) = change {
+                self.qos_flows.push(flow.clone());
+            }
+        }
+        self.qos_flows.sort_by_key(|f| f.qfi);
+    }
 }
 
 /// `SmPolicyUpdateContextData` (TS 29.512 §5.6.2.4), trimmed — the SMF's update
@@ -297,22 +358,27 @@ async fn update_sm_policy(
     State(pcf): State<PcfState>,
     Path(policy_id): Path<String>,
     Json(_upd): Json<SmPolicyUpdateContextData>,
-) -> Result<Json<SmPolicyDecision>, StatusCode> {
-    let ctx = match pcf.associations.lock().unwrap().get(&policy_id) {
-        Some((ctx, _)) => ctx.clone(),
+) -> Result<Json<SmPolicyUpdate>, StatusCode> {
+    let (ctx, prev) = match pcf.associations.lock().unwrap().get(&policy_id) {
+        Some((ctx, prev)) => (ctx.clone(), prev.clone()),
         None => return Err(StatusCode::NOT_FOUND),
     };
-    let decision = pcf.decide_for(&ctx).await;
+    let fresh = pcf.decide_for(&ctx).await;
+    // Notify a **partial** delta — only what changed since the last decision, a
+    // removed flow as JSON `null` (TS 29.512). The SMF merges it onto its stored
+    // policy rather than treating the response as a full replacement.
+    let delta = prev.diff(&fresh).unwrap_or_default();
     tracing::info!(
         %policy_id,
-        flows = decision.qos_flows.len(),
-        "updated SM policy association"
+        flows = fresh.qos_flows.len(),
+        flow_changes = delta.qos_flows.len(),
+        "updated SM policy association (partial)"
     );
-    // Store the fresh decision (skip if the association was deleted meanwhile).
+    // Store the fresh full decision (skip if the association was deleted meanwhile).
     if let Some(entry) = pcf.associations.lock().unwrap().get_mut(&policy_id) {
-        entry.1 = decision.clone();
+        entry.1 = fresh;
     }
-    Ok(Json(decision))
+    Ok(Json(delta))
 }
 
 /// `Npcf_SMPolicyControl_Delete`.
@@ -365,13 +431,14 @@ impl PcfClient {
         Ok(SmPolicyCreated { policy_id, decision })
     }
 
-    /// Update (re-authorize) an SM policy association; returns the fresh decision.
+    /// Update (re-authorize) an SM policy association; returns the **partial** delta
+    /// (only what changed) to merge onto the SMF's stored decision.
     pub async fn update_sm_policy(
         &self,
         policy_id: &str,
         upd: &SmPolicyUpdateContextData,
-    ) -> Result<SmPolicyDecision, SbiError> {
-        let decision = self
+    ) -> Result<SmPolicyUpdate, SbiError> {
+        let update = self
             .http
             .post(format!(
                 "{}/npcf-smpolicycontrol/v1/sm-policies/{}/update",
@@ -383,7 +450,7 @@ impl PcfClient {
             .error_for_status()?
             .json()
             .await?;
-        Ok(decision)
+        Ok(update)
     }
 
     /// Delete an SM policy association.
@@ -512,17 +579,74 @@ mod tests {
             }
         });
         udr.put_sm_policy_data("imsi-1", &v2).await.unwrap();
-        let updated = pcf
+        let update = pcf
             .update_sm_policy(&created.policy_id, &SmPolicyUpdateContextData::default())
             .await
             .unwrap();
-        let ambr = updated.session_ambr.as_ref().unwrap();
+        // A PARTIAL delta: the session AMBR changed (Set) and only QFI 2 was added;
+        // the unchanged QFI 1 is omitted (kept), not restated.
+        let FieldUpdate::Set(ambr) = &update.session_ambr else { panic!("AMBR changed → Set") };
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("50 Mbps", "100 Mbps"));
-        assert_eq!(updated.qos_flows.len(), 2, "the mid-session change added a GBR flow");
+        assert_eq!(update.qos_flows.len(), 1, "only the added GBR flow is in the delta");
+        assert!(update.qos_flows.get(&2).unwrap().is_some(), "QFI 2 installed");
+        assert!(!update.qos_flows.contains_key(&1), "unchanged QFI 1 omitted (kept)");
+
+        // Merging the delta onto the previous decision recovers the full v2 policy.
+        let mut merged = created.decision.clone();
+        merged.apply(&update);
+        assert_eq!(merged.qos_flows.len(), 2, "merge keeps QFI 1 and installs QFI 2");
+        assert_eq!(merged.session_ambr.as_ref().unwrap().downlink, "100 Mbps");
 
         // Updating an unknown association → error (404).
         assert!(
             pcf.update_sm_policy("nope", &SmPolicyUpdateContextData::default()).await.is_err()
         );
+    }
+
+    /// The partial SM Update delta (TS 29.512): `diff` emits only the attributes that
+    /// changed — a new/changed flow as a value, a removed flow as JSON `null`, an
+    /// unchanged flow omitted; `apply` merges the delta back, keeping omitted flows.
+    #[test]
+    fn sm_policy_partial_diff_and_apply() {
+        let flow = |qfi, five_qi| QosFlowPolicy {
+            qfi,
+            five_qi,
+            arp_priority: 8,
+            pre_empt_cap: false,
+            pre_empt_vuln: false,
+            gbr: None,
+            filter: None,
+        };
+        let prev = SmPolicyDecision {
+            session_ambr: Some(SessionAmbrPolicy { uplink: "1 Gbps".into(), downlink: "2 Gbps".into() }),
+            qos_flows: vec![flow(1, 9), flow(2, 1)],
+        };
+        // Next: AMBR unchanged, QFI 1 re-rated (5QI 9→6), QFI 2 removed, QFI 3 added.
+        let next = SmPolicyDecision {
+            session_ambr: prev.session_ambr.clone(),
+            qos_flows: vec![flow(1, 6), flow(3, 5)],
+        };
+        let delta = prev.diff(&next).expect("something changed");
+        assert_eq!(delta.session_ambr, FieldUpdate::Keep, "AMBR unchanged → omitted");
+        assert_eq!(delta.qos_flows.len(), 3, "QFI 1 (changed), 2 (removed), 3 (added)");
+        assert_eq!(delta.qos_flows.get(&1).unwrap().as_ref().unwrap().five_qi, 6, "QFI 1 re-rated");
+        assert_eq!(*delta.qos_flows.get(&2).unwrap(), None, "QFI 2 removed → null");
+        assert!(delta.qos_flows.get(&3).unwrap().is_some(), "QFI 3 added");
+
+        // On the wire the removal is a JSON null; the unchanged AMBR is absent.
+        let wire = serde_json::to_value(&delta).unwrap();
+        assert!(wire.get("sessionAmbr").is_none(), "unchanged AMBR omitted");
+        assert!(wire.pointer("/qosFlows/2").unwrap().is_null(), "removed flow is null");
+
+        // apply merges the delta onto prev → exactly next (QFI-ordered).
+        let mut merged = prev.clone();
+        merged.apply(&delta);
+        assert_eq!(merged, next, "merge reconstructs the next decision");
+
+        // A no-op update (prev vs prev) → no delta.
+        assert_eq!(prev.diff(&prev.clone()), None);
+        // Clearing the AMBR is a Clear, not a Keep.
+        let cleared = SmPolicyDecision { session_ambr: None, qos_flows: prev.qos_flows.clone() };
+        assert_eq!(prev.diff(&cleared).unwrap().session_ambr, FieldUpdate::Clear);
     }
 }
