@@ -132,6 +132,9 @@ enum UeCmd {
     Start(u64),
     /// T3522 fired for this UE — retransmit or abort.
     T3522Expiry(u64),
+    /// T3555 fired for this UE — retransmit the Configuration Update Command (it
+    /// requested acknowledgement) or give up.
+    T3555Expiry(u64),
     /// Push a mid-session PDU-session QoS change to the RAN/UE (from the SMF).
     ModifyPolicy(Box<ModifyPolicy>),
     /// Network-initiated release of one or more PDU sessions for this UE (from the
@@ -437,6 +440,25 @@ fn arm_t3522(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64, secs: u64) {
     });
 }
 
+/// T3555 (TS 24.501 §10.2) — the Configuration Update Command retransmission timer:
+/// started when the AMF sends a command that **requested acknowledgement**, and
+/// retransmitted on each expiry up to [`T3555_MAX_SENDS`] total transmissions before
+/// the network abandons the procedure (§5.4.4.3). Override with `RADIAN_AMF_T3555_SECS`.
+const T3555_SECS: u64 = 6;
+const T3555_ENV: &str = "RADIAN_AMF_T3555_SECS";
+const T3555_MAX_SENDS: u8 = 5; // initial + 4 retransmissions
+
+/// Arm T3555: after the configured interval, post an expiry for this UE onto its
+/// association (the retransmission is driven from the association task).
+fn arm_t3555(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64) {
+    let secs = std::env::var(T3555_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(T3555_SECS);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        let _ = tx.send(UeCmd::T3555Expiry(amf_ue_id));
+    });
+}
+
 /// The release guard: how long the AMF waits for the UE's PDU Session Release
 /// Complete before finalising the release itself. Override with
 /// `RADIAN_AMF_RELEASE_GUARD_SECS`.
@@ -568,6 +590,21 @@ struct UeContext {
     /// Complete before finalising at the SMF (TS 23.502 §4.3.4). A guard timer
     /// finalises anyway if the complete never arrives. Empty = none releasing.
     releasing: std::collections::HashSet<u8>,
+    /// An outstanding **Configuration Update Command** that requested acknowledgement:
+    /// the plaintext command (re-protected on each retransmit) + how many times it has
+    /// been sent. Set when the command goes out, cleared by the UE's Configuration
+    /// Update Complete; T3555 retransmits while it's `Some`. `None` = none awaiting ack.
+    pending_config_update: Option<PendingConfigUpdate>,
+}
+
+/// A Configuration Update Command awaiting the UE's acknowledgement (see
+/// `UeContext::pending_config_update`).
+#[derive(Debug, Clone)]
+struct PendingConfigUpdate {
+    /// The plaintext command, re-protected (fresh NAS COUNT) on each retransmission.
+    cuc: Nas5gsMessage,
+    /// Transmissions so far (1 = the initial send); capped at [`T3555_MAX_SENDS`].
+    attempts: u8,
 }
 
 /// An AM policy change awaiting a CM-IDLE UE's return (see
@@ -686,6 +723,7 @@ async fn serve_gnb(
                         on_network_deregistration(&mut ues, &amf_smf, id, &dereg_tx, T3522_SECS).await
                     }
                     UeCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, T3522_SECS),
+                    UeCmd::T3555Expiry(id) => on_t3555_expiry(&mut ues, id, &dereg_tx),
                     UeCmd::ModifyPolicy(m) => on_network_modification(&mut ues, &m),
                     UeCmd::ReleaseSession { amf_ue_id, psis, cause } => {
                         on_network_release(&mut ues, amf_ue_id, &psis, cause, &dereg_tx)
@@ -1237,11 +1275,14 @@ fn on_sdm_data_change(
         }
         // Any subscription change → tell the UE its configuration changed (Generic UE
         // Configuration Update). When the allowed NSSAI changed the command **carries**
-        // the new set (TS 24.501 §9.11.3.37); otherwise it is a plain nudge. A UE with
-        // no security context can't be NAS-signalled — skip it (the RAN update lands).
+        // the new set (TS 24.501 §9.11.3.37) and **requests acknowledgement** — the UE
+        // must reply with a Configuration Update Complete, and T3555 retransmits until
+        // it does. A plain AMBR nudge needs no ack. A UE with no security context can't
+        // be NAS-signalled — skip it (the RAN update still lands).
+        let mut track_cuc = None;
         if let Some(sec) = ctx.sec.as_mut() {
             let cuc_msg = if nssai_changed {
-                nas::configuration_update_command_with_nssai(&allowed, narrowed)
+                nas::configuration_update_command_with_nssai(&allowed, narrowed, true)
             } else {
                 nas::configuration_update_command()
             };
@@ -1250,6 +1291,14 @@ fn on_sdm_data_change(
                 ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
                 "DownlinkNASTransport (ConfigurationUpdateCommand)",
             ));
+            // The NSSAI command awaits acknowledgement → track it for retransmission.
+            if nssai_changed {
+                track_cuc = Some(cuc_msg);
+            }
+        }
+        if let Some(cuc_msg) = track_cuc {
+            ctx.pending_config_update = Some(PendingConfigUpdate { cuc: cuc_msg, attempts: 1 });
+            arm_t3555(tx, amf_ue_id);
         }
         (dl, to_release)
     };
@@ -1412,6 +1461,51 @@ fn on_t3522_expiry(
         ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::DEREGISTER),
         "UEContextReleaseCommand",
     )]
+}
+
+/// T3555 fired: retransmit the outstanding Configuration Update Command (re-protected
+/// with a fresh NAS COUNT) while transmissions remain; after [`T3555_MAX_SENDS`] the
+/// network abandons the procedure (§5.4.4.3) and drops the pending state. A stale
+/// expiry (the UE already acknowledged, so `pending_config_update` is cleared) is a
+/// no-op.
+fn on_t3555_expiry(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_ue_id: u64,
+    tx: &UnboundedSender<UeCmd>,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        return Vec::new(); // context gone
+    };
+    let Some(attempts) = ctx.pending_config_update.as_ref().map(|p| p.attempts) else {
+        return Vec::new(); // acknowledged already, or none outstanding
+    };
+    let ran_ue_id = ctx.ran_ue_id;
+
+    if attempts < T3555_MAX_SENDS {
+        let cuc_msg = ctx.pending_config_update.as_ref().unwrap().cuc.clone();
+        let Some(sec) = ctx.sec.as_mut() else {
+            return Vec::new();
+        };
+        let bytes = sec.protect(&cuc_msg, nas::sht::INTEGRITY_CIPHERED, 1);
+        ctx.pending_config_update = Some(PendingConfigUpdate { cuc: cuc_msg, attempts: attempts + 1 });
+        arm_t3555(tx, amf_ue_id);
+        warn!(
+            "UE {amf_ue_id}: T3555 expired — retransmitting Configuration Update Command \
+             (attempt {}/{T3555_MAX_SENDS})",
+            attempts + 1
+        );
+        return vec![(
+            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
+            "DownlinkNASTransport (ConfigurationUpdateCommand)",
+        )];
+    }
+
+    warn!(
+        "UE {amf_ue_id}: T3555 exhausted after {T3555_MAX_SENDS} transmissions — \
+         abandoning the Configuration Update (no acknowledgement from the UE)"
+    );
+    ctx.pending_config_update = None;
+    Vec::new()
 }
 
 /// Decode one NGAP PDU and dispatch it.
@@ -2768,6 +2862,7 @@ impl UeContext {
             am_policy: None,
             pending_am_policy: None,
             releasing: std::collections::HashSet::new(),
+            pending_config_update: None,
         }
     }
 
@@ -3008,10 +3103,17 @@ async fn dispatch_uplink_nas(
             ))
         }
         Some(Nas5gmmMessageType::ConfigurationUpdateComplete) => {
-            // The UE acknowledged a Configuration Update Command (TS 24.501 §8.2.20);
-            // no further action (a re-registration it was asked for arrives as its own
-            // Registration Request).
-            info!("UE {amf_ue_id}: Configuration Update Complete");
+            // The UE acknowledged a Configuration Update Command (TS 24.501 §8.2.20):
+            // clear the outstanding command so T3555 stops retransmitting (a pending
+            // expiry then no-ops). A re-registration it was asked for arrives as its
+            // own Registration Request.
+            let stopped =
+                ues.get_mut(&amf_ue_id).is_some_and(|c| c.pending_config_update.take().is_some());
+            if stopped {
+                info!("UE {amf_ue_id}: Configuration Update Complete — T3555 stopped");
+            } else {
+                info!("UE {amf_ue_id}: Configuration Update Complete");
+            }
             None
         }
         Some(Nas5gmmMessageType::UlNasTransport) => {
@@ -5898,8 +6000,8 @@ mod tests {
     /// it: a UE-AMBR change updates the RAN (UE Context Modification) and nudges the
     /// UE (Configuration Update Command); an NSSAI-only change nudges the UE; a no-op
     /// change / unknown UE signals nothing.
-    #[test]
-    fn sdm_data_change_pushes_to_ran_and_ue() {
+    #[tokio::test]
+    async fn sdm_data_change_pushes_to_ran_and_ue() {
         let (ki, ke) = ([0x71u8; 16], [0x72u8; 16]);
         let amf_ue_id = 0x51u64;
         let mut ctx = UeContext::new(2, RegState::Registered, Some("imsi-999700000000051".into()));
@@ -5943,6 +6045,14 @@ mod tests {
             vec![(1, None), (2, None)]
         );
         assert!(nas::configuration_update_registration_requested(&msg), "narrowing → re-register");
+        // An NSSAI-carrying command requests acknowledgement and is tracked for
+        // retransmission under T3555 until the UE's Configuration Update Complete.
+        assert!(nas::configuration_update_acknowledgement_requested(&msg), "ack requested");
+        assert!(
+            ues[&amf_ue_id].pending_config_update.is_some(),
+            "the outstanding command is tracked (T3555 armed)"
+        );
+        assert_eq!(ues[&amf_ue_id].pending_config_update.as_ref().unwrap().attempts, 1);
 
         // A widening (slice 3 added, none removed) carries the new NSSAI but does NOT
         // request re-registration.
@@ -6007,7 +6117,8 @@ mod tests {
     }
 
     /// The UE's Configuration Update Complete is recognised (acknowledged, no
-    /// downlink) rather than falling through as an unhandled uplink NAS message.
+    /// downlink) rather than falling through as an unhandled uplink NAS message — and
+    /// it clears the outstanding command so T3555 stops retransmitting.
     #[tokio::test]
     async fn config_update_complete_is_recognised() {
         let amf_auth = auth::AmfAuth::new("http://127.0.0.1:1", "999", "70");
@@ -6015,6 +6126,11 @@ mod tests {
         let amf_ue_id = 0x91u64;
         let mut ctx = UeContext::new(5, RegState::Registered, Some("imsi-999700000000091".into()));
         ctx.sec = Some(nas::NasSecurityContext::new([0x1u8; 16], [0x2u8; 16], NAS_NIA, NAS_NEA));
+        // An outstanding acknowledgement-requested command is awaiting the ack.
+        ctx.pending_config_update = Some(PendingConfigUpdate {
+            cuc: nas::configuration_update_command_with_nssai(&[(1, None)], false, true),
+            attempts: 2,
+        });
         let mut ues = HashMap::new();
         ues.insert(amf_ue_id, ctx);
         let (tx, _rx) = unbounded_channel::<UeCmd>();
@@ -6029,6 +6145,52 @@ mod tests {
         )
         .await;
         assert!(out.is_none(), "acknowledged with no downlink");
+        assert!(
+            ues[&amf_ue_id].pending_config_update.is_none(),
+            "the Complete cleared the outstanding command (T3555 stopped)"
+        );
+    }
+
+    /// T3555: an acknowledgement-requested Configuration Update Command is
+    /// retransmitted on each expiry (re-protected with a fresh NAS COUNT) up to
+    /// T3555_MAX_SENDS, then abandoned; a Complete before then stops it.
+    #[tokio::test]
+    async fn config_update_retransmits_then_gives_up() {
+        let (ki, ke) = ([0x63u8; 16], [0x64u8; 16]);
+        let amf_ue_id = 0x77u64;
+        let mut ctx = UeContext::new(3, RegState::Registered, Some("imsi-999700000000077".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.pending_config_update = Some(PendingConfigUpdate {
+            cuc: nas::configuration_update_command_with_nssai(&[(1, None), (2, None)], true, true),
+            attempts: 1, // the initial send already went out
+        });
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+
+        // Each expiry up to the cap retransmits the command; the UE decodes it and sees
+        // the same allowed NSSAI + the re-registration/ack request.
+        for attempt in 2..=T3555_MAX_SENDS {
+            let dls = on_t3555_expiry(&mut ues, amf_ue_id, &tx);
+            assert_eq!(dls.len(), 1, "retransmitted (attempt {attempt})");
+            assert_eq!(dls[0].1, "DownlinkNASTransport (ConfigurationUpdateCommand)");
+            let cuc = downlink_nas_pdu(&dls[0].0).expect("N1 in the DL NAS transport");
+            let msg = ue_sec.unprotect(&cuc, 1).expect("UE verifies the retransmission");
+            assert_eq!(
+                nas::allowed_nssai_from_configuration_update_command(&msg),
+                vec![(1, None), (2, None)]
+            );
+            assert!(nas::configuration_update_acknowledgement_requested(&msg));
+            assert_eq!(ues[&amf_ue_id].pending_config_update.as_ref().unwrap().attempts, attempt);
+        }
+        // The cap is reached → the next expiry abandons the procedure (no downlink,
+        // pending cleared) so it stops retransmitting forever.
+        let dls = on_t3555_expiry(&mut ues, amf_ue_id, &tx);
+        assert!(dls.is_empty(), "exhausted → no more retransmissions");
+        assert!(ues[&amf_ue_id].pending_config_update.is_none(), "pending cleared on give-up");
+        // A stale expiry after clearing is a harmless no-op.
+        assert!(on_t3555_expiry(&mut ues, amf_ue_id, &tx).is_empty());
     }
 
     /// A subscribed UE-AMBR change (Nudm_SDM) while a PCF AM-policy override is in
