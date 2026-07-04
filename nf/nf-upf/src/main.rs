@@ -316,7 +316,7 @@ mod tests {
         .expect("session established");
         if let Some((teid, ip)) = gnb {
             pfcp::handle_n4(
-                &pfcp::session_modification_request(1, 2, 2, teid, ip, "internet"),
+                &pfcp::session_modification_request(1, 2, 2, teid, ip, "internet", false),
                 node_ip,
                 &mut state,
                 0,

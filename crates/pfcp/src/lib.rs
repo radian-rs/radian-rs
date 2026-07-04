@@ -42,6 +42,7 @@ use rs_pfcp::ie::volume_measurement::VolumeMeasurement;
 use rs_pfcp::ie::volume_threshold::VolumeThreshold;
 use rs_pfcp::ie::mbr::Mbr;
 use rs_pfcp::ie::network_instance::NetworkInstance;
+use rs_pfcp::ie::pfcpsm_req_flags::PfcpsmReqFlags;
 use rs_pfcp::ie::outer_header_creation::OuterHeaderCreation;
 use rs_pfcp::ie::qer_id::QerId;
 use rs_pfcp::ie::remove_pdr::RemovePdr;
@@ -988,6 +989,7 @@ pub fn session_modification_request(
     gnb_teid: u32,
     gnb_ip: Ipv4Addr,
     dnn: &str,
+    send_end_marker: bool,
 ) -> Vec<u8> {
     // Re-point the downlink FAR at the gNB tunnel. Re-send the destination interface
     // (Access) and the session's Network Instance (DNN) alongside the Outer Header
@@ -1003,10 +1005,19 @@ pub fn session_modification_request(
         .build()
         .expect("build Update FAR");
 
-    SessionModificationRequestBuilder::new(up_seid, seq)
-        .update_fars(vec![update_far.to_ie()])
-        .build()
-        .marshal()
+    let mut builder =
+        SessionModificationRequestBuilder::new(up_seid, seq).update_fars(vec![update_far.to_ie()]);
+    // On a handover / path switch (the downlink is re-pointed from an existing gNB
+    // tunnel to a new one), request a GTP-U **End Marker** via PFCPSMReq-Flags SNDEM
+    // (TS 29.244 §8.2.79): the UPF marks the end of the old path before switching, so
+    // the target gNB delivers downlink in order across the move.
+    if send_end_marker {
+        builder = builder.pfcpsm_req_flags(Ie::new(
+            IeType::PfcpsmReqFlags,
+            PfcpsmReqFlags::SNDEM.marshal().to_vec(),
+        ));
+    }
+    builder.build().marshal()
 }
 
 /// SMF: build a PFCP Session Deletion Request (TS 29.244 §7.5.6) — addressed by
@@ -1424,7 +1435,7 @@ mod tests {
         // SMF installs the gNB's downlink F-TEID via Session Modification.
         let gnb_ip = Ipv4Addr::new(10, 0, 0, 9);
         let resp = handle_n4(
-            &session_modification_request(up_seid, 2, 1, 0x5678, gnb_ip, "internet"),
+            &session_modification_request(up_seid, 2, 1, 0x5678, gnb_ip, "internet", false),
             node_ip,
             &mut state,
             0,
@@ -1455,7 +1466,7 @@ mod tests {
         // The session and its uplink TEID survive — a Service Request can re-activate.
         assert_eq!(state.session_count(), 1, "session retained across deactivation");
         let resp = handle_n4(
-            &session_modification_request(up_seid, 4, 1, 0x9ABC, gnb_ip, "internet"),
+            &session_modification_request(up_seid, 4, 1, 0x9ABC, gnb_ip, "internet", false),
             node_ip,
             &mut state,
             0,
@@ -1493,7 +1504,7 @@ mod tests {
         // The downlink re-point (Session Modification) re-sends the Network Instance
         // and destination interface alongside the gNB Outer Header Creation.
         let gnb_ip = Ipv4Addr::new(10, 0, 9, 1);
-        let modr = session_modification_request(1, 2, 2, 0x5678, gnb_ip, "internet");
+        let modr = session_modification_request(1, 2, 2, 0x5678, gnb_ip, "internet", false);
         let msg = rs_pfcp::message::parse(&modr).expect("parse modification");
         let ufp = msg
             .ies(IeType::UpdateFar)
@@ -1535,6 +1546,29 @@ mod tests {
         let session = parse_session_establishment_response(&resp).expect("parse response");
         assert_eq!(session.n3_addr, node_ip, "the UPF reported its chosen N3 address");
         assert_ne!(session.n3_teid, 0, "the UPF allocated a non-zero N3 TEID");
+    }
+
+    #[test]
+    fn end_marker_requested_only_on_a_repoint() {
+        let gnb_ip = Ipv4Addr::new(10, 0, 9, 1);
+
+        // A plain downlink install (first activation / Service-Request resume) carries
+        // no PFCPSMReq-Flags — no End Marker.
+        let plain = session_modification_request(1, 2, 2, 0x5678, gnb_ip, "internet", false);
+        let msg = rs_pfcp::message::parse(&plain).expect("parse plain modification");
+        assert!(
+            msg.ies(IeType::PfcpsmReqFlags).next().is_none(),
+            "no End Marker requested on a plain downlink install"
+        );
+
+        // A handover / path-switch re-point requests a GTP-U End Marker via
+        // PFCPSMReq-Flags SNDEM.
+        let repoint = session_modification_request(1, 3, 2, 0x9ABC, gnb_ip, "internet", true);
+        let msg = rs_pfcp::message::parse(&repoint).expect("parse re-point modification");
+        let flags_ie =
+            msg.ies(IeType::PfcpsmReqFlags).next().expect("PFCPSMReq-Flags IE present on a re-point");
+        let flags = PfcpsmReqFlags::unmarshal(&flags_ie.payload).expect("parse PFCPSMReq-Flags");
+        assert!(flags.contains(PfcpsmReqFlags::SNDEM), "SNDEM (Send End Marker) is set");
     }
 
     #[test]
@@ -1746,7 +1780,7 @@ mod tests {
             .expect("establish");
         let up_seid = 1u64;
         let gnb = Ipv4Addr::new(10, 0, 0, 9);
-        handle_n4(&session_modification_request(up_seid, 2, 1, 0x5678, gnb, "internet"), node_ip, &mut state, 0)
+        handle_n4(&session_modification_request(up_seid, 2, 1, 0x5678, gnb, "internet", false), node_ip, &mut state, 0)
             .expect("activate downlink");
 
         // AN release → the session buffers downlink (not drops).
@@ -1765,7 +1799,7 @@ mod tests {
 
         // Service Request resume: re-installing the downlink flushes the buffer to
         // the new gNB tunnel.
-        handle_n4(&session_modification_request(up_seid, 4, 1, 0x9ABC, gnb, "internet"), node_ip, &mut state, 0)
+        handle_n4(&session_modification_request(up_seid, 4, 1, 0x9ABC, gnb, "internet", false), node_ip, &mut state, 0)
             .expect("re-activate");
         assert!(!state.is_buffering(UE_IP), "no longer buffering after resume");
         let flushed = state.take_flush();

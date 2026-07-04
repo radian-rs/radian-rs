@@ -97,7 +97,7 @@ pub async fn establish_session(
         .context("parse session establishment response")?;
 
     let mod_resp =
-        transact(&sock, &pfcp::session_modification_request(est.up_seid, 3, 2, gnb_teid, gnb_ip, "internet")).await?;
+        transact(&sock, &pfcp::session_modification_request(est.up_seid, 3, 2, gnb_teid, gnb_ip, "internet", false)).await?;
     anyhow::ensure!(pfcp::response_accepted(&mod_resp), "UPF rejected session modification");
 
     Ok(est.n3_teid)

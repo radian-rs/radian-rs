@@ -823,16 +823,25 @@ async fn update_sm_context(
     if !valid_gnb_target(gnb_teid, gnb_addr) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let (up_seid, dnn) = {
+    let (up_seid, dnn, old_gnb) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
-            Some(c) => (c.up_seid, c.dnn.clone()),
+            Some(c) => (c.up_seid, c.dnn.clone(), c.gnb),
             None => return StatusCode::NOT_FOUND.into_response(),
         }
     };
+    // A handover / path switch (the downlink is re-pointed from an existing gNB
+    // tunnel to a *different* one) asks the UPF for a GTP-U End Marker on the old
+    // path. A first activation or a Service-Request re-activation (no prior gNB, or
+    // the same one) does not.
+    let send_end_marker = old_gnb.is_some_and(|g| g != (gnb_teid, gnb_addr));
 
     let seq = smf.next_seq();
-    let mod_req = pfcp::session_modification_request(up_seid, seq, FAR_ID, gnb_teid, gnb_addr, &dnn);
+    let mod_req =
+        pfcp::session_modification_request(up_seid, seq, FAR_ID, gnb_teid, gnb_addr, &dnn, send_end_marker);
+    if send_end_marker {
+        tracing::info!(%sm_ref, "downlink re-point across a handover — requesting a GTP-U End Marker");
+    }
     let resp = match smf.transact(&mod_req, seq).await {
         Some(r) => r,
         None => return StatusCode::BAD_GATEWAY.into_response(),
@@ -1726,6 +1735,23 @@ mod tests {
             upf_state.lock().unwrap().route_downlink(Ipv4Addr::new(10, 45, 0, 2)),
             Some((0x5678, Ipv4Addr::new(10, 0, 0, 9))),
             "UPF routes an N6 downlink packet to the gNB by the UE's assigned IP"
+        );
+
+        // AMF → SMF: a second UpdateSMContext re-pointing to a DIFFERENT gNB — a
+        // handover / path switch. The modification carries a GTP-U End Marker request
+        // (PFCPSMReq-Flags SNDEM); the UPF tolerates it and re-points the downlink.
+        let status = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
+            .json(&serde_json::json!({"gnbN3Teid":"00009abc","gnbN3Addr":"10.0.0.10"}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_success(), "re-point UpdateSMContext succeeded");
+        assert_eq!(
+            upf_state.lock().unwrap().downlink_for(1),
+            Some((0x9abc, Ipv4Addr::new(10, 0, 0, 10))),
+            "the downlink followed the handover to the new gNB tunnel"
         );
 
         // AMF → SMF: ReleaseSMContext (deregistration) — the N4 session goes too.
