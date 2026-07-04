@@ -2190,9 +2190,129 @@ pub fn modify_response_result(pdu: &NGAP_PDU) -> Option<(u64, u32, Vec<u8>)> {
     Some((amf_ue_id?, ran_ue_id?, modified))
 }
 
+/// Build a `PDUSessionResourceReleaseCommand` (TS 38.413 §9.2.1.6) — the AMF asks
+/// the NG-RAN to release `psi`'s resources. The N1 **PDU Session Release Command**
+/// rides as the NAS-PDU (the gNB relays it to the UE); the per-session transfer
+/// carries a NAS *normal-release* cause. Network-initiated PDU session release
+/// (TS 23.502 §4.3.4).
+pub fn pdu_session_resource_release_command(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    psi: u8,
+    nas: Vec<u8>,
+) -> NGAP_PDU {
+    let transfer = encode_aper(&PDUSessionResourceReleaseCommandTransfer {
+        cause: Cause::Nas(CauseNas(CauseNas::NORMAL_RELEASE)),
+        ie_extensions: None,
+    });
+    build_ngap!(InitiatingMessage, PDUSessionResourceRelease,
+        REJECT, PDUSessionResourceReleaseCommand,
+        REJECT AMF_UE_NGAP_ID(amf_ue_id),
+        REJECT RAN_UE_NGAP_ID(ran_ue_id),
+        IGNORE NAS_PDU(NAS_PDU(nas)),
+        REJECT PDUSessionResourceToReleaseListRelCmd(PDUSessionResourceToReleaseListRelCmd(vec![
+            PDUSessionResourceToReleaseItemRelCmd {
+                pdu_session_id: PDUSessionID(psi),
+                pdu_session_resource_release_command_transfer:
+                    PDUSessionResourceToReleaseItemRelCmdPDUSessionResourceReleaseCommandTransfer(transfer),
+                ie_extensions: None,
+            },
+        ])),
+    )
+}
+
+/// Extract `(pdu_session_id, N1 NAS-PDU)` from a `PDUSessionResourceReleaseCommand` —
+/// the N1 SM container (PDU Session Release Command) the gNB relays to the UE, and
+/// the released session id. The gNB side / tests.
+pub fn nas_pdu_from_release_command(pdu: &NGAP_PDU) -> Option<(u8, Vec<u8>)> {
+    let NGAP_PDU::InitiatingMessage(im) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_PDUSessionResourceRelease(cmd) = &im.value else {
+        return None;
+    };
+    let mut nas = None;
+    let mut psi = None;
+    for e in &cmd.protocol_i_es.0 {
+        match &e.value {
+            PDUSessionResourceReleaseCommandProtocolIEs_EntryValue::Id_NAS_PDU(n) => {
+                nas = Some(n.0.clone())
+            }
+            PDUSessionResourceReleaseCommandProtocolIEs_EntryValue::Id_PDUSessionResourceToReleaseListRelCmd(l) => {
+                psi = l.0.first().map(|it| it.pdu_session_id.0)
+            }
+            _ => {}
+        }
+    }
+    Some((psi?, nas?))
+}
+
+/// Build a `PDUSessionResourceReleaseResponse` (gNB→AMF) confirming `psi`'s
+/// resources were released — for tests and a gNB simulator.
+pub fn pdu_session_resource_release_response(amf_ue_id: u64, ran_ue_id: u32, psi: u8) -> NGAP_PDU {
+    let transfer = encode_aper(&PDUSessionResourceReleaseResponseTransfer { ie_extensions: None });
+    build_ngap!(SuccessfulOutcome, PDUSessionResourceRelease,
+        REJECT, PDUSessionResourceReleaseResponse,
+        REJECT AMF_UE_NGAP_ID(amf_ue_id),
+        REJECT RAN_UE_NGAP_ID(ran_ue_id),
+        IGNORE PDUSessionResourceReleasedListRelRes(PDUSessionResourceReleasedListRelRes(vec![
+            PDUSessionResourceReleasedItemRelRes {
+                pdu_session_id: PDUSessionID(psi),
+                pdu_session_resource_release_response_transfer:
+                    PDUSessionResourceReleasedItemRelResPDUSessionResourceReleaseResponseTransfer(transfer),
+                ie_extensions: None,
+            },
+        ])),
+    )
+}
+
+/// The `(amf_ue_id, ran_ue_id, [released pdu_session_id])` reported by a decoded
+/// `PDUSessionResourceReleaseResponse` — the AMF's confirmation the gNB released
+/// the resources.
+pub fn release_response_result(pdu: &NGAP_PDU) -> Option<(u64, u32, Vec<u8>)> {
+    let NGAP_PDU::SuccessfulOutcome(so) = pdu else {
+        return None;
+    };
+    let SuccessfulOutcomeValue::Id_PDUSessionResourceRelease(resp) = &so.value else {
+        return None;
+    };
+    let mut amf_ue_id = None;
+    let mut ran_ue_id = None;
+    let mut released = Vec::new();
+    for e in &resp.protocol_i_es.0 {
+        match &e.value {
+            PDUSessionResourceReleaseResponseProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            PDUSessionResourceReleaseResponseProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => {
+                ran_ue_id = Some(v.0)
+            }
+            PDUSessionResourceReleaseResponseProtocolIEs_EntryValue::Id_PDUSessionResourceReleasedListRelRes(l) => {
+                released = l.0.iter().map(|it| it.pdu_session_id.0).collect()
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, released))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdu_session_resource_release_roundtrips() {
+        // The command carries the N1 release command + the released psi; the gNB
+        // parses both, and its response reports the released session back.
+        let n1 = vec![0x2e, 5, 0, 0xd3, 36];
+        let cmd = pdu_session_resource_release_command(7, 3, 5, n1.clone());
+        let back = NGAP_PDU::decode(&cmd.encode().expect("encode")).expect("decode");
+        assert_eq!(nas_pdu_from_release_command(&back), Some((5, n1)));
+
+        let resp = pdu_session_resource_release_response(7, 3, 5);
+        let back = NGAP_PDU::decode(&resp.encode().expect("encode")).expect("decode");
+        assert_eq!(release_response_result(&back), Some((7, 3, vec![5])));
+    }
 
     #[test]
     fn pdu_session_resource_setup_request_roundtrips() {
