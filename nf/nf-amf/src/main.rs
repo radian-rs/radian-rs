@@ -386,6 +386,12 @@ struct UeContext {
     /// K_AMF, retained alongside `sec` to derive **K_gNB** (TS 33.501 Annex A.9)
     /// for the Initial Context Setup's Security Key IE.
     kamf: Option<[u8; 32]>,
+    /// The **NH chain** state (TS 33.501 §6.9.2.3.3): `(sync_input, NCC)` — the
+    /// sync input is the initial K_gNB before the first hop and the latest NH
+    /// after. Each Xn path switch derives a fresh NH from it, increments the NCC
+    /// (mod 8), and hands the pair to the target gNB. Seeded whenever an Initial
+    /// Context Setup delivers a K_gNB.
+    nh_chain: Option<([u8; 32], u8)>,
     /// The UE's advertised 5GS security capabilities `[EA, IA]`, replayed verbatim in the
     /// Security Mode Command (TS 24.501 §8.2.25) so the UE can detect a bidding-down attack.
     replayed_ue_sec_cap: Option<[u8; 2]>,
@@ -1050,6 +1056,11 @@ async fn handle_ngap(
                     send_or_log(conn, &dl, "UEContextReleaseCommand").await;
                 }
             }
+            InitiatingMessageValue::Id_PathSwitchRequest(_) => {
+                if let Some((ack, label)) = on_path_switch(ues, amf_smf, &pdu).await {
+                    send_or_log(conn, &ack, label).await;
+                }
+            }
             _ => info!("unhandled initiating message: {}", pdu.procedure_name()),
         },
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
@@ -1292,6 +1303,11 @@ async fn on_service_request(
         };
         (bytes, kgnb, ics_label, dl_label)
     });
+    // Re-seed the NH chain from the freshly delivered K_gNB (NCC back to 0 — an
+    // idle-resume derives a new initial AS key, TS 33.501 §6.9.2.3.3).
+    if let Some((_, Some(k), _, _)) = &accept {
+        ctx.nh_chain = Some((*k, 0));
+    }
     ues.insert(amf_ue_id, ctx);
     if let Some(supi) = &supi {
         UE_DIRECTORY.lock().unwrap().insert(supi.clone(), (amf_ue_id, dereg_tx.clone()));
@@ -1377,6 +1393,66 @@ async fn on_service_request(
         downlinks.extend(on_am_policy_update(ues, amf_ue_id, p.ue_ambr, p.rfsp, p.area_restriction));
     }
     downlinks
+}
+
+/// Handle an **Xn handover path switch** (TS 38.413 §8.4.4): the target gNB took
+/// the UE over the Xn interface and asks the AMF to switch the downlink path. The
+/// AMF re-points each switched PDU session's UPF downlink to the target's new DL
+/// F-TEID (UpdateSMContext → N4 modify), refreshes the UE's location, rotates the
+/// **NH chain** (TS 33.501 §6.9.2.3.3: NH = KDF(K_AMF, sync), NCC+1 mod 8), and
+/// answers with a `PathSwitchRequestAcknowledge` carrying the fresh `{NCC, NH}`
+/// for the target's vertical key derivation.
+async fn on_path_switch(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    pdu: &NGAP_PDU,
+) -> Option<(NGAP_PDU, &'static str)> {
+    let Some((amf_ue_id, new_ran_ue_id, tac, sessions)) = ngap::path_switch_params(pdu) else {
+        warn!("PathSwitchRequest missing mandatory IEs — ignored");
+        return None;
+    };
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        warn!("PathSwitchRequest for unknown UE {amf_ue_id} — ignored");
+        return None;
+    };
+    // The NH chain needs K_AMF and a seeded sync input (the ICS-delivered K_gNB).
+    let (Some(kamf), Some((sync, ncc))) = (ctx.kamf, ctx.nh_chain) else {
+        warn!("UE {amf_ue_id}: path switch without a seeded NH chain — ignored");
+        return None;
+    };
+    ctx.ran_ue_id = new_ran_ue_id;
+    ctx.tac = tac.or(ctx.tac);
+    // Vertical key derivation: a fresh NH, NCC incremented (3-bit counter).
+    let fresh_nh = aka::nh(&kamf, &sync);
+    let fresh_ncc = (ncc + 1) % 8;
+    ctx.nh_chain = Some((fresh_nh, fresh_ncc));
+    info!(
+        "UE {amf_ue_id}: Xn path switch to RAN-UE {new_ran_ue_id} (TAC {tac:02x?}) — NH chain \
+         rotated to NCC {fresh_ncc}, {} session(s) to switch",
+        sessions.len()
+    );
+
+    // Re-point each switched session's UPF downlink to the target gNB.
+    let mut switched = Vec::new();
+    for (psi, gnb_teid, gnb_addr) in &sessions {
+        let Some((sm_ref, smf_base)) = ues.get(&amf_ue_id).and_then(|c| c.sm_refs.get(psi).cloned())
+        else {
+            warn!("UE {amf_ue_id}: path switch for PDU session {psi} but no SM context tracked");
+            continue;
+        };
+        match amf_smf.update_sm_context(&smf_base, &sm_ref, *gnb_teid, *gnb_addr).await {
+            Ok(()) => {
+                info!("UE {amf_ue_id}: PDU session {psi} switched to the target gNB (F-TEID {gnb_teid:#x})");
+                switched.push(*psi);
+            }
+            Err(e) => warn!("UE {amf_ue_id}: path switch UpdateSMContext failed for {psi}: {e}"),
+        }
+    }
+
+    Some((
+        ngap::path_switch_request_acknowledge(amf_ue_id, new_ran_ue_id, fresh_ncc, &fresh_nh, &switched),
+        "PathSwitchRequestAcknowledge",
+    ))
 }
 
 /// Handle a gNB's `PDUSessionResourceSetupResponse`: extract the gNB DL N3 F-TEID and
@@ -1499,6 +1575,7 @@ impl UeContext {
             auth: None,
             sec: None,
             kamf: None,
+            nh_chain: None,
             replayed_ue_sec_cap: None,
             sm_refs: HashMap::new(),
             ue_ambr: None,
@@ -2235,6 +2312,9 @@ async fn on_security_mode_complete(
         "UE {amf_ue_id}: SecurityModeComplete — Initial Context Setup with the Registration Accept \
          (allowed NSSAI: {allowed:?}, rejected: {rejected:?}, RFSP {rfsp:?}, UE-AMBR {ue_ambr:?})"
     );
+    // Seed the NH chain: the delivered K_gNB is the sync input for the first NH
+    // (NCC 0 → the first path switch hands out {NH₁, NCC 1}).
+    ctx.nh_chain = Some((security_key, 0));
     let (allowed_tacs, not_allowed_tacs) = area_restriction.unwrap_or_default();
     let ic = ngap::InitialContext {
         allowed_nssai: allowed.clone(),
@@ -3117,6 +3197,98 @@ mod tests {
         UE_DIRECTORY.lock().unwrap().remove(supi);
     }
 
+    /// Xn handover path switch (TS 38.413 §8.4.4 + TS 33.501 §6.9.2.3.3): the
+    /// target gNB's PathSwitchRequest re-points the UPF downlink to its new
+    /// F-TEID, rotates the NH chain (fresh NH, NCC+1), and the acknowledge hands
+    /// the target the {NCC, NH} pair; a second switch chains NH from the first.
+    #[tokio::test]
+    async fn xn_path_switch_rotates_nh_and_repoints_the_downlink() {
+        use std::sync::Mutex as StdMutex;
+
+        // Mock SMF capturing the downlink re-point bodies.
+        static SWITCHES: StdMutex<Vec<(String, String)>> = StdMutex::new(Vec::new());
+        async fn mock_modify(
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::http::StatusCode {
+            if let (Some(teid), Some(addr)) = (
+                body.get("gnbN3Teid").and_then(|v| v.as_str()),
+                body.get("gnbN3Addr").and_then(|v| v.as_str()),
+            ) {
+                SWITCHES.lock().unwrap().push((teid.into(), addr.into()));
+            }
+            axum::http::StatusCode::OK
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new().route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
+            axum::routing::post(mock_modify),
+        );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+
+        // A CM-CONNECTED UE whose NH chain was seeded by the Initial Context Setup.
+        let kamf = [0x71u8; 32];
+        let kgnb0 = aka::kgnb(&kamf, 0);
+        let amf_ue_id = 0x171u64;
+        let mut ctx = UeContext::new(3, RegState::Registered, Some("imsi-999700000000171".into()));
+        ctx.kamf = Some(kamf);
+        ctx.nh_chain = Some((kgnb0, 0));
+        ctx.tac = Some([0, 0, 1]);
+        ctx.sm_refs.insert(5, ("ctx-ps5".into(), format!("http://{smf_addr}")));
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+
+        // The target gNB (RAN-UE 9, TAC 000002) asks to switch PDU session 5.
+        let req = ngap::path_switch_request(
+            amf_ue_id,
+            9,
+            "999",
+            "70",
+            &[0, 0, 2],
+            &[0x20, 0x20],
+            &[(5, 0x77, std::net::Ipv4Addr::new(10, 0, 9, 2))],
+        );
+        let (ack, label) =
+            on_path_switch(&mut ues, &amf_smf, &req).await.expect("acknowledged");
+        assert_eq!(label, "PathSwitchRequestAcknowledge");
+        // The fresh {NCC, NH}: first hop = KDF(K_AMF, initial K_gNB), NCC 1.
+        let nh1 = aka::nh(&kamf, &kgnb0);
+        assert_eq!(ngap::path_switch_ack_security(&ack), Some((1, nh1, vec![5])));
+        // The context followed the UE to the target gNB.
+        let ctx = ues.get(&amf_ue_id).unwrap();
+        assert_eq!(ctx.ran_ue_id, 9);
+        assert_eq!(ctx.tac, Some([0, 0, 2]), "location refreshed from the ULI");
+        assert_eq!(ctx.nh_chain, Some((nh1, 1)), "chain rotated");
+        // The UPF downlink was re-pointed to the target's F-TEID.
+        assert_eq!(
+            SWITCHES.lock().unwrap().as_slice(),
+            [("00000077".to_string(), "10.0.9.2".to_string())]
+        );
+
+        // A second switch chains the NH from the first (NCC 2).
+        let req2 = ngap::path_switch_request(
+            amf_ue_id,
+            11,
+            "999",
+            "70",
+            &[0, 0, 1],
+            &[0x20, 0x20],
+            &[(5, 0x88, std::net::Ipv4Addr::new(10, 0, 9, 3))],
+        );
+        let (ack2, _) = on_path_switch(&mut ues, &amf_smf, &req2).await.expect("acknowledged");
+        let nh2 = aka::nh(&kamf, &nh1);
+        assert_ne!(nh2, nh1);
+        assert_eq!(ngap::path_switch_ack_security(&ack2), Some((2, nh2, vec![5])));
+        assert_eq!(ues.get(&amf_ue_id).unwrap().nh_chain, Some((nh2, 2)));
+
+        // Unknown UE / unseeded chain → no acknowledge.
+        let bogus = ngap::path_switch_request(9999, 1, "999", "70", &[0, 0, 1], &[0x20, 0x20], &[]);
+        assert!(on_path_switch(&mut ues, &amf_smf, &bogus).await.is_none());
+        ues.get_mut(&amf_ue_id).unwrap().nh_chain = None;
+        assert!(on_path_switch(&mut ues, &amf_smf, &req2).await.is_none());
+    }
+
     /// Initial Context Setup (TS 38.413 §8.3.1): on Security Mode Complete the AMF
     /// establishes the UE context at the gNB with ONE InitialContextSetupRequest —
     /// K_gNB (derived from K_AMF + the SM Complete's uplink NAS COUNT), the UE's
@@ -3155,6 +3327,8 @@ mod tests {
         assert_eq!((got_amf, got_ran), (amf_ue_id, 8));
         // K_gNB = KDF(K_AMF, UL NAS COUNT of the SM Complete = 0).
         assert_eq!(ic.security_key, aka::kgnb(&kamf, 0));
+        // The NH chain is seeded from the delivered K_gNB (NCC 0).
+        assert_eq!(ues.get(&amf_ue_id).unwrap().nh_chain, Some((ic.security_key, 0)));
         assert_eq!(ic.ue_sec_cap, [0x20, 0x20], "capabilities replayed to the RAN");
         assert_eq!(ic.ue_ambr, Some((600_000_000, 300_000_000)));
         assert_eq!(ic.rfsp, Some(7));
@@ -3453,9 +3627,11 @@ mod tests {
         assert_eq!(restored.sm_refs.len(), 1, "PDU session carried over");
         assert!(UE_DIRECTORY.lock().unwrap().contains_key(supi), "reachable again over N2");
 
-        // The fresh K_gNB is bound to the Service Request's UL NAS COUNT (0).
+        // The fresh K_gNB is bound to the Service Request's UL NAS COUNT (0), and
+        // the NH chain is re-seeded from it.
         let (_a, _r, ic) = ngap::initial_context_setup_params(&dls[0].0).expect("ICS parses");
         assert_eq!(ic.security_key, aka::kgnb(&kamf, 0), "fresh K_gNB from the SR's UL NAS COUNT");
+        assert_eq!(restored.nh_chain, Some((ic.security_key, 0)), "NH chain re-seeded");
         // The UE decodes the Service Accept (the ICS NAS-PDU) under its own context.
         let accept = ue_sec.unprotect(&ic.nas, 1).expect("UE verifies the Service Accept");
         assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::ServiceAccept));
