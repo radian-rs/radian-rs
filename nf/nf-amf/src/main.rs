@@ -151,11 +151,12 @@ enum UeCmd {
     /// a pending AM policy change). Sent to the gNB associations serving any of the
     /// area's TAs; each sends an NGAP Paging carrying the full TAI list.
     Page { tmsi: u32, tacs: Vec<[u8; 3]> },
-    /// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify):
-    /// the new UE-AMBR `(downlink, uplink)` bits/sec for this UE.
+    /// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify): the
+    /// UE-AMBR `(downlink, uplink)` bits/sec override for this UE — `None` **removes**
+    /// the override, falling the effective UE-AMBR back to the subscribed value.
     UpdateAmPolicy {
         amf_ue_id: u64,
-        ue_ambr: (u64, u64),
+        ue_ambr: Option<(u64, u64)>,
         rfsp: Option<u16>,
         area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
     },
@@ -571,7 +572,7 @@ struct UeContext {
 /// `UeContext::pending_am_policy`).
 #[derive(Debug, Clone, PartialEq)]
 struct PendingAmPolicy {
-    ue_ambr: (u64, u64),
+    ue_ambr: Option<(u64, u64)>,
     rfsp: Option<u16>,
     area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
 }
@@ -939,14 +940,18 @@ fn namf_callback_router() -> axum::Router {
         axum::Json(policy): axum::Json<sbi_core::npcf_am::PolicyAssociation>,
     ) -> axum::http::StatusCode {
         // The UE-AMBR (enforced at the gNB), the RFSP (RAT/frequency steering), and
-        // the service area restriction (allowed/non-allowed TACs) are all applied.
-        let Some(ambr) = policy.ue_ambr.as_ref() else {
-            return axum::http::StatusCode::NO_CONTENT; // nothing actionable
-        };
-        let (Some(dl), Some(ul)) =
-            (pdu_session::bitrate_to_bps(&ambr.downlink), pdu_session::bitrate_to_bps(&ambr.uplink))
-        else {
-            return axum::http::StatusCode::BAD_REQUEST;
+        // the service area restriction (allowed/non-allowed TACs) are all applied. A
+        // policy with **no** UE-AMBR removes the override — the effective UE-AMBR
+        // falls back to the subscribed (am-data) value.
+        let ue_ambr: Option<(u64, u64)> = match policy.ue_ambr.as_ref() {
+            None => None,
+            Some(ambr) => match (
+                pdu_session::bitrate_to_bps(&ambr.downlink),
+                pdu_session::bitrate_to_bps(&ambr.uplink),
+            ) {
+                (Some(dl), Some(ul)) => Some((dl, ul)),
+                _ => return axum::http::StatusCode::BAD_REQUEST,
+            },
         };
         let rfsp = policy.rfsp;
         let area_restriction = policy.serv_area_res.as_ref().and_then(area_restriction_tacs);
@@ -955,7 +960,7 @@ fn namf_callback_router() -> axum::Router {
                 if tx
                     .send(UeCmd::UpdateAmPolicy {
                         amf_ue_id,
-                        ue_ambr: (dl, ul),
+                        ue_ambr,
                         rfsp,
                         area_restriction: area_restriction.clone(),
                     })
@@ -975,7 +980,7 @@ fn namf_callback_router() -> axum::Router {
                 retained.iter_mut().find(|(_, c)| c.suci.as_deref() == Some(supi.as_str()));
             entry.map(|(tmsi, ctx)| {
                 ctx.pending_am_policy =
-                    Some(PendingAmPolicy { ue_ambr: (dl, ul), rfsp, area_restriction });
+                    Some(PendingAmPolicy { ue_ambr, rfsp, area_restriction });
                 *tmsi
             })
         };
@@ -1091,7 +1096,7 @@ async fn on_network_deregistration(
 fn on_am_policy_update(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
-    ue_ambr: (u64, u64),
+    ue_ambr: Option<(u64, u64)>,
     rfsp: Option<u16>,
     area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
 ) -> Vec<(NGAP_PDU, &'static str)> {
@@ -1099,17 +1104,17 @@ fn on_am_policy_update(
         warn!("AM policy update for unknown UE {amf_ue_id}");
         return Vec::new();
     };
-    // The PCF override takes precedence over the subscribed UE-AMBR.
-    ctx.pcf_ue_ambr = Some(ue_ambr);
+    // The PCF override takes precedence over the subscribed UE-AMBR; `None` removes it
+    // (the effective UE-AMBR then falls back to the subscribed value).
+    ctx.pcf_ue_ambr = ue_ambr;
     ctx.recompute_ue_ambr();
     ctx.rfsp = rfsp;
     ctx.area_restriction = area_restriction.clone();
     let ran_ue_id = ctx.ran_ue_id;
     let effective_ambr = ctx.ue_ambr;
     info!(
-        "UE {amf_ue_id}: AM policy updated — signalling RFSP {rfsp:?}, UE-AMBR {}/{} (dl/ul) bps, \
-         service area {area_restriction:?} to the RAN",
-        ue_ambr.0, ue_ambr.1
+        "UE {amf_ue_id}: AM policy updated — signalling RFSP {rfsp:?}, effective UE-AMBR \
+         {effective_ambr:?} (dl/ul) bps, service area {area_restriction:?} to the RAN"
     );
     // Tell the RAN the new UE-context policy (RFSP + UE-AMBR).
     let mut dl = vec![(
@@ -3972,7 +3977,7 @@ mod tests {
 
         // The changed policy also moves the UE to a new service area (allow TAC 000002).
         let dls =
-            on_am_policy_update(&mut ues, 1, (600_000_000, 300_000_000), Some(9), Some((vec![[0, 0, 2]], Vec::new())));
+            on_am_policy_update(&mut ues, 1, Some((600_000_000, 300_000_000)), Some(9), Some((vec![[0, 0, 2]], Vec::new())));
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             [
@@ -4007,11 +4012,44 @@ mod tests {
             Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand)
         );
         // A change with no service area falls back to the plain transport (no MRL).
-        let dls = on_am_policy_update(&mut ues, 1, (1, 1), None, None);
+        let dls = on_am_policy_update(&mut ues, 1, Some((1, 1)), None, None);
         assert_eq!(ngap::area_restriction_from_downlink_nas(&dls[1].0), None);
         assert_eq!(ues.get(&1).unwrap().area_restriction, None, "service area cleared");
         // Unknown UE → no downlinks.
-        assert!(on_am_policy_update(&mut ues, 999, (1, 1), None, None).is_empty());
+        assert!(on_am_policy_update(&mut ues, 999, Some((1, 1)), None, None).is_empty());
+    }
+
+    /// The PCF removing its UE-AMBR override (an UpdateNotify with no UE-AMBR) falls
+    /// the effective UE-AMBR back to the subscribed value and re-signals the RAN.
+    #[test]
+    fn pcf_removing_the_ambr_override_falls_back_to_subscribed() {
+        let (ki, ke) = ([0xa1u8; 16], [0xa2u8; 16]);
+        let amf_ue_id = 0x81u64;
+        let mut ctx = UeContext::new(4, RegState::Registered, Some("imsi-999700000000081".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.subscribed_ue_ambr = Some((1_000_000, 500_000));
+        ctx.pcf_ue_ambr = Some((5_000_000, 5_000_000));
+        ctx.recompute_ue_ambr();
+        ctx.rfsp = Some(7);
+        assert_eq!(ctx.ue_ambr, Some((5_000_000, 5_000_000)), "override in effect");
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+
+        // The PCF removes the UE-AMBR override → effective falls back to subscribed,
+        // signalled to the RAN in a UE Context Modification.
+        let dls = on_am_policy_update(&mut ues, amf_ue_id, None, Some(7), None);
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            [
+                "UEContextModificationRequest (RFSP)",
+                "DownlinkNASTransport (ConfigurationUpdateCommand)"
+            ]
+        );
+        assert_eq!(ues[&amf_ue_id].pcf_ue_ambr, None, "override removed");
+        assert_eq!(ues[&amf_ue_id].ue_ambr, Some((1_000_000, 500_000)), "effective = subscribed");
+        let back = NGAP_PDU::decode(&dls[0].0.encode().unwrap()).unwrap();
+        let (_a, _r, _rfsp, ambr) = ngap::ue_context_modification_params(&back).unwrap();
+        assert_eq!(ambr, Some((1_000_000, 500_000)), "RAN gets the subscribed UE-AMBR");
     }
 
     /// Service area restriction: the PCF policy's `servAreaRes` is parsed into
@@ -5379,7 +5417,7 @@ mod tests {
         assert_eq!(
             RETAINED.lock().unwrap().get(&tmsi).unwrap().pending_am_policy,
             Some(PendingAmPolicy {
-                ue_ambr: (222_000_000, 111_000_000),
+                ue_ambr: Some((222_000_000, 111_000_000)),
                 rfsp: Some(9),
                 area_restriction: Some((vec![[0, 0, 3]], Vec::new())),
             })
