@@ -233,6 +233,16 @@ pub fn guti_tmsi_from_registration_request(msg: &Nas5gsMessage) -> Option<u32> {
     reg.fgs_mobile_identity.as_guti().map(|g| g.tmsi)
 }
 
+/// The 5G-TMSI the AMF assigned in a Registration Accept's 5G-GUTI IE — how the UE
+/// (and tests) read a **reallocated** GUTI (TS 24.501 §5.4.1.3). `None` when the
+/// accept carries no GUTI.
+pub fn guti_tmsi_from_registration_accept(msg: &Nas5gsMessage) -> Option<u32> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationAccept(accept)) = msg else {
+        return None;
+    };
+    accept.fg_guti.as_ref().and_then(|g| g.as_guti()).map(|g| g.tmsi)
+}
+
 /// Build the null-protection-scheme SUCI mobile identity for `mcc`/`mnc`/`msin`
 /// (TS 24.501 §9.11.3.4) — the inverse of what [`suci_to_supi`] deconceals.
 fn suci_mobile_identity(mcc: &str, mnc: &str, msin: &str) -> NasFGsMobileIdentity {
@@ -1519,6 +1529,8 @@ mod tests {
             gmm_message_type(&back),
             Some(Nas5gmmMessageType::RegistrationAccept)
         );
+        // The assigned 5G-GUTI's 5G-TMSI reads back (GUTI reallocation, design/85).
+        assert_eq!(guti_tmsi_from_registration_accept(&back), Some(0x01020304));
         // The allowed (IEI 0x15) and rejected (IEI 0x11) NSSAIs survive the round trip.
         assert_eq!(allowed_nssai_from_registration_accept(&back), allowed.to_vec());
         assert_eq!(
