@@ -124,7 +124,7 @@ const T3522_MAX_SENDS: u8 = 5; // initial + 4 retransmissions
 
 /// A command delivered to a gNB association's per-UE control channel (from the SBI
 /// callback surface into the association task that owns the NAS security context).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum UeCmd {
     /// Begin network-initiated deregistration for this UE (subscription withdrawn).
     Start(u64),
@@ -143,6 +143,14 @@ enum UeCmd {
         ue_ambr: (u64, u64),
         rfsp: Option<u16>,
         area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
+    },
+    /// Hand this association's UE context over to another association (an Xn path
+    /// switch landed on the target gNB). The owner removes the context, replies on
+    /// the oneshot, and releases its gNB's stale context with a
+    /// `UEContextReleaseCommand` (cause *successful-handover*).
+    TakeUe {
+        amf_ue_id: u64,
+        reply: tokio::sync::oneshot::Sender<Option<Box<UeContext>>>,
     },
 }
 
@@ -579,6 +587,9 @@ async fn serve_gnb(
                         info!("paging CM-IDLE UE (5G-TMSI {tmsi:#010x}, area {tacs:02x?}) on this gNB");
                         vec![(ngap::paging(tmsi, PLMN_MCC, PLMN_MNC, &tacs), "Paging")]
                     }
+                    // An Xn path switch landed on another association — hand the
+                    // context over and release this gNB's stale side.
+                    UeCmd::TakeUe { amf_ue_id, reply } => on_take_ue(&mut ues, amf_ue_id, reply),
                 };
                 for (dl, label) in downlinks {
                     send_or_log(&conn, &dl, label).await;
@@ -1057,7 +1068,7 @@ async fn handle_ngap(
                 }
             }
             InitiatingMessageValue::Id_PathSwitchRequest(_) => {
-                if let Some((ack, label)) = on_path_switch(ues, amf_smf, &pdu).await {
+                if let Some((ack, label)) = on_path_switch(ues, amf_smf, &pdu, dereg_tx).await {
                     send_or_log(conn, &ack, label).await;
                 }
             }
@@ -1402,18 +1413,94 @@ async fn on_service_request(
 /// **NH chain** (TS 33.501 §6.9.2.3.3: NH = KDF(K_AMF, sync), NCC+1 mod 8), and
 /// answers with a `PathSwitchRequestAcknowledge` carrying the fresh `{NCC, NH}`
 /// for the target's vertical key derivation.
+/// Hand a UE context over to the association an Xn path switch landed on: remove
+/// it, reply on the oneshot, and — when this task really owned it — command the
+/// **source gNB** to release its stale UE context (TS 23.502 §4.9.1.2 completes
+/// with the source side released; cause *successful-handover*).
+fn on_take_ue(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_ue_id: u64,
+    reply: tokio::sync::oneshot::Sender<Option<Box<UeContext>>>,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let ctx = ues.remove(&amf_ue_id);
+    let release = ctx.as_ref().map(|c| {
+        info!(
+            "UE {amf_ue_id}: handed over to another gNB — releasing the source's stale context \
+             (RAN-UE {})",
+            c.ran_ue_id
+        );
+        (
+            ngap::ue_context_release_command_radio(
+                amf_ue_id,
+                c.ran_ue_id,
+                ngap::CauseRadioNetwork::SUCCESSFUL_HANDOVER,
+            ),
+            "UEContextReleaseCommand (successful handover)",
+        )
+    });
+    let _ = reply.send(ctx.map(Box::new));
+    release.into_iter().collect()
+}
+
 async fn on_path_switch(
     ues: &mut HashMap<u64, UeContext>,
     amf_smf: &pdu_session::AmfSmf,
     pdu: &NGAP_PDU,
+    dereg_tx: &UnboundedSender<UeCmd>,
 ) -> Option<(NGAP_PDU, &'static str)> {
     let Some((amf_ue_id, new_ran_ue_id, tac, sessions)) = ngap::path_switch_params(pdu) else {
         warn!("PathSwitchRequest missing mandatory IEs — ignored");
         return None;
     };
+    // The path switch arrives on the TARGET gNB's association, but the UE context
+    // lives with the SOURCE gNB's. Take it over: ask every other association to
+    // hand it out; the owner replies with the context and releases its gNB's
+    // stale side (UEContextReleaseCommand, cause successful-handover).
+    if !ues.contains_key(&amf_ue_id) {
+        let others: Vec<UnboundedSender<UeCmd>> = GNB_LINKS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| !l.tx.same_channel(dereg_tx))
+            .map(|l| l.tx.clone())
+            .collect();
+        // Ask every other association concurrently (a live select loop answers
+        // immediately — the owner with the context, everyone else with None);
+        // the overall wait is bounded, not per-link.
+        let mut asks = tokio::task::JoinSet::new();
+        for tx in others {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            if tx.send(UeCmd::TakeUe { amf_ue_id, reply: reply_tx }).is_ok() {
+                asks.spawn(async move {
+                    tokio::time::timeout(std::time::Duration::from_millis(500), reply_rx)
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .flatten()
+                });
+            }
+        }
+        let mut taken = None;
+        while let Some(res) = asks.join_next().await {
+            if let Ok(Some(ctx)) = res {
+                taken = Some(ctx);
+                break;
+            }
+        }
+        asks.abort_all();
+        match taken {
+            Some(ctx) => {
+                info!("UE {amf_ue_id}: context taken over from the source gNB's association");
+                ues.insert(amf_ue_id, *ctx);
+            }
+            None => {
+                warn!("PathSwitchRequest for unknown UE {amf_ue_id} — no association owns it");
+                return None;
+            }
+        }
+    }
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
-        warn!("PathSwitchRequest for unknown UE {amf_ue_id} — ignored");
-        return None;
+        return None; // unreachable: inserted or present above
     };
     // The NH chain needs K_AMF and a seeded sync input (the ICS-delivered K_gNB).
     let (Some(kamf), Some((sync, ncc))) = (ctx.kamf, ctx.nh_chain) else {
@@ -1426,6 +1513,10 @@ async fn on_path_switch(
     let fresh_nh = aka::nh(&kamf, &sync);
     let fresh_ncc = (ncc + 1) % 8;
     ctx.nh_chain = Some((fresh_nh, fresh_ncc));
+    // The SBI callback surface must now reach the UE through THIS association.
+    if let Some(supi) = &ctx.suci {
+        UE_DIRECTORY.lock().unwrap().insert(supi.clone(), (amf_ue_id, dereg_tx.clone()));
+    }
     info!(
         "UE {amf_ue_id}: Xn path switch to RAN-UE {new_ran_ue_id} (TAC {tac:02x?}) — NH chain \
          rotated to NCC {fresh_ncc}, {} session(s) to switch",
@@ -3239,6 +3330,8 @@ mod tests {
         let mut ues = HashMap::new();
         ues.insert(amf_ue_id, ctx);
 
+        // This association's own channel (the context is local — no takeover).
+        let (dereg_tx, _dereg_rx) = tokio::sync::mpsc::unbounded_channel();
         // The target gNB (RAN-UE 9, TAC 000002) asks to switch PDU session 5.
         let req = ngap::path_switch_request(
             amf_ue_id,
@@ -3250,7 +3343,7 @@ mod tests {
             &[(5, 0x77, std::net::Ipv4Addr::new(10, 0, 9, 2))],
         );
         let (ack, label) =
-            on_path_switch(&mut ues, &amf_smf, &req).await.expect("acknowledged");
+            on_path_switch(&mut ues, &amf_smf, &req, &dereg_tx).await.expect("acknowledged");
         assert_eq!(label, "PathSwitchRequestAcknowledge");
         // The fresh {NCC, NH}: first hop = KDF(K_AMF, initial K_gNB), NCC 1.
         let nh1 = aka::nh(&kamf, &kgnb0);
@@ -3276,7 +3369,7 @@ mod tests {
             &[0x20, 0x20],
             &[(5, 0x88, std::net::Ipv4Addr::new(10, 0, 9, 3))],
         );
-        let (ack2, _) = on_path_switch(&mut ues, &amf_smf, &req2).await.expect("acknowledged");
+        let (ack2, _) = on_path_switch(&mut ues, &amf_smf, &req2, &dereg_tx).await.expect("acknowledged");
         let nh2 = aka::nh(&kamf, &nh1);
         assert_ne!(nh2, nh1);
         assert_eq!(ngap::path_switch_ack_security(&ack2), Some((2, nh2, vec![5])));
@@ -3284,9 +3377,107 @@ mod tests {
 
         // Unknown UE / unseeded chain → no acknowledge.
         let bogus = ngap::path_switch_request(9999, 1, "999", "70", &[0, 0, 1], &[0x20, 0x20], &[]);
-        assert!(on_path_switch(&mut ues, &amf_smf, &bogus).await.is_none());
+        assert!(on_path_switch(&mut ues, &amf_smf, &bogus, &dereg_tx).await.is_none());
         ues.get_mut(&amf_ue_id).unwrap().nh_chain = None;
-        assert!(on_path_switch(&mut ues, &amf_smf, &req2).await.is_none());
+        assert!(on_path_switch(&mut ues, &amf_smf, &req2, &dereg_tx).await.is_none());
+    }
+
+    /// Cross-association takeover: the PathSwitchRequest arrives on the TARGET
+    /// gNB's association while the UE context lives with the SOURCE's. The target
+    /// pulls the context over (UeCmd::TakeUe), the source association releases its
+    /// gNB's stale side (UEContextReleaseCommand, cause successful-handover), and
+    /// the SBI callback directory re-points to the target association.
+    #[tokio::test]
+    async fn path_switch_takes_over_the_ue_and_releases_the_source() {
+        use std::sync::Mutex as StdMutex;
+
+        // Mock SMF for the downlink re-point.
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new().route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
+            axum::routing::post(|| async { axum::http::StatusCode::OK }),
+        );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+
+        // The SOURCE association: its select loop (simulated) owns the UE context
+        // and services TakeUe; its release downlinks are captured.
+        let kamf = [0x81u8; 32];
+        let kgnb0 = aka::kgnb(&kamf, 0);
+        let amf_ue_id = 0x181u64;
+        let supi = "imsi-999700000000181";
+        let mut ctx = UeContext::new(4, RegState::Registered, Some(supi.into()));
+        ctx.kamf = Some(kamf);
+        ctx.nh_chain = Some((kgnb0, 0));
+        ctx.sm_refs.insert(5, ("ctx-ho5".into(), format!("http://{smf_addr}")));
+        let (src_tx, mut src_rx) = tokio::sync::mpsc::unbounded_channel();
+        let src_released: std::sync::Arc<StdMutex<Vec<(NGAP_PDU, &'static str)>>> =
+            std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let src_released_w = src_released.clone();
+        tokio::spawn(async move {
+            let mut src_ues = HashMap::new();
+            src_ues.insert(amf_ue_id, ctx);
+            while let Some(cmd) = src_rx.recv().await {
+                if let UeCmd::TakeUe { amf_ue_id, reply } = cmd {
+                    let dls = on_take_ue(&mut src_ues, amf_ue_id, reply);
+                    src_released_w.lock().unwrap().extend(dls);
+                }
+            }
+        });
+        // The TARGET association: registered too (skipped by the same_channel
+        // filter), with an empty UE map.
+        let (tgt_tx, _tgt_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut links = GNB_LINKS.lock().unwrap();
+            links.push(GnbLink { tacs: Vec::new(), tx: src_tx.clone() });
+            links.push(GnbLink { tacs: Vec::new(), tx: tgt_tx.clone() });
+        }
+        // The SBI callback surface currently reaches the UE via the source.
+        UE_DIRECTORY.lock().unwrap().insert(supi.into(), (amf_ue_id, src_tx.clone()));
+
+        // The path switch lands on the TARGET association.
+        let req = ngap::path_switch_request(
+            amf_ue_id,
+            9,
+            "999",
+            "70",
+            &[0, 0, 2],
+            &[0x20, 0x20],
+            &[(5, 0x99, std::net::Ipv4Addr::new(10, 0, 9, 4))],
+        );
+        let mut tgt_ues = HashMap::new();
+        let (ack, _) =
+            on_path_switch(&mut tgt_ues, &amf_smf, &req, &tgt_tx).await.expect("acknowledged");
+
+        // The context moved to the target association and was switched there.
+        let moved = tgt_ues.get(&amf_ue_id).expect("context taken over");
+        assert_eq!(moved.ran_ue_id, 9);
+        assert_eq!(moved.nh_chain, Some((aka::nh(&kamf, &kgnb0), 1)));
+        assert_eq!(
+            ngap::path_switch_ack_security(&ack),
+            Some((1, aka::nh(&kamf, &kgnb0), vec![5]))
+        );
+        // The source association released its gNB's stale UE context.
+        let released = src_released.lock().unwrap();
+        assert_eq!(released.len(), 1, "one release toward the source gNB");
+        let (release_pdu, label) = &released[0];
+        assert_eq!(*label, "UEContextReleaseCommand (successful handover)");
+        assert_eq!(
+            ngap::parse_ue_context_release_command(release_pdu),
+            Some((amf_ue_id, 4, None)),
+            "addressed by the OLD RAN-UE-NGAP-ID"
+        );
+        assert_eq!(
+            ngap::release_command_radio_cause(release_pdu),
+            Some(ngap::CauseRadioNetwork::SUCCESSFUL_HANDOVER)
+        );
+        // The SBI callback directory re-points to the target association.
+        let (dir_id, dir_tx) = UE_DIRECTORY.lock().unwrap().get(supi).cloned().expect("directory");
+        assert_eq!(dir_id, amf_ue_id);
+        assert!(dir_tx.same_channel(&tgt_tx), "callbacks now reach the target association");
+        assert!(!dir_tx.same_channel(&src_tx));
+        UE_DIRECTORY.lock().unwrap().remove(supi);
     }
 
     /// Initial Context Setup (TS 38.413 §8.3.1): on Security Mode Complete the AMF
