@@ -30,7 +30,8 @@ use nas::{Nas5gmmMessage, Nas5gmmMessageType, Nas5gsMessage};
 use ngap::{
     InitialUEMessage, InitialUEMessageProtocolIEs_EntryValue, InitiatingMessage,
     InitiatingMessageValue, NGAP_PDU, PDUSessionResourceSetupResponseProtocolIEs_EntryValue,
-    SuccessfulOutcome, SuccessfulOutcomeValue, UplinkNASTransport,
+    SuccessfulOutcome, SuccessfulOutcomeValue, UnsuccessfulOutcome, UnsuccessfulOutcomeValue,
+    UplinkNASTransport,
     UplinkNASTransportProtocolIEs_EntryValue,
 };
 use sctp_rs::{
@@ -1088,10 +1089,18 @@ async fn handle_ngap(
                 }
             }
             InitiatingMessageValue::Id_HandoverPreparation(_) => {
-                on_handover_required(ues, amf_smf, &pdu, dereg_tx).await;
+                if let Some((failure, label)) = on_handover_required(ues, amf_smf, &pdu, dereg_tx).await
+                {
+                    send_or_log(conn, &failure, label).await;
+                }
             }
             InitiatingMessageValue::Id_HandoverNotification(_) => {
                 on_handover_notify(ues, amf_smf, &pdu, dereg_tx).await;
+            }
+            InitiatingMessageValue::Id_HandoverCancel(_) => {
+                if let Some((ack, label)) = on_handover_cancel(&pdu) {
+                    send_or_log(conn, &ack, label).await;
+                }
             }
             _ => info!("unhandled initiating message: {}", pdu.procedure_name()),
         },
@@ -1129,6 +1138,10 @@ async fn handle_ngap(
             value: SuccessfulOutcomeValue::Id_HandoverResourceAllocation(_),
             ..
         }) => on_handover_request_ack(&pdu),
+        NGAP_PDU::UnsuccessfulOutcome(UnsuccessfulOutcome {
+            value: UnsuccessfulOutcomeValue::Id_HandoverResourceAllocation(_),
+            ..
+        }) => on_handover_failure(&pdu),
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
             value: SuccessfulOutcomeValue::Id_InitialContextSetup(_),
             ..
@@ -1446,6 +1459,14 @@ struct PendingHandover {
     /// through it; the context is taken from it at Notify).
     source_tx: UnboundedSender<UeCmd>,
     source_ran_ue_id: u32,
+    /// The target association's command channel — cancellation / expiry cleans
+    /// the target's side through it.
+    target_tx: UnboundedSender<UeCmd>,
+    /// The target's RAN-UE-NGAP-ID, known once it acknowledged.
+    target_ran_ue_id: Option<u32>,
+    /// The Handover Command was sent (the acknowledge arrived) — TNGRELOCprep
+    /// stopped, TNGRELOCoverall runs.
+    commanded: bool,
     /// The rotated NH-chain pair handed to the target in the Handover Request —
     /// applied to the context when the UE arrives.
     nh: [u8; 32],
@@ -1459,6 +1480,66 @@ struct PendingHandover {
 static HANDOVERS: LazyLock<Mutex<HashMap<u64, PendingHandover>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// TNGRELOCprep (TS 38.413 §8.4.1): bounds the preparation phase — armed at
+/// Handover Required, stopped by the acknowledge. Expiry fails the handover
+/// toward the source. Override with `RADIAN_AMF_TNGRELOCPREP_SECS`.
+const TNGRELOCPREP_SECS: u64 = 10;
+/// TNGRELOCoverall (TS 38.413 §8.4.2): bounds the whole relocation — armed at the
+/// Handover Command, stopped by Handover Notify. Expiry drops the in-flight entry
+/// and releases the target's prepared context. Override with
+/// `RADIAN_AMF_TNGRELOCOVERALL_SECS`.
+const TNGRELOCOVERALL_SECS: u64 = 20;
+
+fn env_secs(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// TNGRELOCprep expiry: an unanswered handover preparation is dropped and failed
+/// toward the source gNB.
+async fn expire_handover_prep(amf_ue_id: u64, after: std::time::Duration) {
+    tokio::time::sleep(after).await;
+    let expired = {
+        let mut handovers = HANDOVERS.lock().unwrap();
+        match handovers.get(&amf_ue_id) {
+            Some(p) if !p.commanded => handovers.remove(&amf_ue_id),
+            _ => None, // acknowledged (TNGRELOCoverall takes over) or already done
+        }
+    };
+    if let Some(p) = expired {
+        warn!("UE {amf_ue_id}: TNGRELOCprep expired — handover preparation abandoned");
+        let failure = ngap::handover_preparation_failure(
+            amf_ue_id,
+            p.source_ran_ue_id,
+            ngap::CauseRadioNetwork::TNGRELOCPREP_EXPIRY,
+        );
+        let _ = p.source_tx.send(UeCmd::Forward {
+            pdu: Box::new(failure),
+            label: "HandoverPreparationFailure (TNGRELOCprep expiry)",
+        });
+    }
+}
+
+/// TNGRELOCoverall expiry: a commanded handover whose UE never arrived is dropped
+/// and the target's prepared context is released.
+async fn expire_handover_overall(amf_ue_id: u64, after: std::time::Duration) {
+    tokio::time::sleep(after).await;
+    let Some(p) = HANDOVERS.lock().unwrap().remove(&amf_ue_id) else {
+        return; // completed (Notify consumed it)
+    };
+    warn!("UE {amf_ue_id}: TNGRELOCoverall expired — the UE never arrived at the target");
+    if let Some(target_ran) = p.target_ran_ue_id {
+        let release = ngap::ue_context_release_command_radio(
+            amf_ue_id,
+            target_ran,
+            ngap::CauseRadioNetwork::TNGRELOCOVERALL_EXPIRY,
+        );
+        let _ = p.target_tx.send(UeCmd::Forward {
+            pdu: Box::new(release),
+            label: "UEContextReleaseCommand (TNGRELOCoverall expiry)",
+        });
+    }
+}
+
 /// Handle a **Handover Required** (TS 38.413 §8.4.1, on the SOURCE association):
 /// resolve the target gNB by its Global RAN Node ID, rotate the NH chain
 /// (TS 33.501 §6.9.2.3.2 — the target derives its K_gNB from the fresh
@@ -1469,20 +1550,27 @@ async fn on_handover_required(
     amf_smf: &pdu_session::AmfSmf,
     pdu: &NGAP_PDU,
     dereg_tx: &UnboundedSender<UeCmd>,
-) {
+) -> Option<(NGAP_PDU, &'static str)> {
     let Some((amf_ue_id, ran_ue_id, target_gnb_id, psis, direct_forwarding, container)) =
         ngap::handover_required_params(pdu)
     else {
         warn!("HandoverRequired missing mandatory IEs — ignored");
-        return;
+        return None;
+    };
+    // Preparation-failure shorthand toward the source (this association).
+    let prep_failure = |cause: u8| {
+        Some((
+            ngap::handover_preparation_failure(amf_ue_id, ran_ue_id, cause),
+            "HandoverPreparationFailure",
+        ))
     };
     let Some(ctx) = ues.get(&amf_ue_id) else {
-        warn!("HandoverRequired for unknown UE {amf_ue_id} — ignored");
-        return;
+        warn!("HandoverRequired for unknown UE {amf_ue_id} — preparation failed");
+        return prep_failure(ngap::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID);
     };
     let (Some(kamf), Some((sync, ncc))) = (ctx.kamf, ctx.nh_chain) else {
-        warn!("UE {amf_ue_id}: handover without a seeded NH chain — ignored");
-        return;
+        warn!("UE {amf_ue_id}: handover without a seeded NH chain — preparation failed");
+        return prep_failure(ngap::CauseRadioNetwork::UNSPECIFIED);
     };
     // The target gNB's association, by the id it advertised in its NG Setup.
     let Some(target_tx) = GNB_LINKS
@@ -1492,8 +1580,8 @@ async fn on_handover_required(
         .find(|l| l.gnb_id == Some(target_gnb_id) && !l.tx.same_channel(dereg_tx))
         .map(|l| l.tx.clone())
     else {
-        warn!("UE {amf_ue_id}: handover target gNB {target_gnb_id} has no N2 association — ignored");
-        return;
+        warn!("UE {amf_ue_id}: handover target gNB {target_gnb_id} has no N2 association — preparation failed");
+        return prep_failure(ngap::CauseRadioNetwork::UNKNOWN_TARGET_ID);
     };
     // Vertical key derivation for the target (burned even if the handover fails).
     let fresh_nh = aka::nh(&kamf, &sync);
@@ -1540,15 +1628,25 @@ async fn on_handover_required(
         PendingHandover {
             source_tx: dereg_tx.clone(),
             source_ran_ue_id: ran_ue_id,
+            target_tx: target_tx.clone(),
+            target_ran_ue_id: None,
+            commanded: false,
             nh: fresh_nh,
             ncc: fresh_ncc,
             admitted: Vec::new(),
         },
     );
+    // Bound the preparation phase (TNGRELOCprep): an unanswered target fails the
+    // handover toward the source.
+    tokio::spawn(expire_handover_prep(
+        amf_ue_id,
+        std::time::Duration::from_secs(env_secs("RADIAN_AMF_TNGRELOCPREP_SECS", TNGRELOCPREP_SECS)),
+    ));
     let _ = target_tx.send(UeCmd::Forward {
         pdu: Box::new(request),
         label: "HandoverRequest",
     });
+    None
 }
 
 /// Handle a **Handover Request Acknowledge** (on the TARGET association): record
@@ -1574,6 +1672,16 @@ fn on_handover_request_ack(pdu: &NGAP_PDU) {
         .filter_map(|(psi, _, _, fwd)| fwd.map(|(t, a)| (*psi, t, a)))
         .collect();
     pending.admitted = admitted.iter().map(|(psi, teid, addr, _)| (*psi, *teid, *addr)).collect();
+    pending.target_ran_ue_id = Some(target_ran_ue_id);
+    pending.commanded = true;
+    // TNGRELOCprep stops here; TNGRELOCoverall bounds the execution phase.
+    tokio::spawn(expire_handover_overall(
+        amf_ue_id,
+        std::time::Duration::from_secs(env_secs(
+            "RADIAN_AMF_TNGRELOCOVERALL_SECS",
+            TNGRELOCOVERALL_SECS,
+        )),
+    ));
     info!(
         "UE {amf_ue_id}: target admitted {} session(s) (target RAN-UE {target_ran_ue_id}, \
          {} forwarding tunnel(s)) — Handover Command to the source",
@@ -1586,6 +1694,59 @@ fn on_handover_request_ack(pdu: &NGAP_PDU) {
         pdu: Box::new(command),
         label: "HandoverCommand",
     });
+}
+
+/// Handle a **Handover Failure** (on the TARGET association): the target cannot
+/// allocate resources — drop the in-flight handover and fail it toward the source
+/// (Handover Preparation Failure).
+fn on_handover_failure(pdu: &NGAP_PDU) {
+    let Some((amf_ue_id, cause)) = ngap::handover_failure_params(pdu) else {
+        warn!("HandoverFailure missing mandatory IEs — ignored");
+        return;
+    };
+    let Some(pending) = HANDOVERS.lock().unwrap().remove(&amf_ue_id) else {
+        warn!("HandoverFailure for UE {amf_ue_id} with no handover in flight");
+        return;
+    };
+    warn!("UE {amf_ue_id}: the target rejected the handover (cause {cause:?}) — failing the source");
+    let failure = ngap::handover_preparation_failure(
+        amf_ue_id,
+        pending.source_ran_ue_id,
+        cause.unwrap_or(ngap::CauseRadioNetwork::HO_FAILURE_IN_TARGET_5GC_NGRAN_NODE_OR_TARGET_SYSTEM),
+    );
+    let _ = pending.source_tx.send(UeCmd::Forward {
+        pdu: Box::new(failure),
+        label: "HandoverPreparationFailure (target rejected)",
+    });
+}
+
+/// Handle a **Handover Cancel** (on the SOURCE association): the source aborts
+/// the in-flight handover — drop it, release the target's prepared context (when
+/// it already acknowledged), and answer with a Handover Cancel Acknowledge.
+fn on_handover_cancel(pdu: &NGAP_PDU) -> Option<(NGAP_PDU, &'static str)> {
+    let Some((amf_ue_id, ran_ue_id)) = ngap::handover_cancel_params(pdu) else {
+        warn!("HandoverCancel missing mandatory IEs — ignored");
+        return None;
+    };
+    match HANDOVERS.lock().unwrap().remove(&amf_ue_id) {
+        Some(pending) => {
+            info!("UE {amf_ue_id}: handover cancelled by the source");
+            if let Some(target_ran) = pending.target_ran_ue_id {
+                // The target had prepared resources — release its side.
+                let release = ngap::ue_context_release_command_radio(
+                    amf_ue_id,
+                    target_ran,
+                    ngap::CauseRadioNetwork::HANDOVER_CANCELLED,
+                );
+                let _ = pending.target_tx.send(UeCmd::Forward {
+                    pdu: Box::new(release),
+                    label: "UEContextReleaseCommand (handover cancelled)",
+                });
+            }
+        }
+        None => info!("UE {amf_ue_id}: cancel for no handover in flight — acknowledging anyway"),
+    }
+    Some((ngap::handover_cancel_acknowledge(amf_ue_id, ran_ue_id), "HandoverCancelAcknowledge"))
 }
 
 /// Handle a **Handover Notify** (on the TARGET association): the UE arrived. Take
@@ -1730,7 +1891,16 @@ async fn on_path_switch(
             }
             None => {
                 warn!("PathSwitchRequest for unknown UE {amf_ue_id} — no association owns it");
-                return None;
+                let psis: Vec<u8> = sessions.iter().map(|(psi, _, _)| *psi).collect();
+                return Some((
+                    ngap::path_switch_request_failure(
+                        amf_ue_id,
+                        new_ran_ue_id,
+                        &psis,
+                        ngap::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID,
+                    ),
+                    "PathSwitchRequestFailure",
+                ));
             }
         }
     }
@@ -1739,8 +1909,17 @@ async fn on_path_switch(
     };
     // The NH chain needs K_AMF and a seeded sync input (the ICS-delivered K_gNB).
     let (Some(kamf), Some((sync, ncc))) = (ctx.kamf, ctx.nh_chain) else {
-        warn!("UE {amf_ue_id}: path switch without a seeded NH chain — ignored");
-        return None;
+        warn!("UE {amf_ue_id}: path switch without a seeded NH chain — failing it");
+        let psis: Vec<u8> = sessions.iter().map(|(psi, _, _)| *psi).collect();
+        return Some((
+            ngap::path_switch_request_failure(
+                amf_ue_id,
+                new_ran_ue_id,
+                &psis,
+                ngap::CauseRadioNetwork::UNSPECIFIED,
+            ),
+            "PathSwitchRequestFailure",
+        ));
     };
     ctx.ran_ue_id = new_ran_ue_id;
     ctx.tac = tac.or(ctx.tac);
@@ -3610,11 +3789,18 @@ mod tests {
         assert_eq!(ngap::path_switch_ack_security(&ack2), Some((2, nh2, vec![5])));
         assert_eq!(ues.get(&amf_ue_id).unwrap().nh_chain, Some((nh2, 2)));
 
-        // Unknown UE / unseeded chain → no acknowledge.
-        let bogus = ngap::path_switch_request(9999, 1, "999", "70", &[0, 0, 1], &[0x20, 0x20], &[]);
-        assert!(on_path_switch(&mut ues, &amf_smf, &bogus, &dereg_tx).await.is_none());
+        // Unknown UE / unseeded chain → a PathSwitchRequestFailure, not an ack.
+        let bogus =
+            ngap::path_switch_request(9999, 1, "999", "70", &[0, 0, 1], &[0x20, 0x20], &[(5, 1, std::net::Ipv4Addr::LOCALHOST)]);
+        let (fail, label) =
+            on_path_switch(&mut ues, &amf_smf, &bogus, &dereg_tx).await.expect("failure sent");
+        assert_eq!(label, "PathSwitchRequestFailure");
+        assert_eq!(ngap::path_switch_failure_params(&fail), Some((9999, 1, vec![5])));
         ues.get_mut(&amf_ue_id).unwrap().nh_chain = None;
-        assert!(on_path_switch(&mut ues, &amf_smf, &req2, &dereg_tx).await.is_none());
+        let (fail, label) =
+            on_path_switch(&mut ues, &amf_smf, &req2, &dereg_tx).await.expect("failure sent");
+        assert_eq!(label, "PathSwitchRequestFailure");
+        assert_eq!(ngap::path_switch_failure_params(&fail), Some((amf_ue_id, 11, vec![5])));
     }
 
     /// The full N2 handover (TS 23.502 §4.9.1.3): Handover Required on the source
@@ -3803,6 +3989,131 @@ mod tests {
         assert!(dir_tx.same_channel(&tgt_tx));
         assert!(HANDOVERS.lock().unwrap().get(&amf_ue_id).is_none(), "handover consumed");
         UE_DIRECTORY.lock().unwrap().remove(supi);
+    }
+
+    /// The N2-handover failure paths: an unknown target fails the preparation, a
+    /// target rejection fails it back to the source, a source cancel releases the
+    /// target's prepared context, and the TNGRELOCprep / TNGRELOCoverall expiries
+    /// clean up abandoned handovers.
+    #[tokio::test]
+    async fn n2_handover_failure_paths_clean_up() {
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+        let kamf = [0xa1u8; 32];
+        let kgnb0 = aka::kgnb(&kamf, 0);
+        let (src_tx, mut src_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tgt_tx, mut tgt_rx) = tokio::sync::mpsc::unbounded_channel();
+        GNB_LINKS
+            .lock()
+            .unwrap()
+            .push(GnbLink { tacs: Vec::new(), gnb_id: Some(0x88), tx: tgt_tx.clone() });
+
+        let seed_ctx = |ues: &mut HashMap<u64, UeContext>, id: u64| {
+            let mut ctx = UeContext::new(4, RegState::Registered, Some(format!("imsi-99970{id}")));
+            ctx.kamf = Some(kamf);
+            ctx.nh_chain = Some((kgnb0, 0));
+            ues.insert(id, ctx);
+        };
+        // Pull the next Forward off a link, skipping foreign broadcasts.
+        async fn next_forward(
+            rx: &mut tokio::sync::mpsc::UnboundedReceiver<UeCmd>,
+        ) -> (NGAP_PDU, &'static str) {
+            loop {
+                match rx.recv().await {
+                    Some(UeCmd::Forward { pdu, label }) => return (*pdu, label),
+                    Some(_) => continue,
+                    None => panic!("link closed"),
+                }
+            }
+        }
+
+        // (a) Unknown target gNB → immediate preparation failure to the source.
+        let mut ues = HashMap::new();
+        seed_ctx(&mut ues, 0x1a1);
+        let required =
+            ngap::handover_required(0x1a1, 4, 0xEE, "999", "70", &[0, 0, 1], &[5], false, vec![]);
+        let (fail, _) =
+            on_handover_required(&mut ues, &amf_smf, &required, &src_tx).await.expect("failed");
+        assert_eq!(
+            ngap::handover_preparation_failure_params(&fail),
+            Some((0x1a1, 4, Some(ngap::CauseRadioNetwork::UNKNOWN_TARGET_ID)))
+        );
+        assert!(HANDOVERS.lock().unwrap().get(&0x1a1).is_none());
+
+        // (b) The target rejects (Handover Failure) → the source gets a
+        // preparation failure and the in-flight entry is dropped.
+        let required =
+            ngap::handover_required(0x1a1, 4, 0x88, "999", "70", &[0, 0, 1], &[], false, vec![]);
+        assert!(on_handover_required(&mut ues, &amf_smf, &required, &src_tx).await.is_none());
+        let _ = next_forward(&mut tgt_rx).await; // the HandoverRequest
+        on_handover_failure(&ngap::handover_failure(
+            0x1a1,
+            ngap::CauseRadioNetwork::HO_TARGET_NOT_ALLOWED,
+        ));
+        let (fail, label) = next_forward(&mut src_rx).await;
+        assert_eq!(label, "HandoverPreparationFailure (target rejected)");
+        assert_eq!(
+            ngap::handover_preparation_failure_params(&fail),
+            Some((0x1a1, 4, Some(ngap::CauseRadioNetwork::HO_TARGET_NOT_ALLOWED)))
+        );
+        assert!(HANDOVERS.lock().unwrap().get(&0x1a1).is_none());
+
+        // (c) A source cancel after the target acknowledged: the target's prepared
+        // context is released and the source gets a Cancel Acknowledge.
+        let required =
+            ngap::handover_required(0x1a1, 4, 0x88, "999", "70", &[0, 0, 1], &[], false, vec![]);
+        assert!(on_handover_required(&mut ues, &amf_smf, &required, &src_tx).await.is_none());
+        let _ = next_forward(&mut tgt_rx).await; // the HandoverRequest
+        on_handover_request_ack(&ngap::handover_request_acknowledge(0x1a1, 9, &[], vec![]));
+        let _ = next_forward(&mut src_rx).await; // the HandoverCommand
+        let (ack, _) = on_handover_cancel(&ngap::handover_cancel(
+            0x1a1,
+            4,
+            ngap::CauseRadioNetwork::HANDOVER_CANCELLED,
+        ))
+        .expect("acknowledged");
+        assert_eq!(ngap::handover_cancel_ack_params(&ack), Some((0x1a1, 4)));
+        let (release, label) = next_forward(&mut tgt_rx).await;
+        assert_eq!(label, "UEContextReleaseCommand (handover cancelled)");
+        assert_eq!(ngap::parse_ue_context_release_command(&release), Some((0x1a1, 9, None)));
+        assert_eq!(
+            ngap::release_command_radio_cause(&release),
+            Some(ngap::CauseRadioNetwork::HANDOVER_CANCELLED)
+        );
+        assert!(HANDOVERS.lock().unwrap().get(&0x1a1).is_none());
+
+        // (d) TNGRELOCprep expiry: an unanswered preparation fails to the source.
+        let required =
+            ngap::handover_required(0x1a1, 4, 0x88, "999", "70", &[0, 0, 1], &[], false, vec![]);
+        assert!(on_handover_required(&mut ues, &amf_smf, &required, &src_tx).await.is_none());
+        let _ = next_forward(&mut tgt_rx).await;
+        expire_handover_prep(0x1a1, std::time::Duration::from_millis(20)).await;
+        let (fail, label) = next_forward(&mut src_rx).await;
+        assert_eq!(label, "HandoverPreparationFailure (TNGRELOCprep expiry)");
+        assert_eq!(
+            ngap::handover_preparation_failure_params(&fail),
+            Some((0x1a1, 4, Some(ngap::CauseRadioNetwork::TNGRELOCPREP_EXPIRY)))
+        );
+        assert!(HANDOVERS.lock().unwrap().get(&0x1a1).is_none());
+
+        // (e) TNGRELOCoverall expiry: a commanded handover whose UE never arrives
+        // is dropped and the target's prepared context released.
+        let required =
+            ngap::handover_required(0x1a1, 4, 0x88, "999", "70", &[0, 0, 1], &[], false, vec![]);
+        assert!(on_handover_required(&mut ues, &amf_smf, &required, &src_tx).await.is_none());
+        let _ = next_forward(&mut tgt_rx).await;
+        on_handover_request_ack(&ngap::handover_request_acknowledge(0x1a1, 9, &[], vec![]));
+        let _ = next_forward(&mut src_rx).await; // the HandoverCommand
+        // Prep expiry does nothing once commanded.
+        expire_handover_prep(0x1a1, std::time::Duration::from_millis(10)).await;
+        assert!(HANDOVERS.lock().unwrap().get(&0x1a1).is_some(), "commanded — prep expiry no-op");
+        expire_handover_overall(0x1a1, std::time::Duration::from_millis(20)).await;
+        let (release, label) = next_forward(&mut tgt_rx).await;
+        assert_eq!(label, "UEContextReleaseCommand (TNGRELOCoverall expiry)");
+        assert_eq!(
+            ngap::release_command_radio_cause(&release),
+            Some(ngap::CauseRadioNetwork::TNGRELOCOVERALL_EXPIRY)
+        );
+        assert!(HANDOVERS.lock().unwrap().get(&0x1a1).is_none());
     }
 
     /// Cross-association takeover: the PathSwitchRequest arrives on the TARGET
