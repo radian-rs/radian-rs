@@ -51,6 +51,10 @@ struct SmContext {
     n3_addr: Ipv4Addr,
     /// The UE's assigned IP (this session's PDU address).
     ue_ip: Ipv4Addr,
+    /// The DNN this session is for — carried as the PFCP **Network Instance** on the
+    /// forwarding rules (establishment + every downlink re-point), the name an
+    /// operator binds to a VRF.
+    dnn: String,
     /// The slice serving this session — re-sent in the activate response.
     snssai: Snssai,
     /// gNB downlink target, once `UpdateSMContext` installs it. Cleared on AN
@@ -484,6 +488,7 @@ async fn create_sm_context(
             seq,
             smf.smf_ip,
             ue_ip,
+            &req.dnn,
             ambr,
             &flows,
             smf.usage_threshold_bytes,
@@ -553,6 +558,7 @@ async fn create_sm_context(
             n3_teid: est.n3_teid,
             n3_addr: est.n3_addr,
             ue_ip,
+            dnn: req.dnn.clone(),
             snssai: sub.snssai.clone(),
             gnb: None,
             indirect_fwd: None,
@@ -817,16 +823,16 @@ async fn update_sm_context(
     if !valid_gnb_target(gnb_teid, gnb_addr) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let up_seid = {
+    let (up_seid, dnn) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
-            Some(c) => c.up_seid,
+            Some(c) => (c.up_seid, c.dnn.clone()),
             None => return StatusCode::NOT_FOUND.into_response(),
         }
     };
 
     let seq = smf.next_seq();
-    let mod_req = pfcp::session_modification_request(up_seid, seq, FAR_ID, gnb_teid, gnb_addr);
+    let mod_req = pfcp::session_modification_request(up_seid, seq, FAR_ID, gnb_teid, gnb_addr, &dnn);
     let resp = match smf.transact(&mod_req, seq).await {
         Some(r) => r,
         None => return StatusCode::BAD_GATEWAY.into_response(),
