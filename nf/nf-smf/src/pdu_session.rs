@@ -1180,13 +1180,17 @@ async fn refresh_sm_policy(
         // sm-data fallback session — no PCF association to re-authorize.
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
-    let decision = sbi_core::npcf::PcfClient::new(pcf_base)
+    let update = sbi_core::npcf::PcfClient::new(pcf_base)
         .update_sm_policy(&policy_id, &sbi_core::npcf::SmPolicyUpdateContextData::default())
         .await
         .map_err(|e| {
             tracing::warn!(%sm_ref, "PCF SM policy update failed: {e}");
             problem(StatusCode::BAD_GATEWAY, "PCF_UNREACHABLE", "Npcf SM policy update failed")
         })?;
+    // The Update response is a partial delta — merge it onto the stored policy to
+    // recover the full authorized decision, keeping any attribute the PCF omitted.
+    let mut decision = old_policy.clone();
+    decision.apply(&update);
     let changed = old_policy != decision;
 
     // Propagate a changed session AMBR onto the user plane: re-rate the UPF's QER.
