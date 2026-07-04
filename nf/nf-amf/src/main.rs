@@ -1253,11 +1253,22 @@ async fn on_service_request(
     let ue_ambr = ctx.ue_ambr;
     // Protect the accept before the context moves into the association map: a
     // Service Accept for a resume, a Registration Accept (same GUTI, the NEW
-    // registration area's 5GS TAI list) for a mobility update.
+    // registration area's 5GS TAI list) for a mobility update. The AN release
+    // dropped the gNB's AS context, so the return re-establishes it with an
+    // **Initial Context Setup** carrying a **fresh K_gNB** derived from the trigger
+    // message's uplink NAS COUNT (TS 33.501 §6.9.2.1.1) — the accept rides as its
+    // NAS-PDU.
     let allowed = ctx.allowed_nssai.clone().unwrap_or_default();
     let registration_area = ctx.registration_area.clone();
+    let kamf = ctx.kamf;
+    let ue_sec_cap = ctx.replayed_ue_sec_cap.unwrap_or(UE_SEC_CAP);
+    let rfsp = ctx.rfsp;
+    let area_restriction = ctx.area_restriction.clone();
     let accept = ctx.sec.as_mut().map(|s| {
-        if is_mobility_update {
+        // `unprotect` already advanced ul_count past the Service Request /
+        // mobility Registration Request that triggered this return.
+        let kgnb = kamf.map(|k| aka::kgnb(&k, s.ul_count.wrapping_sub(1)));
+        let (bytes, ics_label, dl_label) = if is_mobility_update {
             let accept = nas::registration_accept(
                 PLMN_MCC,
                 PLMN_MNC,
@@ -1267,10 +1278,19 @@ async fn on_service_request(
                 T3512_SECS,
                 &registration_area,
             );
-            (s.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1), "DownlinkNASTransport (RegistrationAccept — mobility update)")
+            (
+                s.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1),
+                "InitialContextSetupRequest (RegistrationAccept — mobility update)",
+                "DownlinkNASTransport (RegistrationAccept — mobility update)",
+            )
         } else {
-            (s.protect(&nas::service_accept(), nas::sht::INTEGRITY_CIPHERED, 1), "DownlinkNASTransport (ServiceAccept)")
-        }
+            (
+                s.protect(&nas::service_accept(), nas::sht::INTEGRITY_CIPHERED, 1),
+                "InitialContextSetupRequest (ServiceAccept)",
+                "DownlinkNASTransport (ServiceAccept)",
+            )
+        };
+        (bytes, kgnb, ics_label, dl_label)
     });
     ues.insert(amf_ue_id, ctx);
     if let Some(supi) = &supi {
@@ -1285,8 +1305,32 @@ async fn on_service_request(
     }
 
     let mut downlinks = Vec::new();
-    if let Some((accept, label)) = accept {
-        downlinks.push((ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, accept), label));
+    if let Some((bytes, kgnb, ics_label, dl_label)) = accept {
+        match kgnb {
+            Some(security_key) => {
+                let (allowed_tacs, not_allowed_tacs) = area_restriction.unwrap_or_default();
+                let ic = ngap::InitialContext {
+                    allowed_nssai: allowed,
+                    ue_sec_cap,
+                    security_key,
+                    ue_ambr,
+                    rfsp,
+                    area_restriction: (!allowed_tacs.is_empty() || !not_allowed_tacs.is_empty())
+                        .then_some((allowed_tacs, not_allowed_tacs)),
+                    nas: bytes,
+                };
+                downlinks.push((
+                    ngap::initial_context_setup_request(amf_ue_id, ran_ue_id, PLMN_MCC, PLMN_MNC, &ic),
+                    ics_label,
+                ));
+            }
+            None => {
+                // No K_AMF retained (a pre-K_gNB context) — degrade to the plain
+                // NAS transport rather than hand the RAN a bogus key.
+                warn!("UE {amf_ue_id}: no K_AMF to derive a fresh K_gNB — accept without a context setup");
+                downlinks.push((ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes), dl_label));
+            }
+        }
     }
 
     // Re-activate each PDU session (Service Request only: a mobility update leaves
@@ -3005,10 +3049,12 @@ mod tests {
         let (ki, ke) = ([0xbbu8; 16], [0xccu8; 16]);
         let supi = "imsi-999700000000151";
         let tmsi = 0x0000_0151u32;
+        let kamf = [0x51u8; 32];
         let mut ctx = UeContext::new(0, RegState::Registered, Some(supi.into()));
         ctx.cm_state = CmState::Idle;
         ctx.guti_tmsi = Some(tmsi);
         ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.kamf = Some(kamf);
         ctx.tac = Some([0, 0, 1]);
         ctx.registration_area = vec![[0, 0, 1]];
         ctx.allowed_nssai = Some(vec![(1, Some([1, 2, 3]))]);
@@ -3035,10 +3081,12 @@ mod tests {
         let mut ues = HashMap::new();
         let dls = on_service_request(&mut ues, &amf_smf, init, tmsi, &gnb_tx).await;
 
-        // One downlink: the Registration Accept. No user-plane reactivation.
+        // One downlink: the Initial Context Setup carrying the mobility
+        // Registration Accept (a fresh AS context at the new gNB). No user-plane
+        // reactivation.
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
-            ["DownlinkNASTransport (RegistrationAccept — mobility update)"]
+            ["InitialContextSetupRequest (RegistrationAccept — mobility update)"]
         );
         assert_eq!(MOBILITY_ACTIVATIONS.load(AtomicOrdering::Relaxed), 0, "UP stays deactivated");
         // The context is restored CM-CONNECTED with the area RE-ASSIGNED around
@@ -3051,9 +3099,12 @@ mod tests {
         assert!(UE_DIRECTORY.lock().unwrap().contains_key(supi), "reachable again over N2");
         assert!(RETAINED.lock().unwrap().get(&tmsi).is_none(), "retained context consumed");
 
+        // A fresh K_gNB bound to the mobility Registration Request's UL NAS COUNT.
+        let (_a, _r, ic) = ngap::initial_context_setup_params(&dls[0].0).expect("ICS parses");
+        assert_eq!(ic.security_key, aka::kgnb(&kamf, 0));
+        assert_eq!(ic.allowed_nssai, vec![(1, Some([1, 2, 3]))], "retained NSSAI at the RAN too");
         // The UE decodes the accept: same GUTI, the NEW 5GS TAI list, NSSAI kept.
-        let bytes = downlink_nas_pdu(&dls[0].0).expect("NAS PDU");
-        let accept = ue_sec.unprotect(&bytes, 1).expect("UE verifies the accept");
+        let accept = ue_sec.unprotect(&ic.nas, 1).expect("UE verifies the accept");
         assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::RegistrationAccept));
         assert_eq!(
             nas::registration_area_from_registration_accept(&accept),
@@ -3209,6 +3260,7 @@ mod tests {
         ctx.cm_state = CmState::Idle;
         ctx.guti_tmsi = Some(tmsi);
         ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.kamf = Some([0x21u8; 32]);
         ctx.ue_ambr = Some((2_000_000_000, 1_000_000_000));
         RETAINED.lock().unwrap().insert(tmsi, ctx);
 
@@ -3286,7 +3338,7 @@ mod tests {
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             [
-                "DownlinkNASTransport (ServiceAccept)",
+                "InitialContextSetupRequest (ServiceAccept)",
                 "UEContextModificationRequest (RFSP)",
                 "DownlinkNASTransport (ConfigurationUpdateCommand)",
             ]
@@ -3306,8 +3358,10 @@ mod tests {
             ngap::area_restriction_from_downlink_nas(&dls[2].0),
             Some((vec![[0, 0, 3]], Vec::new()))
         );
-        // The UE verifies the Service Accept then the Configuration Update Command.
-        let accept = ue_sec.unprotect(&downlink_nas_pdu(&dls[0].0).unwrap(), 1).expect("Service Accept");
+        // The UE verifies the Service Accept (the ICS NAS-PDU) then the
+        // Configuration Update Command.
+        let (_a, _r, ic) = ngap::initial_context_setup_params(&dls[0].0).expect("ICS parses");
+        let accept = ue_sec.unprotect(&ic.nas, 1).expect("Service Accept");
         assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::ServiceAccept));
         let cuc = ue_sec.unprotect(&downlink_nas_pdu(&dls[2].0).unwrap(), 1).expect("CUC");
         assert_eq!(
@@ -3353,15 +3407,17 @@ mod tests {
         tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
         let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
 
-        // A CM-IDLE UE retained by its 5G-TMSI, with a NAS security context + one
-        // PDU session (as AN release would have left it).
+        // A CM-IDLE UE retained by its 5G-TMSI, with a NAS security context + K_AMF
+        // + one PDU session (as AN release would have left it).
         let (ki, ke) = ([0x55u8; 16], [0x66u8; 16]);
+        let kamf = [0x91u8; 32];
         let supi = "imsi-999700000000091";
         let tmsi = 0x0000_0091u32;
         let mut ctx = UeContext::new(0, RegState::Registered, Some(supi.into()));
         ctx.cm_state = CmState::Idle;
         ctx.guti_tmsi = Some(tmsi);
         ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.kamf = Some(kamf);
         ctx.sm_refs.insert(5, ("ctx-5".into(), format!("http://{smf_addr}")));
         RETAINED.lock().unwrap().insert(tmsi, ctx);
 
@@ -3380,10 +3436,12 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let dls = on_service_request(&mut ues, &amf_smf, init, tmsi, &tx).await;
 
-        // Service Accept then the N2 PDU Session Resource Setup for the reactivated session.
+        // The AS context is re-established (Initial Context Setup with a fresh
+        // K_gNB, the Service Accept as its NAS-PDU), then the N2 PDU Session
+        // Resource Setup for the reactivated session.
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
-            ["DownlinkNASTransport (ServiceAccept)", "PDUSessionResourceSetupRequest (resume)"]
+            ["InitialContextSetupRequest (ServiceAccept)", "PDUSessionResourceSetupRequest (resume)"]
         );
         assert_eq!(ACTIVATIONS.load(AtomicOrdering::Relaxed), 1, "SMF asked to re-activate the session");
         // The context is restored into the association (CM-CONNECTED) and removed
@@ -3395,9 +3453,11 @@ mod tests {
         assert_eq!(restored.sm_refs.len(), 1, "PDU session carried over");
         assert!(UE_DIRECTORY.lock().unwrap().contains_key(supi), "reachable again over N2");
 
-        // The UE decodes the Service Accept under its own context.
-        let accept_bytes = downlink_nas_pdu(&dls[0].0).expect("NAS PDU");
-        let accept = ue_sec.unprotect(&accept_bytes, 1).expect("UE verifies the Service Accept");
+        // The fresh K_gNB is bound to the Service Request's UL NAS COUNT (0).
+        let (_a, _r, ic) = ngap::initial_context_setup_params(&dls[0].0).expect("ICS parses");
+        assert_eq!(ic.security_key, aka::kgnb(&kamf, 0), "fresh K_gNB from the SR's UL NAS COUNT");
+        // The UE decodes the Service Accept (the ICS NAS-PDU) under its own context.
+        let accept = ue_sec.unprotect(&ic.nas, 1).expect("UE verifies the Service Accept");
         assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::ServiceAccept));
 
         UE_DIRECTORY.lock().unwrap().remove(supi);
