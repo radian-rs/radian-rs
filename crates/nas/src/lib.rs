@@ -1034,10 +1034,35 @@ pub fn pdu_session_modification_command(
     m
 }
 
+/// Build a 5GSM **PDU Session Release Command** (TS 24.501 §8.3.4) as the raw N1 SM
+/// container bytes: the 5GSM header (message type 0xD3), then the mandatory 5GSM
+/// cause (V, one octet). Network-initiated release ⇒ PTI 0; pick `cause` from
+/// [`sm_cause`] (e.g. *regular deactivation*). The gNB relays this to the UE inside
+/// the N2 PDU Session Resource Release Command.
+pub fn pdu_session_release_command(pdu_session_id: u8, pti: u8, cause: u8) -> Vec<u8> {
+    // EPD (0x2e), PDU session id, PTI, message type (0xD3 = Release Command), cause.
+    vec![0x2e, pdu_session_id, pti, 0xd3, cause]
+}
+
+/// Build a 5GSM **PDU Session Release Complete** (TS 24.501 §8.3.5) as the raw N1 SM
+/// container bytes — the UE's answer to a Release Command. UE side / tests.
+pub fn pdu_session_release_complete(pdu_session_id: u8, pti: u8) -> Vec<u8> {
+    // EPD, PDU session id, PTI, message type (0xD4 = Release Complete). No cause.
+    vec![0x2e, pdu_session_id, pti, 0xd4]
+}
+
+/// Whether a raw N1 SM container is a 5GSM **PDU Session Release Complete** (message
+/// type 0xD4 at offset 3) — the AMF finalises the release when the UE sends it.
+pub fn is_pdu_session_release_complete(sm_container: &[u8]) -> bool {
+    sm_container.get(3) == Some(&0xd4)
+}
+
 /// 5GSM cause values (TS 24.501 §9.11.4.2) this stack emits.
 pub mod sm_cause {
     /// #26 — insufficient resources (GFBR admission control refused the session).
     pub const INSUFFICIENT_RESOURCES: u8 = 26;
+    /// #36 — regular deactivation (the network released the PDU session normally).
+    pub const REGULAR_DEACTIVATION: u8 = 36;
     /// #27 — the requested DNN is not subscribed / unknown.
     pub const MISSING_OR_UNKNOWN_DNN: u8 = 27;
     /// #31 — request rejected, unspecified (internal / upstream failure).
@@ -1480,6 +1505,23 @@ mod tests {
         assert!(cmd.windows(1).any(|w| w == [0x79]), "0x79 QoS flow descriptions IE");
         // The released QFI 3 has a delete op (opcode 2 = 0x40, no parameters).
         assert!(cmd.windows(3).any(|w| w == [3, 0x40, 0x00]), "delete QoS flow description for QFI 3");
+    }
+
+    #[test]
+    fn pdu_session_release_command_and_complete_layout() {
+        // Release Command: EPD, psi, PTI 0 (network-initiated), 0xD3, cause #36.
+        let cmd = pdu_session_release_command(5, 0, sm_cause::REGULAR_DEACTIVATION);
+        assert_eq!(cmd, vec![0x2e, 5, 0, 0xd3, 36]);
+        assert!(!is_pdu_session_release_complete(&cmd));
+
+        // Release Complete: EPD, psi, PTI, 0xD4 — recognised by the detector.
+        let complete = pdu_session_release_complete(5, 0);
+        assert_eq!(complete, vec![0x2e, 5, 0, 0xd4]);
+        assert!(is_pdu_session_release_complete(&complete));
+        // A UL NAS Transport carrying it round-trips to its (psi, container).
+        let raw = ul_nas_transport_sm(5, complete.clone(), None, None);
+        let msg = decode_nas_5gs_message(&raw).unwrap();
+        assert_eq!(sm_container_from_ul_nas_transport(&msg), Some((5, complete)));
     }
 
     #[test]

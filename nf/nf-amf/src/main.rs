@@ -133,6 +133,9 @@ enum UeCmd {
     T3522Expiry(u64),
     /// Push a mid-session PDU-session QoS change to the RAN/UE (from the SMF).
     ModifyPolicy(Box<ModifyPolicy>),
+    /// Network-initiated PDU session release for this UE (from the SMF): release
+    /// the session's RAN resources (N2) and tell the UE (N1 Release Command).
+    ReleaseSession { amf_ue_id: u64, psi: u8, cause: u8 },
     /// Page a CM-IDLE UE by 5G-TMSI across its registration area (downlink data or
     /// a pending AM policy change). Sent to the gNB associations serving any of the
     /// area's TAs; each sends an NGAP Paging carrying the full TAI list.
@@ -586,6 +589,9 @@ async fn serve_gnb(
                     }
                     UeCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, T3522_SECS),
                     UeCmd::ModifyPolicy(m) => on_network_modification(&mut ues, &m),
+                    UeCmd::ReleaseSession { amf_ue_id, psi, cause } => {
+                        on_network_release(&mut ues, amf_ue_id, psi, cause)
+                    }
                     UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr, rfsp, area_restriction } => {
                         on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp, area_restriction)
                     }
@@ -693,6 +699,40 @@ fn namf_callback_router() -> axum::Router {
         }
     }
 
+    /// `Namf_Communication`-style transfer for a **network-initiated PDU session
+    /// release** (TS 23.502 §4.3.4): the SMF asks the AMF to release a UE's session.
+    /// The AMF hands it to the owning association task, which sends the N2 Release
+    /// Command (+ N1 Release Command). `202` if the UE is reachable, `404` otherwise.
+    async fn release_session(
+        axum::extract::Path(supi): axum::extract::Path<String>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::http::StatusCode {
+        let Some(psi) =
+            body.get("pduSessionId").and_then(|v| v.as_u64()).and_then(|v| u8::try_from(v).ok())
+        else {
+            return axum::http::StatusCode::BAD_REQUEST;
+        };
+        // Optional 5GSM release cause; default regular deactivation (#36).
+        let cause = body
+            .get("cause")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u8::try_from(v).ok())
+            .unwrap_or(nas::sm_cause::REGULAR_DEACTIVATION);
+        let entry = UE_DIRECTORY.lock().unwrap().get(&supi).cloned();
+        match entry {
+            Some((amf_ue_id, tx)) => {
+                let cmd = UeCmd::ReleaseSession { amf_ue_id, psi, cause };
+                if tx.send(cmd).is_ok() {
+                    info!(%supi, psi, "PDU session release requested by the SMF");
+                    axum::http::StatusCode::ACCEPTED
+                } else {
+                    axum::http::StatusCode::NOT_FOUND
+                }
+            }
+            None => axum::http::StatusCode::NOT_FOUND,
+        }
+    }
+
     /// `Namf_Communication_N1N2MessageTransfer` (TS 29.518, simplified) — the SMF
     /// asks the AMF to page a UE for which downlink data arrived at the UPF. The AMF
     /// resolves the SUPI to its retained CM-IDLE 5G-TMSI and pages its registration
@@ -785,6 +825,10 @@ fn namf_callback_router() -> axum::Router {
         .route(
             "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages",
             axum::routing::post(page_ue),
+        )
+        .route(
+            "/namf-comm/v1/ue-contexts/{supi}/release",
+            axum::routing::post(release_session),
         )
         .route(
             "/npcf-callback/v1/am-policy-notify/{supi}",
@@ -952,6 +996,38 @@ fn on_network_modification(
         m.amf_ue_id, m.psi, m.released_qfis
     );
     vec![(modify, "PDUSessionResourceModifyRequest")]
+}
+
+/// Network-initiated PDU session release (TS 23.502 §4.3.4): the SMF asked to
+/// release `psi`. Build the N1 **PDU Session Release Command** (network-initiated ⇒
+/// PTI 0, protected in a DL NAS Transport) and the N2 **PDU Session Resource
+/// Release Command** carrying it — the gNB tears down the DRBs, relays the N1 to
+/// the UE, and answers a Release Response (finalised in [`on_release_response`]).
+fn on_network_release(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_ue_id: u64,
+    psi: u8,
+    cause: u8,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        warn!("PDU session release for unknown UE {amf_ue_id}");
+        return Vec::new();
+    };
+    if !ctx.sm_refs.contains_key(&psi) {
+        warn!("UE {amf_ue_id}: release for psi {psi} with no active session");
+        return Vec::new();
+    }
+    let ran_ue_id = ctx.ran_ue_id;
+    let Some(sec) = ctx.sec.as_mut() else {
+        warn!("UE {amf_ue_id}: PDU session release before NAS security — skipped");
+        return Vec::new();
+    };
+    let cmd = nas::pdu_session_release_command(psi, 0, cause);
+    let dl = nas::dl_nas_transport_sm(psi, cmd);
+    let nas_bytes = sec.protect(&dl, nas::sht::INTEGRITY_CIPHERED, 1);
+    let release = ngap::pdu_session_resource_release_command(amf_ue_id, ran_ue_id, psi, nas_bytes);
+    info!("UE {amf_ue_id}: PDU Session Resource Release sent (psi {psi}, 5GSM cause {cause})");
+    vec![(release, "PDUSessionResourceReleaseCommand")]
 }
 
 /// T3522 fired: retransmit the Deregistration Request while attempts remain;
@@ -1146,6 +1222,10 @@ async fn handle_ngap(
             value: SuccessfulOutcomeValue::Id_InitialContextSetup(_),
             ..
         }) => on_initial_context_setup_response(ues, amf_smf, &pdu).await,
+        NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+            value: SuccessfulOutcomeValue::Id_PDUSessionResourceRelease(_),
+            ..
+        }) => on_release_response(ues, amf_smf, &pdu).await,
         _ => info!("unhandled PDU: {}", pdu.procedure_name()),
     }
 }
@@ -2191,6 +2271,37 @@ async fn on_initial_context_setup_response(
     }
 }
 
+/// The gNB confirmed a network-initiated PDU session release
+/// (`PDUSessionResourceReleaseResponse`): the RAN resources are torn down, so
+/// finalise each released session at the SMF (N4 delete / IP release) and drop it
+/// from the UE context. The UE's N1 PDU Session Release Complete follows over UL
+/// NAS (handled in [`dispatch_uplink_nas`]).
+async fn on_release_response(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    pdu: &NGAP_PDU,
+) {
+    let Some((amf_ue_id, _ran, released)) = ngap::release_response_result(pdu) else {
+        info!("gNB PDUSessionResourceReleaseResponse (unparseable)");
+        return;
+    };
+    info!("gNB released PDU session resources for UE {amf_ue_id} (psi {released:?})");
+    for psi in released {
+        let Some((sm_ref, smf_base)) = ues.get(&amf_ue_id).and_then(|c| c.sm_refs.get(&psi).cloned())
+        else {
+            warn!("UE {amf_ue_id}: release response for psi {psi} with no SM context tracked");
+            continue;
+        };
+        match amf_smf.release_sm_context(&smf_base, &sm_ref).await {
+            Ok(()) => info!("UE {amf_ue_id}: PDU session {psi} released at the SMF"),
+            Err(e) => warn!("UE {amf_ue_id}: SMF release for session {psi} failed: {e}"),
+        }
+        if let Some(c) = ues.get_mut(&amf_ue_id) {
+            c.sm_refs.remove(&psi);
+        }
+    }
+}
+
 /// Extract the AMF-UE-NGAP-ID from a `PDUSessionResourceSetupResponse`.
 fn setup_response_amf_ue_id(pdu: &NGAP_PDU) -> Option<u64> {
     let NGAP_PDU::SuccessfulOutcome(so) = pdu else {
@@ -2538,6 +2649,14 @@ async fn dispatch_uplink_nas(
                 warn!("UE {amf_ue_id}: UL NAS Transport without an SM container");
                 return None;
             };
+            // A PDU Session Release Complete (0xD4) is the UE's final ack to a
+            // network-initiated release; the session was already finalised on the
+            // N2 Release Response (`on_release_response`), so acknowledge and stop —
+            // it must not fall through to the establishment (CreateSMContext) path.
+            if nas::is_pdu_session_release_complete(&container) {
+                info!("UE {amf_ue_id}: PDU Session Release Complete for psi {psi}");
+                return None;
+            }
             let Some((supi, ran_ue_id)) =
                 ues.get(&amf_ue_id).and_then(|c| Some((c.suci.clone()?, c.ran_ue_id)))
             else {
@@ -5316,6 +5435,69 @@ mod tests {
         // A psi the UE has no session for is a no-op.
         let m_bad = ModifyPolicy { psi: 9, ..m.clone() };
         assert!(on_network_modification(&mut ues, &m_bad).is_empty(), "no session for psi 9");
+    }
+
+    /// A network-initiated PDU session release: the AMF sends the N2 Release Command
+    /// carrying a UE-decodable N1 PDU Session Release Command, and on the gNB's
+    /// Release Response finalises the session at the SMF and drops it.
+    #[tokio::test]
+    async fn network_release_tears_down_session_ran_and_ue() {
+        use std::sync::Mutex as StdMutex;
+
+        static RELEASED: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+        async fn mock_release(
+            axum::extract::Path(sm_ref): axum::extract::Path<String>,
+        ) -> axum::http::StatusCode {
+            RELEASED.lock().unwrap().push(sm_ref);
+            axum::http::StatusCode::NO_CONTENT
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new().route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release",
+            axum::routing::post(mock_release),
+        );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+
+        let (ki, ke) = ([0x33u8; 16], [0x44u8; 16]);
+        let amf_ue_id = 0x7a1u64;
+        let mut ctx = UeContext::new(9, RegState::Registered, Some("imsi-999700000000201".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.sm_refs.insert(5, ("ctx-5".into(), format!("http://{smf_addr}")));
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+
+        // N2 Release Command built; the UE decodes the embedded N1 Release Command.
+        let dls = on_network_release(&mut ues, amf_ue_id, 5, nas::sm_cause::REGULAR_DEACTIVATION);
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["PDUSessionResourceReleaseCommand"]
+        );
+        let back = NGAP_PDU::decode(&dls[0].0.encode().unwrap()).unwrap();
+        let (psi, nas_bytes) = ngap::nas_pdu_from_release_command(&back).expect("N1 in the release");
+        assert_eq!(psi, 5);
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let msg = ue_sec.unprotect(&nas_bytes, 1).expect("UE verifies the Release Command");
+        let (sm_psi, container) =
+            nas::sm_container_from_dl_nas_transport(&msg).expect("N1 SM container");
+        assert_eq!(sm_psi, 5);
+        assert_eq!(&container[..], &[0x2e, 5, 0, 0xd3, nas::sm_cause::REGULAR_DEACTIVATION]);
+        // The session is still tracked until the gNB confirms.
+        assert!(ues[&amf_ue_id].sm_refs.contains_key(&5));
+
+        // On the gNB's Release Response the AMF releases at the SMF and drops it.
+        on_release_response(
+            &mut ues,
+            &amf_smf,
+            &ngap::pdu_session_resource_release_response(amf_ue_id, 9, 5),
+        )
+        .await;
+        assert_eq!(RELEASED.lock().unwrap().as_slice(), ["ctx-5".to_string()]);
+        assert!(!ues[&amf_ue_id].sm_refs.contains_key(&5), "session dropped after release");
+
+        // A release for a session the UE doesn't have is a no-op.
+        assert!(on_network_release(&mut ues, amf_ue_id, 9, 36).is_empty(), "no session for psi 9");
     }
 
     /// A subscription-withdrawal callback reaches the UE's association; the
