@@ -803,6 +803,34 @@ pub fn configuration_update_command() -> Nas5gsMessage {
     )
 }
 
+/// Build a 5GMM **Configuration Update Command** (TS 24.501 §8.2.19) carrying the
+/// UE's new **Allowed NSSAI** (IEI 0x15, §9.11.3.37) — the network delivers a
+/// changed allowed-slice set to the UE inline. `allowed` empty ⇒ a plain command
+/// (equivalent to [`configuration_update_command`]).
+pub fn configuration_update_command_with_nssai(
+    allowed: &[(u8, Option<[u8; 3]>)],
+) -> Nas5gsMessage {
+    let mut cuc = messages::NasConfigurationUpdateCommand::new();
+    if !allowed.is_empty() {
+        cuc = cuc.set_allowed_nssai(NasNssai::new(nssai_value(allowed)));
+    }
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::ConfigurationUpdateCommand,
+        Nas5gmmMessage::ConfigurationUpdateCommand(cuc),
+    )
+}
+
+/// The allowed NSSAI carried in a decoded Configuration Update Command (UE side /
+/// tests); empty when the IE is absent.
+pub fn allowed_nssai_from_configuration_update_command(
+    msg: &Nas5gsMessage,
+) -> Vec<(u8, Option<[u8; 3]>)> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::ConfigurationUpdateCommand(cuc)) = msg else {
+        return Vec::new();
+    };
+    cuc.allowed_nssai.as_ref().map(|n| parse_nssai_value(&n.value)).unwrap_or_default()
+}
+
 /// Build a 5GMM **Registration Complete** (TS 24.501 §8.2.8). UE side / tests.
 pub fn registration_complete() -> Nas5gsMessage {
     Nas5gsMessage::new_5gmm(
@@ -1544,6 +1572,16 @@ mod tests {
         let bytes = encode_nas_5gs_message(&configuration_update_command()).expect("encode");
         let msg = decode_nas_5gs_message(&bytes).expect("decode");
         assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::ConfigurationUpdateCommand));
+        // A plain command carries no allowed NSSAI.
+        assert!(allowed_nssai_from_configuration_update_command(&msg).is_empty());
+
+        // A command carrying the Allowed NSSAI round-trips to that slice set.
+        let allowed = vec![(1u8, Some([1, 2, 3])), (2, None)];
+        let bytes = encode_nas_5gs_message(&configuration_update_command_with_nssai(&allowed))
+            .expect("encode");
+        let msg = decode_nas_5gs_message(&bytes).expect("decode");
+        assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::ConfigurationUpdateCommand));
+        assert_eq!(allowed_nssai_from_configuration_update_command(&msg), allowed);
     }
 
     #[test]
