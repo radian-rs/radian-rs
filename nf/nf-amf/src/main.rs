@@ -27,6 +27,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use anyhow::Context;
 use nas::{Nas5gmmMessage, Nas5gmmMessageType, Nas5gsMessage};
+use sbi_core::npcf_am::FieldUpdate;
 use ngap::{
     InitialUEMessage, InitialUEMessageProtocolIEs_EntryValue, InitiatingMessage,
     InitiatingMessageValue, NGAP_PDU, PDUSessionResourceSetupResponseProtocolIEs_EntryValue,
@@ -151,14 +152,15 @@ enum UeCmd {
     /// a pending AM policy change). Sent to the gNB associations serving any of the
     /// area's TAs; each sends an NGAP Paging carrying the full TAI list.
     Page { tmsi: u32, tacs: Vec<[u8; 3]> },
-    /// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify): the
-    /// UE-AMBR `(downlink, uplink)` bits/sec override for this UE — `None` **removes**
-    /// the override, falling the effective UE-AMBR back to the subscribed value.
+    /// Apply a PCF-notified AM policy change (Npcf_AMPolicyControl_UpdateNotify): a
+    /// **partial** delta where each attribute is a [`FieldUpdate`] — omitted keeps the
+    /// UE's current value, `Clear` removes it (UE-AMBR falls back to the subscribed
+    /// value), `Set` replaces it. The AMF resolves each against the UE context.
     UpdateAmPolicy {
         amf_ue_id: u64,
-        ue_ambr: Option<(u64, u64)>,
-        rfsp: Option<u16>,
-        area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
+        ue_ambr: FieldUpdate<(u64, u64)>,
+        rfsp: FieldUpdate<u16>,
+        area_restriction: FieldUpdate<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
     },
     /// Hand this association's UE context over to another association (an Xn path
     /// switch landed on the target gNB). The owner removes the context, replies on
@@ -569,12 +571,12 @@ struct UeContext {
 }
 
 /// An AM policy change awaiting a CM-IDLE UE's return (see
-/// `UeContext::pending_am_policy`).
+/// `UeContext::pending_am_policy`) — the partial delta held until resume.
 #[derive(Debug, Clone, PartialEq)]
 struct PendingAmPolicy {
-    ue_ambr: Option<(u64, u64)>,
-    rfsp: Option<u16>,
-    area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
+    ue_ambr: FieldUpdate<(u64, u64)>,
+    rfsp: FieldUpdate<u16>,
+    area_restriction: FieldUpdate<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
 }
 
 /// What an `InitialUEMessage` asks the AMF to do next.
@@ -937,31 +939,41 @@ fn namf_callback_router() -> axum::Router {
     /// applied when it resumes); `404` if the UE is unknown.
     async fn am_policy_notify(
         axum::extract::Path(supi): axum::extract::Path<String>,
-        axum::Json(policy): axum::Json<sbi_core::npcf_am::PolicyAssociation>,
+        axum::Json(policy): axum::Json<sbi_core::npcf_am::PolicyUpdate>,
     ) -> axum::http::StatusCode {
-        // The UE-AMBR (enforced at the gNB), the RFSP (RAT/frequency steering), and
-        // the service area restriction (allowed/non-allowed TACs) are all applied. A
-        // policy with **no** UE-AMBR removes the override — the effective UE-AMBR
-        // falls back to the subscribed (am-data) value.
-        let ue_ambr: Option<(u64, u64)> = match policy.ue_ambr.as_ref() {
-            None => None,
-            Some(ambr) => match (
+        // A **partial** delta (TS 29.507): each attribute is omitted (keep), cleared,
+        // or set. Translate the wire types into the AMF's internal ones, preserving
+        // the three-way distinction — an omitted UE-AMBR leaves the override intact,
+        // a cleared one removes it (effective falls back to the subscribed value).
+        let ue_ambr = match policy.ue_ambr {
+            FieldUpdate::Keep => FieldUpdate::Keep,
+            FieldUpdate::Clear => FieldUpdate::Clear,
+            FieldUpdate::Set(ambr) => match (
                 pdu_session::bitrate_to_bps(&ambr.downlink),
                 pdu_session::bitrate_to_bps(&ambr.uplink),
             ) {
-                (Some(dl), Some(ul)) => Some((dl, ul)),
+                (Some(dl), Some(ul)) => FieldUpdate::Set((dl, ul)),
                 _ => return axum::http::StatusCode::BAD_REQUEST,
             },
         };
         let rfsp = policy.rfsp;
-        let area_restriction = policy.serv_area_res.as_ref().and_then(area_restriction_tacs);
+        // A set service area with no usable TAC (all malformed) resolves to a clear,
+        // matching the pre-partial behaviour; omitted stays omitted.
+        let area_restriction = match policy.serv_area_res {
+            FieldUpdate::Keep => FieldUpdate::Keep,
+            FieldUpdate::Clear => FieldUpdate::Clear,
+            FieldUpdate::Set(sar) => match area_restriction_tacs(&sar) {
+                Some(tacs) => FieldUpdate::Set(tacs),
+                None => FieldUpdate::Clear,
+            },
+        };
         match UE_DIRECTORY.lock().unwrap().get(&supi).cloned() {
             Some((amf_ue_id, tx))
                 if tx
                     .send(UeCmd::UpdateAmPolicy {
                         amf_ue_id,
-                        ue_ambr,
-                        rfsp,
+                        ue_ambr: ue_ambr.clone(),
+                        rfsp: rfsp.clone(),
                         area_restriction: area_restriction.clone(),
                     })
                     .is_ok() =>
@@ -1096,22 +1108,26 @@ async fn on_network_deregistration(
 fn on_am_policy_update(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
-    ue_ambr: Option<(u64, u64)>,
-    rfsp: Option<u16>,
-    area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
+    ue_ambr: FieldUpdate<(u64, u64)>,
+    rfsp: FieldUpdate<u16>,
+    area_restriction: FieldUpdate<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
 ) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
         warn!("AM policy update for unknown UE {amf_ue_id}");
         return Vec::new();
     };
-    // The PCF override takes precedence over the subscribed UE-AMBR; `None` removes it
-    // (the effective UE-AMBR then falls back to the subscribed value).
-    ctx.pcf_ue_ambr = ue_ambr;
+    // Resolve each partial delta against the current context: an omitted attribute
+    // keeps its value, a cleared one removes it, a set one replaces it. The PCF
+    // override takes precedence over the subscribed UE-AMBR; clearing it falls the
+    // effective UE-AMBR back to the subscribed value.
+    ctx.pcf_ue_ambr = ue_ambr.apply(ctx.pcf_ue_ambr);
     ctx.recompute_ue_ambr();
-    ctx.rfsp = rfsp;
-    ctx.area_restriction = area_restriction.clone();
+    ctx.rfsp = rfsp.apply(ctx.rfsp);
+    ctx.area_restriction = area_restriction.apply(ctx.area_restriction.take());
     let ran_ue_id = ctx.ran_ue_id;
     let effective_ambr = ctx.ue_ambr;
+    let rfsp = ctx.rfsp;
+    let area_restriction = ctx.area_restriction.clone();
     info!(
         "UE {amf_ue_id}: AM policy updated — signalling RFSP {rfsp:?}, effective UE-AMBR \
          {effective_ambr:?} (dl/ul) bps, service area {area_restriction:?} to the RAN"
@@ -3990,8 +4006,13 @@ mod tests {
         ues.insert(1u64, ctx);
 
         // The changed policy also moves the UE to a new service area (allow TAC 000002).
-        let dls =
-            on_am_policy_update(&mut ues, 1, Some((600_000_000, 300_000_000)), Some(9), Some((vec![[0, 0, 2]], Vec::new())));
+        let dls = on_am_policy_update(
+            &mut ues,
+            1,
+            FieldUpdate::Set((600_000_000, 300_000_000)),
+            FieldUpdate::Set(9),
+            FieldUpdate::Set((vec![[0, 0, 2]], Vec::new())),
+        );
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             [
@@ -4025,12 +4046,12 @@ mod tests {
             nas::gmm_message_type(&cuc),
             Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand)
         );
-        // A change with no service area falls back to the plain transport (no MRL).
-        let dls = on_am_policy_update(&mut ues, 1, Some((1, 1)), None, None);
+        // Clearing the service area falls back to the plain transport (no MRL).
+        let dls = on_am_policy_update(&mut ues, 1, FieldUpdate::Set((1, 1)), FieldUpdate::Clear, FieldUpdate::Clear);
         assert_eq!(ngap::area_restriction_from_downlink_nas(&dls[1].0), None);
         assert_eq!(ues.get(&1).unwrap().area_restriction, None, "service area cleared");
         // Unknown UE → no downlinks.
-        assert!(on_am_policy_update(&mut ues, 999, Some((1, 1)), None, None).is_empty());
+        assert!(on_am_policy_update(&mut ues, 999, FieldUpdate::Set((1, 1)), FieldUpdate::Keep, FieldUpdate::Keep).is_empty());
     }
 
     /// The PCF removing its UE-AMBR override (an UpdateNotify with no UE-AMBR) falls
@@ -4049,9 +4070,11 @@ mod tests {
         let mut ues = HashMap::new();
         ues.insert(amf_ue_id, ctx);
 
-        // The PCF removes the UE-AMBR override → effective falls back to subscribed,
-        // signalled to the RAN in a UE Context Modification.
-        let dls = on_am_policy_update(&mut ues, amf_ue_id, None, Some(7), None);
+        // The PCF removes the UE-AMBR override (a partial delta that clears only the
+        // UE-AMBR — RFSP and service area omitted, so they're kept) → effective falls
+        // back to subscribed, signalled to the RAN in a UE Context Modification.
+        let dls =
+            on_am_policy_update(&mut ues, amf_ue_id, FieldUpdate::Clear, FieldUpdate::Keep, FieldUpdate::Keep);
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             [
@@ -4061,9 +4084,47 @@ mod tests {
         );
         assert_eq!(ues[&amf_ue_id].pcf_ue_ambr, None, "override removed");
         assert_eq!(ues[&amf_ue_id].ue_ambr, Some((1_000_000, 500_000)), "effective = subscribed");
+        assert_eq!(ues[&amf_ue_id].rfsp, Some(7), "RFSP kept (omitted from the delta)");
         let back = NGAP_PDU::decode(&dls[0].0.encode().unwrap()).unwrap();
         let (_a, _r, _rfsp, ambr) = ngap::ue_context_modification_params(&back).unwrap();
         assert_eq!(ambr, Some((1_000_000, 500_000)), "RAN gets the subscribed UE-AMBR");
+    }
+
+    /// A **partial** UpdateNotify that changes only the RFSP: the omitted UE-AMBR and
+    /// service area are kept (not wiped), so the effective UE-AMBR and the Mobility
+    /// Restriction List survive the delta.
+    #[test]
+    fn partial_update_notify_keeps_omitted_fields() {
+        let (ki, ke) = ([0xb1u8; 16], [0xb2u8; 16]);
+        let amf_ue_id = 0x91u64;
+        let mut ctx = UeContext::new(5, RegState::Registered, Some("imsi-999700000000091".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.subscribed_ue_ambr = Some((1_000_000, 500_000));
+        ctx.pcf_ue_ambr = Some((5_000_000, 5_000_000));
+        ctx.recompute_ue_ambr();
+        ctx.rfsp = Some(3);
+        ctx.area_restriction = Some((vec![[0, 0, 1]], Vec::new()));
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+
+        // Only the RFSP changes (3 → 9); UE-AMBR and service area are omitted (`Keep`).
+        let dls = on_am_policy_update(&mut ues, amf_ue_id, FieldUpdate::Keep, FieldUpdate::Set(9), FieldUpdate::Keep);
+        let ctx = &ues[&amf_ue_id];
+        assert_eq!(ctx.rfsp, Some(9), "RFSP set");
+        assert_eq!(ctx.pcf_ue_ambr, Some((5_000_000, 5_000_000)), "UE-AMBR override kept");
+        assert_eq!(ctx.ue_ambr, Some((5_000_000, 5_000_000)), "effective UE-AMBR kept");
+        assert_eq!(ctx.area_restriction, Some((vec![[0, 0, 1]], Vec::new())), "service area kept");
+        // The RAN still sees the kept UE-AMBR alongside the new RFSP; the kept service
+        // area still rides the Configuration Update Command's transport (MRL).
+        assert_eq!(
+            ngap::ue_context_modification_params(&dls[0].0),
+            Some((amf_ue_id, 5, Some(9), Some((5_000_000, 5_000_000))))
+        );
+        assert_eq!(
+            ngap::area_restriction_from_downlink_nas(&dls[1].0),
+            Some((vec![[0, 0, 1]], Vec::new())),
+            "kept service area still signalled"
+        );
     }
 
     /// Service area restriction: the PCF policy's `servAreaRes` is parsed into
@@ -5427,13 +5488,14 @@ mod tests {
             }
         }
         assert!(paged, "CM-IDLE UE paged for the policy change");
-        // The change is held in the retained context (latest wins).
+        // The change is held in the retained context (latest wins) — all three
+        // attributes were present in the notify, so each is a `Set`.
         assert_eq!(
             RETAINED.lock().unwrap().get(&tmsi).unwrap().pending_am_policy,
             Some(PendingAmPolicy {
-                ue_ambr: Some((222_000_000, 111_000_000)),
-                rfsp: Some(9),
-                area_restriction: Some((vec![[0, 0, 3]], Vec::new())),
+                ue_ambr: FieldUpdate::Set((222_000_000, 111_000_000)),
+                rfsp: FieldUpdate::Set(9),
+                area_restriction: FieldUpdate::Set((vec![[0, 0, 3]], Vec::new())),
             })
         );
         // A completely unknown UE still yields 404.

@@ -76,6 +76,128 @@ pub struct PolicyAssociation {
     pub triggers: Vec<String>,
 }
 
+/// One attribute in a **partial** AM policy update (TS 29.507 `Npcf_AMPolicyControl`
+/// UpdateNotify): absent from the notification (**keep** the AMF's current value),
+/// present as JSON `null` (**clear** it), or present with a value (**set** it).
+/// Distinguishing *absent* from *null* is what makes an UpdateNotify a partial delta
+/// rather than a full replacement — the PCF signals only the attributes it changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldUpdate<T> {
+    /// The attribute was omitted — keep whatever the AMF already has.
+    Keep,
+    /// The attribute was sent as `null` — remove it (fall back to the default).
+    Clear,
+    /// The attribute carried a value — set it.
+    Set(T),
+}
+
+// Not `#[derive(Default)]`: that would add a spurious `T: Default` bound, breaking
+// `FieldUpdate<Ambr>::default()` (an `Ambr` isn't `Default`) — which the `Keep`
+// default never needs, since it carries no `T`.
+#[allow(clippy::derivable_impls)]
+impl<T> Default for FieldUpdate<T> {
+    fn default() -> Self {
+        FieldUpdate::Keep
+    }
+}
+
+impl<T> FieldUpdate<T> {
+    /// Resolve the delta against the AMF's `current` value: `Keep` leaves it, `Clear`
+    /// removes it, `Set` replaces it.
+    pub fn apply(self, current: Option<T>) -> Option<T> {
+        match self {
+            FieldUpdate::Keep => current,
+            FieldUpdate::Clear => None,
+            FieldUpdate::Set(v) => Some(v),
+        }
+    }
+
+    /// Whether the attribute was omitted (used to skip it when serializing / to tell
+    /// "not changed" from "changed").
+    pub fn is_keep(&self) -> bool {
+        matches!(self, FieldUpdate::Keep)
+    }
+}
+
+/// Deserialize a present attribute into `Clear` (JSON `null`) or `Set` (a value). Only
+/// called when the key is present; an absent key uses `Default` (`Keep`).
+fn de_field_update<'de, D, T>(d: D) -> Result<FieldUpdate<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(match Option::<T>::deserialize(d)? {
+        None => FieldUpdate::Clear,
+        Some(v) => FieldUpdate::Set(v),
+    })
+}
+
+/// Serialize `Clear` as JSON `null` and `Set` as the value. `Keep` is never reached
+/// here — `skip_serializing_if = "FieldUpdate::is_keep"` omits the key entirely.
+fn ser_field_update<S, T>(v: &FieldUpdate<T>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    T: Serialize,
+{
+    match v {
+        FieldUpdate::Set(x) => x.serialize(s),
+        FieldUpdate::Keep | FieldUpdate::Clear => s.serialize_none(),
+    }
+}
+
+/// `PolicyUpdate` (TS 29.507 §5.6.2) — the **partial** body of an
+/// `Npcf_AMPolicyControl_UpdateNotify`. Each attribute is a [`FieldUpdate`]: omitted
+/// means the AMF keeps its current value, `null` removes it, a value sets it. Built
+/// by [`PolicyAssociation::diff`] from the previous and fresh decisions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyUpdate {
+    #[serde(
+        default,
+        skip_serializing_if = "FieldUpdate::is_keep",
+        serialize_with = "ser_field_update",
+        deserialize_with = "de_field_update"
+    )]
+    pub rfsp: FieldUpdate<u16>,
+    #[serde(
+        default,
+        skip_serializing_if = "FieldUpdate::is_keep",
+        serialize_with = "ser_field_update",
+        deserialize_with = "de_field_update"
+    )]
+    pub ue_ambr: FieldUpdate<Ambr>,
+    #[serde(
+        rename = "servAreaRes",
+        default,
+        skip_serializing_if = "FieldUpdate::is_keep",
+        serialize_with = "ser_field_update",
+        deserialize_with = "de_field_update"
+    )]
+    pub serv_area_res: FieldUpdate<ServiceAreaRestriction>,
+}
+
+impl PolicyAssociation {
+    /// The partial UpdateNotify that carries `self` (the previous decision) to `next`:
+    /// each attribute that changed is present (a new value → `Set`, a removed value →
+    /// `Clear`/JSON `null`); unchanged attributes are omitted so the AMF keeps them.
+    /// `None` when nothing relevant changed (the PCF then notifies nothing).
+    pub fn diff(&self, next: &PolicyAssociation) -> Option<PolicyUpdate> {
+        fn field<T: Clone + PartialEq>(prev: &Option<T>, next: &Option<T>) -> FieldUpdate<T> {
+            match (prev == next, next) {
+                (true, _) => FieldUpdate::Keep,
+                (false, Some(v)) => FieldUpdate::Set(v.clone()),
+                (false, None) => FieldUpdate::Clear,
+            }
+        }
+        let update = PolicyUpdate {
+            rfsp: field(&self.rfsp, &next.rfsp),
+            ue_ambr: field(&self.ue_ambr, &next.ue_ambr),
+            serv_area_res: field(&self.serv_area_res, &next.serv_area_res),
+        };
+        (update != PolicyUpdate::default()).then_some(update)
+    }
+}
+
 /// Local AM policy configuration — the decision the PCF returns for an association.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -208,9 +330,12 @@ async fn update(State(pcf): State<AmPcfState>, Path(id): Path<String>) -> axum::
     if let Some(entry) = pcf.associations.lock().unwrap().get_mut(&id) {
         entry.1 = fresh.clone();
     }
-    if let Some(uri) = &req.notification_uri {
-        tracing::info!(supi = %req.supi, assoc = %id, "AM policy changed — notifying the AMF (UpdateNotify)");
-        if let Err(e) = crate::sbi_client().post(uri).json(&fresh).send().await {
+    // Notify the AMF with a **partial** delta — only the attributes that changed,
+    // a removed one carried as JSON `null` (TS 29.507 partial UpdateNotify). The AMF
+    // keeps any attribute the delta omits rather than treating absence as removal.
+    if let (Some(uri), Some(delta)) = (&req.notification_uri, prev.diff(&fresh)) {
+        tracing::info!(supi = %req.supi, assoc = %id, "AM policy changed — notifying the AMF (UpdateNotify, partial)");
+        if let Err(e) = crate::sbi_client().post(uri).json(&delta).send().await {
             tracing::warn!("Npcf_AMPolicyControl_UpdateNotify failed: {e}");
         }
     }
@@ -379,15 +504,15 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering as O};
         use subscriber_db::SubscriberStore;
 
-        // Mock AMF notification surface recording the pushed policies.
+        // Mock AMF notification surface recording the pushed **partial** updates.
         static NOTIFS: AtomicUsize = AtomicUsize::new(0);
-        let last: Arc<Mutex<Option<PolicyAssociation>>> = Arc::new(Mutex::new(None));
+        let last: Arc<Mutex<Option<PolicyUpdate>>> = Arc::new(Mutex::new(None));
         let last_h = last.clone();
         let amf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let amf_addr = amf_l.local_addr().unwrap();
         let amf = axum::Router::new().route(
             "/npcf-am-policy-notify/{supi}",
-            post(move |axum::Json(p): axum::Json<PolicyAssociation>| {
+            post(move |axum::Json(p): axum::Json<PolicyUpdate>| {
                 let last = last_h.clone();
                 async move {
                     NOTIFS.fetch_add(1, O::Relaxed);
@@ -441,7 +566,15 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(NOTIFS.load(O::Relaxed), 1, "AMF notified once on the change");
-        assert_eq!(last.lock().unwrap().as_ref().unwrap().rfsp, Some(8));
+        // Partial delta: only the changed RFSP is present; the (unset) UE-AMBR and
+        // service area are omitted (`Keep`) rather than pushed as removals.
+        {
+            let got = last.lock().unwrap();
+            let upd = got.as_ref().unwrap();
+            assert_eq!(upd.rfsp, FieldUpdate::Set(8));
+            assert_eq!(upd.ue_ambr, FieldUpdate::Keep, "UE-AMBR omitted, not cleared");
+            assert_eq!(upd.serv_area_res, FieldUpdate::Keep, "service area omitted");
+        }
 
         // A service-area-only edit (RFSP unchanged) still counts as a change: the
         // notify fires and the pushed policy carries the new servAreaRes.
@@ -464,7 +597,53 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(NOTIFS.load(O::Relaxed), 2, "AMF notified again on the service-area change");
+        // The RFSP didn't change this round, so it's omitted (`Keep`) — the AMF holds
+        // the RFSP it already has; only the new service area rides the delta.
         let got = last.lock().unwrap();
-        assert_eq!(got.as_ref().unwrap().serv_area_res.as_ref().unwrap().restriction_type, "ALLOWED_AREAS");
+        let upd = got.as_ref().unwrap();
+        assert_eq!(upd.rfsp, FieldUpdate::Keep, "RFSP unchanged → omitted from the delta");
+        let FieldUpdate::Set(sar) = &upd.serv_area_res else { panic!("service area set") };
+        assert_eq!(sar.restriction_type, "ALLOWED_AREAS");
+        assert_eq!(sar.tacs, ["000007"]);
+    }
+
+    /// The partial UpdateNotify wire format (TS 29.507): an omitted attribute
+    /// deserializes to `Keep`, a JSON `null` to `Clear`, a value to `Set`; and
+    /// [`PolicyAssociation::diff`] emits exactly the attributes that changed (a
+    /// removed one as `null`), omitting the rest.
+    #[test]
+    fn policy_update_partial_semantics() {
+        // Wire → FieldUpdate: absent = Keep, null = Clear, value = Set.
+        let parsed: PolicyUpdate =
+            serde_json::from_value(serde_json::json!({ "rfsp": 5, "ueAmbr": null })).unwrap();
+        assert_eq!(parsed.rfsp, FieldUpdate::Set(5), "value → Set");
+        assert_eq!(parsed.ue_ambr, FieldUpdate::Clear, "null → Clear");
+        assert_eq!(parsed.serv_area_res, FieldUpdate::Keep, "absent → Keep");
+        // apply() resolves each against the AMF's current value.
+        assert_eq!(FieldUpdate::Keep.apply(Some(3)), Some(3));
+        assert_eq!(FieldUpdate::<u16>::Clear.apply(Some(3)), None);
+        assert_eq!(FieldUpdate::Set(9).apply(Some(3)), Some(9));
+
+        // diff: change one attribute, remove another, leave the third.
+        let prev = PolicyAssociation {
+            rfsp: Some(3),
+            ue_ambr: Some(Ambr { uplink: "1 Gbps".into(), downlink: "2 Gbps".into() }),
+            serv_area_res: Some(ServiceAreaRestriction {
+                restriction_type: "ALLOWED_AREAS".into(),
+                tacs: vec!["000001".into()],
+            }),
+            triggers: Vec::new(),
+        };
+        let next = PolicyAssociation { rfsp: Some(8), ue_ambr: None, ..prev.clone() };
+        let delta = prev.diff(&next).expect("something changed");
+        assert_eq!(delta.rfsp, FieldUpdate::Set(8), "RFSP changed → Set");
+        assert_eq!(delta.ue_ambr, FieldUpdate::Clear, "UE-AMBR removed → Clear");
+        assert_eq!(delta.serv_area_res, FieldUpdate::Keep, "service area unchanged → Keep");
+        // On the wire the delta is exactly {rfsp, ueAmbr:null} — the service area is absent.
+        let wire = serde_json::to_value(&delta).unwrap();
+        assert_eq!(wire, serde_json::json!({ "rfsp": 8, "ueAmbr": null }));
+
+        // No change → nothing to notify.
+        assert_eq!(prev.diff(&prev.clone()), None);
     }
 }
