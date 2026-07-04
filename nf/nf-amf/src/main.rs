@@ -1311,6 +1311,23 @@ async fn on_service_request(
             }
         }
     }
+    // GUTI reallocation (TS 24.501 §5.4.1.3): a registration update reassigns the
+    // 5G-GUTI — a fresh 5G-TMSI (this connection's AMF-UE-NGAP-ID, as at initial
+    // registration). Re-key GUTI_DIRECTORY (SUPI → new TMSI) so a later GUTI
+    // re-registration resolves; RETAINED re-keys naturally on the next AN release,
+    // which retains under `ctx.guti_tmsi`. A Service Request keeps the GUTI.
+    let reg_tmsi = if is_registration_update {
+        let new_tmsi = amf_ue_id as u32;
+        if let Some(supi) = &ctx.suci {
+            let mut gutis = GUTI_DIRECTORY.lock().unwrap();
+            gutis.retain(|_, s| s != supi);
+            gutis.insert(new_tmsi, supi.clone());
+        }
+        ctx.guti_tmsi = Some(new_tmsi);
+        new_tmsi
+    } else {
+        tmsi
+    };
     // An AM policy change that arrived while the UE was CM-IDLE — applied below,
     // once the context is back in the association map.
     let pending_am_policy = ctx.pending_am_policy.take();
@@ -1337,11 +1354,12 @@ async fn on_service_request(
         let kgnb = kamf.map(|k| aka::kgnb(&k, s.ul_count.wrapping_sub(1)));
         let (bytes, ics_label, dl_label) = if is_registration_update {
             // A registration update (mobility or periodic) is answered with a fresh
-            // Registration Accept (same GUTI, T3512, the current registration area).
+            // Registration Accept carrying the **reallocated** 5G-GUTI, T3512, and
+            // the current registration area.
             let accept = nas::registration_accept(
                 PLMN_MCC,
                 PLMN_MNC,
-                tmsi,
+                reg_tmsi,
                 &allowed,
                 &[],
                 T3512_SECS,
@@ -1379,11 +1397,13 @@ async fn on_service_request(
     }
     if is_mobility_update {
         info!(
-            "UE {amf_ue_id}: mobility registration update (tmsi {tmsi:#010x}) — registration area re-assigned to {registration_area:02x?}"
+            "UE {amf_ue_id}: mobility registration update (tmsi {tmsi:#010x} → {reg_tmsi:#010x}) — \
+             registration area re-assigned to {registration_area:02x?}, GUTI reallocated"
         );
     } else if is_periodic {
         info!(
-            "UE {amf_ue_id}: periodic registration update (tmsi {tmsi:#010x}) — still reachable, retained context refreshed"
+            "UE {amf_ue_id}: periodic registration update (tmsi {tmsi:#010x} → {reg_tmsi:#010x}) — \
+             still reachable, GUTI reallocated, retained context refreshed"
         );
     } else {
         info!("UE {amf_ue_id} resuming from CM-IDLE (Service Request, tmsi {tmsi:#010x}); {} session(s)", sm_refs.len());
@@ -3719,6 +3739,9 @@ mod tests {
         ctx.retained_at = Some(std::time::Instant::now()); // was ticking toward eviction
         ctx.sm_refs.insert(5, ("ctx-per".into(), "http://127.0.0.1:1".into()));
         RETAINED.lock().unwrap().insert(tmsi, ctx);
+        GUTI_DIRECTORY.lock().unwrap().insert(tmsi, supi.into()); // the old GUTI
+
+
 
         // The UE checks in from the same gNB (TAC 000001) with a protected periodic
         // Registration Request — a mock SMF that would fail any activation call.
@@ -3741,22 +3764,31 @@ mod tests {
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             ["InitialContextSetupRequest (RegistrationAccept — periodic)"]
         );
-        let (_a, _r, ic) = ngap::initial_context_setup_params(&dls[0].0).expect("ICS parses");
+        let (new_amf_id, _r, ic) = ngap::initial_context_setup_params(&dls[0].0).expect("ICS parses");
         // The context is restored CM-CONNECTED, the retained timer stopped, the
         // area unchanged (the UE didn't move), the session intact.
-        let restored = ues.get(&(_a)).expect("context restored");
+        let restored = ues.get(&new_amf_id).expect("context restored");
         assert_eq!(restored.cm_state, CmState::Connected);
         assert_eq!(restored.retained_at, None, "mobile-reachable timer stopped");
         assert_eq!(restored.registration_area, vec![[0, 0, 1], [0, 0, 2]], "area unchanged");
         assert_eq!(restored.sm_refs.len(), 1, "PDU session kept");
         assert!(RETAINED.lock().unwrap().get(&tmsi).is_none(), "no longer awaiting eviction");
-        // The UE decodes the accept: same area, kept NSSAI.
+        // GUTI reallocation: a fresh 5G-TMSI (the new AMF-UE-NGAP-ID); GUTI_DIRECTORY
+        // re-keyed (old TMSI gone, new → SUPI); the context holds the new TMSI.
+        let new_tmsi = new_amf_id as u32;
+        assert_ne!(new_tmsi, tmsi, "GUTI reallocated");
+        assert_eq!(restored.guti_tmsi, Some(new_tmsi));
+        assert_eq!(GUTI_DIRECTORY.lock().unwrap().get(&tmsi), None, "old GUTI removed");
+        assert_eq!(GUTI_DIRECTORY.lock().unwrap().get(&new_tmsi).map(String::as_str), Some(supi));
+        // The UE decodes the accept: the new GUTI, same area, kept NSSAI.
         let accept = ue_sec.unprotect(&ic.nas, 1).expect("UE verifies the accept");
         assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::RegistrationAccept));
+        assert_eq!(nas::guti_tmsi_from_registration_accept(&accept), Some(new_tmsi), "new GUTI to the UE");
         assert_eq!(
             nas::registration_area_from_registration_accept(&accept),
             Some(vec![[0, 0, 1], [0, 0, 2]])
         );
+        GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != supi);
         UE_DIRECTORY.lock().unwrap().remove(supi);
     }
 
