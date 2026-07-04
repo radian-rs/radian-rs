@@ -836,6 +836,49 @@ pub fn session_establishment_request(
     builder.build().expect("build Session Establishment Request").marshal()
 }
 
+/// SMF: build a PFCP Session Establishment Request for an **indirect data
+/// forwarding** tunnel (TS 23.502 §4.9.1.3.3). One PDR matches packets arriving on
+/// a UPF-allocated Access-facing F-TEID (the ingress the source gNB forwards to);
+/// its FAR forwards them, with Outer Header Creation set at establishment, to the
+/// **target** gNB's DL forwarding F-TEID. The UPF returns the allocated ingress
+/// F-TEID in the response's Created PDR (id 1), which the AMF hands the source in
+/// the Handover Command.
+pub fn session_establishment_request_indirect_forwarding(
+    cp_seid: u64,
+    seq: u32,
+    smf_ip: Ipv4Addr,
+    target_teid: u32,
+    target_addr: Ipv4Addr,
+) -> Vec<u8> {
+    let pdi = PdiBuilder::uplink_access()
+        .f_teid(Fteid::ipv4(0, smf_ip)) // placeholder; the UPF allocates the ingress F-TEID
+        .build()
+        .expect("build forwarding PDI");
+    let pdr = CreatePdrBuilder::new(PdrId::new(1))
+        .precedence(Precedence::new(100))
+        .pdi(pdi)
+        .far_id(FarId::new(1))
+        .build()
+        .expect("build forwarding Create PDR");
+    let params = rs_pfcp::ie::forwarding_parameters::ForwardingParameters::new(
+        rs_pfcp::ie::destination_interface::DestinationInterface::new(Interface::Access),
+    )
+    .with_outer_header_creation(OuterHeaderCreation::gtpu_ipv4(target_teid, target_addr));
+    let far = CreateFar::builder(FarId::new(1))
+        .apply_action(ApplyAction::FORW)
+        .forwarding_parameters(params)
+        .build()
+        .expect("build forwarding Create FAR");
+    SessionEstablishmentRequestBuilder::new(0u64, seq)
+        .node_id(smf_ip)
+        .fseid(cp_seid, smf_ip)
+        .create_pdrs(vec![pdr.to_ie()])
+        .create_fars(vec![far.to_ie()])
+        .build()
+        .expect("build indirect-forwarding Session Establishment Request")
+        .marshal()
+}
+
 /// SMF: build a PFCP Session Modification Request that re-rates the session-AMBR
 /// QER (a mid-session policy change) — an Update QER carrying the new MBR.
 pub fn session_qer_update_request(up_seid: u64, seq: u32, ambr: SessionAmbr) -> Vec<u8> {
@@ -1481,6 +1524,30 @@ mod tests {
         // exhausted per-flow bucket.
         let other = udp_packet(40000, 9999, 1000);
         assert!(state.admit_uplink(teid, 0, &other), "non-GBR traffic still admitted on the session AMBR");
+    }
+
+    #[test]
+    fn indirect_forwarding_session_allocates_an_ingress_fteid() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        // The SMF sets up a forwarding tunnel toward the target gNB's DL
+        // forwarding F-TEID (0x99 @ 10.0.9.6); the UPF allocates the ingress F-TEID
+        // the source will forward to, and returns it in the establishment response.
+        let target = Ipv4Addr::new(10, 0, 9, 6);
+        let resp = handle_n4(
+            &session_establishment_request_indirect_forwarding(0xF00D, 7, node_ip, 0x99, target),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("establish forwarding");
+        let session = parse_session_establishment_response(&resp).expect("response parses");
+        assert_ne!(session.n3_teid, 0, "the UPF allocated an ingress F-TEID");
+        assert_eq!(session.n3_addr, node_ip);
+        // The forwarding session tears down like any other (Session Deletion).
+        let del = session_deletion_request(session.up_seid, 8);
+        let del_resp = handle_n4(&del, node_ip, &mut state, 0).expect("delete forwarding");
+        assert!(response_accepted(&del_resp));
     }
 
     #[test]

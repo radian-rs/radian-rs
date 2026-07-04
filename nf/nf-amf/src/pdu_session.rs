@@ -173,6 +173,7 @@ impl From<&str> for CreateSmError {
 }
 
 /// The AMF's client toward the SMF's `Nsmf_PDUSession` service.
+#[derive(Clone)]
 pub struct AmfSmf {
     nrf: NrfClient,
     /// The serving PLMN this AMF passes in CreateSMContext (TS 29.502 `servingNetwork`).
@@ -290,6 +291,59 @@ impl AmfSmf {
             .map_err(|e| format!("Nsmf UpdateSMContext request failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Nsmf UpdateSMContext returned {}", resp.status()));
+        }
+        Ok(())
+    }
+
+    /// Set up an **indirect data forwarding** tunnel for an N2 handover
+    /// (TS 23.502 §4.9.1.3.3): the SMF establishes a UPF forwarding session toward
+    /// the target gNB's DL forwarding F-TEID and returns the UPF-allocated ingress
+    /// F-TEID the source gNB forwards to.
+    pub async fn setup_indirect_forwarding(
+        &self,
+        smf_base: &str,
+        sm_ref: &str,
+        target_teid: u32,
+        target_addr: Ipv4Addr,
+    ) -> Result<(u32, Ipv4Addr), String> {
+        let resp = sbi_core::sbi_client()
+            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/indirect-forwarding"))
+            .json(&serde_json::json!({
+                "targetN3Teid": format!("{target_teid:08x}"),
+                "targetN3Addr": target_addr.to_string(),
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Nsmf indirect-forwarding request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Nsmf indirect-forwarding returned {}", resp.status()));
+        }
+        let body: serde_json::Value =
+            resp.json().await.map_err(|e| format!("indirect-forwarding body: {e}"))?;
+        let teid = body
+            .get("fwdN3Teid")
+            .and_then(|v| v.as_str())
+            .and_then(|s| u32::from_str_radix(s, 16).ok())
+            .ok_or("indirect-forwarding: missing fwdN3Teid")?;
+        let addr = body
+            .get("fwdN3Addr")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .ok_or("indirect-forwarding: missing fwdN3Addr")?;
+        Ok((teid, addr))
+    }
+
+    /// Release an indirect data forwarding tunnel at the SMF (handover complete or
+    /// failed). Idempotent.
+    pub async fn release_indirect_forwarding(&self, smf_base: &str, sm_ref: &str) -> Result<(), String> {
+        let resp = sbi_core::sbi_client()
+            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/indirect-forwarding"))
+            .json(&serde_json::json!({ "release": true }))
+            .send()
+            .await
+            .map_err(|e| format!("Nsmf indirect-forwarding release failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Nsmf indirect-forwarding release returned {}", resp.status()));
         }
         Ok(())
     }

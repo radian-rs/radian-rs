@@ -56,6 +56,10 @@ struct SmContext {
     /// gNB downlink target, once `UpdateSMContext` installs it. Cleared on AN
     /// release (deactivation).
     gnb: Option<(u32, Ipv4Addr)>,
+    /// An **indirect data forwarding** tunnel's UP-SEID, set up for an N2 handover
+    /// (source → UPF → target). `None` when no forwarding is in place; released
+    /// when the handover completes or fails.
+    indirect_fwd: Option<u64>,
     /// Subscriber + session identity, for the UECM smf-registration teardown.
     supi: String,
     pdu_session_id: u8,
@@ -371,6 +375,10 @@ pub fn router(state: Arc<SmfState>) -> Router {
             "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/refresh-policy",
             post(refresh_sm_policy),
         )
+        .route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/indirect-forwarding",
+            post(indirect_forwarding),
+        )
         .with_state(state)
 }
 
@@ -547,6 +555,7 @@ async fn create_sm_context(
             ue_ip,
             snssai: sub.snssai.clone(),
             gnb: None,
+            indirect_fwd: None,
             supi: req.supi.clone(),
             pdu_session_id: req.pdu_session_id,
             sm_policy,
@@ -864,6 +873,94 @@ async fn deactivate_up(smf: &Arc<SmfState>, sm_ref: &str) -> StatusCode {
         tracing::info!(%sm_ref, up_seid, "deactivated UP connection (AN release); downlink buffered at the UPF");
     }
     StatusCode::OK
+}
+
+/// Set up (or release) an **indirect data forwarding** tunnel for an N2 handover
+/// (TS 23.502 §4.9.1.3.3). With `release`, the forwarding session is deleted;
+/// otherwise the SMF establishes a UPF forwarding session toward the target gNB's
+/// DL forwarding F-TEID and returns the UPF-allocated ingress F-TEID the source
+/// gNB forwards to.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IndirectForwardingReq {
+    #[serde(default)]
+    target_n3_teid: Option<String>,
+    #[serde(default)]
+    target_n3_addr: Option<Ipv4Addr>,
+    #[serde(default)]
+    release: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndirectForwardingRsp {
+    fwd_n3_teid: String,
+    fwd_n3_addr: Ipv4Addr,
+}
+
+async fn indirect_forwarding(
+    State(smf): State<Arc<SmfState>>,
+    Path(sm_ref): Path<String>,
+    Json(req): Json<IndirectForwardingReq>,
+) -> axum::response::Response {
+    if req.release {
+        // Tear the forwarding session down (idempotent: no tunnel → 204).
+        let fwd_seid = smf.contexts.lock().unwrap().get_mut(&sm_ref).and_then(|c| c.indirect_fwd.take());
+        let Some(fwd_seid) = fwd_seid else {
+            return StatusCode::NO_CONTENT.into_response();
+        };
+        let seq = smf.next_seq();
+        match smf.transact(&pfcp::session_deletion_request(fwd_seid, seq), seq).await {
+            Some(r) if pfcp::response_accepted(&r) => {
+                tracing::info!(%sm_ref, "released the indirect forwarding tunnel");
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            _ => return StatusCode::BAD_GATEWAY.into_response(),
+        }
+    }
+    // Set up: needs the target gNB's DL forwarding F-TEID.
+    let (Some(teid_hex), Some(target_addr)) = (req.target_n3_teid, req.target_n3_addr) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(target_teid) = u32::from_str_radix(teid_hex.trim_start_matches("0x"), 16) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if smf.contexts.lock().unwrap().get(&sm_ref).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
+    let seq = smf.next_seq();
+    let est = pfcp::session_establishment_request_indirect_forwarding(
+        cp_seid,
+        seq,
+        smf.smf_ip,
+        target_teid,
+        target_addr,
+    );
+    let resp = match smf.transact(&est, seq).await {
+        Some(r) => r,
+        None => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let Some(session) = pfcp::parse_session_establishment_response(&resp) else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    if let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref) {
+        c.indirect_fwd = Some(session.up_seid);
+    }
+    tracing::info!(
+        %sm_ref,
+        ingress_teid = format!("{:08x}", session.n3_teid),
+        target_teid = format!("{target_teid:08x}"),
+        "indirect forwarding tunnel up (source → UPF → target)"
+    );
+    (
+        StatusCode::OK,
+        Json(IndirectForwardingRsp {
+            fwd_n3_teid: format!("{:08x}", session.n3_teid),
+            fwd_n3_addr: session.n3_addr,
+        }),
+    )
+        .into_response()
 }
 
 /// `Nsmf_PDUSession_ReleaseSMContext` (TS 29.502 §5.2.2.4): tear the N4 session

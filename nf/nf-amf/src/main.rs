@@ -1098,7 +1098,7 @@ async fn handle_ngap(
                 on_handover_notify(ues, amf_smf, &pdu, dereg_tx).await;
             }
             InitiatingMessageValue::Id_HandoverCancel(_) => {
-                if let Some((ack, label)) = on_handover_cancel(&pdu) {
+                if let Some((ack, label)) = on_handover_cancel(amf_smf, &pdu).await {
                     send_or_log(conn, &ack, label).await;
                 }
             }
@@ -1137,7 +1137,7 @@ async fn handle_ngap(
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
             value: SuccessfulOutcomeValue::Id_HandoverResourceAllocation(_),
             ..
-        }) => on_handover_request_ack(&pdu),
+        }) => on_handover_request_ack(amf_smf, &pdu).await,
         NGAP_PDU::UnsuccessfulOutcome(UnsuccessfulOutcome {
             value: UnsuccessfulOutcomeValue::Id_HandoverResourceAllocation(_),
             ..
@@ -1473,6 +1473,16 @@ struct PendingHandover {
     ncc: u8,
     /// Sessions admitted by the target: `(psi, target DL F-TEID, addr)`.
     admitted: Vec<(u8, u32, std::net::Ipv4Addr)>,
+    /// The source signalled a direct Xn-U forwarding path. `false` ⇒ the AMF sets
+    /// up **indirect forwarding** (source → UPF → target) via the SMFs.
+    direct_forwarding: bool,
+    /// The handed-over PDU sessions' SM contexts `(psi, (sm_ref, smf_base))` — how
+    /// the ack/completion handlers reach the SMFs (the UE context lives on the
+    /// source association, out of reach from the target where the ack lands).
+    sessions: Vec<(u8, (String, String))>,
+    /// Indirect forwarding tunnels were established — released on completion /
+    /// cancellation / expiry.
+    indirect_active: bool,
 }
 
 /// N2 handovers in flight, AMF-wide (the messages arrive on two different gNB
@@ -1519,9 +1529,13 @@ async fn expire_handover_prep(amf_ue_id: u64, after: std::time::Duration) {
     }
 }
 
-/// TNGRELOCoverall expiry: a commanded handover whose UE never arrived is dropped
-/// and the target's prepared context is released.
-async fn expire_handover_overall(amf_ue_id: u64, after: std::time::Duration) {
+/// TNGRELOCoverall expiry: a commanded handover whose UE never arrived is dropped;
+/// the target's prepared context and any indirect forwarding tunnels are released.
+async fn expire_handover_overall(
+    amf_ue_id: u64,
+    amf_smf: pdu_session::AmfSmf,
+    after: std::time::Duration,
+) {
     tokio::time::sleep(after).await;
     let Some(p) = HANDOVERS.lock().unwrap().remove(&amf_ue_id) else {
         return; // completed (Notify consumed it)
@@ -1538,6 +1552,7 @@ async fn expire_handover_overall(amf_ue_id: u64, after: std::time::Duration) {
             label: "UEContextReleaseCommand (TNGRELOCoverall expiry)",
         });
     }
+    release_indirect_forwarding(&amf_smf, &p).await;
 }
 
 /// Handle a **Handover Required** (TS 38.413 §8.4.1, on the SOURCE association):
@@ -1589,6 +1604,7 @@ async fn on_handover_required(
     // Each session's UL N3 F-TEID + QoS flows, from its serving SMF (the same
     // retained-state fetch the Service Request resume uses).
     let mut sessions = Vec::new();
+    let mut sm_contexts: Vec<(u8, (String, String))> = Vec::new();
     for psi in &psis {
         let Some((sm_ref, smf_base)) = ctx.sm_refs.get(psi).cloned() else {
             warn!("UE {amf_ue_id}: handover for PDU session {psi} but no SM context tracked");
@@ -1602,6 +1618,7 @@ async fn on_handover_required(
                     created.ngap_flows.clone()
                 };
                 sessions.push((*psi, flows, created.up_n3_teid, created.up_n3_addr));
+                sm_contexts.push((*psi, (sm_ref, smf_base)));
             }
             Err(e) => warn!("UE {amf_ue_id}: N3 info fetch for PDU session {psi} failed: {e}"),
         }
@@ -1634,6 +1651,9 @@ async fn on_handover_required(
             nh: fresh_nh,
             ncc: fresh_ncc,
             admitted: Vec::new(),
+            direct_forwarding,
+            sessions: sm_contexts,
+            indirect_active: false,
         },
     );
     // Bound the preparation phase (TNGRELOCprep): an unanswered target fails the
@@ -1650,50 +1670,94 @@ async fn on_handover_required(
 }
 
 /// Handle a **Handover Request Acknowledge** (on the TARGET association): record
-/// the admitted sessions (the target's DL F-TEIDs, applied at Notify) and relay
-/// the target's transparent container to the source in a **Handover Command**.
-fn on_handover_request_ack(pdu: &NGAP_PDU) {
+/// the admitted sessions (the target's DL F-TEIDs, applied at Notify), set up the
+/// data-forwarding path, and relay the target's transparent container to the
+/// source in a **Handover Command**. With a direct Xn-U path the command carries
+/// the target's forwarding F-TEIDs; otherwise the AMF sets up **indirect
+/// forwarding** — a UPF forwarding tunnel per session (source → UPF → target) — and
+/// the command carries the UPF's ingress F-TEIDs instead (TS 23.502 §4.9.1.3.3).
+async fn on_handover_request_ack(amf_smf: &pdu_session::AmfSmf, pdu: &NGAP_PDU) {
     let Some((amf_ue_id, target_ran_ue_id, admitted, container)) =
         ngap::handover_request_ack_params(pdu)
     else {
         warn!("HandoverRequestAcknowledge missing mandatory IEs — ignored");
         return;
     };
-    let mut handovers = HANDOVERS.lock().unwrap();
-    let Some(pending) = handovers.get_mut(&amf_ue_id) else {
-        warn!("HandoverRequestAcknowledge for UE {amf_ue_id} with no handover in flight");
-        return;
+    // Snapshot what the forwarding setup needs (the lock can't be held across the
+    // await); bail if there's no handover in flight.
+    let (source_ran_ue_id, source_tx, direct_forwarding, session_ctx) = {
+        let mut handovers = HANDOVERS.lock().unwrap();
+        let Some(pending) = handovers.get_mut(&amf_ue_id) else {
+            warn!("HandoverRequestAcknowledge for UE {amf_ue_id} with no handover in flight");
+            return;
+        };
+        pending.admitted = admitted.iter().map(|(psi, teid, addr, _)| (*psi, *teid, *addr)).collect();
+        pending.target_ran_ue_id = Some(target_ran_ue_id);
+        pending.commanded = true;
+        (
+            pending.source_ran_ue_id,
+            pending.source_tx.clone(),
+            pending.direct_forwarding,
+            pending.sessions.clone(),
+        )
     };
-    // The target's DL forwarding F-TEIDs go back to the source in the Handover
-    // Command — the source forwards in-flight downlink packets there while the
-    // UE moves (TS 23.502 §4.9.1.3.2, direct forwarding).
-    let forwarding: Vec<(u8, u32, std::net::Ipv4Addr)> = admitted
-        .iter()
-        .filter_map(|(psi, _, _, fwd)| fwd.map(|(t, a)| (*psi, t, a)))
-        .collect();
-    pending.admitted = admitted.iter().map(|(psi, teid, addr, _)| (*psi, *teid, *addr)).collect();
-    pending.target_ran_ue_id = Some(target_ran_ue_id);
-    pending.commanded = true;
     // TNGRELOCprep stops here; TNGRELOCoverall bounds the execution phase.
     tokio::spawn(expire_handover_overall(
         amf_ue_id,
-        std::time::Duration::from_secs(env_secs(
-            "RADIAN_AMF_TNGRELOCOVERALL_SECS",
-            TNGRELOCOVERALL_SECS,
-        )),
+        amf_smf.clone(),
+        std::time::Duration::from_secs(env_secs("RADIAN_AMF_TNGRELOCOVERALL_SECS", TNGRELOCOVERALL_SECS)),
     ));
+
+    // Build the Handover Command's forwarding list.
+    let mut forwarding = Vec::new();
+    let mut indirect_active = false;
+    for (psi, _dl_teid, _dl_addr, fwd) in &admitted {
+        let Some((target_fwd_teid, target_fwd_addr)) = *fwd else {
+            continue; // this session isn't forwarding
+        };
+        if direct_forwarding {
+            // Xn-U path: the source forwards straight to the target's F-TEID.
+            forwarding.push((*psi, target_fwd_teid, target_fwd_addr));
+        } else if let Some((_, (sm_ref, smf_base))) = session_ctx.iter().find(|(p, _)| p == psi) {
+            // No Xn-U: set up a UPF forwarding tunnel and give the source its
+            // ingress F-TEID instead.
+            match amf_smf
+                .setup_indirect_forwarding(smf_base, sm_ref, target_fwd_teid, target_fwd_addr)
+                .await
+            {
+                Ok((upf_teid, upf_addr)) => {
+                    forwarding.push((*psi, upf_teid, upf_addr));
+                    indirect_active = true;
+                }
+                Err(e) => warn!("UE {amf_ue_id}: indirect forwarding setup for PDU session {psi} failed: {e}"),
+            }
+        }
+    }
+    // The overall-expiry task may already have fired; only record if still pending.
+    if let Some(pending) = HANDOVERS.lock().unwrap().get_mut(&amf_ue_id) {
+        pending.indirect_active = indirect_active;
+    }
     info!(
-        "UE {amf_ue_id}: target admitted {} session(s) (target RAN-UE {target_ran_ue_id}, \
+        "UE {amf_ue_id}: target admitted {} session(s) (target RAN-UE {target_ran_ue_id}, {} \
          {} forwarding tunnel(s)) — Handover Command to the source",
-        pending.admitted.len(),
-        forwarding.len()
+        admitted.len(),
+        forwarding.len(),
+        if direct_forwarding { "direct" } else { "indirect" }
     );
-    let command =
-        ngap::handover_command(amf_ue_id, pending.source_ran_ue_id, &forwarding, container);
-    let _ = pending.source_tx.send(UeCmd::Forward {
-        pdu: Box::new(command),
-        label: "HandoverCommand",
-    });
+    let command = ngap::handover_command(amf_ue_id, source_ran_ue_id, &forwarding, container);
+    let _ = source_tx.send(UeCmd::Forward { pdu: Box::new(command), label: "HandoverCommand" });
+}
+
+/// Release any indirect data-forwarding tunnels a handover set up (idempotent).
+async fn release_indirect_forwarding(amf_smf: &pdu_session::AmfSmf, p: &PendingHandover) {
+    if !p.indirect_active {
+        return;
+    }
+    for (_psi, (sm_ref, smf_base)) in &p.sessions {
+        if let Err(e) = amf_smf.release_indirect_forwarding(smf_base, sm_ref).await {
+            warn!("release of indirect forwarding ({sm_ref}) failed: {e}");
+        }
+    }
 }
 
 /// Handle a **Handover Failure** (on the TARGET association): the target cannot
@@ -1723,12 +1787,16 @@ fn on_handover_failure(pdu: &NGAP_PDU) {
 /// Handle a **Handover Cancel** (on the SOURCE association): the source aborts
 /// the in-flight handover — drop it, release the target's prepared context (when
 /// it already acknowledged), and answer with a Handover Cancel Acknowledge.
-fn on_handover_cancel(pdu: &NGAP_PDU) -> Option<(NGAP_PDU, &'static str)> {
+async fn on_handover_cancel(
+    amf_smf: &pdu_session::AmfSmf,
+    pdu: &NGAP_PDU,
+) -> Option<(NGAP_PDU, &'static str)> {
     let Some((amf_ue_id, ran_ue_id)) = ngap::handover_cancel_params(pdu) else {
         warn!("HandoverCancel missing mandatory IEs — ignored");
         return None;
     };
-    match HANDOVERS.lock().unwrap().remove(&amf_ue_id) {
+    let pending = HANDOVERS.lock().unwrap().remove(&amf_ue_id);
+    match pending {
         Some(pending) => {
             info!("UE {amf_ue_id}: handover cancelled by the source");
             if let Some(target_ran) = pending.target_ran_ue_id {
@@ -1743,6 +1811,7 @@ fn on_handover_cancel(pdu: &NGAP_PDU) -> Option<(NGAP_PDU, &'static str)> {
                     label: "UEContextReleaseCommand (handover cancelled)",
                 });
             }
+            release_indirect_forwarding(amf_smf, &pending).await;
         }
         None => info!("UE {amf_ue_id}: cancel for no handover in flight — acknowledging anyway"),
     }
@@ -1807,6 +1876,8 @@ async fn on_handover_notify(
             Err(e) => warn!("UE {amf_ue_id}: handover UpdateSMContext failed for {psi}: {e}"),
         }
     }
+    // The UE is on the target: the forwarding tunnels have done their job.
+    release_indirect_forwarding(amf_smf, &pending).await;
 }
 
 /// Hand a UE context over to the association an Xn path switch landed on: remove
@@ -3803,6 +3874,149 @@ mod tests {
         assert_eq!(ngap::path_switch_failure_params(&fail), Some((amf_ue_id, 11, vec![5])));
     }
 
+    /// Indirect data forwarding (TS 23.502 §4.9.1.3.3): when the source has no
+    /// direct Xn-U path, the AMF sets up a UPF forwarding tunnel per session and
+    /// the Handover Command carries the **UPF's** ingress F-TEID (not the target's
+    /// forwarding F-TEID); the tunnels are released when the UE arrives.
+    #[tokio::test]
+    async fn n2_handover_sets_up_indirect_forwarding() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+
+        // Mock SMF: ACTIVATING → UL N3 info; indirect-forwarding setup → a UPF
+        // ingress F-TEID (000000cc); release → 204. Setup/release counted.
+        static SETUPS: AtomicUsize = AtomicUsize::new(0);
+        static RELEASES: AtomicUsize = AtomicUsize::new(0);
+        async fn mock_modify(axum::Json(_): axum::Json<serde_json::Value>) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "upN3Teid": "00000001", "upN3Addr": "127.0.0.1", "ueIpv4Addr": "10.45.0.2"
+                })),
+            )
+                .into_response()
+        }
+        async fn mock_fwd(axum::Json(body): axum::Json<serde_json::Value>) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            if body.get("release").and_then(|v| v.as_bool()) == Some(true) {
+                RELEASES.fetch_add(1, O::Relaxed);
+                return axum::http::StatusCode::NO_CONTENT.into_response();
+            }
+            SETUPS.fetch_add(1, O::Relaxed);
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({ "fwdN3Teid": "000000cc", "fwdN3Addr": "10.0.9.9" })),
+            )
+                .into_response()
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new()
+            .route("/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify", axum::routing::post(mock_modify))
+            .route(
+                "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/indirect-forwarding",
+                axum::routing::post(mock_fwd),
+            );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+
+        let kamf = [0xc1u8; 32];
+        let amf_ue_id = 0x1c1u64;
+        let supi = "imsi-999700000000201";
+        let mut ctx = UeContext::new(4, RegState::Registered, Some(supi.into()));
+        ctx.kamf = Some(kamf);
+        ctx.nh_chain = Some((aka::kgnb(&kamf, 0), 0));
+        ctx.sm_refs.insert(5, ("ctx-ind".into(), format!("http://{smf_addr}")));
+        let mut src_ues = HashMap::new();
+        src_ues.insert(amf_ue_id, ctx);
+
+        let (src_tx, mut src_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tgt_tx, mut tgt_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut links = GNB_LINKS.lock().unwrap();
+            links.push(GnbLink { tacs: Vec::new(), gnb_id: None, tx: src_tx.clone() });
+            links.push(GnbLink { tacs: Vec::new(), gnb_id: Some(0x99), tx: tgt_tx.clone() });
+        }
+        UE_DIRECTORY.lock().unwrap().insert(supi.into(), (amf_ue_id, src_tx.clone()));
+
+        async fn next_forward(
+            rx: &mut tokio::sync::mpsc::UnboundedReceiver<UeCmd>,
+        ) -> (NGAP_PDU, &'static str) {
+            loop {
+                match rx.recv().await {
+                    Some(UeCmd::Forward { pdu, label }) => return (*pdu, label),
+                    Some(_) => continue,
+                    None => panic!("link closed"),
+                }
+            }
+        }
+
+        // Handover Required with NO direct forwarding path.
+        let required =
+            ngap::handover_required(amf_ue_id, 4, 0x99, "999", "70", &[0, 0, 2], &[5], false, b"s2t".to_vec());
+        assert!(on_handover_required(&mut src_ues, &amf_smf, &required, &src_tx).await.is_none());
+        let _ = next_forward(&mut tgt_rx).await; // the HandoverRequest
+
+        // The source association's select loop (simulated): owns the context and
+        // services TakeUe + captures forwarded PDUs (the Handover Command).
+        let src_cap: std::sync::Arc<std::sync::Mutex<Vec<(NGAP_PDU, &'static str)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let src_cap_w = src_cap.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = src_rx.recv().await {
+                match cmd {
+                    UeCmd::TakeUe { amf_ue_id, reply } => {
+                        for dl in on_take_ue(&mut src_ues, amf_ue_id, reply) {
+                            src_cap_w.lock().unwrap().push(dl);
+                        }
+                    }
+                    UeCmd::Forward { pdu, label } => src_cap_w.lock().unwrap().push((*pdu, label)),
+                    _ => {}
+                }
+            }
+        });
+
+        // The target admits the session offering a DL FORWARDING F-TEID (0xBB).
+        let ack = ngap::handover_request_acknowledge(
+            amf_ue_id,
+            9,
+            &[(5, 0xAA, std::net::Ipv4Addr::new(10, 0, 9, 5), Some((0xBB, std::net::Ipv4Addr::new(10, 0, 9, 6))))],
+            b"t2s".to_vec(),
+        );
+        on_handover_request_ack(&amf_smf, &ack).await;
+
+        // The AMF set up ONE indirect tunnel and the Handover Command carries the
+        // UPF's ingress F-TEID (000000cc @ 10.0.9.9), not the target's 0xBB.
+        assert_eq!(SETUPS.load(O::Relaxed), 1, "one indirect tunnel established");
+        let mut command_ok = false;
+        for _ in 0..50 {
+            {
+                let cap = src_cap.lock().unwrap();
+                if let Some((pdu, _)) = cap.iter().find(|(_, l)| *l == "HandoverCommand") {
+                    assert_eq!(
+                        ngap::handover_command_params(pdu),
+                        Some((amf_ue_id, 4, vec![(5, 0xCC, std::net::Ipv4Addr::new(10, 0, 9, 9))], b"t2s".to_vec())),
+                        "the source forwards to the UPF ingress, not the target"
+                    );
+                    command_ok = true;
+                }
+            }
+            if command_ok {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(command_ok, "Handover Command with the UPF ingress F-TEID reached the source");
+        assert!(HANDOVERS.lock().unwrap().get(&amf_ue_id).unwrap().indirect_active);
+
+        // The UE arrives → the forwarding tunnel is released.
+        let notify = ngap::handover_notify(amf_ue_id, 9, "999", "70", &[0, 0, 2]);
+        let mut tgt_ues = HashMap::new();
+        on_handover_notify(&mut tgt_ues, &amf_smf, &notify, &tgt_tx).await;
+        assert_eq!(RELEASES.load(O::Relaxed), 1, "indirect tunnel released on completion");
+        UE_DIRECTORY.lock().unwrap().remove(supi);
+    }
+
     /// The full N2 handover (TS 23.502 §4.9.1.3): Handover Required on the source
     /// association → Handover Request to the target (rotated {NH, NCC} + the UPF's
     /// UL F-TEID) → the target's acknowledge → Handover Command back to the source
@@ -3936,7 +4150,7 @@ mod tests {
             )],
             b"t2s".to_vec(),
         );
-        on_handover_request_ack(&ack);
+        on_handover_request_ack(&amf_smf, &ack).await;
         let mut command_seen = false;
         for _ in 0..50 {
             {
@@ -4063,13 +4277,14 @@ mod tests {
             ngap::handover_required(0x1a1, 4, 0x88, "999", "70", &[0, 0, 1], &[], false, vec![]);
         assert!(on_handover_required(&mut ues, &amf_smf, &required, &src_tx).await.is_none());
         let _ = next_forward(&mut tgt_rx).await; // the HandoverRequest
-        on_handover_request_ack(&ngap::handover_request_acknowledge(0x1a1, 9, &[], vec![]));
+        on_handover_request_ack(&amf_smf, &ngap::handover_request_acknowledge(0x1a1, 9, &[], vec![])).await;
         let _ = next_forward(&mut src_rx).await; // the HandoverCommand
-        let (ack, _) = on_handover_cancel(&ngap::handover_cancel(
+        let (ack, _) = on_handover_cancel(&amf_smf, &ngap::handover_cancel(
             0x1a1,
             4,
             ngap::CauseRadioNetwork::HANDOVER_CANCELLED,
         ))
+        .await
         .expect("acknowledged");
         assert_eq!(ngap::handover_cancel_ack_params(&ack), Some((0x1a1, 4)));
         let (release, label) = next_forward(&mut tgt_rx).await;
@@ -4101,12 +4316,12 @@ mod tests {
             ngap::handover_required(0x1a1, 4, 0x88, "999", "70", &[0, 0, 1], &[], false, vec![]);
         assert!(on_handover_required(&mut ues, &amf_smf, &required, &src_tx).await.is_none());
         let _ = next_forward(&mut tgt_rx).await;
-        on_handover_request_ack(&ngap::handover_request_acknowledge(0x1a1, 9, &[], vec![]));
+        on_handover_request_ack(&amf_smf, &ngap::handover_request_acknowledge(0x1a1, 9, &[], vec![])).await;
         let _ = next_forward(&mut src_rx).await; // the HandoverCommand
         // Prep expiry does nothing once commanded.
         expire_handover_prep(0x1a1, std::time::Duration::from_millis(10)).await;
         assert!(HANDOVERS.lock().unwrap().get(&0x1a1).is_some(), "commanded — prep expiry no-op");
-        expire_handover_overall(0x1a1, std::time::Duration::from_millis(20)).await;
+        expire_handover_overall(0x1a1, amf_smf.clone(), std::time::Duration::from_millis(20)).await;
         let (release, label) = next_forward(&mut tgt_rx).await;
         assert_eq!(label, "UEContextReleaseCommand (TNGRELOCoverall expiry)");
         assert_eq!(
