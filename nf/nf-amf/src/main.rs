@@ -500,9 +500,17 @@ struct UeContext {
     /// release the sessions on it (design/102 narrowing). A `psi` absent here (a
     /// pre-feature session) is left alone rather than wrongly released.
     session_snssai: HashMap<u8, (u8, Option<[u8; 3]>)>,
-    /// The subscribed UE-AMBR from am-data as `(downlink, uplink)` bits/sec, sent
-    /// to the gNB in the N2 PDU Session Resource Setup. `None` → a default is used.
+    /// The **effective** UE-AMBR `(downlink, uplink)` bits/sec sent to the gNB (N2
+    /// setup / UE Context Modification) — a PCF AM-policy value when one is in effect,
+    /// otherwise the subscribed value. Derived by [`UeContext::recompute_ue_ambr`]
+    /// from the two sources below. `None` → a default is used.
     ue_ambr: Option<(u64, u64)>,
+    /// The subscribed UE-AMBR from am-data (Nudm_SDM) — the default, used when no PCF
+    /// AM policy overrides it. Refreshed on a subscribed-data change (design/99).
+    subscribed_ue_ambr: Option<(u64, u64)>,
+    /// The PCF AM-policy UE-AMBR override (TS 23.503) — takes precedence over the
+    /// subscribed value while an AM policy association is in effect.
+    pcf_ue_ambr: Option<(u64, u64)>,
     /// The AM policy RFSP index (RAT/Frequency Selection Priority, TS 23.501
     /// §5.3.4.3) from the PCF — signalled to the RAN in a UE Context Modification.
     /// `None` when the PCF provided no RFSP.
@@ -1091,10 +1099,13 @@ fn on_am_policy_update(
         warn!("AM policy update for unknown UE {amf_ue_id}");
         return Vec::new();
     };
-    ctx.ue_ambr = Some(ue_ambr);
+    // The PCF override takes precedence over the subscribed UE-AMBR.
+    ctx.pcf_ue_ambr = Some(ue_ambr);
+    ctx.recompute_ue_ambr();
     ctx.rfsp = rfsp;
     ctx.area_restriction = area_restriction.clone();
     let ran_ue_id = ctx.ran_ue_id;
+    let effective_ambr = ctx.ue_ambr;
     info!(
         "UE {amf_ue_id}: AM policy updated — signalling RFSP {rfsp:?}, UE-AMBR {}/{} (dl/ul) bps, \
          service area {area_restriction:?} to the RAN",
@@ -1102,7 +1113,7 @@ fn on_am_policy_update(
     );
     // Tell the RAN the new UE-context policy (RFSP + UE-AMBR).
     let mut dl = vec![(
-        ngap::ue_context_modification_request(amf_ue_id, ran_ue_id, rfsp, Some(ue_ambr)),
+        ngap::ue_context_modification_request(amf_ue_id, ran_ue_id, rfsp, effective_ambr),
         "UEContextModificationRequest (RFSP)",
     )];
     // Tell the UE its configuration changed (Generic UE Configuration Update),
@@ -1143,10 +1154,19 @@ fn on_sdm_data_change(
         let mut ambr_changed = false;
         let mut nssai_changed = false;
         if let Some(ambr) = ue_ambr {
-            if ctx.ue_ambr != Some(ambr) {
-                info!("UE {amf_ue_id}: subscribed UE-AMBR updated to {}/{} bps (Nudm_SDM)", ambr.0, ambr.1);
-                ctx.ue_ambr = Some(ambr);
-                ambr_changed = true;
+            if ctx.subscribed_ue_ambr != Some(ambr) {
+                ctx.subscribed_ue_ambr = Some(ambr);
+                let old_effective = ctx.ue_ambr;
+                ctx.recompute_ue_ambr();
+                // Re-signal only if the *effective* UE-AMBR changed — a PCF override
+                // takes precedence, so a subscribed change under it is stored (for when
+                // the PCF policy is removed) but not signalled.
+                if ctx.ue_ambr != old_effective {
+                    info!("UE {amf_ue_id}: effective UE-AMBR updated to {:?} bps (Nudm_SDM)", ctx.ue_ambr);
+                    ambr_changed = true;
+                } else {
+                    info!("UE {amf_ue_id}: subscribed UE-AMBR changed but a PCF override is in effect — not signalled");
+                }
             }
         }
         if let Some(nssai) = allowed_nssai {
@@ -2703,6 +2723,8 @@ impl UeContext {
             replayed_ue_sec_cap: None,
             sm_refs: HashMap::new(),
             session_snssai: HashMap::new(),
+            subscribed_ue_ambr: None,
+            pcf_ue_ambr: None,
             ue_ambr: None,
             rfsp: None,
             area_restriction: None,
@@ -2719,6 +2741,12 @@ impl UeContext {
             pending_am_policy: None,
             releasing: std::collections::HashSet::new(),
         }
+    }
+
+    /// Recompute the effective UE-AMBR from its sources: a PCF AM-policy override
+    /// takes precedence over the subscribed (am-data) value.
+    fn recompute_ue_ambr(&mut self) {
+        self.ue_ambr = self.pcf_ue_ambr.or(self.subscribed_ue_ambr);
     }
 }
 
@@ -3325,15 +3353,17 @@ async fn on_security_mode_complete(
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
         return Vec::new();
     };
-    // AM policy: apply the UE-AMBR override (PCF policy wins) and store the
-    // association for deletion at deregistration.
-    let mut effective_ambr = ue_ambr;
+    // AM policy: record the PCF UE-AMBR override (it takes precedence over the
+    // subscribed value) and store the association for deletion at deregistration.
+    // Fail-open on the subscribed source: an unreachable am-data fetch (`None`) keeps
+    // a previously-known subscribed value rather than clobbering it.
+    ctx.subscribed_ue_ambr = ue_ambr.or(ctx.subscribed_ue_ambr);
     if let Some((pcf_base, assoc_id, policy)) = am {
         if let Some(pcf_ambr) = &policy.ue_ambr {
             if let (Some(dl), Some(ul)) =
                 (bitrate_to_bps(&pcf_ambr.downlink), bitrate_to_bps(&pcf_ambr.uplink))
             {
-                effective_ambr = Some((dl, ul));
+                ctx.pcf_ue_ambr = Some((dl, ul));
                 info!(
                     "UE {amf_ue_id}: AM policy applied — UE-AMBR {}/{} (dl/ul), RFSP {:?}",
                     pcf_ambr.downlink, pcf_ambr.uplink, policy.rfsp
@@ -3349,9 +3379,9 @@ async fn on_security_mode_complete(
         }
         ctx.am_policy = Some((pcf_base, assoc_id));
     }
-    // Fail-open: an unreachable subscription/PCF keeps any UE-AMBR already known
-    // rather than clobbering it.
-    ctx.ue_ambr = effective_ambr.or(ctx.ue_ambr);
+    // Effective UE-AMBR = PCF override, else subscribed (fail-open: both `None` when
+    // subscription/PCF are unreachable → a default is used at signalling).
+    ctx.recompute_ue_ambr();
     let ran_ue_id = ctx.ran_ue_id;
     let tmsi = amf_ue_id as u32;
     // Remember the assigned 5G-TMSI as this UE's persistent identity (a Service
@@ -5173,7 +5203,8 @@ mod tests {
         ctx.kamf = Some(kamf);
         ctx.replayed_ue_sec_cap = Some([0x20, 0x20]);
         ctx.rfsp = Some(7);
-        ctx.ue_ambr = Some((600_000_000, 300_000_000));
+        // A UE-AMBR already known (subscribed); the failed re-fetch below must keep it.
+        ctx.subscribed_ue_ambr = Some((600_000_000, 300_000_000));
         ctx.area_restriction = Some((vec![[0, 0, 1]], Vec::new()));
         ctx.registration_area = vec![[0, 0, 1], [0, 0, 2]];
 
@@ -5851,6 +5882,32 @@ mod tests {
         assert!(ctx.releasing.contains(&6), "session on the removed slice is releasing");
         assert!(!ctx.releasing.contains(&5), "session on a still-allowed slice kept");
         assert_eq!(ctx.allowed_nssai, Some(vec![(1, Some([1, 1, 1]))]));
+    }
+
+    /// A subscribed UE-AMBR change (Nudm_SDM) while a PCF AM-policy override is in
+    /// effect: the subscribed value is stored but not signalled — the PCF override
+    /// still governs the effective UE-AMBR.
+    #[test]
+    fn sdm_ambr_change_yields_to_pcf_override() {
+        let (ki, ke) = ([0x91u8; 16], [0x92u8; 16]);
+        let amf_ue_id = 0x71u64;
+        let mut ctx = UeContext::new(2, RegState::Registered, Some("imsi-999700000000071".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.pcf_ue_ambr = Some((5_000_000, 5_000_000));
+        ctx.subscribed_ue_ambr = Some((1_000_000, 1_000_000));
+        ctx.recompute_ue_ambr();
+        assert_eq!(ctx.ue_ambr, Some((5_000_000, 5_000_000)), "the PCF override wins");
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
+
+        // A new subscribed UE-AMBR: stored, but the effective (PCF) is unchanged so
+        // nothing is signalled.
+        let dls = on_sdm_data_change(&mut ues, amf_ue_id, Some((2_000_000, 800_000)), None, &tx);
+        assert!(dls.is_empty(), "no re-signal while the PCF override governs");
+        let ctx = &ues[&amf_ue_id];
+        assert_eq!(ctx.subscribed_ue_ambr, Some((2_000_000, 800_000)), "subscribed value stored");
+        assert_eq!(ctx.ue_ambr, Some((5_000_000, 5_000_000)), "effective still the PCF override");
     }
 
     /// Shared harness: a mock SMF whose `release` route records the finalised SM
