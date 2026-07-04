@@ -1116,10 +1116,11 @@ fn on_am_policy_update(
     dl
 }
 
-/// Refresh a UE's cached subscription view after a Nudm_SDM data change: update the
-/// stored subscribed UE-AMBR and allowed NSSAI. No UE re-signalling here — a
-/// subscribed-data change takes effect on the next procedure that reads the view
-/// (a PDU session's slice admission, a UE-context modification, a re-registration).
+/// Apply a Nudm_SDM data change: refresh the cached subscription view (subscribed
+/// UE-AMBR / allowed NSSAI) and, when a value actually changed, **push it**: a new
+/// UE-AMBR updates the RAN's enforcement (UE Context Modification), and any change
+/// nudges the UE with a Generic UE Configuration Update (TS 24.501 §5.4.4). A no-op
+/// change (or an unknown UE) signals nothing.
 fn on_sdm_data_change(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
@@ -1130,19 +1131,46 @@ fn on_sdm_data_change(
         warn!("Nudm_SDM data change for unknown UE {amf_ue_id}");
         return Vec::new();
     };
+    let mut ambr_changed = false;
+    let mut nssai_changed = false;
     if let Some(ambr) = ue_ambr {
         if ctx.ue_ambr != Some(ambr) {
             info!("UE {amf_ue_id}: subscribed UE-AMBR updated to {}/{} bps (Nudm_SDM)", ambr.0, ambr.1);
             ctx.ue_ambr = Some(ambr);
+            ambr_changed = true;
         }
     }
     if let Some(nssai) = allowed_nssai {
         if ctx.allowed_nssai.as_ref() != Some(&nssai) {
             info!("UE {amf_ue_id}: subscribed NSSAI updated to {nssai:?} (Nudm_SDM)");
             ctx.allowed_nssai = Some(nssai);
+            nssai_changed = true;
         }
     }
-    Vec::new()
+    if !ambr_changed && !nssai_changed {
+        return Vec::new();
+    }
+    let ran_ue_id = ctx.ran_ue_id;
+    let rfsp = ctx.rfsp;
+    let effective_ambr = ctx.ue_ambr;
+    let mut dl = Vec::new();
+    // A new UE-AMBR → update the RAN's enforcement (RFSP re-sent unchanged).
+    if ambr_changed {
+        dl.push((
+            ngap::ue_context_modification_request(amf_ue_id, ran_ue_id, rfsp, effective_ambr),
+            "UEContextModificationRequest (subscribed UE-AMBR)",
+        ));
+    }
+    // Any subscription change → tell the UE its configuration changed. A UE with no
+    // security context can't be NAS-signalled — skip it (the RAN update still lands).
+    if let Some(sec) = ctx.sec.as_mut() {
+        let cuc = sec.protect(&nas::configuration_update_command(), nas::sht::INTEGRITY_CIPHERED, 1);
+        dl.push((
+            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
+            "DownlinkNASTransport (ConfigurationUpdateCommand)",
+        ));
+    }
+    dl
 }
 
 fn on_network_modification(
@@ -5673,31 +5701,56 @@ mod tests {
         assert!(on_network_modification(&mut ues, &m_bad).is_empty(), "no session for psi 9");
     }
 
-    /// A Nudm_SDM data-change refreshes the UE's cached subscription view (UE-AMBR /
-    /// allowed NSSAI) in place, without emitting any downlink.
+    /// A Nudm_SDM data-change refreshes the UE's cached subscription view AND pushes
+    /// it: a UE-AMBR change updates the RAN (UE Context Modification) and nudges the
+    /// UE (Configuration Update Command); an NSSAI-only change nudges the UE; a no-op
+    /// change / unknown UE signals nothing.
     #[test]
-    fn sdm_data_change_refreshes_the_cached_view() {
+    fn sdm_data_change_pushes_to_ran_and_ue() {
+        let (ki, ke) = ([0x71u8; 16], [0x72u8; 16]);
         let amf_ue_id = 0x51u64;
         let mut ctx = UeContext::new(2, RegState::Registered, Some("imsi-999700000000051".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.rfsp = Some(5);
         ctx.ue_ambr = Some((1_000_000, 1_000_000));
         ctx.allowed_nssai = Some(vec![(1, Some([1, 2, 3]))]);
         let mut ues = HashMap::new();
         ues.insert(amf_ue_id, ctx);
 
-        // A change bumping the UE-AMBR and the NSSAI updates the stored view (no downlink).
+        // A UE-AMBR + NSSAI change updates the stored view and pushes both signals.
         let dls = on_sdm_data_change(
             &mut ues,
             amf_ue_id,
             Some((2_000_000, 500_000)),
             Some(vec![(1, None), (2, None)]),
         );
-        assert!(dls.is_empty(), "no UE re-signalling on a subscription-data change");
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            [
+                "UEContextModificationRequest (subscribed UE-AMBR)",
+                "DownlinkNASTransport (ConfigurationUpdateCommand)"
+            ]
+        );
         assert_eq!(ues[&amf_ue_id].ue_ambr, Some((2_000_000, 500_000)));
         assert_eq!(ues[&amf_ue_id].allowed_nssai, Some(vec![(1, None), (2, None)]));
+        // The RAN gets the new UE-AMBR (RFSP re-sent); the UE verifies the Config Update.
+        let back = NGAP_PDU::decode(&dls[0].0.encode().unwrap()).unwrap();
+        let (_a, _r, rfsp, ambr) = ngap::ue_context_modification_params(&back).unwrap();
+        assert_eq!((rfsp, ambr), (Some(5), Some((2_000_000, 500_000))));
+        let cuc = downlink_nas_pdu(&dls[1].0).expect("N1 in the DL NAS transport");
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let msg = ue_sec.unprotect(&cuc, 1).expect("UE verifies the Configuration Update Command");
+        assert_eq!(nas::gmm_message_type(&msg), Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand));
 
-        // `None` fields leave the current values; an unknown UE is a no-op.
-        on_sdm_data_change(&mut ues, amf_ue_id, None, None);
-        assert_eq!(ues[&amf_ue_id].ue_ambr, Some((2_000_000, 500_000)));
+        // An NSSAI-only change (UE-AMBR unchanged) pushes only the UE nudge.
+        let dls = on_sdm_data_change(&mut ues, amf_ue_id, Some((2_000_000, 500_000)), Some(vec![(1, None)]));
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["DownlinkNASTransport (ConfigurationUpdateCommand)"]
+        );
+
+        // A no-op change signals nothing; an unknown UE is a no-op.
+        assert!(on_sdm_data_change(&mut ues, amf_ue_id, None, None).is_empty());
         assert!(on_sdm_data_change(&mut ues, 999, Some((1, 1)), None).is_empty());
     }
 
