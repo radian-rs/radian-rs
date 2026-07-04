@@ -130,10 +130,10 @@ async fn serve_n4(
         };
         // Remember the control plane's address for UPF-initiated reports.
         *smf_addr.lock().unwrap() = Some(peer);
-        let (resp, flush) = {
+        let (resp, flush, end_markers) = {
             let mut g = state.lock().unwrap();
             let resp = pfcp::handle_n4(&buf[..n], node_ip, &mut g, now_nanos());
-            (resp, g.take_flush())
+            (resp, g.take_flush(), g.take_end_markers())
         };
         // A re-activation (Service Request resume) flushes the packets buffered while
         // the UE was CM-IDLE onto its restored gNB tunnel.
@@ -143,6 +143,17 @@ async fn serve_n4(
                 warn!(%gnb_ip, "buffered-downlink flush send error: {e}");
             } else {
                 info!(%gnb_ip, "flushed a buffered downlink packet to the resumed UE");
+            }
+        }
+        // A downlink path switch (SNDEM): send a GTP-U End Marker on the OLD gNB
+        // tunnel so the source gNB can deliver forwarded then direct-path packets in
+        // order across the handover.
+        for (gnb_teid, gnb_ip) in end_markers {
+            let dst = SocketAddrV4::new(gnb_ip, gtpu::GTPU_PORT);
+            if let Err(e) = n3.send_to(&gtpu::end_marker(gnb_teid), dst).await {
+                warn!(%gnb_ip, "End Marker send error: {e}");
+            } else {
+                info!(%gnb_ip, gnb_teid, "sent a GTP-U End Marker on the old downlink tunnel (path switch)");
             }
         }
         match resp {

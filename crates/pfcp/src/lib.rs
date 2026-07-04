@@ -412,6 +412,9 @@ pub struct UpfState {
     /// `(gNB TEID, gNB IP, inner IP packet)` — drained by
     /// [`take_flush`](UpfState::take_flush) and GTP-U-encapsulated by the caller.
     pending_flush: Vec<(u32, Ipv4Addr, Vec<u8>)>,
+    /// GTP-U End Markers to send on N3 after a downlink path switch, as the **old**
+    /// `(gNB TEID, gNB IP)` — drained by [`take_end_markers`](UpfState::take_end_markers).
+    pending_end_markers: Vec<(u32, Ipv4Addr)>,
 }
 
 impl Default for UpfState {
@@ -428,6 +431,7 @@ impl UpfState {
             next_seid: 1,
             sessions: HashMap::new(),
             pending_flush: Vec::new(),
+            pending_end_markers: Vec::new(),
         }
     }
 
@@ -564,7 +568,25 @@ impl UpfState {
     /// Install the gNB downlink target for a session (from a Session Modification).
     /// Also stops buffering and **flushes** any downlink packets held while the UE
     /// was CM-IDLE — encapsulated to the new tunnel — onto the pending-flush queue.
-    fn set_downlink(&mut self, up_seid: u64, gnb_teid: u32, gnb_ip: Ipv4Addr) -> bool {
+    fn set_downlink(
+        &mut self,
+        up_seid: u64,
+        gnb_teid: u32,
+        gnb_ip: Ipv4Addr,
+        send_end_marker: bool,
+    ) -> bool {
+        // A path switch (SNDEM requested and the downlink actually moved to a new gNB
+        // tunnel): queue a GTP-U End Marker on the OLD tunnel before switching.
+        if send_end_marker {
+            if let Some(old) = self
+                .sessions
+                .get(&up_seid)
+                .and_then(|s| s.downlink)
+                .filter(|&old| old != (gnb_teid, gnb_ip))
+            {
+                self.pending_end_markers.push(old);
+            }
+        }
         let Some(s) = self.sessions.get_mut(&up_seid) else {
             return false;
         };
@@ -624,6 +646,13 @@ impl UpfState {
     /// `(gNB TEID, gNB IP, inner IP packet)` — the caller GTP-U-encapsulates each.
     pub fn take_flush(&mut self) -> Vec<(u32, Ipv4Addr, Vec<u8>)> {
         std::mem::take(&mut self.pending_flush)
+    }
+
+    /// Drain the pending GTP-U **End Markers** to send on N3 after a downlink path
+    /// switch, as the old `(gNB TEID, gNB IP)` — the caller builds
+    /// [`gtpu::end_marker`] for each and sends it to the gNB's N3 address.
+    pub fn take_end_markers(&mut self) -> Vec<(u32, Ipv4Addr)> {
+        std::mem::take(&mut self.pending_end_markers)
     }
 
     /// Whether a session owning `dst` is currently buffering (test/inspection).
@@ -1102,6 +1131,13 @@ pub fn handle_n4(
         MsgType::SessionModificationRequest => {
             // Addressed by UP-SEID (the header SEID the UPF handed out at establishment).
             let up_seid = u64::from(msg.seid()?);
+            // PFCPSMReq-Flags SNDEM (TS 29.244 §8.2.79): on a downlink path switch the
+            // SMF asks for a GTP-U End Marker on the old tunnel.
+            let send_end_marker = msg
+                .ies(IeType::PfcpsmReqFlags)
+                .next()
+                .and_then(|ie| PfcpsmReqFlags::unmarshal(&ie.payload).ok())
+                .is_some_and(|f| f.contains(PfcpsmReqFlags::SNDEM));
             // A downlink Update FAR either installs the gNB tunnel (Outer Header
             // Creation → activate) or DROPs downlink (AN release → deactivate).
             if let Some(uf) = msg
@@ -1115,7 +1151,7 @@ pub fn handle_n4(
                     .and_then(|ohc| Some((u32::from(ohc.teid?), ohc.ipv4_address?)));
                 match ohc {
                     Some((gnb_teid, gnb_ip)) => {
-                        state.set_downlink(up_seid, gnb_teid, gnb_ip);
+                        state.set_downlink(up_seid, gnb_teid, gnb_ip, send_end_marker);
                     }
                     // No OHC + a BUFF/DROP action → deactivate the downlink (AN
                     // release): start buffering downlink for the CM-IDLE UE.
@@ -1569,6 +1605,43 @@ mod tests {
             msg.ies(IeType::PfcpsmReqFlags).next().expect("PFCPSMReq-Flags IE present on a re-point");
         let flags = PfcpsmReqFlags::unmarshal(&flags_ie.payload).expect("parse PFCPSMReq-Flags");
         assert!(flags.contains(PfcpsmReqFlags::SNDEM), "SNDEM (Send End Marker) is set");
+    }
+
+    #[test]
+    fn upf_emits_end_marker_only_on_a_path_switch() {
+        let node_ip = Ipv4Addr::new(10, 0, 0, 8);
+        let mut state = UpfState::new();
+        handle_n4(
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("establish");
+        let up_seid = 1;
+        let gnb_a = Ipv4Addr::new(10, 0, 9, 1);
+        let gnb_b = Ipv4Addr::new(10, 0, 9, 2);
+
+        // First downlink install (no old path) — even with SNDEM, nothing to flush.
+        handle_n4(&session_modification_request(up_seid, 2, 1, 0x5678, gnb_a, "internet", true), node_ip, &mut state, 0)
+            .expect("first install");
+        assert!(state.take_end_markers().is_empty(), "no End Marker on the first downlink install");
+
+        // A re-point WITHOUT SNDEM — no End Marker.
+        handle_n4(&session_modification_request(up_seid, 3, 1, 0x9abc, gnb_b, "internet", false), node_ip, &mut state, 0)
+            .expect("re-point without SNDEM");
+        assert!(state.take_end_markers().is_empty(), "no End Marker when SNDEM is unset");
+
+        // A genuine path switch (SNDEM + a different gNB) — an End Marker for the OLD
+        // (gNB B) tunnel; consumed once.
+        handle_n4(&session_modification_request(up_seid, 4, 1, 0x1234, gnb_a, "internet", true), node_ip, &mut state, 0)
+            .expect("path switch");
+        assert_eq!(
+            state.take_end_markers(),
+            vec![(0x9abc, gnb_b)],
+            "End Marker on the old gNB tunnel the downlink left"
+        );
+        assert!(state.take_end_markers().is_empty(), "drained");
     }
 
     #[test]

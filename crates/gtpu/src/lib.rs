@@ -12,6 +12,7 @@ pub const GTPU_PORT: u16 = 2152;
 // GTP-U message types (TS 29.281 §7.1).
 pub const MSG_ECHO_REQUEST: u8 = 1;
 pub const MSG_ECHO_RESPONSE: u8 = 2;
+pub const MSG_END_MARKER: u8 = 254;
 pub const MSG_G_PDU: u8 = 0xFF;
 
 const VERSION_PT: u8 = 0x30; // version=1 (bits 8-6), protocol type=1 (bit 5)
@@ -27,6 +28,9 @@ pub enum N3Message<'a> {
     GPdu { teid: u32, payload: &'a [u8] },
     EchoRequest { sequence: u16 },
     EchoResponse { sequence: u16 },
+    /// End Marker (TS 29.281 §7.3.4) on `teid` — the last packet has left this
+    /// tunnel (sent by the UPF on the old downlink path after a handover).
+    EndMarker { teid: u32 },
     /// Any other / unhandled message type.
     Other(u8),
 }
@@ -57,6 +61,7 @@ pub fn parse(data: &[u8]) -> Option<N3Message<'_>> {
         MSG_G_PDU => N3Message::GPdu { teid, payload },
         MSG_ECHO_REQUEST => N3Message::EchoRequest { sequence },
         MSG_ECHO_RESPONSE => N3Message::EchoResponse { sequence },
+        MSG_END_MARKER => N3Message::EndMarker { teid },
         other => N3Message::Other(other),
     })
 }
@@ -69,6 +74,19 @@ pub fn encap(teid: u32, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     out.extend_from_slice(&teid.to_be_bytes());
     out.extend_from_slice(payload);
+    out
+}
+
+/// Build a GTP-U **End Marker** (TS 29.281 §7.3.4) for `teid` — a payload-less
+/// message on the old downlink tunnel, sent by the UPF after a path switch so the
+/// (source) gNB knows the downlink stream on that tunnel has ended and can deliver
+/// forwarded then direct-path packets in order.
+pub fn end_marker(teid: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.push(VERSION_PT);
+    out.push(MSG_END_MARKER);
+    out.extend_from_slice(&0u16.to_be_bytes()); // no payload
+    out.extend_from_slice(&teid.to_be_bytes());
     out
 }
 
@@ -122,6 +140,17 @@ mod tests {
     fn echo_roundtrip() {
         assert_eq!(parse(&echo_request(7)), Some(N3Message::EchoRequest { sequence: 7 }));
         assert_eq!(parse(&echo_response(7)), Some(N3Message::EchoResponse { sequence: 7 }));
+    }
+
+    #[test]
+    fn end_marker_roundtrips() {
+        let em = end_marker(0x00000077);
+        assert_eq!(parse(&em), Some(N3Message::EndMarker { teid: 0x00000077 }));
+        // Message type 254, no payload (length 0).
+        assert_eq!(em[1], MSG_END_MARKER);
+        assert_eq!(&em[2..4], &[0x00, 0x00]);
+        assert_eq!(em.len(), 8);
+        assert!(decap(&em).is_none(), "an End Marker is not a G-PDU");
     }
 
     #[test]
