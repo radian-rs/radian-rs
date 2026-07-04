@@ -171,6 +171,43 @@ pub fn ue_context_release_command(amf_ue_id: u64, ran_ue_id: u32, nas_cause: u8)
     )
 }
 
+/// Build a `UEContextReleaseCommand` with a **radio-network cause** (pick from
+/// [`CauseRadioNetwork`]'s constants) — e.g. *successful-handover* toward the
+/// source gNB after an Xn path switch completed.
+pub fn ue_context_release_command_radio(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    radio_cause: u8,
+) -> NGAP_PDU {
+    let ids = UE_NGAP_IDs::UE_NGAP_ID_pair(UE_NGAP_ID_pair {
+        amf_ue_ngap_id: AMF_UE_NGAP_ID(amf_ue_id),
+        ran_ue_ngap_id: RAN_UE_NGAP_ID(ran_ue_id),
+        ie_extensions: None,
+    });
+    build_ngap!(InitiatingMessage, UEContextRelease,
+        REJECT, UEContextReleaseCommand,
+        REJECT UE_NGAP_IDs(ids),
+        IGNORE Cause(Cause::RadioNetwork(CauseRadioNetwork(radio_cause))),
+    )
+}
+
+/// The radio-network cause of a `UEContextReleaseCommand`, when it carries one
+/// (gNB side / tests).
+pub fn release_command_radio_cause(pdu: &NGAP_PDU) -> Option<u8> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_UEContextRelease(cmd) = value else {
+        return None;
+    };
+    cmd.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        UEContextReleaseCommandProtocolIEs_EntryValue::Id_Cause(Cause::RadioNetwork(c)) => {
+            Some(c.0)
+        }
+        _ => None,
+    })
+}
+
 /// Extract `(AMF-UE-NGAP-ID, RAN-UE-NGAP-ID, NAS cause)` from a
 /// UEContextReleaseCommand (gNB side / tests).
 pub fn parse_ue_context_release_command(pdu: &NGAP_PDU) -> Option<(u64, u32, Option<u8>)> {
@@ -1403,6 +1440,20 @@ mod release_tests {
             parse_ue_context_release_command(&back),
             Some((42, 7, Some(CauseNas::NORMAL_RELEASE)))
         );
+
+        // The radio-network-cause variant (successful handover toward the source gNB).
+        let pdu = ue_context_release_command_radio(42, 7, CauseRadioNetwork::SUCCESSFUL_HANDOVER);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(
+            parse_ue_context_release_command(&back),
+            Some((42, 7, None)),
+            "ids parse; the cause is not a NAS cause"
+        );
+        assert_eq!(
+            release_command_radio_cause(&back),
+            Some(CauseRadioNetwork::SUCCESSFUL_HANDOVER)
+        );
+        assert_eq!(release_command_radio_cause(&initial_ue_message_with_nas(1, vec![1])), None);
     }
 
     #[test]
