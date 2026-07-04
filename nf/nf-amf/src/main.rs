@@ -136,6 +136,9 @@ enum UeCmd {
     /// Network-initiated PDU session release for this UE (from the SMF): release
     /// the session's RAN resources (N2) and tell the UE (N1 Release Command).
     ReleaseSession { amf_ue_id: u64, psi: u8, cause: u8 },
+    /// The release guard timer fired: the UE never sent its PDU Session Release
+    /// Complete for `psi` — finalise the release at the SMF anyway.
+    ReleaseGuardExpiry { amf_ue_id: u64, psi: u8 },
     /// Page a CM-IDLE UE by 5G-TMSI across its registration area (downlink data or
     /// a pending AM policy change). Sent to the gNB associations serving any of the
     /// area's TAs; each sends an NGAP Paging carrying the full TAI list.
@@ -373,6 +376,22 @@ fn arm_t3522(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64, secs: u64) {
     });
 }
 
+/// The release guard: how long the AMF waits for the UE's PDU Session Release
+/// Complete before finalising the release itself. Override with
+/// `RADIAN_AMF_RELEASE_GUARD_SECS`.
+const RELEASE_GUARD_SECS: u64 = 6;
+const RELEASE_GUARD_ENV: &str = "RADIAN_AMF_RELEASE_GUARD_SECS";
+
+/// Arm the release guard: after `secs`, post a guard expiry for `(UE, psi)` onto
+/// its association — finalises the release if the UE never answered.
+fn arm_release_guard(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64, psi: u8, secs: u64) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        let _ = tx.send(UeCmd::ReleaseGuardExpiry { amf_ue_id, psi });
+    });
+}
+
 /// Where a UE is in the registration flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegState {
@@ -470,6 +489,11 @@ struct UeContext {
     /// held in the retained context (latest wins) and applied when the UE resumes
     /// with a Service Request; the UE is paged so it comes back promptly.
     pending_am_policy: Option<PendingAmPolicy>,
+    /// PDU sessions with a **network-initiated release** in progress: a Release
+    /// Command was sent and the AMF is awaiting the UE's N1 PDU Session Release
+    /// Complete before finalising at the SMF (TS 23.502 §4.3.4). A guard timer
+    /// finalises anyway if the complete never arrives. Empty = none releasing.
+    releasing: std::collections::HashSet<u8>,
 }
 
 /// An AM policy change awaiting a CM-IDLE UE's return (see
@@ -590,7 +614,17 @@ async fn serve_gnb(
                     UeCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, T3522_SECS),
                     UeCmd::ModifyPolicy(m) => on_network_modification(&mut ues, &m),
                     UeCmd::ReleaseSession { amf_ue_id, psi, cause } => {
-                        on_network_release(&mut ues, amf_ue_id, psi, cause)
+                        on_network_release(&mut ues, amf_ue_id, psi, cause, &dereg_tx)
+                    }
+                    UeCmd::ReleaseGuardExpiry { amf_ue_id, psi } => {
+                        if ues.get(&amf_ue_id).map(|c| c.releasing.contains(&psi)) == Some(true) {
+                            warn!(
+                                "UE {amf_ue_id}: no PDU Session Release Complete for psi {psi} — \
+                                 finalising the release on the guard timer"
+                            );
+                            finalize_release(&mut ues, &amf_smf, amf_ue_id, psi).await;
+                        }
+                        Vec::new()
                     }
                     UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr, rfsp, area_restriction } => {
                         on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp, area_restriction)
@@ -1008,6 +1042,7 @@ fn on_network_release(
     amf_ue_id: u64,
     psi: u8,
     cause: u8,
+    tx: &UnboundedSender<UeCmd>,
 ) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
         warn!("PDU session release for unknown UE {amf_ue_id}");
@@ -1026,6 +1061,15 @@ fn on_network_release(
     let dl = nas::dl_nas_transport_sm(psi, cmd);
     let nas_bytes = sec.protect(&dl, nas::sht::INTEGRITY_CIPHERED, 1);
     let release = ngap::pdu_session_resource_release_command(amf_ue_id, ran_ue_id, psi, nas_bytes);
+    // The session is finalised at the SMF only when the UE answers with its N1 PDU
+    // Session Release Complete (§4.3.4); mark it releasing and arm a guard timer so
+    // a silent UE doesn't leave the session (and its UPF datapath) stranded.
+    ctx.releasing.insert(psi);
+    let secs = std::env::var(RELEASE_GUARD_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(RELEASE_GUARD_SECS);
+    arm_release_guard(tx, amf_ue_id, psi, secs);
     info!("UE {amf_ue_id}: PDU Session Resource Release sent (psi {psi}, 5GSM cause {cause})");
     vec![(release, "PDUSessionResourceReleaseCommand")]
 }
@@ -1225,7 +1269,7 @@ async fn handle_ngap(
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
             value: SuccessfulOutcomeValue::Id_PDUSessionResourceRelease(_),
             ..
-        }) => on_release_response(ues, amf_smf, &pdu).await,
+        }) => on_release_response(ues, &pdu),
         _ => info!("unhandled PDU: {}", pdu.procedure_name()),
     }
 }
@@ -2272,33 +2316,52 @@ async fn on_initial_context_setup_response(
 }
 
 /// The gNB confirmed a network-initiated PDU session release
-/// (`PDUSessionResourceReleaseResponse`): the RAN resources are torn down, so
-/// finalise each released session at the SMF (N4 delete / IP release) and drop it
-/// from the UE context. The UE's N1 PDU Session Release Complete follows over UL
-/// NAS (handled in [`dispatch_uplink_nas`]).
-async fn on_release_response(
-    ues: &mut HashMap<u64, UeContext>,
-    amf_smf: &pdu_session::AmfSmf,
-    pdu: &NGAP_PDU,
-) {
+/// (`PDUSessionResourceReleaseResponse`): the RAN resources (DRBs / N3 tunnel) are
+/// torn down. The session is **not** finalised at the SMF yet — that waits for the
+/// UE's N1 PDU Session Release Complete (TS 23.502 §4.3.4, [`finalize_release`]),
+/// with the guard timer as a backstop.
+fn on_release_response(ues: &HashMap<u64, UeContext>, pdu: &NGAP_PDU) {
     let Some((amf_ue_id, _ran, released)) = ngap::release_response_result(pdu) else {
         info!("gNB PDUSessionResourceReleaseResponse (unparseable)");
         return;
     };
-    info!("gNB released PDU session resources for UE {amf_ue_id} (psi {released:?})");
-    for psi in released {
-        let Some((sm_ref, smf_base)) = ues.get(&amf_ue_id).and_then(|c| c.sm_refs.get(&psi).cloned())
-        else {
-            warn!("UE {amf_ue_id}: release response for psi {psi} with no SM context tracked");
-            continue;
-        };
+    for psi in &released {
+        if ues.get(&amf_ue_id).map(|c| c.releasing.contains(psi)) != Some(true) {
+            warn!("UE {amf_ue_id}: release response for psi {psi} not awaiting release");
+        }
+    }
+    info!(
+        "UE {amf_ue_id}: gNB freed RAN resources for PDU session(s) {released:?} — \
+         awaiting the UE's Release Complete"
+    );
+}
+
+/// Finalise a network-initiated release once the UE's N1 PDU Session Release
+/// Complete arrives (or the guard timer fires): release the SM context at the SMF
+/// (N4 delete / IP release) and drop the session from the UE context. Idempotent —
+/// a no-op if the session isn't releasing (already finalised).
+async fn finalize_release(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    amf_ue_id: u64,
+    psi: u8,
+) {
+    // Only finalise a session an active release is awaiting — guards against a
+    // stray complete and against the guard firing after the complete already ran.
+    if ues.get(&amf_ue_id).map(|c| c.releasing.contains(&psi)) != Some(true) {
+        return;
+    }
+    if let Some((sm_ref, smf_base)) =
+        ues.get(&amf_ue_id).and_then(|c| c.sm_refs.get(&psi).cloned())
+    {
         match amf_smf.release_sm_context(&smf_base, &sm_ref).await {
             Ok(()) => info!("UE {amf_ue_id}: PDU session {psi} released at the SMF"),
             Err(e) => warn!("UE {amf_ue_id}: SMF release for session {psi} failed: {e}"),
         }
-        if let Some(c) = ues.get_mut(&amf_ue_id) {
-            c.sm_refs.remove(&psi);
-        }
+    }
+    if let Some(c) = ues.get_mut(&amf_ue_id) {
+        c.sm_refs.remove(&psi);
+        c.releasing.remove(&psi);
     }
 }
 
@@ -2413,6 +2476,7 @@ impl UeContext {
             retained_at: None,
             am_policy: None,
             pending_am_policy: None,
+            releasing: std::collections::HashSet::new(),
         }
     }
 }
@@ -2650,11 +2714,12 @@ async fn dispatch_uplink_nas(
                 return None;
             };
             // A PDU Session Release Complete (0xD4) is the UE's final ack to a
-            // network-initiated release; the session was already finalised on the
-            // N2 Release Response (`on_release_response`), so acknowledge and stop —
-            // it must not fall through to the establishment (CreateSMContext) path.
+            // network-initiated release: finalise the session at the SMF now (strict
+            // TS 23.502 §4.3.4 ordering — N4 delete follows the complete). It must
+            // not fall through to the establishment (CreateSMContext) path.
             if nas::is_pdu_session_release_complete(&container) {
                 info!("UE {amf_ue_id}: PDU Session Release Complete for psi {psi}");
+                finalize_release(ues, amf_smf, amf_ue_id, psi).await;
                 return None;
             }
             let Some((supi, ran_ue_id)) =
@@ -5437,39 +5502,52 @@ mod tests {
         assert!(on_network_modification(&mut ues, &m_bad).is_empty(), "no session for psi 9");
     }
 
-    /// A network-initiated PDU session release: the AMF sends the N2 Release Command
-    /// carrying a UE-decodable N1 PDU Session Release Command, and on the gNB's
-    /// Release Response finalises the session at the SMF and drops it.
-    #[tokio::test]
-    async fn network_release_tears_down_session_ran_and_ue() {
-        use std::sync::Mutex as StdMutex;
-
-        static RELEASED: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+    /// Shared harness: a mock SMF whose `release` route records the finalised SM
+    /// contexts into a per-test accumulator (State, not a static — the release
+    /// tests run in parallel), plus an AmfSmf and the SMF base URL.
+    async fn release_test_smf(
+    ) -> (pdu_session::AmfSmf, String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::sync::{Arc, Mutex as StdMutex};
+        type Released = Arc<StdMutex<Vec<String>>>;
         async fn mock_release(
+            axum::extract::State(released): axum::extract::State<Released>,
             axum::extract::Path(sm_ref): axum::extract::Path<String>,
         ) -> axum::http::StatusCode {
-            RELEASED.lock().unwrap().push(sm_ref);
+            released.lock().unwrap().push(sm_ref);
             axum::http::StatusCode::NO_CONTENT
         }
+        let released: Released = Arc::new(StdMutex::new(Vec::new()));
         let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let smf_addr = smf_l.local_addr().unwrap();
-        let smf_router = axum::Router::new().route(
-            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release",
-            axum::routing::post(mock_release),
-        );
+        let smf_router = axum::Router::new()
+            .route(
+                "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release",
+                axum::routing::post(mock_release),
+            )
+            .with_state(released.clone());
         tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
-        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+        (pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70"), format!("http://{smf_addr}"), released)
+    }
 
+    /// A network-initiated PDU session release: the AMF sends the N2 Release Command
+    /// carrying a UE-decodable N1 Release Command; the gNB's Release Response frees
+    /// the RAN side but the session is finalised at the SMF only when the UE's N1
+    /// Release Complete arrives (TS 23.502 §4.3.4).
+    #[tokio::test]
+    async fn network_release_finalises_on_ue_complete() {
+        let (amf_smf, smf_base, released) = release_test_smf().await;
         let (ki, ke) = ([0x33u8; 16], [0x44u8; 16]);
         let amf_ue_id = 0x7a1u64;
         let mut ctx = UeContext::new(9, RegState::Registered, Some("imsi-999700000000201".into()));
         ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
-        ctx.sm_refs.insert(5, ("ctx-5".into(), format!("http://{smf_addr}")));
+        ctx.sm_refs.insert(5, ("ctx-5".into(), smf_base));
         let mut ues = HashMap::new();
         ues.insert(amf_ue_id, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
+        let amf_auth = auth::AmfAuth::new("http://127.0.0.1:1", "999", "70");
 
         // N2 Release Command built; the UE decodes the embedded N1 Release Command.
-        let dls = on_network_release(&mut ues, amf_ue_id, 5, nas::sm_cause::REGULAR_DEACTIVATION);
+        let dls = on_network_release(&mut ues, amf_ue_id, 5, nas::sm_cause::REGULAR_DEACTIVATION, &tx);
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             ["PDUSessionResourceReleaseCommand"]
@@ -5483,21 +5561,58 @@ mod tests {
             nas::sm_container_from_dl_nas_transport(&msg).expect("N1 SM container");
         assert_eq!(sm_psi, 5);
         assert_eq!(&container[..], &[0x2e, 5, 0, 0xd3, nas::sm_cause::REGULAR_DEACTIVATION]);
-        // The session is still tracked until the gNB confirms.
-        assert!(ues[&amf_ue_id].sm_refs.contains_key(&5));
+        assert!(ues[&amf_ue_id].releasing.contains(&5), "release pending");
 
-        // On the gNB's Release Response the AMF releases at the SMF and drops it.
-        on_release_response(
-            &mut ues,
-            &amf_smf,
-            &ngap::pdu_session_resource_release_response(amf_ue_id, 9, 5),
-        )
-        .await;
-        assert_eq!(RELEASED.lock().unwrap().as_slice(), ["ctx-5".to_string()]);
-        assert!(!ues[&amf_ue_id].sm_refs.contains_key(&5), "session dropped after release");
+        // The gNB's Release Response frees the RAN side but does NOT finalise: the
+        // session is still tracked at the SMF, awaiting the UE's complete.
+        on_release_response(&ues, &ngap::pdu_session_resource_release_response(amf_ue_id, 9, 5));
+        assert!(released.lock().unwrap().is_empty(), "not finalised on the N2 response");
+        assert!(ues[&amf_ue_id].sm_refs.contains_key(&5), "session kept until the complete");
+
+        // The UE's PDU Session Release Complete (over UL NAS) finalises it.
+        let complete = nas::decode_nas_5gs_message(&nas::ul_nas_transport_sm(
+            5,
+            nas::pdu_session_release_complete(5, 0),
+            None,
+            None,
+        ))
+        .unwrap();
+        let out =
+            dispatch_uplink_nas(&mut ues, &amf_auth, &amf_smf, amf_ue_id, complete, &tx).await;
+        assert!(out.is_none(), "release complete produces no downlink");
+        assert_eq!(released.lock().unwrap().as_slice(), ["ctx-5".to_string()]);
+        assert!(!ues[&amf_ue_id].sm_refs.contains_key(&5), "session dropped");
+        assert!(!ues[&amf_ue_id].releasing.contains(&5), "no longer releasing");
+
+        // A late guard-timer firing is idempotent — the session is already gone.
+        finalize_release(&mut ues, &amf_smf, amf_ue_id, 5).await;
+        assert_eq!(released.lock().unwrap().len(), 1, "no double release");
 
         // A release for a session the UE doesn't have is a no-op.
-        assert!(on_network_release(&mut ues, amf_ue_id, 9, 36).is_empty(), "no session for psi 9");
+        assert!(on_network_release(&mut ues, amf_ue_id, 9, 36, &tx).is_empty(), "no session for psi 9");
+    }
+
+    /// The release guard: if the UE never sends its Release Complete, the guard
+    /// timer's expiry finalises the release at the SMF anyway (no stranded session).
+    #[tokio::test]
+    async fn network_release_guard_finalises_a_silent_ue() {
+        let (amf_smf, smf_base, released) = release_test_smf().await;
+        let amf_ue_id = 0x7b2u64;
+        let mut ctx = UeContext::new(9, RegState::Registered, Some("imsi-999700000000202".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new([0x1u8; 16], [0x2u8; 16], NAS_NIA, NAS_NEA));
+        ctx.sm_refs.insert(5, ("ctx-guard".into(), smf_base));
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
+
+        on_network_release(&mut ues, amf_ue_id, 5, nas::sm_cause::REGULAR_DEACTIVATION, &tx);
+        on_release_response(&ues, &ngap::pdu_session_resource_release_response(amf_ue_id, 9, 5));
+        assert!(released.lock().unwrap().is_empty(), "still pending, no complete yet");
+
+        // The guard fires (what UeCmd::ReleaseGuardExpiry's arm invokes).
+        finalize_release(&mut ues, &amf_smf, amf_ue_id, 5).await;
+        assert_eq!(released.lock().unwrap().as_slice(), ["ctx-guard".to_string()]);
+        assert!(!ues[&amf_ue_id].sm_refs.contains_key(&5), "session finalised by the guard");
     }
 
     /// A subscription-withdrawal callback reaches the UE's association; the
