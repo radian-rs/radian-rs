@@ -140,7 +140,7 @@ mod tests {
     ) -> (UpfState, u32) {
         let mut state = UpfState::new();
         pfcp::handle_n4(
-            &pfcp::session_establishment_request(0xCAFE, 1, UPF_IP, UE_IP, ambr, flows, None),
+            &pfcp::session_establishment_request(0xCAFE, 1, UPF_IP, UE_IP, "internet", ambr, flows, None),
             UPF_IP,
             &mut state,
             0,
@@ -148,7 +148,7 @@ mod tests {
         .expect("establish");
         let n3_teid = 1; // first UPF allocation
         pfcp::handle_n4(
-            &pfcp::session_modification_request(1, 2, 2, GNB_TEID, GNB_IP),
+            &pfcp::session_modification_request(1, 2, 2, GNB_TEID, GNB_IP, "internet"),
             UPF_IP,
             &mut state,
             0,

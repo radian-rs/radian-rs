@@ -19,7 +19,7 @@ use rs_pfcp::ie::cause::CauseValue;
 use rs_pfcp::ie::create_far::CreateFar;
 use rs_pfcp::ie::create_pdr::{CreatePdr, CreatePdrBuilder};
 use rs_pfcp::ie::created_pdr::CreatedPdr;
-use rs_pfcp::ie::destination_interface::Interface;
+use rs_pfcp::ie::destination_interface::{DestinationInterface, Interface};
 use rs_pfcp::ie::f_teid::Fteid;
 use rs_pfcp::ie::far_id::FarId;
 use rs_pfcp::ie::fseid::Fseid;
@@ -41,6 +41,7 @@ use rs_pfcp::ie::usage_report_trigger::UsageReportTrigger;
 use rs_pfcp::ie::volume_measurement::VolumeMeasurement;
 use rs_pfcp::ie::volume_threshold::VolumeThreshold;
 use rs_pfcp::ie::mbr::Mbr;
+use rs_pfcp::ie::network_instance::NetworkInstance;
 use rs_pfcp::ie::outer_header_creation::OuterHeaderCreation;
 use rs_pfcp::ie::qer_id::QerId;
 use rs_pfcp::ie::remove_pdr::RemovePdr;
@@ -741,6 +742,7 @@ pub fn session_establishment_request(
     seq: u32,
     smf_ip: Ipv4Addr,
     ue_ip: Ipv4Addr,
+    dnn: &str,
     ambr: Option<SessionAmbr>,
     flows: &[FlowQer],
     usage_threshold_bytes: Option<u64>,
@@ -762,8 +764,11 @@ pub fn session_establishment_request(
         ul_pdr = ul_pdr.qer_id(q);
     }
     let ul_pdr = ul_pdr.build().expect("build uplink Create PDR");
+    // Forward to the core, tagging the FAR with the session's Network Instance (the
+    // DNN/APN, TS 29.244 §8.2.4) — an operator binds that name to a VRF, and a
+    // downstream controller (e.g. a MUP/SRv6 mobile-backhaul) maps the session to it.
     let ul_far = CreateFar::builder(FarId::new(1))
-        .forward_to(Interface::Core)
+        .forward_to_network(Interface::Core, NetworkInstance::new(dnn))
         .build()
         .expect("build uplink Create FAR");
 
@@ -780,7 +785,7 @@ pub fn session_establishment_request(
     }
     let dl_pdr = dl_pdr.build().expect("build downlink Create PDR");
     let dl_far = CreateFar::builder(FarId::new(2))
-        .forward_to(Interface::Access)
+        .forward_to_network(Interface::Access, NetworkInstance::new(dnn))
         .build()
         .expect("build downlink Create FAR");
 
@@ -967,8 +972,15 @@ pub fn session_modification_request(
     far_id: u32,
     gnb_teid: u32,
     gnb_ip: Ipv4Addr,
+    dnn: &str,
 ) -> Vec<u8> {
-    let mut params = UpdateForwardingParameters::new();
+    // Re-point the downlink FAR at the gNB tunnel. Re-send the destination interface
+    // (Access) and the session's Network Instance (DNN) alongside the Outer Header
+    // Creation so the Update FAR is fully specified — matching free5GC and keeping
+    // the DNN→VRF binding visible to a downstream controller on every update.
+    let mut params = UpdateForwardingParameters::new()
+        .with_destination_interface(DestinationInterface::new(Interface::Access))
+        .with_network_instance(NetworkInstance::new(dnn));
     params.outer_header_creation = Some(OuterHeaderCreation::gtpu_ipv4(gnb_teid, gnb_ip));
     let update_far = UpdateFar::builder(FarId::new(far_id))
         .apply_action(ApplyAction::FORW)
@@ -1349,7 +1361,7 @@ mod tests {
     fn session_establishment_allocates_and_tracks() {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
-        let req = session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[], None);
+        let req = session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None);
         let resp = handle_n4(&req, node_ip, &mut state, 0).expect("session response");
 
         assert_eq!(state.session_count(), 1, "UPF tracks the session");
@@ -1365,7 +1377,7 @@ mod tests {
     fn session_deletion_removes_the_session() {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
-        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[], None), node_ip, &mut state, 0)
+        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None), node_ip, &mut state, 0)
             .expect("establish");
         let up_seid = 1; // first allocation
         assert_eq!(state.session_count(), 1);
@@ -1388,7 +1400,7 @@ mod tests {
     fn session_modification_installs_downlink() {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
-        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[], None), node_ip, &mut state, 0)
+        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None), node_ip, &mut state, 0)
             .expect("establish");
         let up_seid = 1; // first allocation
         assert_eq!(state.downlink_for(up_seid), None, "no downlink before modification");
@@ -1397,7 +1409,7 @@ mod tests {
         // SMF installs the gNB's downlink F-TEID via Session Modification.
         let gnb_ip = Ipv4Addr::new(10, 0, 0, 9);
         let resp = handle_n4(
-            &session_modification_request(up_seid, 2, 1, 0x5678, gnb_ip),
+            &session_modification_request(up_seid, 2, 1, 0x5678, gnb_ip, "internet"),
             node_ip,
             &mut state,
             0,
@@ -1428,7 +1440,7 @@ mod tests {
         // The session and its uplink TEID survive — a Service Request can re-activate.
         assert_eq!(state.session_count(), 1, "session retained across deactivation");
         let resp = handle_n4(
-            &session_modification_request(up_seid, 4, 1, 0x9ABC, gnb_ip),
+            &session_modification_request(up_seid, 4, 1, 0x9ABC, gnb_ip, "internet"),
             node_ip,
             &mut state,
             0,
@@ -1443,12 +1455,48 @@ mod tests {
     }
 
     #[test]
+    fn network_instance_carries_the_dnn() {
+        use rs_pfcp::ie::create_far::CreateFar;
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+
+        // Establishment: every Create FAR's forwarding parameters tag the session's
+        // DNN as the Network Instance (TS 29.244 §8.2.4) — the DNN→VRF binding a
+        // downstream controller (e.g. a MUP/SRv6 backhaul) reads to originate routes.
+        let est = session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None);
+        let msg = rs_pfcp::message::parse(&est).expect("parse establishment");
+        let nis: Vec<String> = msg
+            .ies(IeType::CreateFar)
+            .filter_map(|ie| CreateFar::unmarshal(&ie.payload).ok())
+            .filter_map(|far| Some(far.forwarding_parameters?.network_instance?.instance))
+            .collect();
+        assert_eq!(
+            nis,
+            vec!["internet".to_string(), "internet".to_string()],
+            "both the uplink (Core) and downlink (Access) FAR carry Network Instance = DNN"
+        );
+
+        // The downlink re-point (Session Modification) re-sends the Network Instance
+        // and destination interface alongside the gNB Outer Header Creation.
+        let gnb_ip = Ipv4Addr::new(10, 0, 9, 1);
+        let modr = session_modification_request(1, 2, 2, 0x5678, gnb_ip, "internet");
+        let msg = rs_pfcp::message::parse(&modr).expect("parse modification");
+        let ufp = msg
+            .ies(IeType::UpdateFar)
+            .filter_map(|ie| UpdateFar::unmarshal(&ie.payload).ok())
+            .find_map(|uf| uf.update_forwarding_parameters)
+            .expect("Update FAR forwarding parameters");
+        assert_eq!(ufp.network_instance.map(|ni| ni.instance), Some("internet".to_string()));
+        assert!(ufp.destination_interface.is_some(), "destination interface re-sent (Access)");
+        assert!(ufp.outer_header_creation.is_some(), "OHC toward the gNB retained");
+    }
+
+    #[test]
     fn establishment_qer_sets_session_ambr_and_update_re_rates_it() {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
         let ambr = SessionAmbr { uplink_bps: 1_000_000_000, downlink_bps: 2_000_000_000 };
         handle_n4(
-            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, Some(ambr), &[], None),
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", Some(ambr), &[], None),
             node_ip,
             &mut state,
             0,
@@ -1502,7 +1550,7 @@ mod tests {
             mfbr_ul_bps: 80_000,
         };
         handle_n4(
-            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, Some(ambr), &[flow], None),
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", Some(ambr), &[flow], None),
             node_ip,
             &mut state,
             0,
@@ -1563,7 +1611,7 @@ mod tests {
             mfbr_ul_bps: 80_000,
         };
         handle_n4(
-            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[f2], None),
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[f2], None),
             node_ip,
             &mut state,
             0,
@@ -1616,7 +1664,7 @@ mod tests {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
         handle_n4(
-            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[], None),
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None),
             node_ip,
             &mut state,
             0,
@@ -1647,11 +1695,11 @@ mod tests {
     fn an_release_buffers_downlink_reports_and_flushes_on_resume() {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = UpfState::new();
-        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[], None), node_ip, &mut state, 0)
+        handle_n4(&session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None), node_ip, &mut state, 0)
             .expect("establish");
         let up_seid = 1u64;
         let gnb = Ipv4Addr::new(10, 0, 0, 9);
-        handle_n4(&session_modification_request(up_seid, 2, 1, 0x5678, gnb), node_ip, &mut state, 0)
+        handle_n4(&session_modification_request(up_seid, 2, 1, 0x5678, gnb, "internet"), node_ip, &mut state, 0)
             .expect("activate downlink");
 
         // AN release → the session buffers downlink (not drops).
@@ -1670,7 +1718,7 @@ mod tests {
 
         // Service Request resume: re-installing the downlink flushes the buffer to
         // the new gNB tunnel.
-        handle_n4(&session_modification_request(up_seid, 4, 1, 0x9ABC, gnb), node_ip, &mut state, 0)
+        handle_n4(&session_modification_request(up_seid, 4, 1, 0x9ABC, gnb, "internet"), node_ip, &mut state, 0)
             .expect("re-activate");
         assert!(!state.is_buffering(UE_IP), "no longer buffering after resume");
         let flushed = state.take_flush();
@@ -1703,7 +1751,7 @@ mod tests {
             mfbr_ul_bps: 100_000_000,
         };
         handle_n4(
-            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[f2], None),
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[f2], None),
             node_ip,
             &mut state,
             0,
@@ -1742,7 +1790,7 @@ mod tests {
         let mut state = UpfState::new();
         // Session URR with a 2500-byte volume threshold (VOLTH reporting).
         handle_n4(
-            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[], Some(2500)),
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], Some(2500)),
             node_ip,
             &mut state,
             0,
@@ -1831,7 +1879,7 @@ mod tests {
             MsgType::HeartbeatResponse
         );
         assert_eq!(
-            round_trip(&smf, &mut buf, session_establishment_request(0x1234, 3, upf_ip, UE_IP, None, &[], None)).await,
+            round_trip(&smf, &mut buf, session_establishment_request(0x1234, 3, upf_ip, UE_IP, "internet", None, &[], None)).await,
             MsgType::SessionEstablishmentResponse
         );
     }

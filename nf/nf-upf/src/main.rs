@@ -308,7 +308,7 @@ mod tests {
         let node_ip = Ipv4Addr::new(127, 0, 0, 1);
         let mut state = pfcp::UpfState::new();
         pfcp::handle_n4(
-            &pfcp::session_establishment_request(0xCAFE, 1, node_ip, UE_IP, None, &[], None),
+            &pfcp::session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None),
             node_ip,
             &mut state,
             0,
@@ -316,7 +316,7 @@ mod tests {
         .expect("session established");
         if let Some((teid, ip)) = gnb {
             pfcp::handle_n4(
-                &pfcp::session_modification_request(1, 2, 2, teid, ip),
+                &pfcp::session_modification_request(1, 2, 2, teid, ip, "internet"),
                 node_ip,
                 &mut state,
                 0,
