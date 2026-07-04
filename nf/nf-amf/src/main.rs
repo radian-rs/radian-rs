@@ -383,6 +383,9 @@ struct UeContext {
     auth: Option<auth::PendingAuth>,
     /// NAS security context, present once the Security Mode Command is sent.
     sec: Option<nas::NasSecurityContext>,
+    /// K_AMF, retained alongside `sec` to derive **K_gNB** (TS 33.501 Annex A.9)
+    /// for the Initial Context Setup's Security Key IE.
+    kamf: Option<[u8; 32]>,
     /// The UE's advertised 5GS security capabilities `[EA, IA]`, replayed verbatim in the
     /// Security Mode Command (TS 24.501 §8.2.25) so the UE can detect a bidding-down attack.
     replayed_ue_sec_cap: Option<[u8; 2]>,
@@ -1079,6 +1082,15 @@ async fn handle_ngap(
             }
             None => info!("gNB UEContextModificationResponse (unparseable)"),
         },
+        NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+            value: SuccessfulOutcomeValue::Id_InitialContextSetup(_),
+            ..
+        }) => match ngap::initial_context_setup_response_ids(&pdu) {
+            Some((amf_ue_id, _ran)) => {
+                info!("gNB established the UE context (InitialContextSetupResponse) for UE {amf_ue_id}")
+            }
+            None => info!("gNB InitialContextSetupResponse (unparseable)"),
+        },
         _ => info!("unhandled PDU: {}", pdu.procedure_name()),
     }
 }
@@ -1442,6 +1454,7 @@ impl UeContext {
             suci,
             auth: None,
             sec: None,
+            kamf: None,
             replayed_ue_sec_cap: None,
             sm_refs: HashMap::new(),
             ue_ambr: None,
@@ -1979,12 +1992,16 @@ async fn complete_authentication(
         .get(&amf_ue_id)
         .and_then(|c| c.replayed_ue_sec_cap)
         .unwrap_or(UE_SEC_CAP);
-    let Some((sec, smc_bytes, _nea, _nia)) = establish_security(&kseaf, &supi, ue_sec_cap) else {
+    let Some((sec, smc_bytes, _nea, _nia, kamf)) = establish_security(&kseaf, &supi, ue_sec_cap)
+    else {
         warn!("UE {amf_ue_id}: cannot establish NAS security (no common integrity algorithm?)");
         return None;
     };
     let ctx = ues.get_mut(&amf_ue_id)?;
     ctx.sec = Some(sec);
+    // K_AMF is retained to derive K_gNB for the Initial Context Setup's Security
+    // Key IE (TS 33.501 Annex A.9).
+    ctx.kamf = Some(kamf);
     ctx.state = RegState::SecurityMode;
     let ran_ue_id = ctx.ran_ue_id;
     Some((
@@ -2004,7 +2021,7 @@ fn establish_security(
     kseaf_hex: &str,
     supi: &str,
     ue_sec_cap: [u8; 2],
-) -> Option<(nas::NasSecurityContext, Vec<u8>, u8, u8)> {
+) -> Option<(nas::NasSecurityContext, Vec<u8>, u8, u8, [u8; 32])> {
     let nea = select_algo(ue_sec_cap[0], &NEA_PRIORITY)?;
     let nia = select_algo(ue_sec_cap[1], &NIA_PRIORITY)?;
     let kseaf: [u8; 32] = hex::decode(kseaf_hex).ok()?.try_into().ok()?;
@@ -2014,7 +2031,7 @@ fn establish_security(
     let smc = nas::security_mode_command(nea, nia, NGKSI, &ue_sec_cap);
     let bytes = sec.protect(&smc, nas::sht::INTEGRITY_NEW_CONTEXT, 1);
     info!(supi = %supi, "NAS security: selected NEA{nea} / NIA{nia}");
-    Some((sec, bytes, nea, nia))
+    Some((sec, bytes, nea, nia, kamf))
 }
 
 /// On Security Mode Complete, fetch the subscriber's am-data, intersect it with
@@ -2070,7 +2087,9 @@ async fn on_security_mode_complete(
         }
         ctx.am_policy = Some((pcf_base, assoc_id));
     }
-    ctx.ue_ambr = effective_ambr;
+    // Fail-open: an unreachable subscription/PCF keeps any UE-AMBR already known
+    // rather than clobbering it.
+    ctx.ue_ambr = effective_ambr.or(ctx.ue_ambr);
     let ran_ue_id = ctx.ran_ue_id;
     let tmsi = amf_ue_id as u32;
     // Remember the assigned 5G-TMSI as this UE's persistent identity (a Service
@@ -2122,6 +2141,12 @@ async fn on_security_mode_complete(
 
     ctx.allowed_nssai = subscribed.is_some().then(|| allowed.clone());
     let registration_area = ctx.registration_area.clone();
+    // Everything the Initial Context Setup carries alongside the accept — copied
+    // before the mutable `sec` borrow.
+    let kamf = ctx.kamf;
+    let ue_sec_cap = ctx.replayed_ue_sec_cap.unwrap_or(UE_SEC_CAP);
+    let (rfsp, ue_ambr) = (ctx.rfsp, ctx.ue_ambr);
+    let area_restriction = ctx.area_restriction.clone();
     let Some(sec) = ctx.sec.as_mut() else {
         return Vec::new();
     };
@@ -2143,40 +2168,44 @@ async fn on_security_mode_complete(
         T3512_SECS,
         &registration_area,
     );
+    // K_gNB from K_AMF and the Security Mode Complete's uplink NAS COUNT
+    // (TS 33.501 Annex A.9) — `unprotect` has already advanced ul_count past it.
+    let kgnb = kamf.map(|k| aka::kgnb(&k, sec.ul_count.wrapping_sub(1)));
     let bytes = sec.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1);
-    info!(
-        "UE {amf_ue_id}: SecurityModeComplete — sending Registration Accept \
-         (allowed NSSAI: {allowed:?}, rejected: {rejected:?})"
-    );
-    // Carry the service area restriction (if any) to the RAN as a Mobility
-    // Restriction List on the Registration Accept's DownlinkNASTransport
-    // (TS 38.413 §9.2.5.3) — the gNB then enforces the UE's allowed tracking areas.
-    let accept_dl = match &ctx.area_restriction {
-        Some((allowed_tacs, not_allowed_tacs)) => ngap::downlink_nas_transport_with_area_restriction(
-            amf_ue_id,
-            ran_ue_id,
-            bytes,
-            PLMN_MCC,
-            PLMN_MNC,
-            allowed_tacs,
-            not_allowed_tacs,
-        ),
-        None => ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
+
+    // Establish the UE context at the gNB with an **Initial Context Setup Request**
+    // (TS 38.413 §8.3.1): GUAMI, allowed NSSAI, the UE's security capabilities,
+    // K_gNB, the AM policy outputs (UE-AMBR / RFSP / mobility restriction), and the
+    // Registration Accept as its NAS-PDU — one procedure instead of a plain
+    // DownlinkNASTransport plus a trailing UE Context Modification.
+    let Some(security_key) = kgnb else {
+        // No K_AMF retained (unreachable in practice: it is stored with `sec`) —
+        // degrade to the plain NAS transport rather than hand the RAN a bogus key.
+        warn!("UE {amf_ue_id}: no K_AMF to derive K_gNB — sending the accept without a context setup");
+        return vec![(
+            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
+            "DownlinkNASTransport (RegistrationAccept)",
+        )];
     };
-    let mut dl = vec![(accept_dl, "DownlinkNASTransport (RegistrationAccept)")];
-    // Signal the AM policy (RFSP + UE-AMBR) to the RAN at the UE-context level
-    // (TS 38.413 §9.2.2.7). RFSP has no other N2 home, so this is where the gNB
-    // learns the UE's RAT/frequency-selection priority. Skipped when the PCF
-    // supplied neither (nothing to steer).
-    let (rfsp, ambr) = (ctx.rfsp, ctx.ue_ambr);
-    if rfsp.is_some() || ambr.is_some() {
-        info!("UE {amf_ue_id}: signalling AM policy to the RAN — RFSP {rfsp:?}, UE-AMBR {ambr:?} bps");
-        dl.push((
-            ngap::ue_context_modification_request(amf_ue_id, ran_ue_id, rfsp, ambr),
-            "UEContextModificationRequest (RFSP)",
-        ));
-    }
-    dl
+    info!(
+        "UE {amf_ue_id}: SecurityModeComplete — Initial Context Setup with the Registration Accept \
+         (allowed NSSAI: {allowed:?}, rejected: {rejected:?}, RFSP {rfsp:?}, UE-AMBR {ue_ambr:?})"
+    );
+    let (allowed_tacs, not_allowed_tacs) = area_restriction.unwrap_or_default();
+    let ic = ngap::InitialContext {
+        allowed_nssai: allowed.clone(),
+        ue_sec_cap,
+        security_key,
+        ue_ambr,
+        rfsp,
+        area_restriction: (!allowed_tacs.is_empty() || !not_allowed_tacs.is_empty())
+            .then_some((allowed_tacs, not_allowed_tacs)),
+        nas: bytes,
+    };
+    vec![(
+        ngap::initial_context_setup_request(amf_ue_id, ran_ue_id, PLMN_MCC, PLMN_MNC, &ic),
+        "InitialContextSetupRequest (RegistrationAccept)",
+    )]
 }
 
 /// Intersect the UE's requested NSSAI with the subscribed one (TS 23.501 slice
@@ -3035,6 +3064,59 @@ mod tests {
             vec![(1, Some([1, 2, 3]))]
         );
         UE_DIRECTORY.lock().unwrap().remove(supi);
+    }
+
+    /// Initial Context Setup (TS 38.413 §8.3.1): on Security Mode Complete the AMF
+    /// establishes the UE context at the gNB with ONE InitialContextSetupRequest —
+    /// K_gNB (derived from K_AMF + the SM Complete's uplink NAS COUNT), the UE's
+    /// security capabilities, the AM policy outputs (UE-AMBR / RFSP / mobility
+    /// restriction), and the protected Registration Accept as its NAS-PDU.
+    #[tokio::test]
+    async fn security_mode_complete_triggers_initial_context_setup() {
+        let (ki, ke) = ([0xddu8; 16], [0xeeu8; 16]);
+        let kamf = [0x77u8; 32];
+        let amf_ue_id = 0x161u64;
+        let mut ctx = UeContext::new(8, RegState::SecurityMode, Some("imsi-999700000000161".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.kamf = Some(kamf);
+        ctx.replayed_ue_sec_cap = Some([0x20, 0x20]);
+        ctx.rfsp = Some(7);
+        ctx.ue_ambr = Some((600_000_000, 300_000_000));
+        ctx.area_restriction = Some((vec![[0, 0, 1]], Vec::new()));
+        ctx.registration_area = vec![[0, 0, 1], [0, 0, 2]];
+
+        // The UE sends the Security Mode Complete; the AMF verifies it (this is
+        // what advances the uplink NAS COUNT the K_gNB derivation uses).
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let smc = ue_sec.protect(&nas::security_mode_complete(), nas::sht::INTEGRITY_CIPHERED, 0);
+        assert!(ctx.sec.as_mut().unwrap().unprotect(&smc, 0).is_some());
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+
+        // Bogus NRF base: am-data fetch + AM policy creation fail gracefully.
+        let dls = on_security_mode_complete(&mut ues, amf_ue_id, "http://127.0.0.1:1").await;
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["InitialContextSetupRequest (RegistrationAccept)"]
+        );
+        let (got_amf, got_ran, ic) =
+            ngap::initial_context_setup_params(&dls[0].0).expect("ICS parses");
+        assert_eq!((got_amf, got_ran), (amf_ue_id, 8));
+        // K_gNB = KDF(K_AMF, UL NAS COUNT of the SM Complete = 0).
+        assert_eq!(ic.security_key, aka::kgnb(&kamf, 0));
+        assert_eq!(ic.ue_sec_cap, [0x20, 0x20], "capabilities replayed to the RAN");
+        assert_eq!(ic.ue_ambr, Some((600_000_000, 300_000_000)));
+        assert_eq!(ic.rfsp, Some(7));
+        assert_eq!(ic.area_restriction, Some((vec![[0, 0, 1]], Vec::new())));
+        // The gNB relays the NAS-PDU; the UE verifies the Registration Accept and
+        // reads its registration area.
+        let accept = ue_sec.unprotect(&ic.nas, 1).expect("UE verifies the accept");
+        assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::RegistrationAccept));
+        assert_eq!(
+            nas::registration_area_from_registration_accept(&accept),
+            Some(vec![[0, 0, 1], [0, 0, 2]])
+        );
+        GUTI_DIRECTORY.lock().unwrap().remove(&(amf_ue_id as u32));
     }
 
     /// The registration area assigned at registration: the serving gNB's Supported
@@ -3896,7 +3978,7 @@ mod tests {
 
         // The AMF negotiates against a UE advertising ONLY 128-NEA1/128-NIA1.
         let ue_cap = [0x40u8, 0x40u8];
-        let (mut amf_sec, smc_bytes, nea, nia) =
+        let (mut amf_sec, smc_bytes, nea, nia, _kamf) =
             establish_security(&kseaf_hex, supi, ue_cap).expect("establish security");
         assert_eq!((nea, nia), (1, 1), "negotiated down to NEA1/NIA1");
 
@@ -3942,7 +4024,7 @@ mod tests {
         let kseaf_hex = outcome.kseaf.unwrap();
 
         // ── AMF derives NAS security + Security Mode Command ──
-        let (mut amf_sec, smc_bytes, _, _) =
+        let (mut amf_sec, smc_bytes, _, _, _kamf) =
             establish_security(&kseaf_hex, supi, UE_SEC_CAP).expect("establish security");
 
         // ── UE derives the same NAS keys and verifies the SMC ──
