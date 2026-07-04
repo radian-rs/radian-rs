@@ -1145,12 +1145,7 @@ async fn handle_ngap(
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
             value: SuccessfulOutcomeValue::Id_InitialContextSetup(_),
             ..
-        }) => match ngap::initial_context_setup_response_ids(&pdu) {
-            Some((amf_ue_id, _ran)) => {
-                info!("gNB established the UE context (InitialContextSetupResponse) for UE {amf_ue_id}")
-            }
-            None => info!("gNB InitialContextSetupResponse (unparseable)"),
-        },
+        }) => on_initial_context_setup_response(ues, amf_smf, &pdu).await,
         _ => info!("unhandled PDU: {}", pdu.procedure_name()),
     }
 }
@@ -1409,43 +1404,10 @@ async fn on_service_request(
         info!("UE {amf_ue_id} resuming from CM-IDLE (Service Request, tmsi {tmsi:#010x}); {} session(s)", sm_refs.len());
     }
 
-    let mut downlinks = Vec::new();
-    if let Some((bytes, kgnb, ics_label, dl_label)) = accept {
-        match kgnb {
-            Some(security_key) => {
-                let (allowed_tacs, not_allowed_tacs) = area_restriction.unwrap_or_default();
-                let ic = ngap::InitialContext {
-                    allowed_nssai: allowed,
-                    ue_sec_cap,
-                    security_key,
-                    ue_ambr,
-                    rfsp,
-                    area_restriction: (!allowed_tacs.is_empty() || !not_allowed_tacs.is_empty())
-                        .then_some((allowed_tacs, not_allowed_tacs)),
-                    nas: bytes,
-                };
-                downlinks.push((
-                    ngap::initial_context_setup_request(amf_ue_id, ran_ue_id, PLMN_MCC, PLMN_MNC, &ic),
-                    ics_label,
-                ));
-            }
-            None => {
-                // No K_AMF retained (a pre-K_gNB context) — degrade to the plain
-                // NAS transport rather than hand the RAN a bogus key.
-                warn!("UE {amf_ue_id}: no K_AMF to derive a fresh K_gNB — accept without a context setup");
-                downlinks.push((ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes), dl_label));
-            }
-        }
-    }
-
-    // Re-activate the PDU sessions whose user plane should come back: the SMF
-    // returns the retained UPF N3 F-TEID + QoS, and the AMF re-sends the N2 PDU
-    // Session Resource Setup. The gNB's F-TEID comes back in the setup response
-    // (existing path) → UpdateSMContext re-installs the UPF downlink that AN
-    // release had dropped. A **Service Request** reactivates everything; a
-    // **registration update** reactivates only the sessions the UE listed in its
-    // **Uplink Data Status** IE (TS 24.501 §9.11.3.57 — pending uplink data),
-    // leaving the rest deactivated.
+    // Which PDU sessions get their user plane back: a **Service Request**
+    // reactivates everything; a **registration update** reactivates only the
+    // sessions the UE listed in its **Uplink Data Status** IE (TS 24.501
+    // §9.11.3.57 — pending uplink data), leaving the rest deactivated.
     let uplink_data_psis =
         decoded.as_ref().map(nas::uplink_data_status_from_registration_request).unwrap_or_default();
     let reactivate: Vec<(u8, (String, String))> = if is_service_request {
@@ -1461,6 +1423,10 @@ async fn on_service_request(
             reactivate.iter().map(|(psi, _)| *psi).collect::<Vec<_>>()
         );
     }
+    // Fetch each reactivated session's retained UPF N3 F-TEID + QoS from its SMF
+    // (Nsmf `ACTIVATING`). These set up **inline** in the Initial Context Setup —
+    // one procedure — rather than trailing PDU Session Resource Setup Requests.
+    let mut ics_sessions = Vec::new();
     for (psi, (sm_ref, smf_base)) in &reactivate {
         match amf_smf.activate_up_connection(smf_base, sm_ref).await {
             Ok(created) => {
@@ -1469,24 +1435,55 @@ async fn on_service_request(
                 } else {
                     created.ngap_flows.clone()
                 };
-                let (ambr_dl, ambr_ul) = ue_ambr.unwrap_or(DEFAULT_UE_AMBR_BPS);
-                downlinks.push((
-                    ngap::pdu_session_resource_setup_request(
-                        amf_ue_id,
-                        ran_ue_id,
-                        *psi,
-                        &flows,
-                        created.up_n3_teid,
-                        created.up_n3_addr,
-                        ambr_dl,
-                        ambr_ul,
-                        Vec::new(), // no N1 SM on resume; the Service Accept went separately
-                    ),
-                    "PDUSessionResourceSetupRequest (resume)",
-                ));
-                info!("UE {amf_ue_id}: PDU session {psi} reactivating (N2 setup re-sent)");
+                ics_sessions.push(ngap::IcsPduSession {
+                    psi: *psi,
+                    flows,
+                    upf_teid: created.up_n3_teid,
+                    upf_addr: created.up_n3_addr,
+                });
+                info!("UE {amf_ue_id}: PDU session {psi} reactivating (inline in the Initial Context Setup)");
             }
             Err(e) => warn!("UE {amf_ue_id}: PDU session {psi} reactivation failed: {e}"),
+        }
+    }
+
+    let mut downlinks = Vec::new();
+    if let Some((bytes, kgnb, ics_label, dl_label)) = accept {
+        match kgnb {
+            Some(security_key) => {
+                let (allowed_tacs, not_allowed_tacs) = area_restriction.unwrap_or_default();
+                let ic = ngap::InitialContext {
+                    allowed_nssai: allowed,
+                    ue_sec_cap,
+                    security_key,
+                    ue_ambr,
+                    rfsp,
+                    area_restriction: (!allowed_tacs.is_empty() || !not_allowed_tacs.is_empty())
+                        .then_some((allowed_tacs, not_allowed_tacs)),
+                    pdu_sessions: ics_sessions,
+                    nas: bytes,
+                };
+                downlinks.push((
+                    ngap::initial_context_setup_request(amf_ue_id, ran_ue_id, PLMN_MCC, PLMN_MNC, &ic),
+                    ics_label,
+                ));
+            }
+            None => {
+                // No K_AMF retained (a pre-K_gNB context) — degrade to the plain
+                // NAS transport + trailing PDU setups rather than hand the RAN a
+                // bogus key.
+                warn!("UE {amf_ue_id}: no K_AMF to derive a fresh K_gNB — accept without a context setup");
+                downlinks.push((ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes), dl_label));
+                let (ambr_dl, ambr_ul) = ue_ambr.unwrap_or(DEFAULT_UE_AMBR_BPS);
+                for s in &ics_sessions {
+                    downlinks.push((
+                        ngap::pdu_session_resource_setup_request(
+                            amf_ue_id, ran_ue_id, s.psi, &s.flows, s.upf_teid, s.upf_addr, ambr_dl, ambr_ul, Vec::new(),
+                        ),
+                        "PDUSessionResourceSetupRequest (resume)",
+                    ));
+                }
+            }
         }
     }
 
@@ -2111,6 +2108,38 @@ async fn on_pdu_session_setup_response(
     match amf_smf.update_sm_context(&smf_base, &sm_ref, gnb_teid, gnb_addr).await {
         Ok(()) => info!("UE {amf_ue_id}: PDU session {psi} downlink installed (gNB F-TEID {gnb_teid:#x})"),
         Err(e) => warn!("UE {amf_ue_id}: UpdateSMContext failed: {e}"),
+    }
+}
+
+/// Handle a gNB's `InitialContextSetupResponse`: the UE context is up. When the
+/// ICS set up PDU sessions **inline** (Cxt Res list — a Service Request resume,
+/// design/88), drive UpdateSMContext with each session's gNB DL N3 F-TEID, exactly
+/// as the standalone PDU Session Resource Setup Response path does.
+async fn on_initial_context_setup_response(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    pdu: &NGAP_PDU,
+) {
+    let Some((amf_ue_id, _ran)) = ngap::initial_context_setup_response_ids(pdu) else {
+        warn!("gNB InitialContextSetupResponse (unparseable)");
+        return;
+    };
+    let sessions = ngap::initial_context_setup_session_ids(pdu);
+    info!(
+        "gNB established the UE context (InitialContextSetupResponse) for UE {amf_ue_id} \
+         ({} inline session(s))",
+        sessions.len()
+    );
+    for (psi, gnb_teid, gnb_addr) in sessions {
+        let Some((sm_ref, smf_base)) = ues.get(&amf_ue_id).and_then(|c| c.sm_refs.get(&psi).cloned())
+        else {
+            warn!("UE {amf_ue_id}: ICS response for PDU session {psi} but no SM context tracked");
+            continue;
+        };
+        match amf_smf.update_sm_context(&smf_base, &sm_ref, gnb_teid, gnb_addr).await {
+            Ok(()) => info!("UE {amf_ue_id}: PDU session {psi} downlink installed (gNB F-TEID {gnb_teid:#x})"),
+            Err(e) => warn!("UE {amf_ue_id}: ICS-inline UpdateSMContext failed for {psi}: {e}"),
+        }
     }
 }
 
@@ -2957,6 +2986,7 @@ async fn on_security_mode_complete(
         rfsp,
         area_restriction: (!allowed_tacs.is_empty() || !not_allowed_tacs.is_empty())
             .then_some((allowed_tacs, not_allowed_tacs)),
+        pdu_sessions: Vec::new(), // no PDU sessions exist yet at initial registration
         nas: bytes,
     };
     vec![(
@@ -3875,15 +3905,20 @@ mod tests {
         let mut ues = HashMap::new();
         let dls = on_service_request(&mut ues, &amf_smf, init, tmsi, &gnb_tx).await;
 
-        // The accept, then a PDU Session Resource Setup for PSI 5 only.
+        // One Initial Context Setup carrying the accept and PSI 5 set up inline.
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
-            [
-                "InitialContextSetupRequest (RegistrationAccept — mobility update)",
-                "PDUSessionResourceSetupRequest (resume)"
-            ]
+            ["InitialContextSetupRequest (RegistrationAccept — mobility update)"]
         );
         assert_eq!(ACTS.load(O::Relaxed), 1, "only the flagged session reactivated");
+        // Only PSI 5 rides the ICS — PSI 6 stays deactivated.
+        assert_eq!(
+            ngap::initial_context_setup_request_session_ids(&dls[0].0)
+                .iter()
+                .map(|(psi, _, _)| *psi)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
         UE_DIRECTORY.lock().unwrap().remove(supi);
         GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != supi);
     }
@@ -4964,14 +4999,19 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let dls = on_service_request(&mut ues, &amf_smf, init, tmsi, &tx).await;
 
-        // The AS context is re-established (Initial Context Setup with a fresh
-        // K_gNB, the Service Accept as its NAS-PDU), then the N2 PDU Session
-        // Resource Setup for the reactivated session.
+        // The AS context is re-established with a single Initial Context Setup
+        // carrying a fresh K_gNB, the Service Accept as its NAS-PDU, and the
+        // reactivated PDU session set up **inline** (no trailing setup message).
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
-            ["InitialContextSetupRequest (ServiceAccept)", "PDUSessionResourceSetupRequest (resume)"]
+            ["InitialContextSetupRequest (ServiceAccept)"]
         );
         assert_eq!(ACTIVATIONS.load(AtomicOrdering::Relaxed), 1, "SMF asked to re-activate the session");
+        // The session rides the ICS with the UPF's UL N3 F-TEID (from the mock SMF).
+        assert_eq!(
+            ngap::initial_context_setup_request_session_ids(&dls[0].0),
+            vec![(5, 1, std::net::Ipv4Addr::new(127, 0, 0, 1))]
+        );
         // The context is restored into the association (CM-CONNECTED) and removed
         // from the retained store; the directory points at the new AMF-UE-NGAP-ID.
         assert!(RETAINED.lock().unwrap().get(&tmsi).is_none(), "retained context consumed");
@@ -4991,6 +5031,62 @@ mod tests {
         assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::ServiceAccept));
 
         UE_DIRECTORY.lock().unwrap().remove(supi);
+    }
+
+    /// The gNB's InitialContextSetupResponse for an ICS that set up sessions inline
+    /// drives UpdateSMContext with each session's gNB DL F-TEID — the downlink
+    /// install, exactly as the standalone PDU Session Resource Setup Response does.
+    #[tokio::test]
+    async fn ics_response_installs_inline_session_downlinks() {
+        use std::sync::Mutex as StdMutex;
+
+        static INSTALLED: StdMutex<Vec<(String, String)>> = StdMutex::new(Vec::new());
+        async fn mock_modify(axum::Json(body): axum::Json<serde_json::Value>) -> axum::http::StatusCode {
+            if let (Some(t), Some(a)) = (
+                body.get("gnbN3Teid").and_then(|v| v.as_str()),
+                body.get("gnbN3Addr").and_then(|v| v.as_str()),
+            ) {
+                INSTALLED.lock().unwrap().push((t.into(), a.into()));
+            }
+            axum::http::StatusCode::OK
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new().route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
+            axum::routing::post(mock_modify),
+        );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+
+        let amf_ue_id = 0x231u64;
+        let mut ctx = UeContext::new(3, RegState::Registered, Some("imsi-999700000000231".into()));
+        ctx.sm_refs.insert(5, ("ctx-icsr".into(), format!("http://{smf_addr}")));
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+
+        // The gNB reports its DL F-TEID (0xAB @ 10.0.1.2) for PSI 5.
+        let resp = ngap::initial_context_setup_response_with_sessions(
+            amf_ue_id,
+            3,
+            &[(5, 0xAB, std::net::Ipv4Addr::new(10, 0, 1, 2))],
+        );
+        on_initial_context_setup_response(&mut ues, &amf_smf, &resp).await;
+        assert_eq!(
+            INSTALLED.lock().unwrap().as_slice(),
+            [("000000ab".to_string(), "10.0.1.2".to_string())],
+            "UpdateSMContext installed the gNB's DL F-TEID"
+        );
+
+        // A response with no inline sessions (registration ICS) installs nothing.
+        INSTALLED.lock().unwrap().clear();
+        on_initial_context_setup_response(
+            &mut ues,
+            &amf_smf,
+            &ngap::initial_context_setup_response(amf_ue_id, 3),
+        )
+        .await;
+        assert!(INSTALLED.lock().unwrap().is_empty());
     }
 
     /// A network-initiated PDU session modification builds the N2 PDU Session
