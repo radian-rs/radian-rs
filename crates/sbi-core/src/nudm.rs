@@ -7,17 +7,98 @@
 //! vector (**the long-term key K never reaches this module or the UDM↔UDR wire**),
 //! and SDM proxies the provisioned-data documents verbatim.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRef, Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use subscriber_db::DataSet;
 
 use crate::nudr::UdrClient;
 use crate::SbiError;
+
+/// In-memory `Nudm_SDM` change subscriptions (TS 29.503 §5.3.2), keyed by SUPI. A
+/// consumer (the AMF) subscribes with a callback; a data-change fans a
+/// `ModificationNotification` out to every callback for that SUPI. Cloneable
+/// (shared handle); the UDM is a single process.
+#[derive(Clone, Default)]
+pub struct SdmStore {
+    subs: Arc<Mutex<HashMap<String, Vec<SdmSub>>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct SdmSub {
+    id: String,
+    callback: String,
+}
+
+impl SdmStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a subscription for `supi`, returning its id.
+    fn subscribe(&self, supi: &str, callback: String) -> String {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+        self.subs
+            .lock()
+            .unwrap()
+            .entry(supi.to_string())
+            .or_default()
+            .push(SdmSub { id: id.clone(), callback });
+        id
+    }
+
+    /// Remove a subscription; `true` if it existed.
+    fn unsubscribe(&self, supi: &str, id: &str) -> bool {
+        let mut map = self.subs.lock().unwrap();
+        let Some(list) = map.get_mut(supi) else {
+            return false;
+        };
+        let before = list.len();
+        list.retain(|s| s.id != id);
+        let removed = list.len() != before;
+        if list.is_empty() {
+            map.remove(supi);
+        }
+        removed
+    }
+
+    /// The callback URIs subscribed for `supi`.
+    fn callbacks_for(&self, supi: &str) -> Vec<String> {
+        self.subs
+            .lock()
+            .unwrap()
+            .get(supi)
+            .map(|list| list.iter().map(|s| s.callback.clone()).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Combined UDM router state: the UDR client plus the SDM subscription store.
+/// `FromRef` lets each handler extract just the piece it needs.
+#[derive(Clone)]
+struct UdmState {
+    udr: Arc<UdrClient>,
+    sdm: SdmStore,
+}
+
+impl FromRef<UdmState> for Arc<UdrClient> {
+    fn from_ref(s: &UdmState) -> Self {
+        s.udr.clone()
+    }
+}
+
+impl FromRef<UdmState> for SdmStore {
+    fn from_ref(s: &UdmState) -> Self {
+        s.sdm.clone()
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,7 +155,96 @@ pub fn router(udr: Arc<UdrClient>) -> Router {
         .route("/nudm-sdm/v2/{supi}/am-data", get(sdm_am_data))
         .route("/nudm-sdm/v2/{supi}/sm-data", get(sdm_sm_data))
         .route("/nudm-sdm/v2/{supi}/smf-select-data", get(sdm_smf_select_data))
-        .with_state(udr)
+        // Nudm_SDM change subscriptions: subscribe/unsubscribe + a data-change
+        // fan-out (the trigger a data source — e.g. the UDR — invokes on a change).
+        .route("/nudm-sdm/v2/{supi}/sdm-subscriptions", post(sdm_subscribe))
+        .route("/nudm-sdm/v2/{supi}/sdm-subscriptions/{sub_id}", delete(sdm_unsubscribe))
+        .route("/nudm-sdm/v2/{supi}/notify-data-change", post(sdm_notify_change))
+        .with_state(UdmState { udr, sdm: SdmStore::new() })
+}
+
+/// `Nudm_SDM` subscription (TS 29.503 §6.1.6.2.10, trimmed): a consumer's callback
+/// for subscriber-data changes, plus the monitored resources (advisory here — the
+/// AMF re-fetches am-data on any notification).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SdmSubscription {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_id: Option<String>,
+    pub callback_reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitored_resource_uris: Option<Vec<String>>,
+}
+
+/// `Nudm_SDM` **ModificationNotification** (TS 29.503 §6.1.6.2.10): the changed
+/// resources for a SUPI, POSTed to each subscriber's callback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModificationNotification {
+    pub notify_items: Vec<NotifyItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifyItem {
+    /// The changed resource (e.g. `am-data`).
+    pub resource_id: String,
+}
+
+/// `Nudm_SDM_Subscribe`: record a consumer's callback for `supi`'s data changes.
+/// `201` with the created subscription (carrying its id) and a `Location` header.
+async fn sdm_subscribe(
+    State(sdm): State<SdmStore>,
+    Path(supi): Path<String>,
+    Json(mut sub): Json<SdmSubscription>,
+) -> Result<(StatusCode, [(axum::http::HeaderName, String); 1], Json<SdmSubscription>), StatusCode> {
+    // SSRF guard on the callback (same posture as the UECM dereg callback).
+    if !crate::nudr::is_valid_callback_uri(&sub.callback_reference) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let id = sdm.subscribe(&supi, sub.callback_reference.clone());
+    tracing::info!(%supi, sub_id = %id, callback = %sub.callback_reference, "Nudm_SDM subscription created");
+    let location = format!("/nudm-sdm/v2/{supi}/sdm-subscriptions/{id}");
+    sub.subscription_id = Some(id);
+    Ok((StatusCode::CREATED, [(axum::http::header::LOCATION, location)], Json(sub)))
+}
+
+/// `Nudm_SDM_Unsubscribe`: drop a subscription. `204`, or `404` if unknown.
+async fn sdm_unsubscribe(
+    State(sdm): State<SdmStore>,
+    Path((supi, sub_id)): Path<(String, String)>,
+) -> StatusCode {
+    if sdm.unsubscribe(&supi, &sub_id) {
+        tracing::info!(%supi, %sub_id, "Nudm_SDM subscription removed");
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+/// Fan a subscriber-data change out to every `Nudm_SDM` subscriber for `supi`
+/// (the trigger a data source invokes on a change). Best-effort: each callback is
+/// POSTed a `ModificationNotification`; failures are logged, not fatal. `200` with
+/// the number of subscribers notified.
+async fn sdm_notify_change(
+    State(sdm): State<SdmStore>,
+    Path(supi): Path<String>,
+) -> Json<serde_json::Value> {
+    let callbacks = sdm.callbacks_for(&supi);
+    let notification = ModificationNotification {
+        notify_items: vec![NotifyItem { resource_id: "am-data".to_string() }],
+    };
+    let client = crate::sbi_client();
+    let mut notified = 0u32;
+    for cb in &callbacks {
+        match client.post(cb).json(&notification).send().await {
+            Ok(r) if r.status().is_success() => notified += 1,
+            Ok(r) => tracing::warn!(%supi, callback = %cb, status = %r.status(), "SDM notify rejected"),
+            Err(e) => tracing::warn!(%supi, callback = %cb, "SDM notify failed: {e}"),
+        }
+    }
+    tracing::info!(%supi, subscribers = callbacks.len(), notified, "Nudm_SDM data-change fanned out");
+    Json(serde_json::json!({ "notified": notified }))
 }
 
 /// `Nudm_UECM` (TS 29.503 §5.3): the AMF records itself as the serving AMF for a
@@ -424,6 +594,40 @@ impl NudmClient {
         }
         Ok(Some(resp.error_for_status()?.json().await?))
     }
+
+    /// `Nudm_SDM_Subscribe` — subscribe `callback` to `supi`'s subscriber-data
+    /// changes. Returns the created subscription id (for a later unsubscribe).
+    pub async fn sdm_subscribe(&self, supi: &str, callback: &str) -> Result<String, SbiError> {
+        let sub = SdmSubscription {
+            subscription_id: None,
+            callback_reference: callback.to_string(),
+            monitored_resource_uris: Some(vec![format!("{}/nudm-sdm/v2/{}/am-data", self.base, supi)]),
+        };
+        let created: SdmSubscription = self
+            .http
+            .post(format!("{}/nudm-sdm/v2/{}/sdm-subscriptions", self.base, supi))
+            .json(&sub)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(created.subscription_id.unwrap_or_default())
+    }
+
+    /// `Nudm_SDM_Unsubscribe` — drop a change subscription. `Ok(false)` if unknown.
+    pub async fn sdm_unsubscribe(&self, supi: &str, sub_id: &str) -> Result<bool, SbiError> {
+        let resp = self
+            .http
+            .delete(format!("{}/nudm-sdm/v2/{}/sdm-subscriptions/{}", self.base, supi, sub_id))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        resp.error_for_status()?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -455,5 +659,67 @@ mod tests {
         assert_eq!(sdm.get_am_data("imsi-1", "99970").await.unwrap(), Some(am));
         assert_eq!(sdm.get_am_data("imsi-1", "00101").await.unwrap(), None, "other PLMN");
         assert_eq!(sdm.get_am_data("imsi-2", "99970").await.unwrap(), None, "unknown SUPI");
+    }
+
+    /// A Nudm_SDM change subscription: subscribe a callback, a data-change fans a
+    /// ModificationNotification out to it; after unsubscribing, it reaches nobody.
+    #[tokio::test]
+    async fn sdm_change_subscription_fans_out() {
+        use std::sync::Mutex as StdMutex;
+
+        type Received = Arc<StdMutex<Vec<ModificationNotification>>>;
+        async fn cb(
+            State(rx): State<Received>,
+            Json(n): Json<ModificationNotification>,
+        ) -> StatusCode {
+            rx.lock().unwrap().push(n);
+            StatusCode::NO_CONTENT
+        }
+        let received: Received = Arc::new(StdMutex::new(Vec::new()));
+        let cb_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cb_addr = cb_l.local_addr().unwrap();
+        let cb_router = Router::new().route("/cb", post(cb)).with_state(received.clone());
+        tokio::spawn(async move { crate::run_on(cb_l, cb_router).await.unwrap() });
+
+        // The UDM router (its UDR is unused by the SDM subscription surface).
+        let udr = Arc::new(UdrClient::new("http://127.0.0.1:1"));
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udm_l, router(udr)).await.unwrap() });
+        let udm_base = format!("http://{udm_addr}");
+        let sdm = NudmClient::new(udm_base.clone());
+
+        let sub_id = sdm.sdm_subscribe("imsi-1", &format!("http://{cb_addr}/cb")).await.unwrap();
+        assert!(!sub_id.is_empty(), "a subscription id is returned");
+
+        // The fan-out awaits each callback, so delivery is complete when it returns.
+        let http = crate::sbi_client();
+        let out: serde_json::Value = http
+            .post(format!("{udm_base}/nudm-sdm/v2/imsi-1/notify-data-change"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(out.get("notified").and_then(|v| v.as_u64()), Some(1));
+        {
+            let got = received.lock().unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].notify_items[0].resource_id, "am-data");
+        }
+
+        // After unsubscribing, a change reaches nobody.
+        assert!(sdm.sdm_unsubscribe("imsi-1", &sub_id).await.unwrap());
+        let out: serde_json::Value = http
+            .post(format!("{udm_base}/nudm-sdm/v2/imsi-1/notify-data-change"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(out.get("notified").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(received.lock().unwrap().len(), 1, "no delivery after unsubscribe");
     }
 }

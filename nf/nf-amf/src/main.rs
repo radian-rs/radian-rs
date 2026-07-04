@@ -140,6 +140,13 @@ enum UeCmd {
     /// The release guard timer fired: the UE never sent its PDU Session Release
     /// Complete for `psi` — finalise the release at the SMF anyway.
     ReleaseGuardExpiry { amf_ue_id: u64, psi: u8 },
+    /// A Nudm_SDM data change: refresh the UE's cached subscription view (the newly
+    /// fetched UE-AMBR and allowed NSSAI). `None` fields leave the current value.
+    UpdateSubscribedData {
+        amf_ue_id: u64,
+        ue_ambr: Option<(u64, u64)>,
+        allowed_nssai: Option<Vec<(u8, Option<[u8; 3]>)>>,
+    },
     /// Page a CM-IDLE UE by 5G-TMSI across its registration area (downlink data or
     /// a pending AM policy change). Sent to the gNB associations serving any of the
     /// area's TAs; each sends an NGAP Paging carrying the full TAI list.
@@ -227,6 +234,56 @@ fn spawn_uecm_purge(supi: String) {
                 Err(e) => warn!(%supi, "UECM purge failed: {e}"),
             },
             Err(e) => warn!(%supi, "UECM purge skipped (no UDM): {e}"),
+        }
+    });
+}
+
+/// Nudm_SDM change subscriptions this AMF holds: SUPI → subscription id — kept so a
+/// deregistration can unsubscribe at the UDM.
+static SDM_SUBS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+
+/// Subscribe to the SUPI's `Nudm_SDM` subscriber-data changes (TS 29.503 §5.3.2):
+/// the UDM will POST our `sdm-notify` callback when the subscriber's provisioned
+/// data changes, so we can refresh the cached subscription view. The subscription
+/// id is kept for a later unsubscribe. Best-effort, off the signaling path.
+fn spawn_sdm_subscribe(supi: String) {
+    tokio::spawn(async move {
+        let callback = format!(
+            "{}://{}:{SBI_PORT}/namf-callback/v1/{supi}/sdm-notify",
+            sbi_core::sbi_scheme(),
+            &*ADVERTISE_ADDR
+        );
+        match discover_nf(&NRF_BASE, "UDM").await {
+            Ok(udm) => match sbi_core::nudm::NudmClient::new(udm).sdm_subscribe(&supi, &callback).await {
+                Ok(sub_id) => {
+                    info!(%supi, %sub_id, "Nudm_SDM: subscribed to subscriber-data changes");
+                    SDM_SUBS.lock().unwrap().insert(supi, sub_id);
+                }
+                Err(e) => warn!(%supi, "Nudm_SDM subscribe failed: {e}"),
+            },
+            Err(e) => warn!(%supi, "Nudm_SDM subscribe skipped (no UDM): {e}"),
+        }
+    });
+}
+
+/// Drop the SUPI's `Nudm_SDM` change subscription (deregistration of any flavour).
+/// Best-effort, off the signaling path; a no-op if we held no subscription.
+fn spawn_sdm_unsubscribe(supi: String) {
+    let Some(sub_id) = SDM_SUBS.lock().unwrap().remove(&supi) else {
+        return;
+    };
+    tokio::spawn(async move {
+        match discover_nf(&NRF_BASE, "UDM").await {
+            Ok(udm) => {
+                if let Err(e) =
+                    sbi_core::nudm::NudmClient::new(udm).sdm_unsubscribe(&supi, &sub_id).await
+                {
+                    warn!(%supi, "Nudm_SDM unsubscribe failed: {e}");
+                } else {
+                    info!(%supi, %sub_id, "Nudm_SDM: unsubscribed");
+                }
+            }
+            Err(e) => warn!(%supi, "Nudm_SDM unsubscribe skipped (no UDM): {e}"),
         }
     });
 }
@@ -630,6 +687,9 @@ async fn serve_gnb(
                     UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr, rfsp, area_restriction } => {
                         on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp, area_restriction)
                     }
+                    UeCmd::UpdateSubscribedData { amf_ue_id, ue_ambr, allowed_nssai } => {
+                        on_sdm_data_change(&mut ues, amf_ue_id, ue_ambr, allowed_nssai)
+                    }
                     // Page a CM-IDLE UE on this gNB (non-UE-associated NGAP Paging)
                     // across its registration area.
                     UeCmd::Page { tmsi, tacs } => {
@@ -670,6 +730,26 @@ fn namf_callback_router() -> axum::Router {
             }
             _ => axum::http::StatusCode::NOT_FOUND,
         }
+    }
+    /// `Nudm_SDM_Notification` (TS 29.503 §5.3.2.3): the UDM reports that the
+    /// subscriber's provisioned data changed. Re-fetch am-data and refresh the cached
+    /// subscription view (UE-AMBR / allowed NSSAI) on the owning association. `204` —
+    /// the notification is accepted whether or not the UE is currently connected (a
+    /// CM-IDLE UE re-fetches at its next registration).
+    async fn sdm_notify(
+        axum::extract::Path(supi): axum::extract::Path<String>,
+        axum::Json(_note): axum::Json<sbi_core::nudm::ModificationNotification>,
+    ) -> axum::http::StatusCode {
+        let entry = UE_DIRECTORY.lock().unwrap().get(&supi).cloned();
+        let Some((amf_ue_id, tx)) = entry else {
+            info!(%supi, "Nudm_SDM data-change for a UE not connected — re-fetched at next registration");
+            return axum::http::StatusCode::NO_CONTENT;
+        };
+        // The notification lists changed resources; we re-read the authoritative data.
+        let (allowed_nssai, ue_ambr) = fetch_am_data(&NRF_BASE, &supi).await;
+        info!(%supi, ?ue_ambr, "Nudm_SDM data-change — refreshing the cached subscription view");
+        let _ = tx.send(UeCmd::UpdateSubscribedData { amf_ue_id, ue_ambr, allowed_nssai });
+        axum::http::StatusCode::NO_CONTENT
     }
     /// `Namf_Communication`-style N1N2 message transfer for a network-initiated PDU
     /// session modification: the SMF posts the re-authorized QoS (session AMBR + QoS
@@ -898,6 +978,7 @@ fn namf_callback_router() -> axum::Router {
 
     axum::Router::new()
         .route("/namf-callback/v1/{supi}/dereg-notify", axum::routing::post(dereg_notify))
+        .route("/namf-callback/v1/{supi}/sdm-notify", axum::routing::post(sdm_notify))
         .route(
             "/namf-comm/v1/ue-contexts/{supi}/modify",
             axum::routing::post(modify_policy),
@@ -1033,6 +1114,35 @@ fn on_am_policy_update(
         dl.push((cuc_dl, "DownlinkNASTransport (ConfigurationUpdateCommand)"));
     }
     dl
+}
+
+/// Refresh a UE's cached subscription view after a Nudm_SDM data change: update the
+/// stored subscribed UE-AMBR and allowed NSSAI. No UE re-signalling here — a
+/// subscribed-data change takes effect on the next procedure that reads the view
+/// (a PDU session's slice admission, a UE-context modification, a re-registration).
+fn on_sdm_data_change(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_ue_id: u64,
+    ue_ambr: Option<(u64, u64)>,
+    allowed_nssai: Option<Vec<(u8, Option<[u8; 3]>)>>,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        warn!("Nudm_SDM data change for unknown UE {amf_ue_id}");
+        return Vec::new();
+    };
+    if let Some(ambr) = ue_ambr {
+        if ctx.ue_ambr != Some(ambr) {
+            info!("UE {amf_ue_id}: subscribed UE-AMBR updated to {}/{} bps (Nudm_SDM)", ambr.0, ambr.1);
+            ctx.ue_ambr = Some(ambr);
+        }
+    }
+    if let Some(nssai) = allowed_nssai {
+        if ctx.allowed_nssai.as_ref() != Some(&nssai) {
+            info!("UE {amf_ue_id}: subscribed NSSAI updated to {nssai:?} (Nudm_SDM)");
+            ctx.allowed_nssai = Some(nssai);
+        }
+    }
+    Vec::new()
 }
 
 fn on_network_modification(
@@ -1171,6 +1281,7 @@ fn on_t3522_expiry(
     if let Some(supi) = ctx.suci.clone() {
         // The subscription is gone — its GUTI must not resolve again.
         GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
+        spawn_sdm_unsubscribe(supi.clone());
         spawn_uecm_purge(supi);
     }
     spawn_am_policy_delete(ctx.am_policy.take());
@@ -1407,6 +1518,7 @@ async fn evict_stale_retained(amf_smf: &pdu_session::AmfSmf, max_idle: std::time
         spawn_am_policy_delete(ctx.am_policy.clone());
         if let Some(supi) = supi {
             GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
+            spawn_sdm_unsubscribe(supi.clone());
             spawn_uecm_purge(supi);
         }
     }
@@ -2656,6 +2768,7 @@ async fn on_deregistration(
     ));
     if let Some(supi) = ues.get(&amf_ue_id).and_then(|c| c.suci.clone()) {
         UE_DIRECTORY.lock().unwrap().remove(&supi);
+        spawn_sdm_unsubscribe(supi.clone());
         spawn_uecm_purge(supi);
     }
     spawn_am_policy_delete(ues.get_mut(&amf_ue_id).and_then(|c| c.am_policy.take()));
@@ -2729,6 +2842,7 @@ async fn dispatch_uplink_nas(
                 UE_DIRECTORY.lock().unwrap().remove(&supi);
                 // The subscription is gone — its GUTI must not resolve again.
                 GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
+                spawn_sdm_unsubscribe(supi.clone());
                 spawn_uecm_purge(supi);
             }
             ues.remove(&amf_ue_id);
@@ -2741,9 +2855,12 @@ async fn dispatch_uplink_nas(
             let ctx = ues.get_mut(&amf_ue_id)?;
             ctx.state = RegState::Registered;
             // Record this AMF as the serving AMF (UECM) — the UDR delivers
-            // subscription withdrawals to our callback from now on.
+            // subscription withdrawals to our callback from now on — and subscribe to
+            // Nudm_SDM subscriber-data changes so a mid-registration change refreshes
+            // our cached view.
             if let Some(supi) = ctx.suci.clone() {
-                spawn_uecm_register(supi);
+                spawn_uecm_register(supi.clone());
+                spawn_sdm_subscribe(supi);
             }
             info!(
                 "UE {amf_ue_id} REGISTERED (suci={:?}, ran_ue_id={}, state={:?})",
@@ -5554,6 +5671,34 @@ mod tests {
         // A psi the UE has no session for is a no-op.
         let m_bad = ModifyPolicy { psi: 9, ..m.clone() };
         assert!(on_network_modification(&mut ues, &m_bad).is_empty(), "no session for psi 9");
+    }
+
+    /// A Nudm_SDM data-change refreshes the UE's cached subscription view (UE-AMBR /
+    /// allowed NSSAI) in place, without emitting any downlink.
+    #[test]
+    fn sdm_data_change_refreshes_the_cached_view() {
+        let amf_ue_id = 0x51u64;
+        let mut ctx = UeContext::new(2, RegState::Registered, Some("imsi-999700000000051".into()));
+        ctx.ue_ambr = Some((1_000_000, 1_000_000));
+        ctx.allowed_nssai = Some(vec![(1, Some([1, 2, 3]))]);
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+
+        // A change bumping the UE-AMBR and the NSSAI updates the stored view (no downlink).
+        let dls = on_sdm_data_change(
+            &mut ues,
+            amf_ue_id,
+            Some((2_000_000, 500_000)),
+            Some(vec![(1, None), (2, None)]),
+        );
+        assert!(dls.is_empty(), "no UE re-signalling on a subscription-data change");
+        assert_eq!(ues[&amf_ue_id].ue_ambr, Some((2_000_000, 500_000)));
+        assert_eq!(ues[&amf_ue_id].allowed_nssai, Some(vec![(1, None), (2, None)]));
+
+        // `None` fields leave the current values; an unknown UE is a no-op.
+        on_sdm_data_change(&mut ues, amf_ue_id, None, None);
+        assert_eq!(ues[&amf_ue_id].ue_ambr, Some((2_000_000, 500_000)));
+        assert!(on_sdm_data_change(&mut ues, 999, Some((1, 1)), None).is_empty());
     }
 
     /// Shared harness: a mock SMF whose `release` route records the finalised SM
