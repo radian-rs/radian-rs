@@ -110,6 +110,14 @@ pub fn nas_keys(kamf: &[u8; 32], nea: u8, nia: u8) -> NasKeys {
     }
 }
 
+/// AMF: derive **K_gNB** from K_AMF (TS 33.501 Annex A.9, FC=0x6E) — the AS root
+/// key handed to the NG-RAN in the Initial Context Setup's Security Key IE.
+/// `ul_nas_count` is the uplink NAS COUNT of the trigger message (the Security
+/// Mode Complete at initial registration). 3GPP access.
+pub fn kgnb(kamf: &[u8; 32], ul_nas_count: u32) -> [u8; 32] {
+    oxirush_security::derive_kgnb(kamf, ul_nas_count)
+}
+
 /// The AKA AMF field used for **resynchronisation** (TS 33.102 §6.3.3): MAC-S is
 /// computed with AMF* = 0x0000, not the subscriber's provisioned AMF.
 const RESYNC_AMF: [u8; 2] = [0x00, 0x00];
@@ -275,5 +283,17 @@ mod tests {
         let mut av = generate_5g_he_av(&sub, &sqn, &rand, "999", "70").unwrap();
         av.autn[15] ^= 0xff; // corrupt MAC-A
         assert!(ue_compute_res_star(&sub, &av.rand, &av.autn, "999", "70").is_err());
+    }
+
+    /// K_gNB (TS 33.501 Annex A.9): deterministic in (K_AMF, UL NAS COUNT), and a
+    /// different COUNT yields a different AS root key (key freshness on
+    /// re-derivation).
+    #[test]
+    fn kgnb_is_deterministic_and_count_bound() {
+        let kamf = [0x42u8; 32];
+        let k0 = kgnb(&kamf, 0);
+        assert_eq!(k0, kgnb(&kamf, 0));
+        assert_ne!(k0, kgnb(&kamf, 1));
+        assert_ne!(k0, kgnb(&[0x43u8; 32], 0));
     }
 }

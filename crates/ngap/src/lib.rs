@@ -83,6 +83,25 @@ pub fn downlink_nas_transport_with_area_restriction(
     allowed_tacs: &[[u8; 3]],
     not_allowed_tacs: &[[u8; 3]],
 ) -> NGAP_PDU {
+    let mrl = mobility_restriction_list(mcc, mnc, allowed_tacs, not_allowed_tacs);
+    build_ngap!(InitiatingMessage, DownlinkNASTransport,
+        IGNORE, DownlinkNASTransport,
+        REJECT AMF_UE_NGAP_ID(amf_ue_id),
+        REJECT RAN_UE_NGAP_ID(ran_ue_id),
+        REJECT NAS_PDU(nas),
+        IGNORE MobilityRestrictionList(mrl),
+    )
+}
+
+/// A `MobilityRestrictionList` (TS 38.413 §9.3.1.85) whose Service Area
+/// Information carries the allowed / non-allowed TACs of one PLMN — shared by the
+/// DownlinkNASTransport and Initial Context Setup carriers.
+fn mobility_restriction_list(
+    mcc: &str,
+    mnc: &str,
+    allowed_tacs: &[[u8; 3]],
+    not_allowed_tacs: &[[u8; 3]],
+) -> MobilityRestrictionList {
     let to_tacs = |ts: &[[u8; 3]]| ts.iter().map(|t| TAC(t.to_vec())).collect::<Vec<_>>();
     let area = ServiceAreaInformation_Item {
         plmn_identity: helpers::plmn(mcc, mnc),
@@ -91,21 +110,14 @@ pub fn downlink_nas_transport_with_area_restriction(
             .then(|| NotAllowedTACs(to_tacs(not_allowed_tacs))),
         ie_extensions: None,
     };
-    let mrl = MobilityRestrictionList {
+    MobilityRestrictionList {
         serving_plmn: helpers::plmn(mcc, mnc),
         equivalent_plm_ns: None,
         rat_restrictions: None,
         forbidden_area_information: None,
         service_area_information: Some(ServiceAreaInformation(vec![area])),
         ie_extensions: None,
-    };
-    build_ngap!(InitiatingMessage, DownlinkNASTransport,
-        IGNORE, DownlinkNASTransport,
-        REJECT AMF_UE_NGAP_ID(amf_ue_id),
-        REJECT RAN_UE_NGAP_ID(ran_ue_id),
-        REJECT NAS_PDU(nas),
-        IGNORE MobilityRestrictionList(mrl),
-    )
+    }
 }
 
 /// Extract `(allowed_tacs, non_allowed_tacs)` from the Mobility Restriction List of a
@@ -413,6 +425,196 @@ pub fn parse_ue_context_release_request(pdu: &NGAP_PDU) -> Option<(u64, u32)> {
                 amf_ue_id = Some(id.0)
             }
             UEContextReleaseRequestProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(id) => {
+                ran_ue_id = Some(id.0)
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?))
+}
+
+/// Everything the AMF hands the NG-RAN in an **Initial Context Setup Request**
+/// (TS 38.413 §9.2.2.1) — also what [`initial_context_setup_params`] parses back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct InitialContext {
+    /// Allowed NSSAI: `(SST, optional SD)` per slice.
+    pub allowed_nssai: Vec<(u8, Option<[u8; 3]>)>,
+    /// The UE's 5G security capabilities `[EA, IA]` (replayed from registration).
+    pub ue_sec_cap: [u8; 2],
+    /// K_gNB — the AS root key (Security Key IE, 256 bits).
+    pub security_key: [u8; 32],
+    /// UE Aggregate Maximum Bit Rate `(downlink, uplink)` bits/sec.
+    pub ue_ambr: Option<(u64, u64)>,
+    /// Index to RAT/Frequency Selection Priority.
+    pub rfsp: Option<u16>,
+    /// Service area restriction `(allowed_tacs, not_allowed_tacs)` — sent as a
+    /// Mobility Restriction List.
+    pub area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
+    /// The NAS PDU the gNB relays to the UE (the protected Registration Accept).
+    pub nas: Vec<u8>,
+}
+
+/// Build an `InitialContextSetupRequest` (TS 38.413 §9.2.2.1) — the AMF
+/// establishes the UE context at the NG-RAN: GUAMI, allowed NSSAI, the UE's
+/// security capabilities, **K_gNB** (the AS root key), the UE-AMBR / RFSP /
+/// mobility restriction (when present), and the NAS PDU (Registration Accept)
+/// the gNB relays to the UE. The gNB answers with an Initial Context Setup
+/// Response.
+pub fn initial_context_setup_request(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    mcc: &str,
+    mnc: &str,
+    ic: &InitialContext,
+) -> NGAP_PDU {
+    let mut ies = vec![
+        build_ngap_ie!(InitialContextSetupRequest, REJECT AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id))),
+        build_ngap_ie!(InitialContextSetupRequest, REJECT RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id))),
+    ];
+    if let Some((dl_bps, ul_bps)) = ic.ue_ambr {
+        ies.push(build_ngap_ie!(InitialContextSetupRequest, REJECT UEAggregateMaximumBitRate(UEAggregateMaximumBitRate {
+            ue_aggregate_maximum_bit_rate_dl: BitRate(dl_bps),
+            ue_aggregate_maximum_bit_rate_ul: BitRate(ul_bps),
+            ie_extensions: None,
+        })));
+    }
+    // GUAMI: region/set/pointer 1/1/0, matching the served GUAMI advertised in the
+    // NG Setup Response and the GUTIs the AMF assigns.
+    ies.push(build_ngap_ie!(InitialContextSetupRequest, REJECT GUAMI(guami(plmn(mcc, mnc), 1, 1, 0))));
+    ies.push(build_ngap_ie!(InitialContextSetupRequest, REJECT AllowedNSSAI(AllowedNSSAI(
+        ic.allowed_nssai
+            .iter()
+            .map(|(sst, sd)| AllowedNSSAI_Item { s_nssai: s_nssai(*sst, *sd), ie_extensions: None })
+            .collect(),
+    ))));
+    ies.push(build_ngap_ie!(InitialContextSetupRequest, REJECT UESecurityCapabilities(
+        helpers::ue_security_capabilities(&ic.ue_sec_cap)
+    )));
+    ies.push(build_ngap_ie!(InitialContextSetupRequest, REJECT SecurityKey(SecurityKey(
+        BitVec::<u8, Msb0>::from_slice(&ic.security_key)
+    ))));
+    if let Some((allowed, not_allowed)) = &ic.area_restriction {
+        ies.push(build_ngap_ie!(InitialContextSetupRequest, IGNORE MobilityRestrictionList(
+            mobility_restriction_list(mcc, mnc, allowed, not_allowed)
+        )));
+    }
+    if let Some(rfsp) = ic.rfsp {
+        ies.push(build_ngap_ie!(InitialContextSetupRequest, IGNORE IndexToRFSP(IndexToRFSP(rfsp))));
+    }
+    ies.push(build_ngap_ie!(InitialContextSetupRequest, IGNORE NAS_PDU(NAS_PDU(ic.nas.clone()))));
+    // InitialContextSetup = procedure code 14 (TS 38.413 §9.3.5).
+    NGAP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(14),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_InitialContextSetup(InitialContextSetupRequest {
+            protocol_i_es: InitialContextSetupRequestProtocolIEs(ies),
+        }),
+    })
+}
+
+/// Parse an `InitialContextSetupRequest` back into `(amf_ue_id, ran_ue_id,
+/// InitialContext)` — the RAN side / tests.
+pub fn initial_context_setup_params(pdu: &NGAP_PDU) -> Option<(u64, u32, InitialContext)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_InitialContextSetup(req) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id) = (None, None);
+    let mut ic = InitialContext::default();
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => {
+                ran_ue_id = Some(v.0)
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_AllowedNSSAI(list) => {
+                ic.allowed_nssai = list
+                    .0
+                    .iter()
+                    .filter_map(|item| {
+                        let sst = *item.s_nssai.sst.0.first()?;
+                        let sd = item
+                            .s_nssai
+                            .sd
+                            .as_ref()
+                            .and_then(|sd| <[u8; 3]>::try_from(sd.0.as_slice()).ok());
+                        Some((sst, sd))
+                    })
+                    .collect()
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_UESecurityCapabilities(cap) => {
+                let byte = |bv: &BitVec<u8, Msb0>| -> u8 {
+                    bv.iter().take(8).enumerate().fold(0u8, |acc, (i, b)| {
+                        acc | ((*b as u8) << (7 - i))
+                    })
+                };
+                ic.ue_sec_cap =
+                    [byte(&cap.n_rencryption_algorithms.0), byte(&cap.n_rintegrity_protection_algorithms.0)];
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_SecurityKey(key) => {
+                let bytes = key.0.as_raw_slice();
+                if let Ok(k) = <[u8; 32]>::try_from(bytes) {
+                    ic.security_key = k;
+                }
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_UEAggregateMaximumBitRate(v) => {
+                ic.ue_ambr =
+                    Some((v.ue_aggregate_maximum_bit_rate_dl.0, v.ue_aggregate_maximum_bit_rate_ul.0))
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_IndexToRFSP(v) => {
+                ic.rfsp = Some(v.0)
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_MobilityRestrictionList(mrl) => {
+                if let Some(item) = mrl.service_area_information.as_ref().and_then(|s| s.0.first()) {
+                    let collect = |tacs: &[TAC]| {
+                        tacs.iter()
+                            .filter_map(|t| <[u8; 3]>::try_from(t.0.as_slice()).ok())
+                            .collect::<Vec<_>>()
+                    };
+                    ic.area_restriction = Some((
+                        item.allowed_ta_cs.as_ref().map(|a| collect(&a.0)).unwrap_or_default(),
+                        item.not_allowed_ta_cs.as_ref().map(|a| collect(&a.0)).unwrap_or_default(),
+                    ));
+                }
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_NAS_PDU(nas) => {
+                ic.nas = nas.0.clone()
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, ic))
+}
+
+/// Build an `InitialContextSetupResponse` (NG-RAN→AMF) — for tests and a gNB
+/// simulator.
+pub fn initial_context_setup_response(amf_ue_id: u64, ran_ue_id: u32) -> NGAP_PDU {
+    build_ngap!(SuccessfulOutcome, InitialContextSetup,
+        REJECT, InitialContextSetupResponse,
+        IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        IGNORE RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+    )
+}
+
+/// `(amf_ue_id, ran_ue_id)` from a decoded `InitialContextSetupResponse`.
+pub fn initial_context_setup_response_ids(pdu: &NGAP_PDU) -> Option<(u64, u32)> {
+    let NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome { value, .. }) = pdu else {
+        return None;
+    };
+    let SuccessfulOutcomeValue::Id_InitialContextSetup(resp) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id) = (None, None);
+    for ie in &resp.protocol_i_es.0 {
+        match &ie.value {
+            InitialContextSetupResponseProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(id) => {
+                amf_ue_id = Some(id.0)
+            }
+            InitialContextSetupResponseProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(id) => {
                 ran_ue_id = Some(id.0)
             }
             _ => {}
@@ -1163,6 +1365,41 @@ mod release_tests {
         );
         // A plain DownlinkNASTransport has no restriction.
         assert_eq!(area_restriction_from_downlink_nas(&downlink_nas_transport(7, 3, vec![1])), None);
+    }
+
+    #[test]
+    fn initial_context_setup_roundtrips() {
+        let ic = InitialContext {
+            allowed_nssai: vec![(1, Some([1, 2, 3])), (2, None)],
+            ue_sec_cap: [0x20, 0x20], // NEA2 / NIA2 only
+            security_key: [0xabu8; 32],
+            ue_ambr: Some((1_000_000_000, 500_000_000)),
+            rfsp: Some(5),
+            area_restriction: Some((vec![[0, 0, 1]], Vec::new())),
+            nas: vec![0x7e, 0x02, 0x42],
+        };
+        let pdu = initial_context_setup_request(7, 3, "999", "70", &ic);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(initial_context_setup_params(&back), Some((7, 3, ic)));
+
+        // The optional IEs are genuinely optional.
+        let bare = InitialContext {
+            allowed_nssai: vec![(1, None)],
+            ue_sec_cap: [0x20, 0x20],
+            security_key: [0x11u8; 32],
+            nas: vec![0x7e],
+            ..Default::default()
+        };
+        let pdu = initial_context_setup_request(1, 2, "999", "70", &bare);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(initial_context_setup_params(&back), Some((1, 2, bare)));
+
+        // The gNB's response round-trips; a request isn't misread as one.
+        let resp = initial_context_setup_response(7, 3);
+        let back = NGAP_PDU::decode(&resp.encode().expect("encode")).expect("decode");
+        assert_eq!(initial_context_setup_response_ids(&back), Some((7, 3)));
+        assert_eq!(initial_context_setup_response_ids(&pdu), None);
+        assert_eq!(initial_context_setup_params(&resp), None);
     }
 
     #[test]
