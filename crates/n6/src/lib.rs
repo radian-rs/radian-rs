@@ -148,7 +148,7 @@ mod tests {
         .expect("establish");
         let n3_teid = 1; // first UPF allocation
         pfcp::handle_n4(
-            &pfcp::session_modification_request(1, 2, 2, GNB_TEID, GNB_IP, "internet"),
+            &pfcp::session_modification_request(1, 2, 2, GNB_TEID, GNB_IP, "internet", false),
             UPF_IP,
             &mut state,
             0,
