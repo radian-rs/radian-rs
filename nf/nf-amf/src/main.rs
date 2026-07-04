@@ -1275,11 +1275,15 @@ async fn on_service_request(
         .and_then(|raw| ctx.sec.as_mut().and_then(|s| s.unprotect(raw, 0)));
     let is_service_request =
         decoded.as_ref().and_then(nas::service_request_info).is_some();
-    let is_mobility_update = decoded
-        .as_ref()
-        .and_then(nas::registration_type_from_request)
-        == Some(nas::RegistrationType::MobilityRegistrationUpdate);
-    if !is_service_request && !is_mobility_update {
+    let reg_type = decoded.as_ref().and_then(nas::registration_type_from_request);
+    let is_mobility_update = reg_type == Some(nas::RegistrationType::MobilityRegistrationUpdate);
+    // Periodic registration updating (TS 24.501 §5.5.1.3.2): a CM-IDLE UE proves it
+    // is still reachable when T3512 expires — accepted lightweight (no re-auth),
+    // which refreshes the retained context so the implicit-deregistration sweep
+    // doesn't evict a UE that is still checking in.
+    let is_periodic = reg_type == Some(nas::RegistrationType::PeriodicRegistrationUpdate);
+    let is_registration_update = is_mobility_update || is_periodic;
+    if !is_service_request && !is_registration_update {
         warn!("CM-IDLE return (tmsi {tmsi:#010x}) failed NAS verification — ignored");
         RETAINED.lock().unwrap().insert(tmsi, ctx);
         return Vec::new();
@@ -1296,12 +1300,15 @@ async fn on_service_request(
         // Mobility registration update: the UE left its registration area —
         // re-assign it around the new serving gNB/TAI.
         ctx.registration_area = registration_area_for(ctx.tac, dereg_tx);
-    } else if let Some(tac) = ctx.tac {
+    } else if is_service_request {
         // Service Request from outside the area: extend it (the UE should have
-        // sent a mobility update; tolerate and stay reachable).
-        if !ctx.registration_area.is_empty() && !ctx.registration_area.contains(&tac) {
-            ctx.registration_area.push(tac);
-            ctx.registration_area.truncate(16);
+        // sent a mobility update; tolerate and stay reachable). A periodic update
+        // means the UE hasn't moved — its area is unchanged.
+        if let Some(tac) = ctx.tac {
+            if !ctx.registration_area.is_empty() && !ctx.registration_area.contains(&tac) {
+                ctx.registration_area.push(tac);
+                ctx.registration_area.truncate(16);
+            }
         }
     }
     // An AM policy change that arrived while the UE was CM-IDLE — applied below,
@@ -1328,7 +1335,9 @@ async fn on_service_request(
         // `unprotect` already advanced ul_count past the Service Request /
         // mobility Registration Request that triggered this return.
         let kgnb = kamf.map(|k| aka::kgnb(&k, s.ul_count.wrapping_sub(1)));
-        let (bytes, ics_label, dl_label) = if is_mobility_update {
+        let (bytes, ics_label, dl_label) = if is_registration_update {
+            // A registration update (mobility or periodic) is answered with a fresh
+            // Registration Accept (same GUTI, T3512, the current registration area).
             let accept = nas::registration_accept(
                 PLMN_MCC,
                 PLMN_MNC,
@@ -1338,11 +1347,18 @@ async fn on_service_request(
                 T3512_SECS,
                 &registration_area,
             );
-            (
-                s.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1),
-                "InitialContextSetupRequest (RegistrationAccept — mobility update)",
-                "DownlinkNASTransport (RegistrationAccept — mobility update)",
-            )
+            let (ics, dl) = if is_mobility_update {
+                (
+                    "InitialContextSetupRequest (RegistrationAccept — mobility update)",
+                    "DownlinkNASTransport (RegistrationAccept — mobility update)",
+                )
+            } else {
+                (
+                    "InitialContextSetupRequest (RegistrationAccept — periodic)",
+                    "DownlinkNASTransport (RegistrationAccept — periodic)",
+                )
+            };
+            (s.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1), ics, dl)
         } else {
             (
                 s.protect(&nas::service_accept(), nas::sht::INTEGRITY_CIPHERED, 1),
@@ -1364,6 +1380,10 @@ async fn on_service_request(
     if is_mobility_update {
         info!(
             "UE {amf_ue_id}: mobility registration update (tmsi {tmsi:#010x}) — registration area re-assigned to {registration_area:02x?}"
+        );
+    } else if is_periodic {
+        info!(
+            "UE {amf_ue_id}: periodic registration update (tmsi {tmsi:#010x}) — still reachable, retained context refreshed"
         );
     } else {
         info!("UE {amf_ue_id} resuming from CM-IDLE (Service Request, tmsi {tmsi:#010x}); {} session(s)", sm_refs.len());
@@ -1403,7 +1423,9 @@ async fn on_service_request(
     // QoS, and the AMF re-sends the N2 PDU Session Resource Setup. The gNB's
     // F-TEID comes back in the setup response (existing path) → UpdateSMContext
     // re-installs the UPF downlink that AN release had dropped.
-    let reactivate: &[(u8, (String, String))] = if is_mobility_update { &[] } else { &sm_refs };
+    // A registration update (mobility or periodic) leaves the user plane
+    // deactivated; only a Service Request reactivates the PDU sessions.
+    let reactivate: &[(u8, (String, String))] = if is_registration_update { &[] } else { &sm_refs };
     for (psi, (sm_ref, smf_base)) in reactivate {
         match amf_smf.activate_up_connection(smf_base, sm_ref).await {
             Ok(created) => {
@@ -3674,6 +3696,70 @@ mod tests {
 
     /// Mobility registration update (TS 24.501 §5.5.1.3): a CM-IDLE UE that moved
     /// outside its registration area comes back with a protected Registration
+    /// Periodic registration updating (TS 24.501 §5.5.1.3.2): a CM-IDLE UE checks
+    /// in when T3512 expires. The AMF verifies it under the retained security
+    /// context, keeps the registration area unchanged (the UE hasn't moved),
+    /// answers with a Registration Accept, and does not reactivate the user plane
+    /// — the point is to refresh the context so the implicit-dereg sweep won't
+    /// evict a UE that is still reachable.
+    #[tokio::test]
+    async fn periodic_registration_update_refreshes_without_reauth() {
+        let (ki, ke) = ([0x31u8; 16], [0x32u8; 16]);
+        let kamf = [0x33u8; 32];
+        let supi = "imsi-999700000000211";
+        let tmsi = 0x0000_0211u32;
+        let mut ctx = UeContext::new(0, RegState::Registered, Some(supi.into()));
+        ctx.cm_state = CmState::Idle;
+        ctx.guti_tmsi = Some(tmsi);
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.kamf = Some(kamf);
+        ctx.tac = Some([0, 0, 1]);
+        ctx.registration_area = vec![[0, 0, 1], [0, 0, 2]];
+        ctx.allowed_nssai = Some(vec![(1, Some([1, 2, 3]))]);
+        ctx.retained_at = Some(std::time::Instant::now()); // was ticking toward eviction
+        ctx.sm_refs.insert(5, ("ctx-per".into(), "http://127.0.0.1:1".into()));
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+
+        // The UE checks in from the same gNB (TAC 000001) with a protected periodic
+        // Registration Request — a mock SMF that would fail any activation call.
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let rr = ue_sec.protect(
+            &nas::registration_request_periodic("999", "70", tmsi),
+            nas::sht::INTEGRITY_CIPHERED,
+            0,
+        );
+        let pdu = ngap::initial_ue_message_with_stmsi_at(7, tmsi, rr, "999", "70", &[0, 0, 1]);
+        let init = as_initial_ue(&pdu);
+        let (gnb_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ues = HashMap::new();
+        let dls = on_service_request(&mut ues, &amf_smf, init, tmsi, &gnb_tx).await;
+
+        // One downlink: the ICS carrying the periodic Registration Accept. No PDU
+        // session reactivation.
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["InitialContextSetupRequest (RegistrationAccept — periodic)"]
+        );
+        let (_a, _r, ic) = ngap::initial_context_setup_params(&dls[0].0).expect("ICS parses");
+        // The context is restored CM-CONNECTED, the retained timer stopped, the
+        // area unchanged (the UE didn't move), the session intact.
+        let restored = ues.get(&(_a)).expect("context restored");
+        assert_eq!(restored.cm_state, CmState::Connected);
+        assert_eq!(restored.retained_at, None, "mobile-reachable timer stopped");
+        assert_eq!(restored.registration_area, vec![[0, 0, 1], [0, 0, 2]], "area unchanged");
+        assert_eq!(restored.sm_refs.len(), 1, "PDU session kept");
+        assert!(RETAINED.lock().unwrap().get(&tmsi).is_none(), "no longer awaiting eviction");
+        // The UE decodes the accept: same area, kept NSSAI.
+        let accept = ue_sec.unprotect(&ic.nas, 1).expect("UE verifies the accept");
+        assert_eq!(nas::gmm_message_type(&accept), Some(nas::Nas5gmmMessageType::RegistrationAccept));
+        assert_eq!(
+            nas::registration_area_from_registration_accept(&accept),
+            Some(vec![[0, 0, 1], [0, 0, 2]])
+        );
+        UE_DIRECTORY.lock().unwrap().remove(supi);
+    }
+
     /// Request (type = mobility registration updating, GUTI identity). The AMF
     /// verifies it under the retained security context, **re-assigns** the
     /// registration area around the new serving gNB, and answers with a

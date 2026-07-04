@@ -281,11 +281,14 @@ pub fn registration_request_with_guti(
     encode_nas_5gs_message(&msg).expect("encode 5GMM RegistrationRequest (GUTI)")
 }
 
-/// Build and encode a 5GMM **Registration Request** of type *mobility registration
-/// updating* (TS 24.501 §5.5.1.3) identifying by 5G-GUTI — what a UE sends when it
-/// enters a tracking area outside its registration area (UE side / tests). Sent
-/// integrity-protected under the current security context (ngKSI 0).
-pub fn registration_request_mobility(mcc: &str, mnc: &str, tmsi: u32) -> Nas5gsMessage {
+/// Build a 5GMM **Registration Request** of `reg_type`, identifying by 5G-GUTI,
+/// integrity-protected under the current security context (ngKSI 0). UE side / tests.
+fn registration_request_of_type(
+    reg_type: RegistrationType,
+    mcc: &str,
+    mnc: &str,
+    tmsi: u32,
+) -> Nas5gsMessage {
     let guti = NasFGsMobileIdentity::from_guti(&Guti {
         mcc: mcc_digits(mcc),
         mnc: mnc_digits(mnc),
@@ -295,13 +298,27 @@ pub fn registration_request_mobility(mcc: &str, mnc: &str, tmsi: u32) -> Nas5gsM
         tmsi,
     });
     let reg = messages::NasRegistrationRequest::new(
-        NasFGsRegistrationType::from_parts(RegistrationType::MobilityRegistrationUpdate, false, 0, false),
+        NasFGsRegistrationType::from_parts(reg_type, false, 0, false),
         guti,
     );
     Nas5gsMessage::new_5gmm(
         Nas5gmmMessageType::RegistrationRequest,
         Nas5gmmMessage::RegistrationRequest(reg),
     )
+}
+
+/// A 5GMM Registration Request of type *mobility registration updating*
+/// (TS 24.501 §5.5.1.3) — what a UE sends when it enters a tracking area outside
+/// its registration area (UE side / tests).
+pub fn registration_request_mobility(mcc: &str, mnc: &str, tmsi: u32) -> Nas5gsMessage {
+    registration_request_of_type(RegistrationType::MobilityRegistrationUpdate, mcc, mnc, tmsi)
+}
+
+/// A 5GMM Registration Request of type *periodic registration updating*
+/// (TS 24.501 §5.5.1.3.2) — what a UE sends when T3512 expires to prove it is still
+/// reachable, without moving (UE side / tests).
+pub fn registration_request_periodic(mcc: &str, mnc: &str, tmsi: u32) -> Nas5gsMessage {
+    registration_request_of_type(RegistrationType::PeriodicRegistrationUpdate, mcc, mnc, tmsi)
 }
 
 /// The registration type of a decoded Registration Request (TS 24.501 §9.11.3.7) —
@@ -1536,6 +1553,15 @@ mod tests {
         assert_eq!(guti_tmsi_from_registration_request(&back), Some(0xCAFE_D00D));
         // Other message types have no registration type.
         assert_eq!(registration_type_from_request(&deregistration_accept()), None);
+
+        // A periodic registration updating carries its own type + GUTI.
+        let msg = registration_request_periodic("999", "70", 0x0000_00AB);
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&msg).unwrap()).unwrap();
+        assert_eq!(
+            registration_type_from_request(&back),
+            Some(RegistrationType::PeriodicRegistrationUpdate)
+        );
+        assert_eq!(guti_tmsi_from_registration_request(&back), Some(0x0000_00AB));
     }
 
     #[test]
