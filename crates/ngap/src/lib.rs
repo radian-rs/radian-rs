@@ -487,8 +487,23 @@ pub struct InitialContext {
     /// Service area restriction `(allowed_tacs, not_allowed_tacs)` — sent as a
     /// Mobility Restriction List.
     pub area_restriction: Option<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
+    /// PDU sessions to set up **inline** at context establishment (TS 38.413
+    /// §9.2.2.1, PDU Session Resource Setup List Cxt Req) — used on a Service
+    /// Request resume so the sessions come back in one procedure instead of
+    /// trailing PDU Session Resource Setup Requests. Empty at initial registration.
+    pub pdu_sessions: Vec<IcsPduSession>,
     /// The NAS PDU the gNB relays to the UE (the protected Registration Accept).
     pub nas: Vec<u8>,
+}
+
+/// A PDU session to set up inline in an Initial Context Setup: its id, the UPF's
+/// UL N3 F-TEID, and the QoS flows (the N2 SM info transfer the gNB acts on).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IcsPduSession {
+    pub psi: u8,
+    pub flows: Vec<QosFlow>,
+    pub upf_teid: u32,
+    pub upf_addr: Ipv4Addr,
 }
 
 /// Build an `InitialContextSetupRequest` (TS 38.413 §9.2.2.1) — the AMF
@@ -537,6 +552,25 @@ pub fn initial_context_setup_request(
     }
     if let Some(rfsp) = ic.rfsp {
         ies.push(build_ngap_ie!(InitialContextSetupRequest, IGNORE IndexToRFSP(IndexToRFSP(rfsp))));
+    }
+    if !ic.pdu_sessions.is_empty() {
+        let list = PDUSessionResourceSetupListCxtReq(
+            ic.pdu_sessions
+                .iter()
+                .map(|s| {
+                    let transfer = encode_aper(&setup_request_transfer(&s.flows, s.upf_teid, s.upf_addr));
+                    PDUSessionResourceSetupItemCxtReq {
+                        pdu_session_id: PDUSessionID(s.psi),
+                        nas_pdu: None, // no per-session N1 on resume; the accept is the ICS NAS-PDU
+                        s_nssai: s_nssai(1, None),
+                        pdu_session_resource_setup_request_transfer:
+                            PDUSessionResourceSetupItemCxtReqPDUSessionResourceSetupRequestTransfer(transfer),
+                        ie_extensions: None,
+                    }
+                })
+                .collect(),
+        );
+        ies.push(build_ngap_ie!(InitialContextSetupRequest, REJECT PDUSessionResourceSetupListCxtReq(list)));
     }
     ies.push(build_ngap_ie!(InitialContextSetupRequest, IGNORE NAS_PDU(NAS_PDU(ic.nas.clone()))));
     // InitialContextSetup = procedure code 14 (TS 38.413 §9.3.5).
@@ -658,6 +692,96 @@ pub fn initial_context_setup_response_ids(pdu: &NGAP_PDU) -> Option<(u64, u32)> 
         }
     }
     Some((amf_ue_id?, ran_ue_id?))
+}
+
+/// The `(psi, UPF UL N3 F-TEID, addr)` per PDU session an `InitialContextSetup
+/// Request` sets up inline (`PDUSessionResourceSetupListCxtReq`) — the RAN side /
+/// tests. Empty when the ICS carries no sessions.
+pub fn initial_context_setup_request_session_ids(pdu: &NGAP_PDU) -> Vec<(u8, u32, Ipv4Addr)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return Vec::new();
+    };
+    let InitiatingMessageValue::Id_InitialContextSetup(req) = value else {
+        return Vec::new();
+    };
+    let Some(list) = req.protocol_i_es.0.iter().find_map(|e| match &e.value {
+        InitialContextSetupRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListCxtReq(l) => Some(l),
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    list.0
+        .iter()
+        .filter_map(|item| {
+            let mut codec =
+                PerCodecData::from_slice_aper(&item.pdu_session_resource_setup_request_transfer.0);
+            let transfer = PDUSessionResourceSetupRequestTransfer::aper_decode(&mut codec).ok()?;
+            let fteid = transfer.protocol_i_es.0.iter().find_map(|e| match &e.value {
+                PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_UL_NGU_UP_TNLInformation(u) => fteid_from_uptnl(u),
+                _ => None,
+            })?;
+            Some((item.pdu_session_id.0, fteid.0, fteid.1))
+        })
+        .collect()
+}
+
+/// Build an `InitialContextSetupResponse` reporting the gNB's DL N3 F-TEID for each
+/// PDU session set up inline (`PDUSessionResourceSetupListCxtRes`) — for tests and
+/// a gNB simulator. `admitted` = `(psi, gnb_dl_teid, gnb_dl_addr)`.
+pub fn initial_context_setup_response_with_sessions(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    admitted: &[(u8, u32, Ipv4Addr)],
+) -> NGAP_PDU {
+    let list = PDUSessionResourceSetupListCxtRes(
+        admitted
+            .iter()
+            .map(|(psi, teid, addr)| {
+                let transfer = encode_aper(&setup_response_transfer(1, *teid, *addr));
+                PDUSessionResourceSetupItemCxtRes {
+                    pdu_session_id: PDUSessionID(*psi),
+                    pdu_session_resource_setup_response_transfer:
+                        PDUSessionResourceSetupItemCxtResPDUSessionResourceSetupResponseTransfer(transfer),
+                    ie_extensions: None,
+                }
+            })
+            .collect(),
+    );
+    build_ngap!(SuccessfulOutcome, InitialContextSetup,
+        REJECT, InitialContextSetupResponse,
+        IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        IGNORE RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+        IGNORE PDUSessionResourceSetupListCxtRes(list),
+    )
+}
+
+/// The `(psi, gNB DL N3 F-TEID, addr)` per PDU session set up inline, from a
+/// decoded `InitialContextSetupResponse` — the AMF drives UpdateSMContext with
+/// each. Empty when the response set up no sessions (e.g. at registration).
+pub fn initial_context_setup_session_ids(pdu: &NGAP_PDU) -> Vec<(u8, u32, Ipv4Addr)> {
+    let NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome { value, .. }) = pdu else {
+        return Vec::new();
+    };
+    let SuccessfulOutcomeValue::Id_InitialContextSetup(resp) = value else {
+        return Vec::new();
+    };
+    let Some(list) = resp.protocol_i_es.0.iter().find_map(|e| match &e.value {
+        InitialContextSetupResponseProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListCxtRes(l) => Some(l),
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    list.0
+        .iter()
+        .filter_map(|item| {
+            let mut codec =
+                PerCodecData::from_slice_aper(&item.pdu_session_resource_setup_response_transfer.0);
+            let transfer = PDUSessionResourceSetupResponseTransfer::aper_decode(&mut codec).ok()?;
+            let (teid, addr) =
+                fteid_from_uptnl(&transfer.dl_qos_flow_per_tnl_information.up_transport_layer_information)?;
+            Some((item.pdu_session_id.0, teid, addr))
+        })
+        .collect()
 }
 
 /// Build a `PathSwitchRequest` (TS 38.413 §9.2.3.21) — after an **Xn handover**
@@ -1611,7 +1735,7 @@ fn fteid_from_uptnl(info: &UPTransportLayerInformation) -> Option<(u32, Ipv4Addr
 }
 
 /// Guaranteed bit rates for a GBR QoS flow, in bits/sec.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Gbr {
     pub gfbr_dl_bps: u64,
     pub gfbr_ul_bps: u64,
@@ -1621,7 +1745,7 @@ pub struct Gbr {
 
 /// One authorized QoS flow (TS 23.501 §5.7) — QFI, 5QI, ARP, and GBR rates when
 /// the flow is guaranteed-bit-rate.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QosFlow {
     pub qfi: u8,
     pub five_qi: u8,
@@ -2380,11 +2504,42 @@ mod release_tests {
             ue_ambr: Some((1_000_000_000, 500_000_000)),
             rfsp: Some(5),
             area_restriction: Some((vec![[0, 0, 1]], Vec::new())),
+            pdu_sessions: Vec::new(),
             nas: vec![0x7e, 0x02, 0x42],
         };
         let pdu = initial_context_setup_request(7, 3, "999", "70", &ic);
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        // The parser reports the base context; PDU sessions parse via a dedicated
+        // helper (they set up inline, below).
         assert_eq!(initial_context_setup_params(&back), Some((7, 3, ic)));
+        assert!(initial_context_setup_session_ids(&back).is_empty());
+
+        // A resume ICS carrying an inline PDU session; the gNB answers with its DL
+        // F-TEID in the Cxt Res list.
+        let addr = Ipv4Addr::new(10, 0, 1, 2);
+        let with_session = InitialContext {
+            allowed_nssai: vec![(1, None)],
+            ue_sec_cap: [0x20, 0x20],
+            security_key: [0x22u8; 32],
+            pdu_sessions: vec![IcsPduSession {
+                psi: 5,
+                flows: vec![QosFlow::default_non_gbr()],
+                upf_teid: 0x11,
+                upf_addr: addr,
+            }],
+            nas: vec![0x7e],
+            ..Default::default()
+        };
+        let pdu = initial_context_setup_request(8, 4, "999", "70", &with_session);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        // The base fields still parse (sessions aren't reflected into the struct).
+        let (a, r, _) = initial_context_setup_params(&back).expect("ICS parses");
+        assert_eq!((a, r), (8, 4));
+        // The gNB's response carries its DL F-TEID for the inline session.
+        let resp = initial_context_setup_response_with_sessions(8, 4, &[(5, 0x99, addr)]);
+        let back = NGAP_PDU::decode(&resp.encode().expect("encode")).expect("decode");
+        assert_eq!(initial_context_setup_session_ids(&back), vec![(5, 0x99, addr)]);
+        assert_eq!(initial_context_setup_response_ids(&back), Some((8, 4)));
 
         // The optional IEs are genuinely optional.
         let bare = InitialContext {
