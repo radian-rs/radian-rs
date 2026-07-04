@@ -2141,6 +2141,26 @@ async fn on_initial_context_setup_response(
             Err(e) => warn!("UE {amf_ue_id}: ICS-inline UpdateSMContext failed for {psi}: {e}"),
         }
     }
+
+    // Sessions the gNB could NOT set up (PDUSessionResourceFailedToSetupListCxtRes):
+    // the RAN never established them, so release each at the SMF (tearing down the
+    // UPF datapath) and drop it from the UE context — otherwise the AMF would keep
+    // an orphaned session it would try to reactivate on the next resume.
+    for (psi, cause) in ngap::initial_context_setup_failed_session_ids(pdu) {
+        let Some((sm_ref, smf_base)) = ues.get(&amf_ue_id).and_then(|c| c.sm_refs.get(&psi).cloned())
+        else {
+            warn!("UE {amf_ue_id}: ICS response rejects PDU session {psi} (cause {cause}) but no SM context tracked");
+            continue;
+        };
+        warn!("UE {amf_ue_id}: gNB rejected PDU session {psi} in the InitialContextSetup (cause {cause}); releasing at the SMF");
+        match amf_smf.release_sm_context(&smf_base, &sm_ref).await {
+            Ok(()) => info!("UE {amf_ue_id}: PDU session {psi} released after ICS setup failure"),
+            Err(e) => warn!("UE {amf_ue_id}: release after ICS failure for {psi} failed: {e}"),
+        }
+        if let Some(c) = ues.get_mut(&amf_ue_id) {
+            c.sm_refs.remove(&psi);
+        }
+    }
 }
 
 /// Extract the AMF-UE-NGAP-ID from a `PDUSessionResourceSetupResponse`.
@@ -5034,13 +5054,16 @@ mod tests {
     }
 
     /// The gNB's InitialContextSetupResponse for an ICS that set up sessions inline
-    /// drives UpdateSMContext with each session's gNB DL F-TEID — the downlink
-    /// install, exactly as the standalone PDU Session Resource Setup Response does.
+    /// drives UpdateSMContext with each admitted session's gNB DL F-TEID (the
+    /// downlink install), and releases each session the gNB rejected
+    /// (PDUSessionResourceFailedToSetupListCxtRes) at the SMF, dropping it from the
+    /// UE context.
     #[tokio::test]
     async fn ics_response_installs_inline_session_downlinks() {
         use std::sync::Mutex as StdMutex;
 
         static INSTALLED: StdMutex<Vec<(String, String)>> = StdMutex::new(Vec::new());
+        static RELEASED: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
         async fn mock_modify(axum::Json(body): axum::Json<serde_json::Value>) -> axum::http::StatusCode {
             if let (Some(t), Some(a)) = (
                 body.get("gnbN3Teid").and_then(|v| v.as_str()),
@@ -5050,36 +5073,58 @@ mod tests {
             }
             axum::http::StatusCode::OK
         }
+        async fn mock_release(
+            axum::extract::Path(sm_ref): axum::extract::Path<String>,
+        ) -> axum::http::StatusCode {
+            RELEASED.lock().unwrap().push(sm_ref);
+            axum::http::StatusCode::NO_CONTENT
+        }
         let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let smf_addr = smf_l.local_addr().unwrap();
-        let smf_router = axum::Router::new().route(
-            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
-            axum::routing::post(mock_modify),
-        );
+        let smf_router = axum::Router::new()
+            .route(
+                "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
+                axum::routing::post(mock_modify),
+            )
+            .route(
+                "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release",
+                axum::routing::post(mock_release),
+            );
         tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
         let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
 
         let amf_ue_id = 0x231u64;
         let mut ctx = UeContext::new(3, RegState::Registered, Some("imsi-999700000000231".into()));
         ctx.sm_refs.insert(5, ("ctx-icsr".into(), format!("http://{smf_addr}")));
+        ctx.sm_refs.insert(6, ("ctx-icsr-6".into(), format!("http://{smf_addr}")));
         let mut ues = HashMap::new();
         ues.insert(amf_ue_id, ctx);
 
-        // The gNB reports its DL F-TEID (0xAB @ 10.0.1.2) for PSI 5.
-        let resp = ngap::initial_context_setup_response_with_sessions(
+        // The gNB admits PSI 5 (DL F-TEID 0xAB @ 10.0.1.2) and rejects PSI 6.
+        let resp = ngap::initial_context_setup_response_with_results(
             amf_ue_id,
             3,
             &[(5, 0xAB, std::net::Ipv4Addr::new(10, 0, 1, 2))],
+            &[(6, ngap::CauseRadioNetwork::MULTIPLE_PDU_SESSION_ID_INSTANCES)],
         );
         on_initial_context_setup_response(&mut ues, &amf_smf, &resp).await;
         assert_eq!(
             INSTALLED.lock().unwrap().as_slice(),
             [("000000ab".to_string(), "10.0.1.2".to_string())],
-            "UpdateSMContext installed the gNB's DL F-TEID"
+            "UpdateSMContext installed the admitted session's DL F-TEID"
         );
+        assert_eq!(
+            RELEASED.lock().unwrap().as_slice(),
+            ["ctx-icsr-6".to_string()],
+            "the rejected session was released at the SMF"
+        );
+        let refs = &ues[&amf_ue_id].sm_refs;
+        assert!(refs.contains_key(&5), "admitted session kept");
+        assert!(!refs.contains_key(&6), "rejected session dropped from the UE context");
 
-        // A response with no inline sessions (registration ICS) installs nothing.
+        // A response with no inline sessions (registration ICS) installs/releases nothing.
         INSTALLED.lock().unwrap().clear();
+        RELEASED.lock().unwrap().clear();
         on_initial_context_setup_response(
             &mut ues,
             &amf_smf,
@@ -5087,6 +5132,7 @@ mod tests {
         )
         .await;
         assert!(INSTALLED.lock().unwrap().is_empty());
+        assert!(RELEASED.lock().unwrap().is_empty());
     }
 
     /// A network-initiated PDU session modification builds the N2 PDU Session

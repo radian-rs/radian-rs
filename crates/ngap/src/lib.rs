@@ -727,32 +727,77 @@ pub fn initial_context_setup_request_session_ids(pdu: &NGAP_PDU) -> Vec<(u8, u32
 
 /// Build an `InitialContextSetupResponse` reporting the gNB's DL N3 F-TEID for each
 /// PDU session set up inline (`PDUSessionResourceSetupListCxtRes`) — for tests and
-/// a gNB simulator. `admitted` = `(psi, gnb_dl_teid, gnb_dl_addr)`.
+/// a gNB simulator. `admitted` = `(psi, gnb_dl_teid, gnb_dl_addr)`. A convenience
+/// wrapper over [`initial_context_setup_response_with_results`] with no failures.
 pub fn initial_context_setup_response_with_sessions(
     amf_ue_id: u64,
     ran_ue_id: u32,
     admitted: &[(u8, u32, Ipv4Addr)],
 ) -> NGAP_PDU {
-    let list = PDUSessionResourceSetupListCxtRes(
-        admitted
-            .iter()
-            .map(|(psi, teid, addr)| {
-                let transfer = encode_aper(&setup_response_transfer(1, *teid, *addr));
-                PDUSessionResourceSetupItemCxtRes {
-                    pdu_session_id: PDUSessionID(*psi),
-                    pdu_session_resource_setup_response_transfer:
-                        PDUSessionResourceSetupItemCxtResPDUSessionResourceSetupResponseTransfer(transfer),
-                    ie_extensions: None,
-                }
-            })
-            .collect(),
-    );
-    build_ngap!(SuccessfulOutcome, InitialContextSetup,
-        REJECT, InitialContextSetupResponse,
-        IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
-        IGNORE RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
-        IGNORE PDUSessionResourceSetupListCxtRes(list),
-    )
+    initial_context_setup_response_with_results(amf_ue_id, ran_ue_id, admitted, &[])
+}
+
+/// Build an `InitialContextSetupResponse` reporting the gNB's per-PDU-session
+/// results: `admitted` = `(psi, gnb_dl_teid, gnb_dl_addr)` set up successfully
+/// (`PDUSessionResourceSetupListCxtRes`); `failed` = `(psi, radio-network cause)`
+/// the gNB could not set up (`PDUSessionResourceFailedToSetupListCxtRes`). Either
+/// list is omitted when empty. For tests and a gNB simulator.
+pub fn initial_context_setup_response_with_results(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    admitted: &[(u8, u32, Ipv4Addr)],
+    failed: &[(u8, u8)],
+) -> NGAP_PDU {
+    let mut ies = vec![
+        build_ngap_ie!(InitialContextSetupResponse, IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id))),
+        build_ngap_ie!(InitialContextSetupResponse, IGNORE RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id))),
+    ];
+    if !admitted.is_empty() {
+        let list = PDUSessionResourceSetupListCxtRes(
+            admitted
+                .iter()
+                .map(|(psi, teid, addr)| {
+                    let transfer = encode_aper(&setup_response_transfer(1, *teid, *addr));
+                    PDUSessionResourceSetupItemCxtRes {
+                        pdu_session_id: PDUSessionID(*psi),
+                        pdu_session_resource_setup_response_transfer:
+                            PDUSessionResourceSetupItemCxtResPDUSessionResourceSetupResponseTransfer(transfer),
+                        ie_extensions: None,
+                    }
+                })
+                .collect(),
+        );
+        ies.push(build_ngap_ie!(InitialContextSetupResponse, IGNORE PDUSessionResourceSetupListCxtRes(list)));
+    }
+    if !failed.is_empty() {
+        let list = PDUSessionResourceFailedToSetupListCxtRes(
+            failed
+                .iter()
+                .map(|(psi, cause)| {
+                    let transfer = encode_aper(&PDUSessionResourceSetupUnsuccessfulTransfer {
+                        cause: Cause::RadioNetwork(CauseRadioNetwork(*cause)),
+                        criticality_diagnostics: None,
+                        ie_extensions: None,
+                    });
+                    PDUSessionResourceFailedToSetupItemCxtRes {
+                        pdu_session_id: PDUSessionID(*psi),
+                        pdu_session_resource_setup_unsuccessful_transfer:
+                            PDUSessionResourceFailedToSetupItemCxtResPDUSessionResourceSetupUnsuccessfulTransfer(transfer),
+                        ie_extensions: None,
+                    }
+                })
+                .collect(),
+        );
+        ies.push(build_ngap_ie!(InitialContextSetupResponse, IGNORE PDUSessionResourceFailedToSetupListCxtRes(list)));
+    }
+    // InitialContextSetup = procedure code 14; the response is its successful outcome.
+    NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode(14),
+        criticality: Criticality(Criticality::REJECT),
+        value: SuccessfulOutcomeValue::Id_InitialContextSetup(InitialContextSetupResponse {
+            protocol_i_es: InitialContextSetupResponseProtocolIEs(ies),
+        }),
+    })
 }
 
 /// The `(psi, gNB DL N3 F-TEID, addr)` per PDU session set up inline, from a
@@ -780,6 +825,50 @@ pub fn initial_context_setup_session_ids(pdu: &NGAP_PDU) -> Vec<(u8, u32, Ipv4Ad
             let (teid, addr) =
                 fteid_from_uptnl(&transfer.dl_qos_flow_per_tnl_information.up_transport_layer_information)?;
             Some((item.pdu_session_id.0, teid, addr))
+        })
+        .collect()
+}
+
+/// The numeric value inside a [`Cause`], whatever its group — for logging a
+/// failure without threading each group's constants. The group itself is dropped.
+fn cause_value(cause: &Cause) -> u8 {
+    match cause {
+        Cause::RadioNetwork(c) => c.0,
+        Cause::Transport(c) => c.0,
+        Cause::Nas(c) => c.0,
+        Cause::Protocol(c) => c.0,
+        Cause::Misc(c) => c.0,
+        Cause::Choice_Extensions(_) => 0xff,
+    }
+}
+
+/// The `(psi, cause)` per PDU session the gNB could **not** set up inline
+/// (`PDUSessionResourceFailedToSetupListCxtRes`), from a decoded `InitialContext
+/// SetupResponse` — the AMF releases each at the SMF. Empty when every inline
+/// session was admitted (or the ICS carried none).
+pub fn initial_context_setup_failed_session_ids(pdu: &NGAP_PDU) -> Vec<(u8, u8)> {
+    let NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome { value, .. }) = pdu else {
+        return Vec::new();
+    };
+    let SuccessfulOutcomeValue::Id_InitialContextSetup(resp) = value else {
+        return Vec::new();
+    };
+    let Some(list) = resp.protocol_i_es.0.iter().find_map(|e| match &e.value {
+        InitialContextSetupResponseProtocolIEs_EntryValue::Id_PDUSessionResourceFailedToSetupListCxtRes(l) => Some(l),
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    list.0
+        .iter()
+        .map(|item| {
+            let mut codec =
+                PerCodecData::from_slice_aper(&item.pdu_session_resource_setup_unsuccessful_transfer.0);
+            let cause = PDUSessionResourceSetupUnsuccessfulTransfer::aper_decode(&mut codec)
+                .ok()
+                .map(|t| cause_value(&t.cause))
+                .unwrap_or(0xff);
+            (item.pdu_session_id.0, cause)
         })
         .collect()
 }
@@ -2540,6 +2629,22 @@ mod release_tests {
         let back = NGAP_PDU::decode(&resp.encode().expect("encode")).expect("decode");
         assert_eq!(initial_context_setup_session_ids(&back), vec![(5, 0x99, addr)]);
         assert_eq!(initial_context_setup_response_ids(&back), Some((8, 4)));
+        assert!(initial_context_setup_failed_session_ids(&back).is_empty());
+
+        // A response admitting one session (5) and rejecting another (6): each list
+        // round-trips independently, and the rejected session's cause is read back.
+        let resp = initial_context_setup_response_with_results(
+            8,
+            4,
+            &[(5, 0x99, addr)],
+            &[(6, CauseRadioNetwork::MULTIPLE_PDU_SESSION_ID_INSTANCES)],
+        );
+        let back = NGAP_PDU::decode(&resp.encode().expect("encode")).expect("decode");
+        assert_eq!(initial_context_setup_session_ids(&back), vec![(5, 0x99, addr)]);
+        assert_eq!(
+            initial_context_setup_failed_session_ids(&back),
+            vec![(6, CauseRadioNetwork::MULTIPLE_PDU_SESSION_ID_INSTANCES)]
+        );
 
         // The optional IEs are genuinely optional.
         let bare = InitialContext {
