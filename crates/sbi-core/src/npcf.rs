@@ -64,10 +64,33 @@ pub struct QosFlowPolicy {
     /// matching traffic to this flow and enforce its MFBR.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<PacketFilterPolicy>,
+    /// The **charging data** this flow is metered under (TS 29.512 `PccRule.refChgData`)
+    /// — an id into [`SmPolicyDecision::charging_descs`] resolving to its rating group.
+    /// `None` ⇒ the flow falls back to the legacy rating-group-equals-QFI convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_chg_data: Option<String>,
 }
 
 fn default_arp_priority() -> u8 {
     8
+}
+
+/// `ChargingData` (TS 29.512 §5.6.2.11), trimmed — a charging decision referenced by
+/// one or more PCC rules (`refChgData`). Carries the **rating group** the CHF
+/// accumulates usage under, decoupling charging identity from the QoS flow / QFI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChargingData {
+    /// The rating group (TS 32.255) — the CHF sums usage per group.
+    pub rating_group: u32,
+    /// Metering method ("DURATION" / "VOLUME" / "DURATION_VOLUME"); informational here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metering_method: Option<String>,
+    /// Online / offline charging enabled (informational here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<bool>,
 }
 
 /// A session's aggregate maximum bit rate (TS 29.571 BitRate strings).
@@ -115,15 +138,31 @@ pub struct SmPolicyContextData {
     pub snssai_sd: Option<String>,
 }
 
-/// `SmPolicyDecision` (TS 29.512 §5.6.2.5), trimmed to the session AMBR and the
-/// authorized QoS flows the SMF acts on.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// `SmPolicyDecision` (TS 29.512 §5.6.2.5), trimmed to the session AMBR, the authorized
+/// QoS flows the SMF acts on, and the charging decisions (`chgDecs`) those flows are
+/// metered under.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SmPolicyDecision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_ambr: Option<SessionAmbrPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub qos_flows: Vec<QosFlowPolicy>,
+    /// Charging decisions keyed by charging-data id (TS 29.512 `chgDecs`), referenced by
+    /// a flow's [`QosFlowPolicy::ref_chg_data`]. Conveyed as a keyed partial map in an
+    /// Update (present = install/modify, `null` = remove, absent = keep).
+    #[serde(rename = "chgDecs", default, skip_serializing_if = "HashMap::is_empty")]
+    pub charging_descs: HashMap<String, ChargingData>,
+}
+
+impl SmPolicyDecision {
+    /// The rating group a QoS flow is charged under: the flow's referenced charging
+    /// data ([`QosFlowPolicy::ref_chg_data`] → [`Self::charging_descs`]). `None` when
+    /// the flow (or its reference) isn't found, so the caller keeps its fallback.
+    pub fn rating_group_for(&self, qfi: u8) -> Option<u32> {
+        let chg_id = self.qos_flows.iter().find(|f| f.qfi == qfi)?.ref_chg_data.as_ref()?;
+        Some(self.charging_descs.get(chg_id)?.rating_group)
+    }
 }
 
 /// A **partial** SM policy decision — the Npcf_SMPolicyControl Update response is a
@@ -145,6 +184,10 @@ pub struct SmPolicyUpdate {
     /// map are kept unchanged.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub qos_flows: HashMap<u8, Option<QosFlowPolicy>>,
+    /// Charging-data id → `Some(data)` to install/modify, `null` to remove; ids absent
+    /// from the map are kept unchanged (TS 29.512 `chgDecs` partial update).
+    #[serde(rename = "chgDecs", default, skip_serializing_if = "HashMap::is_empty")]
+    pub charging_descs: HashMap<String, Option<ChargingData>>,
 }
 
 impl SmPolicyDecision {
@@ -167,13 +210,26 @@ impl SmPolicyDecision {
                 qos_flows.insert(of.qfi, None);
             }
         }
-        (!session_ambr.is_keep() || !qos_flows.is_empty())
-            .then_some(SmPolicyUpdate { session_ambr, qos_flows })
+        // Charging decisions, keyed by id: new/changed → install, removed → null.
+        let mut charging_descs = HashMap::new();
+        for (id, cd) in &next.charging_descs {
+            if self.charging_descs.get(id) != Some(cd) {
+                charging_descs.insert(id.clone(), Some(cd.clone()));
+            }
+        }
+        for id in self.charging_descs.keys() {
+            if !next.charging_descs.contains_key(id) {
+                charging_descs.insert(id.clone(), None);
+            }
+        }
+        (!session_ambr.is_keep() || !qos_flows.is_empty() || !charging_descs.is_empty())
+            .then_some(SmPolicyUpdate { session_ambr, qos_flows, charging_descs })
     }
 
-    /// Merge a partial Update onto this decision: set/clear the session AMBR, and for
-    /// each QFI in the delta install/replace (`Some`) or remove (`None`) the flow;
-    /// flows the delta doesn't mention are kept. Flows stay QFI-ordered.
+    /// Merge a partial Update onto this decision: set/clear the session AMBR; for each
+    /// QFI in the delta install/replace (`Some`) or remove (`None`) the flow; and for
+    /// each charging-data id install/replace (`Some`) or remove (`None`) the decision.
+    /// Entries the delta doesn't mention are kept. Flows stay QFI-ordered.
     pub fn apply(&mut self, update: &SmPolicyUpdate) {
         self.session_ambr = update.session_ambr.clone().apply(self.session_ambr.take());
         for (qfi, change) in &update.qos_flows {
@@ -183,6 +239,16 @@ impl SmPolicyDecision {
             }
         }
         self.qos_flows.sort_by_key(|f| f.qfi);
+        for (id, change) in &update.charging_descs {
+            match change {
+                Some(cd) => {
+                    self.charging_descs.insert(id.clone(), cd.clone());
+                }
+                None => {
+                    self.charging_descs.remove(id);
+                }
+            }
+        }
     }
 }
 
@@ -209,8 +275,9 @@ pub struct PolicyConfig {
 }
 
 impl PolicyConfig {
-    /// The demo policy: 1/2 Gbps session AMBR, a default non-GBR flow (5QI 9) and
-    /// a GBR flow (5QI 1, GFBR 100 Mbps / MFBR 200 Mbps) — for any DNN.
+    /// The demo policy: 1/2 Gbps session AMBR, a default non-GBR flow (5QI 9) and a
+    /// GBR flow (5QI 1, GFBR 100 Mbps / MFBR 200 Mbps) charged under rating group 100
+    /// (via the "chg-voice" charging decision) — for any DNN.
     pub fn demo() -> Self {
         let decision = SmPolicyDecision {
             session_ambr: Some(SessionAmbrPolicy {
@@ -226,6 +293,7 @@ impl PolicyConfig {
                     pre_empt_vuln: false,
                     gbr: None,
                     filter: None,
+                    ref_chg_data: None,
                 },
                 QosFlowPolicy {
                     qfi: 2,
@@ -241,8 +309,19 @@ impl PolicyConfig {
                     }),
                     // Conversational-voice-style classifier: UDP on ports 5000–5010.
                     filter: Some(PacketFilterPolicy { protocol: 17, port_low: 5000, port_high: 5010 }),
+                    // Charged under the "chg-voice" decision (rating group 100).
+                    ref_chg_data: Some("chg-voice".into()),
                 },
             ],
+            charging_descs: HashMap::from([(
+                "chg-voice".to_string(),
+                ChargingData {
+                    rating_group: 100,
+                    metering_method: Some("VOLUME".into()),
+                    online: Some(false),
+                    offline: Some(true),
+                },
+            )]),
         };
         Self { per_dnn: HashMap::new(), default: decision }
     }
@@ -513,7 +592,9 @@ mod tests {
                 pre_empt_vuln: false,
                 gbr: None,
                 filter: None,
+                ref_chg_data: None,
             }],
+            ..Default::default()
         };
         let config = PolicyConfig::demo().with_dnn("ims", ims);
         // The override applies to its DNN...
@@ -616,15 +697,18 @@ mod tests {
             pre_empt_vuln: false,
             gbr: None,
             filter: None,
+            ref_chg_data: None,
         };
         let prev = SmPolicyDecision {
             session_ambr: Some(SessionAmbrPolicy { uplink: "1 Gbps".into(), downlink: "2 Gbps".into() }),
             qos_flows: vec![flow(1, 9), flow(2, 1)],
+            ..Default::default()
         };
         // Next: AMBR unchanged, QFI 1 re-rated (5QI 9→6), QFI 2 removed, QFI 3 added.
         let next = SmPolicyDecision {
             session_ambr: prev.session_ambr.clone(),
             qos_flows: vec![flow(1, 6), flow(3, 5)],
+            ..Default::default()
         };
         let delta = prev.diff(&next).expect("something changed");
         assert_eq!(delta.session_ambr, FieldUpdate::Keep, "AMBR unchanged → omitted");
@@ -646,7 +730,58 @@ mod tests {
         // A no-op update (prev vs prev) → no delta.
         assert_eq!(prev.diff(&prev.clone()), None);
         // Clearing the AMBR is a Clear, not a Keep.
-        let cleared = SmPolicyDecision { session_ambr: None, qos_flows: prev.qos_flows.clone() };
+        let cleared =
+            SmPolicyDecision { session_ambr: None, qos_flows: prev.qos_flows.clone(), ..Default::default() };
         assert_eq!(prev.diff(&cleared).unwrap().session_ambr, FieldUpdate::Clear);
+    }
+
+    /// Charging decisions (`chgDecs`) are a keyed partial map — diff/apply install, modify
+    /// and remove them like PCC/QoS entries — and a flow resolves its rating group through
+    /// its `refChgData` reference.
+    #[test]
+    fn charging_descs_partial_map_and_rating_group() {
+        let chg = |rg| ChargingData { rating_group: rg, metering_method: None, online: None, offline: None };
+        let flow = |qfi, chg_id: Option<&str>| QosFlowPolicy {
+            qfi,
+            five_qi: 1,
+            arp_priority: 8,
+            pre_empt_cap: false,
+            pre_empt_vuln: false,
+            gbr: None,
+            filter: None,
+            ref_chg_data: chg_id.map(String::from),
+        };
+        // A flow charged under "chg-a" (rating group 100); an unreferenced "chg-b".
+        let prev = SmPolicyDecision {
+            qos_flows: vec![flow(2, Some("chg-a")), flow(3, None)],
+            charging_descs: HashMap::from([("chg-a".into(), chg(100)), ("chg-b".into(), chg(200))]),
+            ..Default::default()
+        };
+        // The flow's rating group resolves via refChgData → chgDecs.
+        assert_eq!(prev.rating_group_for(2), Some(100), "resolved from the charging decision");
+        assert_eq!(prev.rating_group_for(3), None, "no refChgData → caller falls back");
+        assert_eq!(prev.rating_group_for(9), None, "unknown QFI");
+
+        // Next: re-rate "chg-a" (100→150), remove "chg-b", add "chg-c".
+        let next = SmPolicyDecision {
+            qos_flows: prev.qos_flows.clone(),
+            charging_descs: HashMap::from([("chg-a".into(), chg(150)), ("chg-c".into(), chg(300))]),
+            ..Default::default()
+        };
+        let delta = prev.diff(&next).expect("charging changed");
+        assert_eq!(delta.qos_flows.len(), 0, "flows unchanged → omitted");
+        assert_eq!(delta.charging_descs.len(), 3, "chg-a (changed), chg-b (removed), chg-c (added)");
+        assert_eq!(delta.charging_descs.get("chg-a").unwrap().as_ref().unwrap().rating_group, 150);
+        assert_eq!(*delta.charging_descs.get("chg-b").unwrap(), None, "removed → null");
+        assert!(delta.charging_descs.get("chg-c").unwrap().is_some(), "added");
+        // On the wire, chgDecs carries the removal as null.
+        let wire = serde_json::to_value(&delta).unwrap();
+        assert!(wire.pointer("/chgDecs/chg-b").unwrap().is_null(), "removed charging decision is null");
+
+        // apply merges the delta → exactly next; the re-rated group now resolves.
+        let mut merged = prev.clone();
+        merged.apply(&delta);
+        assert_eq!(merged, next, "merge reconstructs next");
+        assert_eq!(merged.rating_group_for(2), Some(150), "re-rated group after merge");
     }
 }

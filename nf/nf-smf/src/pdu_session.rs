@@ -450,7 +450,12 @@ async fn create_sm_context(
             (created.decision, Some((pcf_base, created.policy_id)))
         }
         None => (
-            sbi_core::npcf::SmPolicyDecision { session_ambr: sub.ambr, qos_flows: sub.qos_flows },
+            sbi_core::npcf::SmPolicyDecision {
+                session_ambr: sub.ambr,
+                qos_flows: sub.qos_flows,
+                // The sm-data fallback carries no PCF charging decisions.
+                charging_descs: Default::default(),
+            },
             None,
         ),
     };
@@ -722,6 +727,7 @@ async fn fetch_session_subscription(
         pre_empt_vuln: false,
         gbr: None,
         filter: None,
+        ref_chg_data: None,
     }];
     if let Some(extra) = dnn_config.get("qosFlows").and_then(|v| v.as_array()) {
         qos_flows.extend(
@@ -984,7 +990,7 @@ async fn release_sm_context(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<StatusCode, SbiProblem> {
-    let (up_seid, supi, psi, sm_policy, reserved_gfbr, charging) = {
+    let (up_seid, supi, psi, sm_policy, reserved_gfbr, charging, policy) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
             Some(c) => (
@@ -994,6 +1000,7 @@ async fn release_sm_context(
                 c.sm_policy.clone(),
                 c.reserved_gfbr,
                 c.charging.clone(),
+                c.policy.clone(),
             ),
             None => {
                 return Err(problem(
@@ -1025,7 +1032,7 @@ async fn release_sm_context(
         let release = sbi_core::nchf::ChargingDataRequest {
             subscriber_identifier: supi.clone(),
             pdu_session_charging_information: None,
-            used_unit_containers: usages.iter().map(container_for).collect(),
+            used_unit_containers: usages.iter().map(|u| container_for(u, &policy)).collect(),
         };
         tokio::spawn(async move {
             match sbi_core::nchf::ChfClient::new(chf_base).release(&charging_ref, &release).await {
@@ -1048,12 +1055,21 @@ async fn release_sm_context(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Map one URR usage volume to an Nchf used-unit container. Rating-group
-/// convention (see `sbi_core::nchf`): the session-level URR is rating group `0`;
-/// a per-flow URR (`PER_FLOW_URR_BASE + qfi`) is rating group `qfi`.
-fn container_for(u: &pfcp::UsageVolume) -> sbi_core::nchf::UsedUnitContainer {
+/// Map one URR usage volume to an Nchf used-unit container. The session-level URR is
+/// rating group `0`; a per-flow URR (`PER_FLOW_URR_BASE + qfi`) is charged under the
+/// rating group of its flow's PCF charging decision (`QosFlowPolicy.ref_chg_data` →
+/// `SmPolicyDecision.charging_descs`), falling back to the legacy
+/// rating-group-equals-QFI convention when the flow has no charging decision.
+fn container_for(
+    u: &pfcp::UsageVolume,
+    decision: &sbi_core::npcf::SmPolicyDecision,
+) -> sbi_core::nchf::UsedUnitContainer {
+    let rating_group = match u.urr_id.checked_sub(pfcp::PER_FLOW_URR_BASE) {
+        Some(qfi) => decision.rating_group_for(qfi as u8).unwrap_or(qfi),
+        None => 0, // the session-level URR
+    };
     sbi_core::nchf::UsedUnitContainer {
-        rating_group: u.urr_id.checked_sub(pfcp::PER_FLOW_URR_BASE).unwrap_or(0),
+        rating_group,
         uplink_volume: u.uplink,
         downlink_volume: u.downlink,
         total_volume: u.total,
@@ -1082,9 +1098,9 @@ pub async fn handle_usage_reports(smf: Arc<SmfState>) {
             let ctxs = smf.contexts.lock().unwrap();
             ctxs.values()
                 .find(|c| c.cp_seid == cp_seid)
-                .map(|c| (c.up_seid, c.supi.clone(), c.charging.clone()))
+                .map(|c| (c.up_seid, c.supi.clone(), c.charging.clone(), c.policy.clone()))
         };
-        let Some((up_seid, supi, charging)) = ctx else {
+        let Some((up_seid, supi, charging, policy)) = ctx else {
             tracing::warn!(cp_seid, "usage report for an unknown session — dropped");
             continue;
         };
@@ -1104,7 +1120,7 @@ pub async fn handle_usage_reports(smf: Arc<SmfState>) {
             let update = sbi_core::nchf::ChargingDataRequest {
                 subscriber_identifier: supi,
                 pdu_session_charging_information: None,
-                used_unit_containers: vec![container_for(&usage)],
+                used_unit_containers: vec![container_for(&usage, &policy)],
             };
             match sbi_core::nchf::ChfClient::new(chf_base).update(&charging_ref, &update).await {
                 Ok(()) => tracing::info!(charging_ref = %charging_ref, "usage relayed to the CHF"),
@@ -2086,6 +2102,40 @@ mod tests {
             "threshold report (1500) + final remainder (400) = the true total — no double-billing"
         );
         assert_eq!(chf.open_sessions(), 0);
+    }
+
+    /// A per-flow URR is charged under the rating group of its flow's PCF charging
+    /// decision (`refChgData` → `chgDecs`), not the QFI; the session URR is group 0,
+    /// and a flow with no charging decision falls back to the QFI.
+    #[test]
+    fn container_charges_under_the_flows_rating_group() {
+        use sbi_core::npcf::{ChargingData, QosFlowPolicy, SmPolicyDecision};
+        let flow = |qfi, chg: Option<&str>| QosFlowPolicy {
+            qfi,
+            five_qi: 1,
+            arp_priority: 8,
+            pre_empt_cap: false,
+            pre_empt_vuln: false,
+            gbr: None,
+            filter: None,
+            ref_chg_data: chg.map(String::from),
+        };
+        // QFI 2 is charged under "chg" (rating group 100); QFI 3 has no charging decision.
+        let decision = SmPolicyDecision {
+            qos_flows: vec![flow(2, Some("chg")), flow(3, None)],
+            charging_descs: std::collections::HashMap::from([(
+                "chg".to_string(),
+                ChargingData { rating_group: 100, metering_method: None, online: None, offline: None },
+            )]),
+            ..Default::default()
+        };
+        let usage = |urr_id| pfcp::UsageVolume { urr_id, total: 30, uplink: 10, downlink: 20 };
+        // The per-flow URR of QFI 2 → the charging decision's rating group (100), not 2.
+        assert_eq!(container_for(&usage(pfcp::PER_FLOW_URR_BASE + 2), &decision).rating_group, 100);
+        // QFI 3 has no charging decision → legacy fallback (rating group = QFI).
+        assert_eq!(container_for(&usage(pfcp::PER_FLOW_URR_BASE + 3), &decision).rating_group, 3);
+        // The session-level URR → rating group 0.
+        assert_eq!(container_for(&usage(1), &decision).rating_group, 0);
     }
 
     /// A UDR-backed PCF + the SMF's refresh-policy trigger: a mid-session change to
