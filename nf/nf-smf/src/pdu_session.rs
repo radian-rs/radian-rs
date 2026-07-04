@@ -451,7 +451,7 @@ async fn create_sm_context(
         }
         None => (
             sbi_core::npcf::SmPolicyDecision {
-                session_ambr: sub.ambr,
+                session_rules: sbi_core::npcf::SmPolicyDecision::session_rules_for(sub.ambr),
                 qos_flows: sub.qos_flows,
                 // The sm-data fallback carries no PCF charging decisions.
                 charging_descs: Default::default(),
@@ -602,7 +602,7 @@ async fn create_sm_context(
             up_n3_addr: est.n3_addr,
             ue_ipv4_addr: ue_ip,
             s_nssai: sub.snssai,
-            session_ambr: decision.session_ambr,
+            session_ambr: decision.session_ambr().cloned(),
             qos_flows: decision.qos_flows,
         }),
     ))
@@ -804,7 +804,7 @@ async fn update_sm_context(
                     up_n3_addr: c.n3_addr,
                     ue_ipv4_addr: c.ue_ip,
                     s_nssai: c.snssai.clone(),
-                    session_ambr: c.policy.session_ambr.clone(),
+                    session_ambr: c.policy.session_ambr().cloned(),
                     qos_flows: c.policy.qos_flows.clone(),
                 }),
             )
@@ -1291,7 +1291,7 @@ fn spawn_amf_pdu_modify(
         };
         let body = serde_json::json!({
             "pduSessionId": psi,
-            "sessionAmbr": decision.session_ambr,
+            "sessionAmbr": decision.session_ambr(),
             "qosFlows": decision.qos_flows,
             "releasedQfis": released_qfis,
         });
@@ -1373,8 +1373,7 @@ fn diff_flows(
 /// the UPF's QER — `None` when the decision has no (parseable) session AMBR.
 fn ambr_bps(decision: &sbi_core::npcf::SmPolicyDecision) -> Option<pfcp::SessionAmbr> {
     decision
-        .session_ambr
-        .as_ref()
+        .session_ambr()
         .and_then(|a| a.to_bps())
         .map(|(uplink_bps, downlink_bps)| pfcp::SessionAmbr { uplink_bps, downlink_bps })
 }
@@ -2170,7 +2169,7 @@ mod tests {
         // the PCF with it.
         let udr = sbi_core::nudr::UdrClient::new(udr_base.clone());
         let v1 = serde_json::json!({ "default": {
-            "sessionAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" },
+            "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" } } },
             "qosFlows": [ { "qfi": 1, "fiveQi": 9 } ] } });
         udr.put_sm_policy_data("imsi-999700000000001", &v1).await.unwrap();
         let _pcf = spin_pcf(&nrf_base, Some(&udr_base)).await;
@@ -2220,7 +2219,7 @@ mod tests {
         // Mid-session change: reprovision the UDR policy-data (v2) — new session AMBR
         // plus a GBR flow (QFI 2) with a classifier.
         let v2 = serde_json::json!({ "default": {
-            "sessionAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" },
+            "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" } } },
             "qosFlows": [
                 { "qfi": 1, "fiveQi": 9 },
                 { "qfi": 2, "fiveQi": 1, "gbr": {
@@ -2241,7 +2240,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200, "refresh succeeded");
         let updated: sbi_core::npcf::SmPolicyDecision = resp.json().await.unwrap();
-        let ambr = updated.session_ambr.as_ref().unwrap();
+        let ambr = updated.session_ambr().unwrap();
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("50 Mbps", "100 Mbps"));
         assert_eq!(updated.qos_flows.len(), 2, "the mid-session change added a GBR flow");
         // The change reached the user plane: the SMF re-rated the UPF's QER...
@@ -2281,7 +2280,7 @@ mod tests {
 
         // Second mid-session change: v3 removes the GBR flow (back to non-GBR only).
         let v3 = serde_json::json!({ "default": {
-            "sessionAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" },
+            "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" } } },
             "qosFlows": [ { "qfi": 1, "fiveQi": 9 } ] } });
         udr.put_sm_policy_data("imsi-999700000000001", &v3).await.unwrap();
         let status = client

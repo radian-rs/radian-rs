@@ -22,7 +22,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::SbiError;
 use crate::nudr::UdrClient;
-use crate::policy::{FieldUpdate, de_field_update, ser_field_update};
 
 /// A GBR flow's rates (TS 29.571 BitRate strings).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,14 +137,27 @@ pub struct SmPolicyContextData {
     pub snssai_sd: Option<String>,
 }
 
-/// `SmPolicyDecision` (TS 29.512 §5.6.2.5), trimmed to the session AMBR, the authorized
-/// QoS flows the SMF acts on, and the charging decisions (`chgDecs`) those flows are
-/// metered under.
+/// A **session rule** (TS 29.512 §5.6.2.7), trimmed to the authorized session AMBR —
+/// the session-level policy, keyed by rule id in [`SmPolicyDecision::session_rules`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_sess_ambr: Option<SessionAmbrPolicy>,
+}
+
+/// `SmPolicyDecision` (TS 29.512 §5.6.2.5), trimmed to the **session rules** (session
+/// AMBR), the authorized QoS flows the SMF acts on, and the charging decisions
+/// (`chgDecs`) those flows are metered under.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SmPolicyDecision {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_ambr: Option<SessionAmbrPolicy>,
+    /// Session rules keyed by rule id (TS 29.512 `sessRules`) — the session AMBR lives
+    /// here. Conveyed as a keyed partial map in an Update (present = install/modify,
+    /// `null` = remove, absent = keep). Use [`Self::session_ambr`] to read the effective
+    /// AMBR without knowing the rule ids.
+    #[serde(rename = "sessRules", default, skip_serializing_if = "HashMap::is_empty")]
+    pub session_rules: HashMap<String, SessionRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub qos_flows: Vec<QosFlowPolicy>,
     /// Charging decisions keyed by charging-data id (TS 29.512 `chgDecs`), referenced by
@@ -156,6 +168,21 @@ pub struct SmPolicyDecision {
 }
 
 impl SmPolicyDecision {
+    /// The effective session AMBR — the `authSessAmbr` of a session rule that carries
+    /// one (the session has a single default rule). `None` when no rule sets it.
+    pub fn session_ambr(&self) -> Option<&SessionAmbrPolicy> {
+        self.session_rules.values().find_map(|r| r.auth_sess_ambr.as_ref())
+    }
+
+    /// A single "default" session rule carrying `ambr` (or no rules when `None`) —
+    /// convenience for building a decision from a flat session AMBR.
+    pub fn session_rules_for(ambr: Option<SessionAmbrPolicy>) -> HashMap<String, SessionRule> {
+        match ambr {
+            Some(a) => HashMap::from([("default".to_string(), SessionRule { auth_sess_ambr: Some(a) })]),
+            None => HashMap::new(),
+        }
+    }
+
     /// The rating group a QoS flow is charged under: the flow's referenced charging
     /// data ([`QosFlowPolicy::ref_chg_data`] → [`Self::charging_descs`]). `None` when
     /// the flow (or its reference) isn't found, so the caller keeps its fallback.
@@ -173,13 +200,10 @@ impl SmPolicyDecision {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SmPolicyUpdate {
-    #[serde(
-        default,
-        skip_serializing_if = "FieldUpdate::is_keep",
-        serialize_with = "ser_field_update",
-        deserialize_with = "de_field_update"
-    )]
-    pub session_ambr: FieldUpdate<SessionAmbrPolicy>,
+    /// Session-rule id → `Some(rule)` to install/modify, `null` to remove; ids absent
+    /// from the map are kept unchanged (TS 29.512 `sessRules` partial update).
+    #[serde(rename = "sessRules", default, skip_serializing_if = "HashMap::is_empty")]
+    pub session_rules: HashMap<String, Option<SessionRule>>,
     /// QFI → `Some(flow)` to install/modify, `null` to remove; QFIs absent from the
     /// map are kept unchanged.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -196,7 +220,10 @@ impl SmPolicyDecision {
     /// flow as `Some`, a removed one as `None` (JSON `null`); unchanged flows omitted.
     /// `None` when nothing changed.
     pub fn diff(&self, next: &SmPolicyDecision) -> Option<SmPolicyUpdate> {
-        let session_ambr = FieldUpdate::diff(&self.session_ambr, &next.session_ambr);
+        // Session rules + charging decisions — id-keyed maps: new/changed → install,
+        // removed → `null` (a shared shape via `diff_keyed`).
+        let session_rules = diff_keyed(&self.session_rules, &next.session_rules);
+        let charging_descs = diff_keyed(&self.charging_descs, &next.charging_descs);
         let mut qos_flows = HashMap::new();
         // New or changed flows → install (Some); unchanged QFIs omitted.
         for nf in &next.qos_flows {
@@ -210,28 +237,15 @@ impl SmPolicyDecision {
                 qos_flows.insert(of.qfi, None);
             }
         }
-        // Charging decisions, keyed by id: new/changed → install, removed → null.
-        let mut charging_descs = HashMap::new();
-        for (id, cd) in &next.charging_descs {
-            if self.charging_descs.get(id) != Some(cd) {
-                charging_descs.insert(id.clone(), Some(cd.clone()));
-            }
-        }
-        for id in self.charging_descs.keys() {
-            if !next.charging_descs.contains_key(id) {
-                charging_descs.insert(id.clone(), None);
-            }
-        }
-        (!session_ambr.is_keep() || !qos_flows.is_empty() || !charging_descs.is_empty())
-            .then_some(SmPolicyUpdate { session_ambr, qos_flows, charging_descs })
+        (!session_rules.is_empty() || !qos_flows.is_empty() || !charging_descs.is_empty())
+            .then_some(SmPolicyUpdate { session_rules, qos_flows, charging_descs })
     }
 
-    /// Merge a partial Update onto this decision: set/clear the session AMBR; for each
-    /// QFI in the delta install/replace (`Some`) or remove (`None`) the flow; and for
-    /// each charging-data id install/replace (`Some`) or remove (`None`) the decision.
-    /// Entries the delta doesn't mention are kept. Flows stay QFI-ordered.
+    /// Merge a partial Update onto this decision: for each session-rule id, QFI, and
+    /// charging-data id in the delta, install/replace (`Some`) or remove (`None`) the
+    /// entry. Entries the delta doesn't mention are kept. Flows stay QFI-ordered.
     pub fn apply(&mut self, update: &SmPolicyUpdate) {
-        self.session_ambr = update.session_ambr.clone().apply(self.session_ambr.take());
+        apply_keyed(&mut self.session_rules, &update.session_rules);
         for (qfi, change) in &update.qos_flows {
             self.qos_flows.retain(|f| f.qfi != *qfi);
             if let Some(flow) = change {
@@ -239,14 +253,40 @@ impl SmPolicyDecision {
             }
         }
         self.qos_flows.sort_by_key(|f| f.qfi);
-        for (id, change) in &update.charging_descs {
-            match change {
-                Some(cd) => {
-                    self.charging_descs.insert(id.clone(), cd.clone());
-                }
-                None => {
-                    self.charging_descs.remove(id);
-                }
+        apply_keyed(&mut self.charging_descs, &update.charging_descs);
+    }
+}
+
+/// The partial-map delta between two id-keyed maps: an id whose value changed or is new
+/// → `Some(new)`, an id removed → `None` (JSON `null`); unchanged ids omitted.
+fn diff_keyed<T: Clone + PartialEq>(
+    prev: &HashMap<String, T>,
+    next: &HashMap<String, T>,
+) -> HashMap<String, Option<T>> {
+    let mut delta = HashMap::new();
+    for (id, v) in next {
+        if prev.get(id) != Some(v) {
+            delta.insert(id.clone(), Some(v.clone()));
+        }
+    }
+    for id in prev.keys() {
+        if !next.contains_key(id) {
+            delta.insert(id.clone(), None);
+        }
+    }
+    delta
+}
+
+/// Merge an id-keyed partial-map delta: `Some` installs/replaces, `None` removes; ids
+/// the delta omits are kept.
+fn apply_keyed<T: Clone>(map: &mut HashMap<String, T>, delta: &HashMap<String, Option<T>>) {
+    for (id, change) in delta {
+        match change {
+            Some(v) => {
+                map.insert(id.clone(), v.clone());
+            }
+            None => {
+                map.remove(id);
             }
         }
     }
@@ -280,10 +320,10 @@ impl PolicyConfig {
     /// (via the "chg-voice" charging decision) — for any DNN.
     pub fn demo() -> Self {
         let decision = SmPolicyDecision {
-            session_ambr: Some(SessionAmbrPolicy {
+            session_rules: SmPolicyDecision::session_rules_for(Some(SessionAmbrPolicy {
                 uplink: "1 Gbps".into(),
                 downlink: "2 Gbps".into(),
-            }),
+            })),
             qos_flows: vec![
                 QosFlowPolicy {
                     qfi: 1,
@@ -569,7 +609,7 @@ mod tests {
         let created = pcf.create_sm_policy(&ctx).await.expect("policy created");
         assert!(!created.policy_id.is_empty(), "an SM policy id was assigned");
         // The demo decision: 1/2 Gbps AMBR + default (5QI 9) + GBR (5QI 1) flows.
-        let ambr = created.decision.session_ambr.as_ref().unwrap();
+        let ambr = created.decision.session_ambr().unwrap();
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("1 Gbps", "2 Gbps"));
         assert_eq!(created.decision.qos_flows.len(), 2);
         assert_eq!((created.decision.qos_flows[0].qfi, created.decision.qos_flows[0].five_qi), (1, 9));
@@ -583,7 +623,10 @@ mod tests {
     #[test]
     fn per_dnn_override_wins_over_default() {
         let ims = SmPolicyDecision {
-            session_ambr: Some(SessionAmbrPolicy { uplink: "5 Mbps".into(), downlink: "5 Mbps".into() }),
+            session_rules: SmPolicyDecision::session_rules_for(Some(SessionAmbrPolicy {
+                uplink: "5 Mbps".into(),
+                downlink: "5 Mbps".into(),
+            })),
             qos_flows: vec![QosFlowPolicy {
                 qfi: 3,
                 five_qi: 5,
@@ -621,7 +664,7 @@ mod tests {
         // Provision the subscriber's SM policy-data (distinct from the local demo).
         let v1 = serde_json::json!({
             "default": {
-                "sessionAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" },
+                "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" } } },
                 "qosFlows": [ { "qfi": 1, "fiveQi": 9 } ]
             }
         });
@@ -643,14 +686,14 @@ mod tests {
         };
         // The UDR policy-data — not the local demo (1/2 Gbps) — drove the decision.
         let created = pcf.create_sm_policy(&ctx).await.unwrap();
-        let ambr = created.decision.session_ambr.as_ref().unwrap();
+        let ambr = created.decision.session_ambr().unwrap();
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("200 Mbps", "400 Mbps"));
         assert_eq!(created.decision.qos_flows.len(), 1);
 
         // Mid-session change: reprovision the UDR, then Update re-reads it.
         let v2 = serde_json::json!({
             "default": {
-                "sessionAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" },
+                "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" } } },
                 "qosFlows": [
                     { "qfi": 1, "fiveQi": 9 },
                     { "qfi": 2, "fiveQi": 1, "gbr": {
@@ -664,9 +707,12 @@ mod tests {
             .update_sm_policy(&created.policy_id, &SmPolicyUpdateContextData::default())
             .await
             .unwrap();
-        // A PARTIAL delta: the session AMBR changed (Set) and only QFI 2 was added;
-        // the unchanged QFI 1 is omitted (kept), not restated.
-        let FieldUpdate::Set(ambr) = &update.session_ambr else { panic!("AMBR changed → Set") };
+        // A PARTIAL delta: the session rule's AMBR changed (installed) and only QFI 2
+        // was added; the unchanged QFI 1 is omitted (kept), not restated.
+        let Some(Some(rule)) = update.session_rules.get("rule-1") else {
+            panic!("session rule changed → installed")
+        };
+        let ambr = rule.auth_sess_ambr.as_ref().unwrap();
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("50 Mbps", "100 Mbps"));
         assert_eq!(update.qos_flows.len(), 1, "only the added GBR flow is in the delta");
         assert!(update.qos_flows.get(&2).unwrap().is_some(), "QFI 2 installed");
@@ -676,7 +722,7 @@ mod tests {
         let mut merged = created.decision.clone();
         merged.apply(&update);
         assert_eq!(merged.qos_flows.len(), 2, "merge keeps QFI 1 and installs QFI 2");
-        assert_eq!(merged.session_ambr.as_ref().unwrap().downlink, "100 Mbps");
+        assert_eq!(merged.session_ambr().unwrap().downlink, "100 Mbps");
 
         // Updating an unknown association → error (404).
         assert!(
@@ -700,26 +746,29 @@ mod tests {
             ref_chg_data: None,
         };
         let prev = SmPolicyDecision {
-            session_ambr: Some(SessionAmbrPolicy { uplink: "1 Gbps".into(), downlink: "2 Gbps".into() }),
+            session_rules: SmPolicyDecision::session_rules_for(Some(SessionAmbrPolicy {
+                uplink: "1 Gbps".into(),
+                downlink: "2 Gbps".into(),
+            })),
             qos_flows: vec![flow(1, 9), flow(2, 1)],
             ..Default::default()
         };
-        // Next: AMBR unchanged, QFI 1 re-rated (5QI 9→6), QFI 2 removed, QFI 3 added.
+        // Next: session rule unchanged, QFI 1 re-rated (5QI 9→6), QFI 2 removed, QFI 3 added.
         let next = SmPolicyDecision {
-            session_ambr: prev.session_ambr.clone(),
+            session_rules: prev.session_rules.clone(),
             qos_flows: vec![flow(1, 6), flow(3, 5)],
             ..Default::default()
         };
         let delta = prev.diff(&next).expect("something changed");
-        assert_eq!(delta.session_ambr, FieldUpdate::Keep, "AMBR unchanged → omitted");
+        assert!(delta.session_rules.is_empty(), "session rule unchanged → omitted");
         assert_eq!(delta.qos_flows.len(), 3, "QFI 1 (changed), 2 (removed), 3 (added)");
         assert_eq!(delta.qos_flows.get(&1).unwrap().as_ref().unwrap().five_qi, 6, "QFI 1 re-rated");
         assert_eq!(*delta.qos_flows.get(&2).unwrap(), None, "QFI 2 removed → null");
         assert!(delta.qos_flows.get(&3).unwrap().is_some(), "QFI 3 added");
 
-        // On the wire the removal is a JSON null; the unchanged AMBR is absent.
+        // On the wire the removal is a JSON null; the unchanged session rule is absent.
         let wire = serde_json::to_value(&delta).unwrap();
-        assert!(wire.get("sessionAmbr").is_none(), "unchanged AMBR omitted");
+        assert!(wire.get("sessRules").is_none(), "unchanged session rule omitted");
         assert!(wire.pointer("/qosFlows/2").unwrap().is_null(), "removed flow is null");
 
         // apply merges the delta onto prev → exactly next (QFI-ordered).
@@ -729,10 +778,13 @@ mod tests {
 
         // A no-op update (prev vs prev) → no delta.
         assert_eq!(prev.diff(&prev.clone()), None);
-        // Clearing the AMBR is a Clear, not a Keep.
-        let cleared =
-            SmPolicyDecision { session_ambr: None, qos_flows: prev.qos_flows.clone(), ..Default::default() };
-        assert_eq!(prev.diff(&cleared).unwrap().session_ambr, FieldUpdate::Clear);
+        // Removing the session rule (clearing the AMBR) → the rule id maps to null.
+        let cleared = SmPolicyDecision { qos_flows: prev.qos_flows.clone(), ..Default::default() };
+        assert_eq!(
+            prev.diff(&cleared).unwrap().session_rules.get("default"),
+            Some(&None),
+            "session rule removed → null"
+        );
     }
 
     /// Charging decisions (`chgDecs`) are a keyed partial map — diff/apply install, modify
@@ -783,5 +835,57 @@ mod tests {
         merged.apply(&delta);
         assert_eq!(merged, next, "merge reconstructs next");
         assert_eq!(merged.rating_group_for(2), Some(150), "re-rated group after merge");
+    }
+
+    /// Session rules (`sessRules`) are a keyed partial map carrying the session AMBR:
+    /// `diff`/`apply` install, modify and remove rules; `session_ambr` reads the
+    /// effective AMBR without knowing the rule ids.
+    #[test]
+    fn session_rules_partial_map_and_ambr() {
+        let rule = |ul: &str, dl: &str| SessionRule {
+            auth_sess_ambr: Some(SessionAmbrPolicy { uplink: ul.into(), downlink: dl.into() }),
+        };
+        let prev = SmPolicyDecision {
+            session_rules: HashMap::from([("default".to_string(), rule("1 Gbps", "2 Gbps"))]),
+            ..Default::default()
+        };
+        // The accessor reads the AMBR from the default rule.
+        let ambr = prev.session_ambr().expect("effective AMBR");
+        assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("1 Gbps", "2 Gbps"));
+
+        // Next: re-rate the default rule (2 Gbps → 5 Gbps), add an AMBR-less "rule-2"
+        // (a session rule carrying no session AMBR — so the effective AMBR stays
+        // unambiguous).
+        let next = SmPolicyDecision {
+            session_rules: HashMap::from([
+                ("default".to_string(), rule("1 Gbps", "5 Gbps")),
+                ("rule-2".to_string(), SessionRule { auth_sess_ambr: None }),
+            ]),
+            ..Default::default()
+        };
+        let delta = prev.diff(&next).expect("session rules changed");
+        assert_eq!(delta.session_rules.len(), 2, "default (changed) + rule-2 (added)");
+        assert!(delta.session_rules.get("default").unwrap().is_some(), "default re-rated");
+        assert!(delta.session_rules.get("rule-2").unwrap().is_some(), "rule-2 added");
+        // On the wire, sessRules carries authSessAmbr under each rule id.
+        let wire = serde_json::to_value(&delta).unwrap();
+        assert_eq!(
+            wire.pointer("/sessRules/default/authSessAmbr/downlink").and_then(|v| v.as_str()),
+            Some("5 Gbps")
+        );
+
+        // apply merges → next; the effective AMBR reflects the re-rate.
+        let mut merged = prev.clone();
+        merged.apply(&delta);
+        assert_eq!(merged, next, "merge reconstructs next");
+        assert_eq!(merged.session_ambr().unwrap().downlink, "5 Gbps", "re-rated AMBR after merge");
+
+        // Removing the default rule → it maps to null; the effective AMBR is then gone.
+        let removed = SmPolicyDecision::default();
+        let delta = prev.diff(&removed).expect("rule removed");
+        assert_eq!(*delta.session_rules.get("default").unwrap(), None, "removed → null");
+        let mut merged = prev.clone();
+        merged.apply(&delta);
+        assert_eq!(merged.session_ambr(), None, "no rule → no effective AMBR");
     }
 }
