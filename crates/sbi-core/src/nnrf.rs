@@ -429,6 +429,7 @@ async fn discover(
 }
 
 /// Client other NFs use to talk to the NRF over HTTP/2 (h2c).
+#[derive(Clone)]
 pub struct NrfClient {
     base: String,
     http: reqwest::Client,
