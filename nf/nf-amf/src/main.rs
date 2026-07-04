@@ -735,8 +735,11 @@ fn namf_callback_router() -> axum::Router {
 
     /// `Namf_Communication`-style transfer for a **network-initiated PDU session
     /// release** (TS 23.502 §4.3.4): the SMF asks the AMF to release a UE's session.
-    /// The AMF hands it to the owning association task, which sends the N2 Release
-    /// Command (+ N1 Release Command). `202` if the UE is reachable, `404` otherwise.
+    /// A **CM-CONNECTED** UE's owning association sends the N2 Release Command (+ N1);
+    /// a **CM-IDLE** UE (no N2 to signal) has the session released at the SMF now and
+    /// dropped from its retained context — the UE is told it is gone by the PDU
+    /// Session Status reconciliation on its next return (design/90). `202` if
+    /// actioned, `404` if the UE holds no such session.
     async fn release_session(
         axum::extract::Path(supi): axum::extract::Path<String>,
         axum::Json(body): axum::Json<serde_json::Value>,
@@ -753,18 +756,39 @@ fn namf_callback_router() -> axum::Router {
             .and_then(|v| u8::try_from(v).ok())
             .unwrap_or(nas::sm_cause::REGULAR_DEACTIVATION);
         let entry = UE_DIRECTORY.lock().unwrap().get(&supi).cloned();
-        match entry {
-            Some((amf_ue_id, tx)) => {
-                let cmd = UeCmd::ReleaseSession { amf_ue_id, psi, cause };
-                if tx.send(cmd).is_ok() {
-                    info!(%supi, psi, "PDU session release requested by the SMF");
-                    axum::http::StatusCode::ACCEPTED
-                } else {
-                    axum::http::StatusCode::NOT_FOUND
-                }
+        if let Some((amf_ue_id, tx)) = entry {
+            // CM-CONNECTED: the owning association runs the full N2/N1 procedure.
+            let cmd = UeCmd::ReleaseSession { amf_ue_id, psi, cause };
+            if tx.send(cmd).is_ok() {
+                info!(%supi, psi, "PDU session release requested by the SMF");
+                return axum::http::StatusCode::ACCEPTED;
             }
-            None => axum::http::StatusCode::NOT_FOUND,
+            // The association closed between the directory lookup and the send —
+            // fall through to the retained-context path (the UE just went idle).
         }
+        // CM-IDLE: find the retained context's session and release it at the SMF now.
+        let target = {
+            let retained = RETAINED.lock().unwrap();
+            retained
+                .iter()
+                .find(|(_, c)| c.suci.as_deref() == Some(supi.as_str()))
+                .and_then(|(tmsi, c)| c.sm_refs.get(&psi).map(|r| (*tmsi, r.clone())))
+        };
+        let Some((tmsi, (sm_ref, smf_base))) = target else {
+            warn!(%supi, psi, "release requested but the UE holds no such session");
+            return axum::http::StatusCode::NOT_FOUND;
+        };
+        let amf_smf = pdu_session::AmfSmf::new(NRF_BASE.as_str(), PLMN_MCC, PLMN_MNC);
+        match amf_smf.release_sm_context(&smf_base, &sm_ref).await {
+            Ok(()) => info!(%supi, psi, "released a CM-IDLE UE's PDU session at the SMF"),
+            Err(e) => warn!(%supi, psi, "CM-IDLE release at the SMF failed: {e}"),
+        }
+        // Drop it from the retained context so the PDU Session Status the AMF sends
+        // on the UE's next return omits it (design/90 reconciliation informs the UE).
+        if let Some(c) = RETAINED.lock().unwrap().get_mut(&tmsi) {
+            c.sm_refs.remove(&psi);
+        }
+        axum::http::StatusCode::ACCEPTED
     }
 
     /// `Namf_Communication_N1N2MessageTransfer` (TS 29.518, simplified) — the SMF
@@ -5613,6 +5637,60 @@ mod tests {
         finalize_release(&mut ues, &amf_smf, amf_ue_id, 5).await;
         assert_eq!(released.lock().unwrap().as_slice(), ["ctx-guard".to_string()]);
         assert!(!ues[&amf_ue_id].sm_refs.contains_key(&5), "session finalised by the guard");
+    }
+
+    /// A network-initiated release for a CM-IDLE UE: no N2 to signal, so the AMF
+    /// releases the retained session at the SMF now and drops it from the retained
+    /// context — the UE is told on its next return by PDU Session Status
+    /// reconciliation (design/90).
+    #[tokio::test]
+    async fn cm_idle_pdu_session_release() {
+        let (_amf_smf, smf_base, released) = release_test_smf().await;
+
+        // A retained CM-IDLE UE with two sessions (not in UE_DIRECTORY).
+        let supi = "imsi-999700000000193";
+        let tmsi = 0x0000_00C1u32;
+        let mut ctx = UeContext::new(0, RegState::Registered, Some(supi.into()));
+        ctx.cm_state = CmState::Idle;
+        ctx.guti_tmsi = Some(tmsi);
+        ctx.sm_refs.insert(5, ("ctx-idle-5".into(), smf_base.clone()));
+        ctx.sm_refs.insert(6, ("ctx-idle-6".into(), smf_base));
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+
+        // The AMF's callback surface; the SMF asks to release session 5.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(listener, namf_callback_router()).await.unwrap() });
+        let client = sbi_core::h2c_client();
+        let status = client
+            .post(format!("http://{addr}/namf-comm/v1/ue-contexts/{supi}/release"))
+            .json(&serde_json::json!({ "pduSessionId": 5 }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 202, "CM-IDLE release accepted");
+
+        // Session 5 released at the SMF and dropped from the retained context; 6 kept.
+        assert_eq!(released.lock().unwrap().as_slice(), ["ctx-idle-5".to_string()]);
+        {
+            let retained = RETAINED.lock().unwrap();
+            let sm_refs = &retained.get(&tmsi).unwrap().sm_refs;
+            assert!(!sm_refs.contains_key(&5), "released session dropped");
+            assert!(sm_refs.contains_key(&6), "other session kept");
+        }
+
+        // A release for a session the UE doesn't hold → 404.
+        let status = client
+            .post(format!("http://{addr}/namf-comm/v1/ue-contexts/{supi}/release"))
+            .json(&serde_json::json!({ "pduSessionId": 9 }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 404);
+
+        RETAINED.lock().unwrap().remove(&tmsi);
     }
 
     /// A subscription-withdrawal callback reaches the UE's association; the
