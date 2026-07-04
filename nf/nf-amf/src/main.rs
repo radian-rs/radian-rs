@@ -495,6 +495,11 @@ struct UeContext {
     /// SMF base URL)`. The stored base ensures UpdateSMContext / ReleaseSMContext
     /// reach the *same* SMF that created the session (SMF selection, design/44).
     sm_refs: HashMap<u8, (String, String)>,
+    /// The serving S-NSSAI `(SST, optional SD)` each PDU session runs on, from the
+    /// SMF at establishment — so a subscribed-NSSAI change that removes a slice can
+    /// release the sessions on it (design/102 narrowing). A `psi` absent here (a
+    /// pre-feature session) is left alone rather than wrongly released.
+    session_snssai: HashMap<u8, (u8, Option<[u8; 3]>)>,
     /// The subscribed UE-AMBR from am-data as `(downlink, uplink)` bits/sec, sent
     /// to the gNB in the N2 PDU Session Resource Setup. `None` → a default is used.
     ue_ambr: Option<(u64, u64)>,
@@ -688,7 +693,7 @@ async fn serve_gnb(
                         on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp, area_restriction)
                     }
                     UeCmd::UpdateSubscribedData { amf_ue_id, ue_ambr, allowed_nssai } => {
-                        on_sdm_data_change(&mut ues, amf_ue_id, ue_ambr, allowed_nssai)
+                        on_sdm_data_change(&mut ues, amf_ue_id, ue_ambr, allowed_nssai, &dereg_tx)
                     }
                     // Page a CM-IDLE UE on this gNB (non-UE-associated NGAP Paging)
                     // across its registration area.
@@ -1126,57 +1131,89 @@ fn on_sdm_data_change(
     amf_ue_id: u64,
     ue_ambr: Option<(u64, u64)>,
     allowed_nssai: Option<Vec<(u8, Option<[u8; 3]>)>>,
+    tx: &UnboundedSender<UeCmd>,
 ) -> Vec<(NGAP_PDU, &'static str)> {
-    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
-        warn!("Nudm_SDM data change for unknown UE {amf_ue_id}");
-        return Vec::new();
-    };
-    let mut ambr_changed = false;
-    let mut nssai_changed = false;
-    if let Some(ambr) = ue_ambr {
-        if ctx.ue_ambr != Some(ambr) {
-            info!("UE {amf_ue_id}: subscribed UE-AMBR updated to {}/{} bps (Nudm_SDM)", ambr.0, ambr.1);
-            ctx.ue_ambr = Some(ambr);
-            ambr_changed = true;
-        }
-    }
-    if let Some(nssai) = allowed_nssai {
-        if ctx.allowed_nssai.as_ref() != Some(&nssai) {
-            info!("UE {amf_ue_id}: subscribed NSSAI updated to {nssai:?} (Nudm_SDM)");
-            ctx.allowed_nssai = Some(nssai);
-            nssai_changed = true;
-        }
-    }
-    if !ambr_changed && !nssai_changed {
-        return Vec::new();
-    }
-    let ran_ue_id = ctx.ran_ue_id;
-    let rfsp = ctx.rfsp;
-    let effective_ambr = ctx.ue_ambr;
-    // Snapshot before the `ctx.sec` mutable borrow below.
-    let allowed = ctx.allowed_nssai.clone().unwrap_or_default();
-    let mut dl = Vec::new();
-    // A new UE-AMBR → update the RAN's enforcement (RFSP re-sent unchanged).
-    if ambr_changed {
-        dl.push((
-            ngap::ue_context_modification_request(amf_ue_id, ran_ue_id, rfsp, effective_ambr),
-            "UEContextModificationRequest (subscribed UE-AMBR)",
-        ));
-    }
-    // Any subscription change → tell the UE its configuration changed (Generic UE
-    // Configuration Update). When the allowed NSSAI changed, the command **carries**
-    // the new set (TS 24.501 §9.11.3.37); otherwise it is a plain nudge. A UE with no
-    // security context can't be NAS-signalled — skip it (the RAN update still lands).
-    if let Some(sec) = ctx.sec.as_mut() {
-        let cuc_msg = if nssai_changed {
-            nas::configuration_update_command_with_nssai(&allowed)
-        } else {
-            nas::configuration_update_command()
+    // The RAN/UE signalling + which sessions the narrowing releases — computed while
+    // the context is borrowed, before the network-initiated release runs on `ues`.
+    let (mut dl, to_release) = {
+        let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+            warn!("Nudm_SDM data change for unknown UE {amf_ue_id}");
+            return Vec::new();
         };
-        let cuc = sec.protect(&cuc_msg, nas::sht::INTEGRITY_CIPHERED, 1);
-        dl.push((
-            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
-            "DownlinkNASTransport (ConfigurationUpdateCommand)",
+        let mut ambr_changed = false;
+        let mut nssai_changed = false;
+        if let Some(ambr) = ue_ambr {
+            if ctx.ue_ambr != Some(ambr) {
+                info!("UE {amf_ue_id}: subscribed UE-AMBR updated to {}/{} bps (Nudm_SDM)", ambr.0, ambr.1);
+                ctx.ue_ambr = Some(ambr);
+                ambr_changed = true;
+            }
+        }
+        if let Some(nssai) = allowed_nssai {
+            if ctx.allowed_nssai.as_ref() != Some(&nssai) {
+                info!("UE {amf_ue_id}: subscribed NSSAI updated to {nssai:?} (Nudm_SDM)");
+                ctx.allowed_nssai = Some(nssai);
+                nssai_changed = true;
+            }
+        }
+        if !ambr_changed && !nssai_changed {
+            return Vec::new();
+        }
+        let ran_ue_id = ctx.ran_ue_id;
+        let rfsp = ctx.rfsp;
+        let effective_ambr = ctx.ue_ambr;
+        // Snapshot before the `ctx.sec` mutable borrow below.
+        let allowed = ctx.allowed_nssai.clone().unwrap_or_default();
+        // A narrowed allowed NSSAI: any PDU session whose serving slice is no longer
+        // allowed must be released (TS 23.501 §5.15 — a slice the UE may no longer
+        // use). A session with no recorded slice (pre-feature) is left alone.
+        let to_release: Vec<u8> = if nssai_changed && !allowed.is_empty() {
+            ctx.sm_refs
+                .keys()
+                .filter(|psi| {
+                    ctx.session_snssai.get(psi).is_some_and(|s| !allowed.contains(s))
+                })
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut dl = Vec::new();
+        // A new UE-AMBR → update the RAN's enforcement (RFSP re-sent unchanged).
+        if ambr_changed {
+            dl.push((
+                ngap::ue_context_modification_request(amf_ue_id, ran_ue_id, rfsp, effective_ambr),
+                "UEContextModificationRequest (subscribed UE-AMBR)",
+            ));
+        }
+        // Any subscription change → tell the UE its configuration changed (Generic UE
+        // Configuration Update). When the allowed NSSAI changed the command **carries**
+        // the new set (TS 24.501 §9.11.3.37); otherwise it is a plain nudge. A UE with
+        // no security context can't be NAS-signalled — skip it (the RAN update lands).
+        if let Some(sec) = ctx.sec.as_mut() {
+            let cuc_msg = if nssai_changed {
+                nas::configuration_update_command_with_nssai(&allowed)
+            } else {
+                nas::configuration_update_command()
+            };
+            let cuc = sec.protect(&cuc_msg, nas::sht::INTEGRITY_CIPHERED, 1);
+            dl.push((
+                ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
+                "DownlinkNASTransport (ConfigurationUpdateCommand)",
+            ));
+        }
+        (dl, to_release)
+    };
+    // Release the sessions on now-disallowed slices (network-initiated release).
+    if !to_release.is_empty() {
+        info!("UE {amf_ue_id}: releasing PDU session(s) {to_release:?} — their slice is no longer allowed");
+        dl.extend(on_network_release(
+            ues,
+            amf_ue_id,
+            &to_release,
+            nas::sm_cause::REGULAR_DEACTIVATION,
+            tx,
         ));
     }
     dl
@@ -2665,6 +2702,7 @@ impl UeContext {
             nh_chain: None,
             replayed_ue_sec_cap: None,
             sm_refs: HashMap::new(),
+            session_snssai: HashMap::new(),
             ue_ambr: None,
             rfsp: None,
             area_restriction: None,
@@ -3039,6 +3077,7 @@ async fn dispatch_uplink_nas(
                     let dl = nas::dl_nas_transport_sm(psi, accept);
                     let Some(ctx) = ues.get_mut(&amf_ue_id) else { return None };
                     ctx.sm_refs.insert(psi, (created.sm_ref, smf_base));
+                    ctx.session_snssai.insert(psi, (created.snssai_sst, created.snssai_sd));
                     let (ambr_dl, ambr_ul) = ctx.ue_ambr.unwrap_or(DEFAULT_UE_AMBR_BPS);
                     let Some(sec) = ctx.sec.as_mut() else {
                         warn!("UE {amf_ue_id}: PDU session before NAS security is established");
@@ -5725,6 +5764,7 @@ mod tests {
         ctx.allowed_nssai = Some(vec![(1, Some([1, 2, 3]))]);
         let mut ues = HashMap::new();
         ues.insert(amf_ue_id, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
 
         // A UE-AMBR + NSSAI change updates the stored view and pushes both signals.
         let dls = on_sdm_data_change(
@@ -5732,6 +5772,7 @@ mod tests {
             amf_ue_id,
             Some((2_000_000, 500_000)),
             Some(vec![(1, None), (2, None)]),
+            &tx,
         );
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
@@ -5758,7 +5799,7 @@ mod tests {
 
         // An NSSAI-only change (UE-AMBR unchanged) pushes only the UE nudge, carrying
         // the new allowed NSSAI. (Same UE security context → the DL NAS COUNT advances.)
-        let dls = on_sdm_data_change(&mut ues, amf_ue_id, Some((2_000_000, 500_000)), Some(vec![(1, None)]));
+        let dls = on_sdm_data_change(&mut ues, amf_ue_id, Some((2_000_000, 500_000)), Some(vec![(1, None)]), &tx);
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             ["DownlinkNASTransport (ConfigurationUpdateCommand)"]
@@ -5768,8 +5809,48 @@ mod tests {
         assert_eq!(nas::allowed_nssai_from_configuration_update_command(&msg), vec![(1, None)]);
 
         // A no-op change signals nothing; an unknown UE is a no-op.
-        assert!(on_sdm_data_change(&mut ues, amf_ue_id, None, None).is_empty());
-        assert!(on_sdm_data_change(&mut ues, 999, Some((1, 1)), None).is_empty());
+        assert!(on_sdm_data_change(&mut ues, amf_ue_id, None, None, &tx).is_empty());
+        assert!(on_sdm_data_change(&mut ues, 999, Some((1, 1)), None, &tx).is_empty());
+    }
+
+    /// A subscribed-NSSAI change that removes a slice releases the UE's PDU sessions
+    /// on that (now-disallowed) slice; sessions on still-allowed slices are kept.
+    #[tokio::test]
+    async fn sdm_narrowing_releases_sessions_on_removed_slice() {
+        let (ki, ke) = ([0x81u8; 16], [0x82u8; 16]);
+        let amf_ue_id = 0x61u64;
+        let mut ctx = UeContext::new(3, RegState::Registered, Some("imsi-999700000000061".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.allowed_nssai = Some(vec![(1, Some([1, 1, 1])), (2, Some([2, 2, 2]))]);
+        ctx.sm_refs.insert(5, ("ctx-5".into(), "http://smf".into()));
+        ctx.sm_refs.insert(6, ("ctx-6".into(), "http://smf".into()));
+        ctx.session_snssai.insert(5, (1, Some([1, 1, 1])));
+        ctx.session_snssai.insert(6, (2, Some([2, 2, 2])));
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
+
+        // Slice 2 removed from the allowed NSSAI → the session on slice 2 (psi 6) is
+        // released; the UE is told (Config Update); psi 5 (slice 1) is untouched.
+        let dls = on_sdm_data_change(
+            &mut ues,
+            amf_ue_id,
+            None,
+            Some(vec![(1, Some([1, 1, 1]))]),
+            &tx,
+        );
+        let labels: Vec<_> = dls.iter().map(|(_, l)| *l).collect();
+        assert!(labels.contains(&"DownlinkNASTransport (ConfigurationUpdateCommand)"));
+        let rel: Vec<_> =
+            dls.iter().filter(|(_, l)| *l == "PDUSessionResourceReleaseCommand").collect();
+        assert_eq!(rel.len(), 1, "one release, for the removed-slice session");
+        let back = NGAP_PDU::decode(&rel[0].0.encode().unwrap()).unwrap();
+        assert_eq!(ngap::nas_pdu_from_release_command(&back).unwrap().0, 6, "psi 6 released");
+
+        let ctx = &ues[&amf_ue_id];
+        assert!(ctx.releasing.contains(&6), "session on the removed slice is releasing");
+        assert!(!ctx.releasing.contains(&5), "session on a still-allowed slice kept");
+        assert_eq!(ctx.allowed_nssai, Some(vec![(1, Some([1, 1, 1]))]));
     }
 
     /// Shared harness: a mock SMF whose `release` route records the finalised SM
