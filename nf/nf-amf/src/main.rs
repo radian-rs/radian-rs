@@ -152,6 +152,10 @@ enum UeCmd {
         amf_ue_id: u64,
         reply: tokio::sync::oneshot::Sender<Option<Box<UeContext>>>,
     },
+    /// Send a pre-built NGAP PDU on this association — cross-association
+    /// signalling for the N2 handover (the Handover Request to the target, the
+    /// Handover Command back to the source).
+    Forward { pdu: Box<NGAP_PDU>, label: &'static str },
 }
 
 /// A network-initiated PDU-session modification for one UE — the parsed QoS the
@@ -246,6 +250,9 @@ static RETAINED: LazyLock<Mutex<HashMap<u32, UeContext>>> =
 /// its NG Setup Supported TA List; empty until NG Setup completes).
 struct GnbLink {
     tacs: Vec<[u8; 3]>,
+    /// The gNB id from the NG Setup's Global RAN Node ID — N2-handover target
+    /// resolution is keyed on it. `None` until NG Setup completes.
+    gnb_id: Option<u32>,
     tx: UnboundedSender<UeCmd>,
 }
 
@@ -557,7 +564,7 @@ async fn serve_gnb(
     let (dereg_tx, mut dereg_rx) = unbounded_channel::<UeCmd>();
     // Register this association so the paging surface can reach its gNB; the
     // served TA list is filled in when the gNB's NG Setup arrives.
-    GNB_LINKS.lock().unwrap().push(GnbLink { tacs: Vec::new(), tx: dereg_tx.clone() });
+    GNB_LINKS.lock().unwrap().push(GnbLink { tacs: Vec::new(), gnb_id: None, tx: dereg_tx.clone() });
     let result = loop {
         tokio::select! {
             received = conn.sctp_recv() => match received {
@@ -590,6 +597,8 @@ async fn serve_gnb(
                     // An Xn path switch landed on another association — hand the
                     // context over and release this gNB's stale side.
                     UeCmd::TakeUe { amf_ue_id, reply } => on_take_ue(&mut ues, amf_ue_id, reply),
+                    // Cross-association N2-handover signalling for this gNB.
+                    UeCmd::Forward { pdu, label } => vec![(*pdu, label)],
                 };
                 for (dl, label) in downlinks {
                     send_or_log(&conn, &dl, label).await;
@@ -1020,16 +1029,22 @@ async fn handle_ngap(
             InitiatingMessageValue::Id_NGSetup(_req) => {
                 // Record the tracking areas this gNB serves (Supported TA List) —
                 // paging is then scoped to the gNBs covering the UE's registration
-                // area instead of broadcast to every association.
-                if let Some(tacs) = ngap::supported_tacs_from_ng_setup(&pdu) {
-                    info!("gNB serves TACs {tacs:02x?} (registration-area paging scope)");
+                // area — and its gNB id (Global RAN Node ID), which N2-handover
+                // target resolution is keyed on.
+                let tacs = ngap::supported_tacs_from_ng_setup(&pdu);
+                let gnb_id = ngap::gnb_id_from_ng_setup(&pdu);
+                if tacs.is_some() || gnb_id.is_some() {
+                    info!("gNB {gnb_id:?} serves TACs {tacs:02x?} (paging / handover scope)");
                     if let Some(link) = GNB_LINKS
                         .lock()
                         .unwrap()
                         .iter_mut()
                         .find(|l| l.tx.same_channel(dereg_tx))
                     {
-                        link.tacs = tacs;
+                        if let Some(tacs) = tacs {
+                            link.tacs = tacs;
+                        }
+                        link.gnb_id = gnb_id;
                     }
                 }
                 let resp = ngap::ng_setup_response(AMF_NAME, PLMN_MCC, PLMN_MNC);
@@ -1072,6 +1087,12 @@ async fn handle_ngap(
                     send_or_log(conn, &ack, label).await;
                 }
             }
+            InitiatingMessageValue::Id_HandoverPreparation(_) => {
+                on_handover_required(ues, amf_smf, &pdu, dereg_tx).await;
+            }
+            InitiatingMessageValue::Id_HandoverNotification(_) => {
+                on_handover_notify(ues, amf_smf, &pdu, dereg_tx).await;
+            }
             _ => info!("unhandled initiating message: {}", pdu.procedure_name()),
         },
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
@@ -1104,6 +1125,10 @@ async fn handle_ngap(
             }
             None => info!("gNB UEContextModificationResponse (unparseable)"),
         },
+        NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+            value: SuccessfulOutcomeValue::Id_HandoverResourceAllocation(_),
+            ..
+        }) => on_handover_request_ack(&pdu),
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
             value: SuccessfulOutcomeValue::Id_InitialContextSetup(_),
             ..
@@ -1413,6 +1438,207 @@ async fn on_service_request(
 /// **NH chain** (TS 33.501 §6.9.2.3.3: NH = KDF(K_AMF, sync), NCC+1 mod 8), and
 /// answers with a `PathSwitchRequestAcknowledge` carrying the fresh `{NCC, NH}`
 /// for the target's vertical key derivation.
+/// An N2 handover in flight (TS 23.502 §4.9.1.3), keyed by AMF-UE-NGAP-ID in
+/// [`HANDOVERS`]: created at Handover Required, filled by the target's
+/// acknowledge, consumed by Handover Notify.
+struct PendingHandover {
+    /// The source association's command channel (the Handover Command goes back
+    /// through it; the context is taken from it at Notify).
+    source_tx: UnboundedSender<UeCmd>,
+    source_ran_ue_id: u32,
+    /// The rotated NH-chain pair handed to the target in the Handover Request —
+    /// applied to the context when the UE arrives.
+    nh: [u8; 32],
+    ncc: u8,
+    /// Sessions admitted by the target: `(psi, target DL F-TEID, addr)`.
+    admitted: Vec<(u8, u32, std::net::Ipv4Addr)>,
+}
+
+/// N2 handovers in flight, AMF-wide (the messages arrive on two different gNB
+/// associations).
+static HANDOVERS: LazyLock<Mutex<HashMap<u64, PendingHandover>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Handle a **Handover Required** (TS 38.413 §8.4.1, on the SOURCE association):
+/// resolve the target gNB by its Global RAN Node ID, rotate the NH chain
+/// (TS 33.501 §6.9.2.3.2 — the target derives its K_gNB from the fresh
+/// `{NH, NCC}`), collect each PDU session's UL N3 F-TEID + QoS from the SMF, and
+/// send the **Handover Request** on the target's association.
+async fn on_handover_required(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    pdu: &NGAP_PDU,
+    dereg_tx: &UnboundedSender<UeCmd>,
+) {
+    let Some((amf_ue_id, ran_ue_id, target_gnb_id, psis, container)) =
+        ngap::handover_required_params(pdu)
+    else {
+        warn!("HandoverRequired missing mandatory IEs — ignored");
+        return;
+    };
+    let Some(ctx) = ues.get(&amf_ue_id) else {
+        warn!("HandoverRequired for unknown UE {amf_ue_id} — ignored");
+        return;
+    };
+    let (Some(kamf), Some((sync, ncc))) = (ctx.kamf, ctx.nh_chain) else {
+        warn!("UE {amf_ue_id}: handover without a seeded NH chain — ignored");
+        return;
+    };
+    // The target gNB's association, by the id it advertised in its NG Setup.
+    let Some(target_tx) = GNB_LINKS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|l| l.gnb_id == Some(target_gnb_id) && !l.tx.same_channel(dereg_tx))
+        .map(|l| l.tx.clone())
+    else {
+        warn!("UE {amf_ue_id}: handover target gNB {target_gnb_id} has no N2 association — ignored");
+        return;
+    };
+    // Vertical key derivation for the target (burned even if the handover fails).
+    let fresh_nh = aka::nh(&kamf, &sync);
+    let fresh_ncc = (ncc + 1) % 8;
+    // Each session's UL N3 F-TEID + QoS flows, from its serving SMF (the same
+    // retained-state fetch the Service Request resume uses).
+    let mut sessions = Vec::new();
+    for psi in &psis {
+        let Some((sm_ref, smf_base)) = ctx.sm_refs.get(psi).cloned() else {
+            warn!("UE {amf_ue_id}: handover for PDU session {psi} but no SM context tracked");
+            continue;
+        };
+        match amf_smf.activate_up_connection(&smf_base, &sm_ref).await {
+            Ok(created) => {
+                let flows = if created.ngap_flows.is_empty() {
+                    vec![ngap::QosFlow::default_non_gbr()]
+                } else {
+                    created.ngap_flows.clone()
+                };
+                sessions.push((*psi, flows, created.up_n3_teid, created.up_n3_addr));
+            }
+            Err(e) => warn!("UE {amf_ue_id}: N3 info fetch for PDU session {psi} failed: {e}"),
+        }
+    }
+    let request = ngap::handover_request(
+        amf_ue_id,
+        PLMN_MCC,
+        PLMN_MNC,
+        ctx.ue_ambr.unwrap_or(DEFAULT_UE_AMBR_BPS),
+        &ctx.replayed_ue_sec_cap.unwrap_or(UE_SEC_CAP),
+        fresh_ncc,
+        &fresh_nh,
+        &ctx.allowed_nssai.clone().unwrap_or_default(),
+        &sessions,
+        container,
+    );
+    info!(
+        "UE {amf_ue_id}: N2 handover to gNB {target_gnb_id} — Handover Request sent \
+         ({} session(s), NCC {fresh_ncc})",
+        sessions.len()
+    );
+    HANDOVERS.lock().unwrap().insert(
+        amf_ue_id,
+        PendingHandover {
+            source_tx: dereg_tx.clone(),
+            source_ran_ue_id: ran_ue_id,
+            nh: fresh_nh,
+            ncc: fresh_ncc,
+            admitted: Vec::new(),
+        },
+    );
+    let _ = target_tx.send(UeCmd::Forward {
+        pdu: Box::new(request),
+        label: "HandoverRequest",
+    });
+}
+
+/// Handle a **Handover Request Acknowledge** (on the TARGET association): record
+/// the admitted sessions (the target's DL F-TEIDs, applied at Notify) and relay
+/// the target's transparent container to the source in a **Handover Command**.
+fn on_handover_request_ack(pdu: &NGAP_PDU) {
+    let Some((amf_ue_id, target_ran_ue_id, admitted, container)) =
+        ngap::handover_request_ack_params(pdu)
+    else {
+        warn!("HandoverRequestAcknowledge missing mandatory IEs — ignored");
+        return;
+    };
+    let mut handovers = HANDOVERS.lock().unwrap();
+    let Some(pending) = handovers.get_mut(&amf_ue_id) else {
+        warn!("HandoverRequestAcknowledge for UE {amf_ue_id} with no handover in flight");
+        return;
+    };
+    pending.admitted = admitted;
+    info!(
+        "UE {amf_ue_id}: target admitted {} session(s) (target RAN-UE {target_ran_ue_id}) — \
+         Handover Command to the source",
+        pending.admitted.len()
+    );
+    let command = ngap::handover_command(amf_ue_id, pending.source_ran_ue_id, container);
+    let _ = pending.source_tx.send(UeCmd::Forward {
+        pdu: Box::new(command),
+        label: "HandoverCommand",
+    });
+}
+
+/// Handle a **Handover Notify** (on the TARGET association): the UE arrived. Take
+/// the context over from the source association (which releases its gNB — cause
+/// *successful-handover*), apply the rotated NH chain and the new location,
+/// re-point each admitted session's UPF downlink to the target's DL F-TEID, and
+/// re-point the SBI callback directory at this association.
+async fn on_handover_notify(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    pdu: &NGAP_PDU,
+    dereg_tx: &UnboundedSender<UeCmd>,
+) {
+    let Some((amf_ue_id, target_ran_ue_id, tac)) = ngap::handover_notify_params(pdu) else {
+        warn!("HandoverNotify missing mandatory IEs — ignored");
+        return;
+    };
+    let Some(pending) = HANDOVERS.lock().unwrap().remove(&amf_ue_id) else {
+        warn!("HandoverNotify for UE {amf_ue_id} with no handover in flight");
+        return;
+    };
+    // Take the context from the source association; it releases its gNB's side.
+    if !ues.contains_key(&amf_ue_id) {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let _ = pending.source_tx.send(UeCmd::TakeUe { amf_ue_id, reply: reply_tx });
+        match tokio::time::timeout(std::time::Duration::from_millis(500), reply_rx).await {
+            Ok(Ok(Some(ctx))) => {
+                ues.insert(amf_ue_id, *ctx);
+            }
+            _ => {
+                warn!("UE {amf_ue_id}: handover notify but the source no longer owns the context");
+                return;
+            }
+        }
+    }
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        return; // unreachable
+    };
+    ctx.ran_ue_id = target_ran_ue_id;
+    ctx.tac = tac.or(ctx.tac);
+    ctx.nh_chain = Some((pending.nh, pending.ncc));
+    if let Some(supi) = &ctx.suci {
+        UE_DIRECTORY.lock().unwrap().insert(supi.clone(), (amf_ue_id, dereg_tx.clone()));
+    }
+    info!(
+        "UE {amf_ue_id}: N2 handover complete — at the target gNB (RAN-UE {target_ran_ue_id}, \
+         TAC {tac:02x?}, NCC {})",
+        pending.ncc
+    );
+    // Re-point each admitted session's UPF downlink to the target gNB.
+    for (psi, gnb_teid, gnb_addr) in &pending.admitted {
+        let Some((sm_ref, smf_base)) = ues.get(&amf_ue_id).and_then(|c| c.sm_refs.get(psi).cloned())
+        else {
+            continue;
+        };
+        match amf_smf.update_sm_context(&smf_base, &sm_ref, *gnb_teid, *gnb_addr).await {
+            Ok(()) => info!("UE {amf_ue_id}: PDU session {psi} switched to the target (F-TEID {gnb_teid:#x})"),
+            Err(e) => warn!("UE {amf_ue_id}: handover UpdateSMContext failed for {psi}: {e}"),
+        }
+    }
+}
+
 /// Hand a UE context over to the association an Xn path switch landed on: remove
 /// it, reply on the oneshot, and — when this task really owned it — command the
 /// **source gNB** to release its stale UE context (TS 23.502 §4.9.1.2 completes
@@ -3091,7 +3317,7 @@ mod tests {
 
         // A mock gNB association link registered in GNB_LINKS (serving the AMF TAC).
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        GNB_LINKS.lock().unwrap().push(GnbLink { tacs: vec![AMF_TAC], tx });
+        GNB_LINKS.lock().unwrap().push(GnbLink { tacs: vec![AMF_TAC], gnb_id: None, tx });
 
         // The SMF calls the AMF's N1N2 paging surface.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3151,9 +3377,9 @@ mod tests {
         let (tx_c, mut rx_c) = tokio::sync::mpsc::unbounded_channel();
         {
             let mut links = GNB_LINKS.lock().unwrap();
-            links.push(GnbLink { tacs: vec![[0, 0, 0x7a]], tx: tx_a });
-            links.push(GnbLink { tacs: vec![[0, 0, 0x78]], tx: tx_b });
-            links.push(GnbLink { tacs: Vec::new(), tx: tx_c });
+            links.push(GnbLink { tacs: vec![[0, 0, 0x7a]], gnb_id: None, tx: tx_a });
+            links.push(GnbLink { tacs: vec![[0, 0, 0x78]], gnb_id: None, tx: tx_b });
+            links.push(GnbLink { tacs: Vec::new(), gnb_id: None, tx: tx_c });
         }
 
         // Page the area: A and C see it (carrying the FULL area), B does not.
@@ -3237,7 +3463,7 @@ mod tests {
         GNB_LINKS
             .lock()
             .unwrap()
-            .push(GnbLink { tacs: vec![[0, 0, 9], [0, 0, 0x0b]], tx: gnb_tx.clone() });
+            .push(GnbLink { tacs: vec![[0, 0, 9], [0, 0, 0x0b]], gnb_id: None, tx: gnb_tx.clone() });
 
         // The UE moved to TAC 000009 (outside its area) → protected mobility
         // Registration Request, GUTI identity, via that gNB.
@@ -3382,6 +3608,182 @@ mod tests {
         assert!(on_path_switch(&mut ues, &amf_smf, &req2, &dereg_tx).await.is_none());
     }
 
+    /// The full N2 handover (TS 23.502 §4.9.1.3): Handover Required on the source
+    /// association → Handover Request to the target (rotated {NH, NCC} + the UPF's
+    /// UL F-TEID) → the target's acknowledge → Handover Command back to the source
+    /// → Handover Notify → context takeover, downlink re-point to the target's DL
+    /// F-TEID, source release, directory re-point.
+    #[tokio::test]
+    async fn n2_handover_orchestrates_source_to_target() {
+        use std::sync::Mutex as StdMutex;
+
+        // Mock SMF: ACTIVATING fetches return the UPF's UL N3 info; gnbN3Teid
+        // bodies (the downlink re-point) are captured.
+        static HO_SWITCHES: StdMutex<Vec<(String, String)>> = StdMutex::new(Vec::new());
+        async fn mock_modify(
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            if body.get("upCnxState").and_then(|v| v.as_str()) == Some("ACTIVATING") {
+                return (
+                    axum::http::StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "upN3Teid": "00000001", "upN3Addr": "127.0.0.1", "ueIpv4Addr": "10.45.0.2"
+                    })),
+                )
+                    .into_response();
+            }
+            if let (Some(teid), Some(addr)) = (
+                body.get("gnbN3Teid").and_then(|v| v.as_str()),
+                body.get("gnbN3Addr").and_then(|v| v.as_str()),
+            ) {
+                HO_SWITCHES.lock().unwrap().push((teid.into(), addr.into()));
+            }
+            axum::http::StatusCode::OK.into_response()
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new().route(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
+            axum::routing::post(mock_modify),
+        );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+
+        // The UE lives on the SOURCE association (RAN-UE 4), NH chain seeded.
+        let kamf = [0x91u8; 32];
+        let kgnb0 = aka::kgnb(&kamf, 0);
+        let amf_ue_id = 0x191u64;
+        let supi = "imsi-999700000000191";
+        let mut ctx = UeContext::new(4, RegState::Registered, Some(supi.into()));
+        ctx.kamf = Some(kamf);
+        ctx.nh_chain = Some((kgnb0, 0));
+        ctx.ue_ambr = Some((900_000_000, 400_000_000));
+        ctx.allowed_nssai = Some(vec![(1, Some([1, 2, 3]))]);
+        ctx.replayed_ue_sec_cap = Some([0x20, 0x20]);
+        ctx.sm_refs.insert(5, ("ctx-n2ho".into(), format!("http://{smf_addr}")));
+        let mut src_ues = HashMap::new();
+        src_ues.insert(amf_ue_id, ctx);
+
+        // Source + target associations; the target advertises gNB id 0x77.
+        let (src_tx, mut src_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tgt_tx, mut tgt_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut links = GNB_LINKS.lock().unwrap();
+            links.push(GnbLink { tacs: Vec::new(), gnb_id: None, tx: src_tx.clone() });
+            links.push(GnbLink { tacs: Vec::new(), gnb_id: Some(0x77), tx: tgt_tx.clone() });
+        }
+        UE_DIRECTORY.lock().unwrap().insert(supi.into(), (amf_ue_id, src_tx.clone()));
+
+        // 1. Handover Required arrives on the SOURCE association.
+        let required = ngap::handover_required(
+            amf_ue_id, 4, 0x77, "999", "70", &[0, 0, 2], &[5], b"s2t".to_vec(),
+        );
+        on_handover_required(&mut src_ues, &amf_smf, &required, &src_tx).await;
+        // The target association received the Handover Request: rotated {NCC, NH},
+        // the UPF's UL F-TEID (from the mock SMF), the source's container.
+        let nh1 = aka::nh(&kamf, &kgnb0);
+        let ho_request = loop {
+            match tgt_rx.recv().await {
+                Some(UeCmd::Forward { pdu, label }) => {
+                    assert_eq!(label, "HandoverRequest");
+                    break *pdu;
+                }
+                // Broadcasts from parallel tests sharing the global registry
+                // (Page / TakeUe probes) — dropping a TakeUe's reply answers None.
+                Some(_) => continue,
+                None => panic!("target link closed"),
+            }
+        };
+        assert_eq!(
+            ngap::handover_request_params(&ho_request),
+            Some((
+                amf_ue_id,
+                1,
+                nh1,
+                vec![(5, 1, std::net::Ipv4Addr::new(127, 0, 0, 1))],
+                b"s2t".to_vec()
+            ))
+        );
+
+        // The source association's select loop (simulated): owns the context,
+        // services TakeUe, and captures forwarded PDUs (the Handover Command).
+        let src_captured: std::sync::Arc<StdMutex<Vec<(NGAP_PDU, &'static str)>>> =
+            std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let src_captured_w = src_captured.clone();
+        tokio::spawn(async move {
+            let mut ues = src_ues;
+            while let Some(cmd) = src_rx.recv().await {
+                match cmd {
+                    UeCmd::TakeUe { amf_ue_id, reply } => {
+                        let dls = on_take_ue(&mut ues, amf_ue_id, reply);
+                        src_captured_w.lock().unwrap().extend(dls);
+                    }
+                    UeCmd::Forward { pdu, label } => {
+                        src_captured_w.lock().unwrap().push((*pdu, label));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // 2. The target acknowledges (its DL F-TEID) → Handover Command to the source.
+        let ack = ngap::handover_request_acknowledge(
+            amf_ue_id,
+            9,
+            &[(5, 0xAA, std::net::Ipv4Addr::new(10, 0, 9, 5))],
+            b"t2s".to_vec(),
+        );
+        on_handover_request_ack(&ack);
+        let mut command_seen = false;
+        for _ in 0..50 {
+            {
+                let captured = src_captured.lock().unwrap();
+                if let Some((pdu, _)) = captured.iter().find(|(_, l)| *l == "HandoverCommand") {
+                    assert_eq!(
+                        ngap::handover_command_params(pdu),
+                        Some((amf_ue_id, 4, b"t2s".to_vec())),
+                        "addressed by the SOURCE RAN-UE-NGAP-ID, relaying the target's container"
+                    );
+                    command_seen = true;
+                }
+            }
+            if command_seen {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(command_seen, "Handover Command reached the source association");
+
+        // 3. The UE arrives: Handover Notify on the TARGET association.
+        let notify = ngap::handover_notify(amf_ue_id, 9, "999", "70", &[0, 0, 2]);
+        let mut tgt_ues = HashMap::new();
+        on_handover_notify(&mut tgt_ues, &amf_smf, &notify, &tgt_tx).await;
+
+        // The context moved: target RAN-UE-ID, new TAC, the rotated NH chain.
+        let moved = tgt_ues.get(&amf_ue_id).expect("context taken over");
+        assert_eq!(moved.ran_ue_id, 9);
+        assert_eq!(moved.tac, Some([0, 0, 2]));
+        assert_eq!(moved.nh_chain, Some((nh1, 1)));
+        // The UPF downlink re-pointed to the target's admitted DL F-TEID.
+        assert_eq!(
+            HO_SWITCHES.lock().unwrap().as_slice(),
+            [("000000aa".to_string(), "10.0.9.5".to_string())]
+        );
+        // The source association released its gNB (successful handover, old RAN-UE 4).
+        let released = src_captured.lock().unwrap();
+        let release = released
+            .iter()
+            .find(|(_, l)| *l == "UEContextReleaseCommand (successful handover)")
+            .expect("source released");
+        assert_eq!(ngap::parse_ue_context_release_command(&release.0), Some((amf_ue_id, 4, None)));
+        // The SBI callback directory re-points to the target association.
+        let (_, dir_tx) = UE_DIRECTORY.lock().unwrap().get(supi).cloned().expect("directory");
+        assert!(dir_tx.same_channel(&tgt_tx));
+        assert!(HANDOVERS.lock().unwrap().get(&amf_ue_id).is_none(), "handover consumed");
+        UE_DIRECTORY.lock().unwrap().remove(supi);
+    }
+
     /// Cross-association takeover: the PathSwitchRequest arrives on the TARGET
     /// gNB's association while the UE context lives with the SOURCE's. The target
     /// pulls the context over (UeCmd::TakeUe), the source association releases its
@@ -3430,8 +3832,8 @@ mod tests {
         let (tgt_tx, _tgt_rx) = tokio::sync::mpsc::unbounded_channel();
         {
             let mut links = GNB_LINKS.lock().unwrap();
-            links.push(GnbLink { tacs: Vec::new(), tx: src_tx.clone() });
-            links.push(GnbLink { tacs: Vec::new(), tx: tgt_tx.clone() });
+            links.push(GnbLink { tacs: Vec::new(), gnb_id: None, tx: src_tx.clone() });
+            links.push(GnbLink { tacs: Vec::new(), gnb_id: None, tx: tgt_tx.clone() });
         }
         // The SBI callback surface currently reaches the UE via the source.
         UE_DIRECTORY.lock().unwrap().insert(supi.into(), (amf_ue_id, src_tx.clone()));
@@ -3544,7 +3946,7 @@ mod tests {
         GNB_LINKS
             .lock()
             .unwrap()
-            .push(GnbLink { tacs: vec![[0, 0, 0x81], [0, 0, 0x82]], tx: tx.clone() });
+            .push(GnbLink { tacs: vec![[0, 0, 0x81], [0, 0, 0x82]], gnb_id: None, tx: tx.clone() });
 
         // gNB TAs + a new UE TAI.
         assert_eq!(
@@ -3570,7 +3972,7 @@ mod tests {
         let supi = "imsi-999700000000141";
         let ue_tac = [0u8, 0, 0x79]; // unique to this test
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        GNB_LINKS.lock().unwrap().push(GnbLink { tacs: vec![ue_tac], tx });
+        GNB_LINKS.lock().unwrap().push(GnbLink { tacs: vec![ue_tac], gnb_id: None, tx });
         let my_pages = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<UeCmd>| {
             let mut hits = 0;
             while let Ok(cmd) = rx.try_recv() {
@@ -3632,7 +4034,7 @@ mod tests {
         // A mock gNB association link to observe the page (no NG Setup yet — an
         // empty TA list is still paged, fail-open).
         let (gnb_tx, mut gnb_rx) = tokio::sync::mpsc::unbounded_channel();
-        GNB_LINKS.lock().unwrap().push(GnbLink { tacs: Vec::new(), tx: gnb_tx });
+        GNB_LINKS.lock().unwrap().push(GnbLink { tacs: Vec::new(), gnb_id: None, tx: gnb_tx });
 
         // The PCF pushes the UpdateNotify while the UE is idle → 202 (held + paged).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
