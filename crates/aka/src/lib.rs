@@ -118,6 +118,14 @@ pub fn kgnb(kamf: &[u8; 32], ul_nas_count: u32) -> [u8; 32] {
     oxirush_security::derive_kgnb(kamf, ul_nas_count)
 }
 
+/// AMF: derive the next **NH** (Next Hop) key of the handover chain
+/// (TS 33.501 Annex A.10, FC=0x6F). `sync_input` is the initial K_gNB for the
+/// first NH (NCC 1) and the previous NH for every one after — each Xn path switch
+/// hands the target gNB a fresh `{NH, NCC}` pair for vertical key derivation.
+pub fn nh(kamf: &[u8; 32], sync_input: &[u8; 32]) -> [u8; 32] {
+    oxirush_security::derive_nh(kamf, sync_input)
+}
+
 /// The AKA AMF field used for **resynchronisation** (TS 33.102 §6.3.3): MAC-S is
 /// computed with AMF* = 0x0000, not the subscriber's provisioned AMF.
 const RESYNC_AMF: [u8; 2] = [0x00, 0x00];
@@ -295,5 +303,19 @@ mod tests {
         assert_eq!(k0, kgnb(&kamf, 0));
         assert_ne!(k0, kgnb(&kamf, 1));
         assert_ne!(k0, kgnb(&[0x43u8; 32], 0));
+    }
+
+    /// The NH chain (TS 33.501 Annex A.10): NH₁ from the initial K_gNB, NHₙ₊₁ from
+    /// NHₙ — deterministic, and every hop yields a fresh key.
+    #[test]
+    fn nh_chain_is_deterministic_and_hops_differ() {
+        let kamf = [0x42u8; 32];
+        let kgnb0 = kgnb(&kamf, 0);
+        let nh1 = nh(&kamf, &kgnb0);
+        let nh2 = nh(&kamf, &nh1);
+        assert_eq!(nh1, nh(&kamf, &kgnb0), "deterministic");
+        assert_ne!(nh1, kgnb0);
+        assert_ne!(nh2, nh1, "each hop is fresh");
+        assert_ne!(nh(&[0x43u8; 32], &kgnb0), nh1, "bound to K_AMF");
     }
 }

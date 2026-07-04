@@ -623,6 +623,163 @@ pub fn initial_context_setup_response_ids(pdu: &NGAP_PDU) -> Option<(u64, u32)> 
     Some((amf_ue_id?, ran_ue_id?))
 }
 
+/// Build a `PathSwitchRequest` (TS 38.413 §9.2.3.21) — after an **Xn handover**
+/// the target gNB asks the AMF to switch the downlink path: the UE's new location,
+/// its security capabilities, and per PDU session the target's new DL N3 F-TEID.
+/// For tests and a gNB simulator. `sessions` = `(psi, dl_teid, dl_addr)`.
+pub fn path_switch_request(
+    source_amf_ue_id: u64,
+    ran_ue_id: u32,
+    mcc: &str,
+    mnc: &str,
+    tac: &[u8; 3],
+    ue_sec_cap: &[u8; 2],
+    sessions: &[(u8, u32, Ipv4Addr)],
+) -> NGAP_PDU {
+    let list = PDUSessionResourceToBeSwitchedDLList(
+        sessions
+            .iter()
+            .map(|(psi, teid, addr)| {
+                let transfer = encode_aper(&PathSwitchRequestTransfer {
+                    dl_ngu_up_tnl_information: gtp_tunnel(*teid, *addr),
+                    dl_ngu_tnl_information_reused: None,
+                    user_plane_security_information: None,
+                    qos_flow_accepted_list: QosFlowAcceptedList(vec![QosFlowAcceptedItem {
+                        qos_flow_identifier: QosFlowIdentifier(1),
+                        ie_extensions: None,
+                    }]),
+                    ie_extensions: None,
+                });
+                PDUSessionResourceToBeSwitchedDLItem {
+                    pdu_session_id: PDUSessionID(*psi),
+                    path_switch_request_transfer:
+                        PDUSessionResourceToBeSwitchedDLItemPathSwitchRequestTransfer(transfer),
+                    ie_extensions: None,
+                }
+            })
+            .collect(),
+    );
+    build_ngap!(InitiatingMessage, PathSwitchRequest,
+        REJECT, PathSwitchRequest,
+        REJECT RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+        REJECT SourceAMF_UE_NGAP_ID(AMF_UE_NGAP_ID(source_amf_ue_id)),
+        IGNORE UserLocationInformation(nr_user_location(mcc, mnc, tac)),
+        IGNORE UESecurityCapabilities(helpers::ue_security_capabilities(ue_sec_cap)),
+        REJECT PDUSessionResourceToBeSwitchedDLList(list),
+    )
+}
+
+/// Parse a `PathSwitchRequest` — `(source_amf_ue_id, new_ran_ue_id, tac,
+/// [(psi, new_dl_teid, new_dl_addr)])`. The AMF side.
+pub fn path_switch_params(
+    pdu: &NGAP_PDU,
+) -> Option<(u64, u32, Option<[u8; 3]>, Vec<(u8, u32, Ipv4Addr)>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_PathSwitchRequest(req) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id, mut tac) = (None, None, None);
+    let mut sessions = Vec::new();
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            PathSwitchRequestProtocolIEs_EntryValue::Id_SourceAMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            PathSwitchRequestProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => ran_ue_id = Some(v.0),
+            PathSwitchRequestProtocolIEs_EntryValue::Id_UserLocationInformation(
+                UserLocationInformation::UserLocationInformationNR(nr),
+            ) => tac = <[u8; 3]>::try_from(nr.tai.tac.0.as_slice()).ok(),
+            PathSwitchRequestProtocolIEs_EntryValue::Id_PDUSessionResourceToBeSwitchedDLList(
+                list,
+            ) => {
+                for item in &list.0 {
+                    let mut codec =
+                        PerCodecData::from_slice_aper(&item.path_switch_request_transfer.0);
+                    if let Ok(t) = PathSwitchRequestTransfer::aper_decode(&mut codec) {
+                        if let Some((teid, addr)) = fteid_from_uptnl(&t.dl_ngu_up_tnl_information) {
+                            sessions.push((item.pdu_session_id.0, teid, addr));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, tac, sessions))
+}
+
+/// Build a `PathSwitchRequestAcknowledge` (TS 38.413 §9.2.3.22) — the AMF confirms
+/// the switch and hands the target gNB a fresh **`{NCC, NH}`** pair
+/// (Security Context IE) for vertical key derivation (TS 33.501 §6.9.2.3.3),
+/// acknowledging each switched PDU session.
+pub fn path_switch_request_acknowledge(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    ncc: u8,
+    nh: &[u8; 32],
+    switched_psis: &[u8],
+) -> NGAP_PDU {
+    let security = SecurityContext {
+        next_hop_chaining_count: NextHopChainingCount(ncc),
+        next_hop_nh: SecurityKey(BitVec::<u8, Msb0>::from_slice(nh)),
+        ie_extensions: None,
+    };
+    let list = PDUSessionResourceSwitchedList(
+        switched_psis
+            .iter()
+            .map(|psi| {
+                let transfer = encode_aper(&PathSwitchRequestAcknowledgeTransfer {
+                    ul_ngu_up_tnl_information: None,
+                    security_indication: None,
+                    ie_extensions: None,
+                });
+                PDUSessionResourceSwitchedItem {
+                    pdu_session_id: PDUSessionID(*psi),
+                    path_switch_request_acknowledge_transfer:
+                        PDUSessionResourceSwitchedItemPathSwitchRequestAcknowledgeTransfer(transfer),
+                    ie_extensions: None,
+                }
+            })
+            .collect(),
+    );
+    build_ngap!(SuccessfulOutcome, PathSwitchRequest,
+        REJECT, PathSwitchRequestAcknowledge,
+        IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id)),
+        IGNORE RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id)),
+        REJECT SecurityContext(security),
+        IGNORE PDUSessionResourceSwitchedList(list),
+    )
+}
+
+/// `(ncc, nh, [switched psi])` from a decoded `PathSwitchRequestAcknowledge` — the
+/// gNB side / tests.
+pub fn path_switch_ack_security(pdu: &NGAP_PDU) -> Option<(u8, [u8; 32], Vec<u8>)> {
+    let NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome { value, .. }) = pdu else {
+        return None;
+    };
+    let SuccessfulOutcomeValue::Id_PathSwitchRequest(ack) = value else {
+        return None;
+    };
+    let mut security = None;
+    let mut switched = Vec::new();
+    for ie in &ack.protocol_i_es.0 {
+        match &ie.value {
+            PathSwitchRequestAcknowledgeProtocolIEs_EntryValue::Id_SecurityContext(s) => {
+                let nh = <[u8; 32]>::try_from(s.next_hop_nh.0.as_raw_slice()).ok()?;
+                security = Some((s.next_hop_chaining_count.0, nh));
+            }
+            PathSwitchRequestAcknowledgeProtocolIEs_EntryValue::Id_PDUSessionResourceSwitchedList(
+                list,
+            ) => switched = list.0.iter().map(|i| i.pdu_session_id.0).collect(),
+            _ => {}
+        }
+    }
+    let (ncc, nh) = security?;
+    Some((ncc, nh, switched))
+}
+
 /// Build a `UEContextModificationRequest` (TS 38.413 §9.2.2.7) — the AMF asks the
 /// NG-RAN to update the UE context. Only the two UE-NGAP-IDs are mandatory; the
 /// **Index to RAT/Frequency Selection Priority** (RFSP, TS 23.501 §5.3.4.3, steers
@@ -1365,6 +1522,28 @@ mod release_tests {
         );
         // A plain DownlinkNASTransport has no restriction.
         assert_eq!(area_restriction_from_downlink_nas(&downlink_nas_transport(7, 3, vec![1])), None);
+    }
+
+    #[test]
+    fn path_switch_roundtrips() {
+        // The target gNB's request: new location + the new DL F-TEIDs.
+        let addr = Ipv4Addr::new(10, 0, 9, 2);
+        let pdu = path_switch_request(7, 9, "999", "70", &[0, 0, 2], &[0x20, 0x20], &[(5, 0x77, addr)]);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(
+            path_switch_params(&back),
+            Some((7, 9, Some([0, 0, 2]), vec![(5, 0x77, addr)]))
+        );
+        assert_eq!(path_switch_params(&initial_ue_message_with_nas(1, vec![1])), None);
+
+        // The AMF's acknowledge: the fresh {NCC, NH} pair + the switched sessions.
+        let nh = [0x5au8; 32];
+        let ack = path_switch_request_acknowledge(7, 9, 1, &nh, &[5]);
+        let back = NGAP_PDU::decode(&ack.encode().expect("encode")).expect("decode");
+        assert_eq!(path_switch_ack_security(&back), Some((1, nh, vec![5])));
+        // A request isn't misread as an acknowledge, and vice versa.
+        assert_eq!(path_switch_ack_security(&pdu), None);
+        assert_eq!(path_switch_params(&ack), None);
     }
 
     #[test]
