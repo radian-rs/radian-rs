@@ -597,14 +597,58 @@ struct UeContext {
     pending_config_update: Option<PendingConfigUpdate>,
 }
 
+/// A service area restriction as `(allowed_tacs, non_allowed_tacs)` — the AMF signals
+/// it to the RAN as a Mobility Restriction List.
+type AreaRestriction = (Vec<[u8; 3]>, Vec<[u8; 3]>);
+
 /// A Configuration Update Command awaiting the UE's acknowledgement (see
 /// `UeContext::pending_config_update`).
 #[derive(Debug, Clone)]
 struct PendingConfigUpdate {
     /// The plaintext command, re-protected (fresh NAS COUNT) on each retransmission.
     cuc: Nas5gsMessage,
+    /// The service area restriction that rides the command's DownlinkNASTransport as a
+    /// Mobility Restriction List — re-sent on each retransmission so the RAN keeps
+    /// enforcing it. `None` = no MRL (e.g. an NSSAI command, whose payload is in the
+    /// NAS itself).
+    area_restriction: Option<AreaRestriction>,
     /// Transmissions so far (1 = the initial send); capped at [`T3555_MAX_SENDS`].
     attempts: u8,
+}
+
+/// Build the DownlinkNASTransport carrying a (protected) Configuration Update Command,
+/// attaching the service area as a Mobility Restriction List when the command has one.
+fn config_update_downlink(
+    amf_ue_id: u64,
+    ran_ue_id: u32,
+    cuc_bytes: Vec<u8>,
+    area_restriction: &Option<AreaRestriction>,
+) -> NGAP_PDU {
+    match area_restriction {
+        Some((allowed, not_allowed)) => ngap::downlink_nas_transport_with_area_restriction(
+            amf_ue_id, ran_ue_id, cuc_bytes, PLMN_MCC, PLMN_MNC, allowed, not_allowed,
+        ),
+        None => ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc_bytes),
+    }
+}
+
+/// Protect and send a Configuration Update Command that **requests acknowledgement**,
+/// tracking it for T3555 retransmission (store the plaintext + service area, arm the
+/// timer). Returns the DownlinkNASTransport to send, or `None` if the UE has no NAS
+/// security context.
+fn push_tracked_config_update(
+    ctx: &mut UeContext,
+    amf_ue_id: u64,
+    cuc: Nas5gsMessage,
+    area_restriction: Option<AreaRestriction>,
+    tx: &UnboundedSender<UeCmd>,
+) -> Option<(NGAP_PDU, &'static str)> {
+    let ran_ue_id = ctx.ran_ue_id;
+    let bytes = ctx.sec.as_mut()?.protect(&cuc, nas::sht::INTEGRITY_CIPHERED, 1);
+    let dl = config_update_downlink(amf_ue_id, ran_ue_id, bytes, &area_restriction);
+    ctx.pending_config_update = Some(PendingConfigUpdate { cuc, area_restriction, attempts: 1 });
+    arm_t3555(tx, amf_ue_id);
+    Some((dl, "DownlinkNASTransport (ConfigurationUpdateCommand)"))
 }
 
 /// An AM policy change awaiting a CM-IDLE UE's return (see
@@ -739,7 +783,7 @@ async fn serve_gnb(
                         Vec::new()
                     }
                     UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr, rfsp, area_restriction } => {
-                        on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp, area_restriction)
+                        on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp, area_restriction, &dereg_tx)
                     }
                     UeCmd::UpdateSubscribedData { amf_ue_id, ue_ambr, allowed_nssai } => {
                         on_sdm_data_change(&mut ues, amf_ue_id, ue_ambr, allowed_nssai, &dereg_tx)
@@ -1149,6 +1193,7 @@ fn on_am_policy_update(
     ue_ambr: FieldUpdate<(u64, u64)>,
     rfsp: FieldUpdate<u16>,
     area_restriction: FieldUpdate<(Vec<[u8; 3]>, Vec<[u8; 3]>)>,
+    tx: &UnboundedSender<UeCmd>,
 ) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
         warn!("AM policy update for unknown UE {amf_ue_id}");
@@ -1175,18 +1220,14 @@ fn on_am_policy_update(
         ngap::ue_context_modification_request(amf_ue_id, ran_ue_id, rfsp, effective_ambr),
         "UEContextModificationRequest (RFSP)",
     )];
-    // Tell the UE its configuration changed (Generic UE Configuration Update),
-    // carrying the updated service area restriction (Mobility Restriction List) to
-    // the RAN on the same DownlinkNASTransport when the policy has one.
-    if let Some(sec) = ctx.sec.as_mut() {
-        let cuc = sec.protect(&nas::configuration_update_command(), nas::sht::INTEGRITY_CIPHERED, 1);
-        let cuc_dl = match &area_restriction {
-            Some((allowed, not_allowed)) => ngap::downlink_nas_transport_with_area_restriction(
-                amf_ue_id, ran_ue_id, cuc, PLMN_MCC, PLMN_MNC, allowed, not_allowed,
-            ),
-            None => ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
-        };
-        dl.push((cuc_dl, "DownlinkNASTransport (ConfigurationUpdateCommand)"));
+    // Tell the UE its configuration changed (Generic UE Configuration Update). The
+    // command **requests acknowledgement** (a bare indication IE, no NSSAI) and is
+    // retransmitted under T3555 until the UE's Configuration Update Complete; the
+    // updated service area restriction rides the same DownlinkNASTransport as a
+    // Mobility Restriction List (re-sent on each retransmission).
+    let cuc = nas::configuration_update_command_with_nssai(&[], false, true);
+    if let Some(entry) = push_tracked_config_update(ctx, amf_ue_id, cuc, area_restriction, tx) {
+        dl.push(entry);
     }
     dl
 }
@@ -1279,26 +1320,21 @@ fn on_sdm_data_change(
         // must reply with a Configuration Update Complete, and T3555 retransmits until
         // it does. A plain AMBR nudge needs no ack. A UE with no security context can't
         // be NAS-signalled — skip it (the RAN update still lands).
-        let mut track_cuc = None;
-        if let Some(sec) = ctx.sec.as_mut() {
-            let cuc_msg = if nssai_changed {
-                nas::configuration_update_command_with_nssai(&allowed, narrowed, true)
-            } else {
-                nas::configuration_update_command()
-            };
-            let cuc = sec.protect(&cuc_msg, nas::sht::INTEGRITY_CIPHERED, 1);
+        if nssai_changed {
+            // The NSSAI-carrying command requests acknowledgement (the new slice set is
+            // in the NAS itself, so no Mobility Restriction List) → tracked for T3555
+            // retransmission.
+            let cuc = nas::configuration_update_command_with_nssai(&allowed, narrowed, true);
+            if let Some(entry) = push_tracked_config_update(ctx, amf_ue_id, cuc, None, tx) {
+                dl.push(entry);
+            }
+        } else if let Some(sec) = ctx.sec.as_mut() {
+            // A plain AMBR nudge — the UE just consumes it, no acknowledgement, not tracked.
+            let cuc = sec.protect(&nas::configuration_update_command(), nas::sht::INTEGRITY_CIPHERED, 1);
             dl.push((
                 ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, cuc),
                 "DownlinkNASTransport (ConfigurationUpdateCommand)",
             ));
-            // The NSSAI command awaits acknowledgement → track it for retransmission.
-            if nssai_changed {
-                track_cuc = Some(cuc_msg);
-            }
-        }
-        if let Some(cuc_msg) = track_cuc {
-            ctx.pending_config_update = Some(PendingConfigUpdate { cuc: cuc_msg, attempts: 1 });
-            arm_t3555(tx, amf_ue_id);
         }
         (dl, to_release)
     };
@@ -1482,22 +1518,26 @@ fn on_t3555_expiry(
     let ran_ue_id = ctx.ran_ue_id;
 
     if attempts < T3555_MAX_SENDS {
-        let cuc_msg = ctx.pending_config_update.as_ref().unwrap().cuc.clone();
+        let (cuc_msg, area_restriction) = {
+            let p = ctx.pending_config_update.as_ref().unwrap();
+            (p.cuc.clone(), p.area_restriction.clone())
+        };
         let Some(sec) = ctx.sec.as_mut() else {
             return Vec::new();
         };
         let bytes = sec.protect(&cuc_msg, nas::sht::INTEGRITY_CIPHERED, 1);
-        ctx.pending_config_update = Some(PendingConfigUpdate { cuc: cuc_msg, attempts: attempts + 1 });
+        // Rebuild the DL faithfully — re-attaching the service area (Mobility
+        // Restriction List) so the RAN keeps enforcing it across the retransmission.
+        let dl = config_update_downlink(amf_ue_id, ran_ue_id, bytes, &area_restriction);
+        ctx.pending_config_update =
+            Some(PendingConfigUpdate { cuc: cuc_msg, area_restriction, attempts: attempts + 1 });
         arm_t3555(tx, amf_ue_id);
         warn!(
             "UE {amf_ue_id}: T3555 expired — retransmitting Configuration Update Command \
              (attempt {}/{T3555_MAX_SENDS})",
             attempts + 1
         );
-        return vec![(
-            ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
-            "DownlinkNASTransport (ConfigurationUpdateCommand)",
-        )];
+        return vec![(dl, "DownlinkNASTransport (ConfigurationUpdateCommand)")];
     }
 
     warn!(
@@ -2027,7 +2067,14 @@ async fn on_service_request(
     // policy carries a service area).
     if let Some(p) = pending_am_policy {
         info!("UE {amf_ue_id}: applying the AM policy change held while CM-IDLE");
-        downlinks.extend(on_am_policy_update(ues, amf_ue_id, p.ue_ambr, p.rfsp, p.area_restriction));
+        downlinks.extend(on_am_policy_update(
+            ues,
+            amf_ue_id,
+            p.ue_ambr,
+            p.rfsp,
+            p.area_restriction,
+            dereg_tx,
+        ));
     }
     downlinks
 }
@@ -4106,6 +4153,7 @@ mod tests {
         ctx.rfsp = Some(3);
         let mut ues = HashMap::new();
         ues.insert(1u64, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
 
         // The changed policy also moves the UE to a new service area (allow TAC 000002).
         let dls = on_am_policy_update(
@@ -4114,6 +4162,7 @@ mod tests {
             FieldUpdate::Set((600_000_000, 300_000_000)),
             FieldUpdate::Set(9),
             FieldUpdate::Set((vec![[0, 0, 2]], Vec::new())),
+            &tx,
         );
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
@@ -4148,18 +4197,32 @@ mod tests {
             nas::gmm_message_type(&cuc),
             Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand)
         );
+        // The AM-policy command requests acknowledgement and is tracked for T3555
+        // retransmission (with the service area, so a resend re-attaches the MRL).
+        assert!(nas::configuration_update_acknowledgement_requested(&cuc), "AM-policy CUC requests ack");
+        let pending = ues.get(&1).unwrap().pending_config_update.as_ref().expect("tracked");
+        assert_eq!(pending.area_restriction, Some((vec![[0, 0, 2]], Vec::new())), "MRL retained for resend");
+
         // Clearing the service area falls back to the plain transport (no MRL).
-        let dls = on_am_policy_update(&mut ues, 1, FieldUpdate::Set((1, 1)), FieldUpdate::Clear, FieldUpdate::Clear);
+        let dls = on_am_policy_update(&mut ues, 1, FieldUpdate::Set((1, 1)), FieldUpdate::Clear, FieldUpdate::Clear, &tx);
         assert_eq!(ngap::area_restriction_from_downlink_nas(&dls[1].0), None);
         assert_eq!(ues.get(&1).unwrap().area_restriction, None, "service area cleared");
+        assert_eq!(
+            ues.get(&1).unwrap().pending_config_update.as_ref().unwrap().area_restriction,
+            None,
+            "no MRL tracked after clearing"
+        );
         // Unknown UE → no downlinks.
-        assert!(on_am_policy_update(&mut ues, 999, FieldUpdate::Set((1, 1)), FieldUpdate::Keep, FieldUpdate::Keep).is_empty());
+        assert!(
+            on_am_policy_update(&mut ues, 999, FieldUpdate::Set((1, 1)), FieldUpdate::Keep, FieldUpdate::Keep, &tx)
+                .is_empty()
+        );
     }
 
     /// The PCF removing its UE-AMBR override (an UpdateNotify with no UE-AMBR) falls
     /// the effective UE-AMBR back to the subscribed value and re-signals the RAN.
-    #[test]
-    fn pcf_removing_the_ambr_override_falls_back_to_subscribed() {
+    #[tokio::test]
+    async fn pcf_removing_the_ambr_override_falls_back_to_subscribed() {
         let (ki, ke) = ([0xa1u8; 16], [0xa2u8; 16]);
         let amf_ue_id = 0x81u64;
         let mut ctx = UeContext::new(4, RegState::Registered, Some("imsi-999700000000081".into()));
@@ -4171,12 +4234,13 @@ mod tests {
         assert_eq!(ctx.ue_ambr, Some((5_000_000, 5_000_000)), "override in effect");
         let mut ues = HashMap::new();
         ues.insert(amf_ue_id, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
 
         // The PCF removes the UE-AMBR override (a partial delta that clears only the
         // UE-AMBR — RFSP and service area omitted, so they're kept) → effective falls
         // back to subscribed, signalled to the RAN in a UE Context Modification.
         let dls =
-            on_am_policy_update(&mut ues, amf_ue_id, FieldUpdate::Clear, FieldUpdate::Keep, FieldUpdate::Keep);
+            on_am_policy_update(&mut ues, amf_ue_id, FieldUpdate::Clear, FieldUpdate::Keep, FieldUpdate::Keep, &tx);
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             [
@@ -4195,8 +4259,8 @@ mod tests {
     /// A **partial** UpdateNotify that changes only the RFSP: the omitted UE-AMBR and
     /// service area are kept (not wiped), so the effective UE-AMBR and the Mobility
     /// Restriction List survive the delta.
-    #[test]
-    fn partial_update_notify_keeps_omitted_fields() {
+    #[tokio::test]
+    async fn partial_update_notify_keeps_omitted_fields() {
         let (ki, ke) = ([0xb1u8; 16], [0xb2u8; 16]);
         let amf_ue_id = 0x91u64;
         let mut ctx = UeContext::new(5, RegState::Registered, Some("imsi-999700000000091".into()));
@@ -4208,9 +4272,11 @@ mod tests {
         ctx.area_restriction = Some((vec![[0, 0, 1]], Vec::new()));
         let mut ues = HashMap::new();
         ues.insert(amf_ue_id, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
 
         // Only the RFSP changes (3 → 9); UE-AMBR and service area are omitted (`Keep`).
-        let dls = on_am_policy_update(&mut ues, amf_ue_id, FieldUpdate::Keep, FieldUpdate::Set(9), FieldUpdate::Keep);
+        let dls =
+            on_am_policy_update(&mut ues, amf_ue_id, FieldUpdate::Keep, FieldUpdate::Set(9), FieldUpdate::Keep, &tx);
         let ctx = &ues[&amf_ue_id];
         assert_eq!(ctx.rfsp, Some(9), "RFSP set");
         assert_eq!(ctx.pcf_ue_ambr, Some((5_000_000, 5_000_000)), "UE-AMBR override kept");
@@ -6129,6 +6195,7 @@ mod tests {
         // An outstanding acknowledgement-requested command is awaiting the ack.
         ctx.pending_config_update = Some(PendingConfigUpdate {
             cuc: nas::configuration_update_command_with_nssai(&[(1, None)], false, true),
+            area_restriction: None,
             attempts: 2,
         });
         let mut ues = HashMap::new();
@@ -6162,6 +6229,8 @@ mod tests {
         ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
         ctx.pending_config_update = Some(PendingConfigUpdate {
             cuc: nas::configuration_update_command_with_nssai(&[(1, None), (2, None)], true, true),
+            // A service area rides the command → each retransmission re-attaches the MRL.
+            area_restriction: Some((vec![[0, 0, 5]], Vec::new())),
             attempts: 1, // the initial send already went out
         });
         let mut ues = HashMap::new();
@@ -6182,6 +6251,12 @@ mod tests {
                 vec![(1, None), (2, None)]
             );
             assert!(nas::configuration_update_acknowledgement_requested(&msg));
+            // The service area is re-attached to each retransmission's transport (MRL).
+            assert_eq!(
+                ngap::area_restriction_from_downlink_nas(&dls[0].0),
+                Some((vec![[0, 0, 5]], Vec::new())),
+                "MRL re-sent on the retransmission"
+            );
             assert_eq!(ues[&amf_ue_id].pending_config_update.as_ref().unwrap().attempts, attempt);
         }
         // The cap is reached → the next expiry abandons the procedure (no downlink,
