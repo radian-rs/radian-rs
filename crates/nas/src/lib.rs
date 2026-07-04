@@ -291,10 +291,11 @@ pub fn registration_request_with_guti(
     encode_nas_5gs_message(&msg).expect("encode 5GMM RegistrationRequest (GUTI)")
 }
 
-/// Encode an **Uplink Data Status** IE value (TS 24.501 §9.11.3.57): a bitmap where
-/// bit `n` of the two-octet value marks PDU session `n` as having pending uplink
-/// data (octet 3 = PSI 0–7, octet 4 = PSI 8–15). PSI 0 is spare.
-fn uplink_data_status_value(psis: &[u8]) -> Vec<u8> {
+/// Encode a two-octet **PDU session bitmap** — the shared value format of the
+/// Uplink Data Status (TS 24.501 §9.11.3.57) and PDU Session Status (§9.11.3.44)
+/// IEs: bit `n` marks PDU session `n` (octet 3 = PSI 0–7, octet 4 = PSI 8–15).
+/// PSI 0 is spare.
+fn psi_bitmap_value(psis: &[u8]) -> Vec<u8> {
     let mut bits = [0u8; 2];
     for &psi in psis {
         if psi < 16 {
@@ -304,8 +305,8 @@ fn uplink_data_status_value(psis: &[u8]) -> Vec<u8> {
     bits.to_vec()
 }
 
-/// The PDU session ids set in an **Uplink Data Status** bitmap value (ascending).
-fn psis_from_uplink_data_status(value: &[u8]) -> Vec<u8> {
+/// The PDU session ids set in a two-octet PDU session bitmap value (ascending).
+fn psis_from_psi_bitmap(value: &[u8]) -> Vec<u8> {
     let mut psis = Vec::new();
     for (byte, &b) in value.iter().take(2).enumerate() {
         for bit in 0..8u8 {
@@ -342,7 +343,7 @@ fn registration_request_of_type(
         guti,
     );
     if !uplink_data_psis.is_empty() {
-        reg = reg.set_uplink_data_status(NasUplinkDataStatus::new(uplink_data_status_value(
+        reg = reg.set_uplink_data_status(NasUplinkDataStatus::new(psi_bitmap_value(
             uplink_data_psis,
         )));
     }
@@ -387,8 +388,39 @@ pub fn uplink_data_status_from_registration_request(msg: &Nas5gsMessage) -> Vec<
     };
     reg.uplink_data_status
         .as_ref()
-        .map(|u| psis_from_uplink_data_status(&u.value))
+        .map(|u| psis_from_psi_bitmap(&u.value))
         .unwrap_or_default()
+}
+
+/// The PDU sessions the UE reports as **still active** in its **PDU Session Status**
+/// IE (TS 24.501 §9.11.3.44), from a decoded Service Request or Registration
+/// Request — the AMF releases any session it tracks that the UE has dropped.
+/// `None` when the IE is absent (the UE reported nothing — leave every session
+/// intact); `Some(psis)` (possibly empty) is the authoritative UE view.
+pub fn pdu_session_status_from_request(msg: &Nas5gsMessage) -> Option<Vec<u8>> {
+    let status = match msg {
+        Nas5gsMessage::Gmm(_, Nas5gmmMessage::ServiceRequest(req)) => req.pdu_session_status.as_ref(),
+        Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationRequest(reg)) => {
+            reg.pdu_session_status.as_ref()
+        }
+        _ => return None,
+    };
+    status.map(|s| psis_from_psi_bitmap(&s.value))
+}
+
+/// The PDU sessions the network reports as **active** in a Service Accept's or
+/// Registration Accept's **PDU Session Status** IE (TS 24.501 §9.11.3.44) — the UE
+/// locally releases any session it holds that the network does not list. `None`
+/// when the IE is absent. UE side / tests.
+pub fn pdu_session_status_from_accept(msg: &Nas5gsMessage) -> Option<Vec<u8>> {
+    let status = match msg {
+        Nas5gsMessage::Gmm(_, Nas5gmmMessage::ServiceAccept(acc)) => acc.pdu_session_status.as_ref(),
+        Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationAccept(acc)) => {
+            acc.pdu_session_status.as_ref()
+        }
+        _ => return None,
+    };
+    status.map(|s| psis_from_psi_bitmap(&s.value))
 }
 
 /// The registration type of a decoded Registration Request (TS 24.501 §9.11.3.7) —
@@ -425,6 +457,11 @@ pub fn supi_from_identity_response(msg: &Nas5gsMessage) -> Option<String> {
 /// with the **allowed NSSAI** (IEI 0x15) when the network grants any slices and
 /// the **rejected NSSAI** (IEI 0x11, cause *not available in the current PLMN*)
 /// for requested slices the subscription doesn't cover (design/32, design/33).
+///
+/// `active_pdu_sessions` carries the network's **PDU Session Status** IE
+/// (§9.11.3.44) when `Some` — the sessions the network considers active, so the UE
+/// releases any it holds that are not listed (reconciliation on a registration
+/// update). `None` omits the IE (initial registration — no sessions yet).
 pub fn registration_accept(
     mcc: &str,
     mnc: &str,
@@ -433,6 +470,7 @@ pub fn registration_accept(
     rejected_nssai: &[(u8, Option<[u8; 3]>)],
     t3512_secs: u32,
     registration_area: &[[u8; 3]],
+    active_pdu_sessions: Option<&[u8]>,
 ) -> Nas5gsMessage {
     let guti = NasFGsMobileIdentity::from_guti(&Guti {
         mcc: mcc_digits(mcc),
@@ -466,6 +504,11 @@ pub fn registration_accept(
             rejected_nssai,
             nssai_cause::NOT_AVAILABLE_IN_PLMN,
         )));
+    }
+    // PDU session status (IEI 0x50): the network's authoritative active-session set,
+    // so the UE releases any session it holds that the network dropped.
+    if let Some(active) = active_pdu_sessions {
+        accept = accept.set_pdu_session_status(NasPduSessionStatus::new(psi_bitmap_value(active)));
     }
     Nas5gsMessage::new_5gmm(
         Nas5gmmMessageType::RegistrationAccept,
@@ -601,6 +644,32 @@ pub fn service_request(service_type: u8, ngksi: u8, tmsi: u32) -> Vec<u8> {
     encode_nas_5gs_message(&msg).expect("encode ServiceRequest")
 }
 
+/// A **Service Request** carrying a **PDU Session Status** IE (TS 24.501
+/// §9.11.3.44) listing the PDU sessions the UE still considers active — the AMF
+/// releases any session it tracks that the UE has locally dropped. UE side / tests.
+pub fn service_request_with_pdu_status(
+    service_type: u8,
+    ngksi: u8,
+    tmsi: u32,
+    active_psis: &[u8],
+) -> Vec<u8> {
+    let stmsi = NasFGsMobileIdentity::from_s_tmsi(&STmsi {
+        amf_set_id: 0x001,
+        amf_pointer: 0x00,
+        tmsi,
+    });
+    let req = messages::NasServiceRequest::new(
+        NasKeySetIdentifier::new(((service_type & 0x07) << 4) | (ngksi & 0x07)),
+        stmsi,
+    )
+    .set_pdu_session_status(NasPduSessionStatus::new(psi_bitmap_value(active_psis)));
+    let msg = Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::ServiceRequest,
+        Nas5gmmMessage::ServiceRequest(req),
+    );
+    encode_nas_5gs_message(&msg).expect("encode ServiceRequest (PDU Session Status)")
+}
+
 /// From a decoded **Service Request**, the `(service_type, 5G-TMSI)`. The AMF uses
 /// the 5G-TMSI to find the UE's retained CM-IDLE context.
 pub fn service_request_info(msg: &Nas5gsMessage) -> Option<(u8, u32)> {
@@ -613,12 +682,18 @@ pub fn service_request_info(msg: &Nas5gsMessage) -> Option<(u8, u32)> {
 }
 
 /// Build a 5GMM **Service Accept** (TS 24.501 §8.2.17) — the AMF's answer resuming
-/// the UE's connection. Minimal (no PDU-session status IE): the reactivated PDU
-/// sessions are re-established over N2 alongside it.
-pub fn service_accept() -> Nas5gsMessage {
+/// the UE's connection. `active_pdu_sessions` carries the **PDU Session Status** IE
+/// (§9.11.3.44) when `Some`: the sessions the network kept active, so the UE
+/// releases any it holds that the network dropped. The reactivated sessions are
+/// re-established over N2 alongside it.
+pub fn service_accept(active_pdu_sessions: Option<&[u8]>) -> Nas5gsMessage {
+    let mut accept = messages::NasServiceAccept::new();
+    if let Some(active) = active_pdu_sessions {
+        accept = accept.set_pdu_session_status(NasPduSessionStatus::new(psi_bitmap_value(active)));
+    }
     Nas5gsMessage::new_5gmm(
         Nas5gmmMessageType::ServiceAccept,
-        Nas5gmmMessage::ServiceAccept(messages::NasServiceAccept::new()),
+        Nas5gmmMessage::ServiceAccept(accept),
     )
 }
 
@@ -1440,7 +1515,7 @@ mod tests {
         assert_eq!(service_request_info(&deregistration_accept()), None);
         // Service Accept round-trips.
         assert_eq!(
-            gmm_message_type(&service_accept()),
+            gmm_message_type(&service_accept(None)),
             Some(Nas5gmmMessageType::ServiceAccept)
         );
     }
@@ -1582,7 +1657,7 @@ mod tests {
         let allowed = [(1u8, Some([1u8, 2, 3])), (2, None)];
         let rejected = [(9u8, Some([9u8, 9, 9]))];
         let area = [[0u8, 0, 1], [0, 0, 2]];
-        let msg = registration_accept("999", "70", 0x01020304, &allowed, &rejected, 3240, &area);
+        let msg = registration_accept("999", "70", 0x01020304, &allowed, &rejected, 3240, &area, None);
         let bytes = encode_nas_5gs_message(&msg).unwrap();
         let back = decode_nas_5gs_message(&bytes).unwrap();
         assert_eq!(
@@ -1606,7 +1681,7 @@ mod tests {
         assert_eq!(registration_area_from_registration_accept(&back), Some(area.to_vec()));
 
         // No slices / no registration area → no IEs.
-        let bare = registration_accept("999", "70", 0x01020304, &[], &[], 3240, &[]);
+        let bare = registration_accept("999", "70", 0x01020304, &[], &[], 3240, &[], None);
         let back = decode_nas_5gs_message(&encode_nas_5gs_message(&bare).unwrap()).unwrap();
         assert!(allowed_nssai_from_registration_accept(&back).is_empty());
         assert!(rejected_nssai_from_registration_accept(&back).is_empty());
@@ -1652,11 +1727,35 @@ mod tests {
     #[test]
     fn uplink_data_status_bitmap_encoding() {
         // PSI 5 → octet 3 bit 5 (0x20); PSI 8 → octet 4 bit 0 (0x01).
-        assert_eq!(uplink_data_status_value(&[5, 8]), vec![0x20, 0x01]);
-        assert_eq!(psis_from_uplink_data_status(&[0x20, 0x01]), vec![5, 8]);
+        assert_eq!(psi_bitmap_value(&[5, 8]), vec![0x20, 0x01]);
+        assert_eq!(psis_from_psi_bitmap(&[0x20, 0x01]), vec![5, 8]);
         // Out-of-range PSIs are dropped; an empty set is all-zero.
-        assert_eq!(uplink_data_status_value(&[]), vec![0, 0]);
-        assert!(psis_from_uplink_data_status(&[0, 0]).is_empty());
+        assert_eq!(psi_bitmap_value(&[]), vec![0, 0]);
+        assert!(psis_from_psi_bitmap(&[0, 0]).is_empty());
+    }
+
+    #[test]
+    fn pdu_session_status_reconciliation_ies() {
+        // UE side: a Service Request carrying a PDU Session Status IE round-trips to
+        // the UE's active-session view; a plain Service Request reports nothing.
+        let raw = service_request_with_pdu_status(1, 0, 0x0000_00AB, &[5, 6]);
+        let back = decode_nas_5gs_message(&raw).unwrap();
+        assert_eq!(pdu_session_status_from_request(&back), Some(vec![5, 6]));
+        let plain = decode_nas_5gs_message(&service_request(1, 0, 0x0000_00AB)).unwrap();
+        assert_eq!(pdu_session_status_from_request(&plain), None, "IE absent → no view");
+
+        // Network side: a Service Accept advertising its active set round-trips; the
+        // minimal accept omits the IE.
+        let acc = service_accept(Some(&[5]));
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&acc).unwrap()).unwrap();
+        assert_eq!(pdu_session_status_from_accept(&back), Some(vec![5]));
+        let bare = decode_nas_5gs_message(&encode_nas_5gs_message(&service_accept(None)).unwrap()).unwrap();
+        assert_eq!(pdu_session_status_from_accept(&bare), None);
+
+        // A Registration Accept carries the same IE (reconciliation on a reg update).
+        let reg = registration_accept("999", "70", 1, &[], &[], 3240, &[], Some(&[7]));
+        let back = decode_nas_5gs_message(&encode_nas_5gs_message(&reg).unwrap()).unwrap();
+        assert_eq!(pdu_session_status_from_accept(&back), Some(vec![7]));
     }
 
     #[test]
@@ -1810,7 +1909,7 @@ mod tests {
         );
 
         // Integrity-protected + ciphered Registration Accept, downlink.
-        let accept = registration_accept("999", "70", 0xDEAD_BEEF, &[], &[], 3240, &[]);
+        let accept = registration_accept("999", "70", 0xDEAD_BEEF, &[], &[], 3240, &[], None);
         let protected = amf.protect(&accept, sht::INTEGRITY_CIPHERED, 1);
         let decoded = ue.unprotect(&protected, 1).expect("UE verifies + deciphers Accept");
         assert_eq!(

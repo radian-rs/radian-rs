@@ -1327,6 +1327,33 @@ async fn on_service_request(
     // once the context is back in the association map.
     let pending_am_policy = ctx.pending_am_policy.take();
     let supi = ctx.suci.clone();
+
+    // PDU Session Status reconciliation (TS 24.501 §5.6.1.5 / §5.6.2.4): the UE's
+    // PDU Session Status IE lists the sessions it still holds. Release any session
+    // the AMF tracks that the UE has locally dropped (an absent IE ⇒ the UE
+    // reported nothing ⇒ keep everything). Done before the sm_refs snapshot so both
+    // the reactivation set and the accept's advertised status reflect the
+    // reconciled state.
+    if let Some(ue_active) = decoded.as_ref().and_then(nas::pdu_session_status_from_request) {
+        let dropped: Vec<(u8, (String, String))> = ctx
+            .sm_refs
+            .iter()
+            .filter(|(psi, _)| !ue_active.contains(psi))
+            .map(|(psi, v)| (*psi, v.clone()))
+            .collect();
+        for (psi, (sm_ref, smf_base)) in dropped {
+            ctx.sm_refs.remove(&psi);
+            warn!("UE {amf_ue_id}: PDU session {psi} dropped by the UE (PDU Session Status); releasing at the SMF");
+            if let Err(e) = amf_smf.release_sm_context(&smf_base, &sm_ref).await {
+                warn!("UE {amf_ue_id}: reconcile release for session {psi} failed: {e}");
+            }
+        }
+    }
+    // The network's authoritative active-session set for the accept's PDU Session
+    // Status IE — the reconciled sm_refs, sorted for a stable bitmap.
+    let mut active_psis: Vec<u8> = ctx.sm_refs.keys().copied().collect();
+    active_psis.sort_unstable();
+
     let sm_refs: Vec<(u8, (String, String))> =
         ctx.sm_refs.iter().map(|(psi, v)| (*psi, v.clone())).collect();
     let ue_ambr = ctx.ue_ambr;
@@ -1359,6 +1386,7 @@ async fn on_service_request(
                 &[],
                 T3512_SECS,
                 &registration_area,
+                Some(&active_psis),
             );
             let (ics, dl) = if is_mobility_update {
                 (
@@ -1374,7 +1402,7 @@ async fn on_service_request(
             (s.protect(&accept, nas::sht::INTEGRITY_CIPHERED, 1), ics, dl)
         } else {
             (
-                s.protect(&nas::service_accept(), nas::sht::INTEGRITY_CIPHERED, 1),
+                s.protect(&nas::service_accept(Some(&active_psis)), nas::sht::INTEGRITY_CIPHERED, 1),
                 "InitialContextSetupRequest (ServiceAccept)",
                 "DownlinkNASTransport (ServiceAccept)",
             )
@@ -2970,6 +2998,7 @@ async fn on_security_mode_complete(
         &rejected,
         T3512_SECS,
         &registration_area,
+        None, // initial registration — no PDU sessions to reconcile yet
     );
     // K_gNB from K_AMF and the Security Mode Complete's uplink NAS COUNT
     // (TS 33.501 Annex A.9) — `unprotect` has already advanced ul_count past it.
@@ -5053,6 +5082,104 @@ mod tests {
         UE_DIRECTORY.lock().unwrap().remove(supi);
     }
 
+    /// A resuming UE whose Service Request carries a PDU Session Status IE listing
+    /// only some of its sessions: the AMF releases the sessions the UE dropped, keeps
+    /// (and reactivates) the rest, and advertises its reconciled active set back in
+    /// the Service Accept's PDU Session Status IE.
+    #[tokio::test]
+    async fn service_request_reconciles_dropped_pdu_session() {
+        use axum::http::StatusCode;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Mutex as StdMutex;
+
+        static ACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
+        static RELEASED: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+        async fn mock_modify(
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            if body.get("upCnxState").and_then(|v| v.as_str()) == Some("ACTIVATING") {
+                ACTIVATIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                return (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "upN3Teid": "00000001", "upN3Addr": "127.0.0.1", "ueIpv4Addr": "10.45.0.2"
+                    })),
+                )
+                    .into_response();
+            }
+            StatusCode::OK.into_response()
+        }
+        async fn mock_release(
+            axum::extract::Path(sm_ref): axum::extract::Path<String>,
+        ) -> StatusCode {
+            RELEASED.lock().unwrap().push(sm_ref);
+            StatusCode::NO_CONTENT
+        }
+        let smf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_l.local_addr().unwrap();
+        let smf_router = axum::Router::new()
+            .route(
+                "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify",
+                axum::routing::post(mock_modify),
+            )
+            .route(
+                "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release",
+                axum::routing::post(mock_release),
+            );
+        tokio::spawn(async move { sbi_core::run_on(smf_l, smf_router).await.unwrap() });
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70");
+
+        // A retained CM-IDLE UE with two PDU sessions (5, 6).
+        let (ki, ke) = ([0x55u8; 16], [0x66u8; 16]);
+        let kamf = [0x92u8; 32];
+        let supi = "imsi-999700000000092";
+        let tmsi = 0x0000_0092u32;
+        let mut ctx = UeContext::new(0, RegState::Registered, Some(supi.into()));
+        ctx.cm_state = CmState::Idle;
+        ctx.guti_tmsi = Some(tmsi);
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.kamf = Some(kamf);
+        ctx.sm_refs.insert(5, ("ctx-5".into(), format!("http://{smf_addr}")));
+        ctx.sm_refs.insert(6, ("ctx-6".into(), format!("http://{smf_addr}")));
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+
+        // The UE resumes with a Service Request whose PDU Session Status lists only
+        // session 5 — it has locally released session 6.
+        let mut ue_sec = nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA);
+        let sr = ue_sec.protect(
+            &nas::decode_nas_5gs_message(&nas::service_request_with_pdu_status(1, 0, tmsi, &[5]))
+                .unwrap(),
+            nas::sht::INTEGRITY_CIPHERED,
+            0,
+        );
+        let pdu = ngap::initial_ue_message_with_stmsi(3, tmsi, sr);
+        let init = as_initial_ue(&pdu);
+
+        let mut ues = HashMap::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dls = on_service_request(&mut ues, &amf_smf, init, tmsi, &tx).await;
+
+        // Session 6 (dropped by the UE) is released at the SMF; only session 5 is
+        // reactivated and rides the ICS inline.
+        assert_eq!(RELEASED.lock().unwrap().as_slice(), ["ctx-6".to_string()], "dropped session released");
+        assert_eq!(ACTIVATIONS.load(AtomicOrdering::Relaxed), 1, "only the kept session reactivated");
+        assert_eq!(
+            ngap::initial_context_setup_request_session_ids(&dls[0].0),
+            vec![(5, 1, std::net::Ipv4Addr::new(127, 0, 0, 1))]
+        );
+        let (_id, restored) = ues.iter().next().expect("context restored");
+        assert_eq!(restored.sm_refs.keys().copied().collect::<Vec<_>>(), vec![5], "only session 5 kept");
+
+        // The Service Accept advertises the reconciled active set (5) so the UE drops
+        // anything else it still held.
+        let (_a, _r, ic) = ngap::initial_context_setup_params(&dls[0].0).expect("ICS parses");
+        let accept = ue_sec.unprotect(&ic.nas, 1).expect("UE verifies the Service Accept");
+        assert_eq!(nas::pdu_session_status_from_accept(&accept), Some(vec![5]));
+
+        UE_DIRECTORY.lock().unwrap().remove(supi);
+    }
+
     /// The gNB's InitialContextSetupResponse for an ICS that set up sessions inline
     /// drives UpdateSMContext with each admitted session's gNB DL F-TEID (the
     /// downlink install), and releases each session the gNB rejected
@@ -5777,7 +5904,7 @@ mod tests {
         let allowed = [(1u8, Some([0x01, 0x02, 0x03]))];
         let rejected = [(5u8, None)];
         let dl = amf_sec.protect(
-            &nas::registration_accept("999", "70", 1, &allowed, &rejected, T3512_SECS, &[]),
+            &nas::registration_accept("999", "70", 1, &allowed, &rejected, T3512_SECS, &[], None),
             nas::sht::INTEGRITY_CIPHERED,
             1,
         );
