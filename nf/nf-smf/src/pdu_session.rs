@@ -444,20 +444,21 @@ async fn create_sm_context(
         Some((pcf_base, created)) => {
             tracing::info!(
                 policy_id = %created.policy_id,
-                flows = created.decision.qos_flows.len(),
+                flows = created.decision.pcc_rules.len(),
                 "SM policy from PCF"
             );
             (created.decision, Some((pcf_base, created.policy_id)))
         }
-        None => (
-            sbi_core::npcf::SmPolicyDecision {
+        None => {
+            // The sm-data fallback: no PCF, so build PCC rules + QoS decisions from the
+            // subscribed flat flows (and no charging decisions).
+            let mut decision = sbi_core::npcf::SmPolicyDecision {
                 session_rules: sbi_core::npcf::SmPolicyDecision::session_rules_for(sub.ambr),
-                qos_flows: sub.qos_flows,
-                // The sm-data fallback carries no PCF charging decisions.
-                charging_descs: Default::default(),
-            },
-            None,
-        ),
+                ..Default::default()
+            };
+            decision.set_flows(sub.qos_flows);
+            (decision, None)
+        }
     };
 
     // GFBR admission control (before any N4 state): reserve the session's aggregate
@@ -603,7 +604,7 @@ async fn create_sm_context(
             ue_ipv4_addr: ue_ip,
             s_nssai: sub.snssai,
             session_ambr: decision.session_ambr().cloned(),
-            qos_flows: decision.qos_flows,
+            qos_flows: decision.qos_flows(),
         }),
     ))
 }
@@ -805,7 +806,7 @@ async fn update_sm_context(
                     ue_ipv4_addr: c.ue_ip,
                     s_nssai: c.snssai.clone(),
                     session_ambr: c.policy.session_ambr().cloned(),
-                    qos_flows: c.policy.qos_flows.clone(),
+                    qos_flows: c.policy.qos_flows(),
                 }),
             )
                 .into_response(),
@@ -1263,7 +1264,7 @@ async fn refresh_sm_policy(
     // N2 PDU Session Resource Modify + N1 PDU Session Modification Command).
     // Best-effort, off the response path — only when the QoS actually changed.
     if changed {
-        tracing::info!(%sm_ref, flows = decision.qos_flows.len(), released = ?released_qfis, "SM policy refreshed from PCF (QoS changed)");
+        tracing::info!(%sm_ref, flows = decision.qos_flows().len(), released = ?released_qfis, "SM policy refreshed from PCF (QoS changed)");
         spawn_amf_pdu_modify(smf.nrf_base.clone(), supi, psi, decision.clone(), released_qfis);
     }
     Ok((StatusCode::OK, Json(decision)).into_response())
@@ -1292,7 +1293,7 @@ fn spawn_amf_pdu_modify(
         let body = serde_json::json!({
             "pduSessionId": psi,
             "sessionAmbr": decision.session_ambr(),
-            "qosFlows": decision.qos_flows,
+            "qosFlows": decision.qos_flows(),
             "releasedQfis": released_qfis,
         });
         let url = format!("{amf}/namf-comm/v1/ue-contexts/{supi}/modify");
@@ -1310,7 +1311,7 @@ fn spawn_amf_pdu_modify(
 /// the input to GFBR admission control. A flow whose GFBR strings don't parse
 /// contributes 0 (it can't be admission-checked).
 fn decision_gfbr(decision: &sbi_core::npcf::SmPolicyDecision) -> (u64, u64) {
-    decision.qos_flows.iter().filter_map(|f| f.gbr.as_ref()).fold((0u64, 0u64), |(dl, ul), g| {
+    decision.qos_flows().iter().filter_map(|f| f.gbr.as_ref()).fold((0u64, 0u64), |(dl, ul), g| {
         (
             dl.saturating_add(sbi_core::npcf::bitrate_to_bps(&g.gfbr_dl).unwrap_or(0)),
             ul.saturating_add(sbi_core::npcf::bitrate_to_bps(&g.gfbr_ul).unwrap_or(0)),
@@ -1323,7 +1324,7 @@ fn decision_gfbr(decision: &sbi_core::npcf::SmPolicyDecision) -> (u64, u64) {
 /// AMBR; a flow whose MFBR strings don't parse is skipped.
 fn flow_qers(decision: &sbi_core::npcf::SmPolicyDecision) -> Vec<pfcp::FlowQer> {
     decision
-        .qos_flows
+        .qos_flows()
         .iter()
         .filter_map(|f| {
             let gbr = f.gbr.as_ref()?;
@@ -2120,14 +2121,14 @@ mod tests {
             ref_chg_data: chg.map(String::from),
         };
         // QFI 2 is charged under "chg" (rating group 100); QFI 3 has no charging decision.
-        let decision = SmPolicyDecision {
-            qos_flows: vec![flow(2, Some("chg")), flow(3, None)],
+        let mut decision = SmPolicyDecision {
             charging_descs: std::collections::HashMap::from([(
                 "chg".to_string(),
                 ChargingData { rating_group: 100, metering_method: None, online: None, offline: None },
             )]),
             ..Default::default()
         };
+        decision.set_flows([flow(2, Some("chg")), flow(3, None)]);
         let usage = |urr_id| pfcp::UsageVolume { urr_id, total: 30, uplink: 10, downlink: 20 };
         // The per-flow URR of QFI 2 → the charging decision's rating group (100), not 2.
         assert_eq!(container_for(&usage(pfcp::PER_FLOW_URR_BASE + 2), &decision).rating_group, 100);
@@ -2170,7 +2171,8 @@ mod tests {
         let udr = sbi_core::nudr::UdrClient::new(udr_base.clone());
         let v1 = serde_json::json!({ "default": {
             "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" } } },
-            "qosFlows": [ { "qfi": 1, "fiveQi": 9 } ] } });
+            "pccRules": { "pcc-1": { "qfi": 1, "refQosData": "qos-1" } },
+            "qosDecs": { "qos-1": { "fiveQi": 9 } } } });
         udr.put_sm_policy_data("imsi-999700000000001", &v1).await.unwrap();
         let _pcf = spin_pcf(&nrf_base, Some(&udr_base)).await;
         // A mock AMF records the SMF's Namf_Communication PDU-modify notification.
@@ -2220,13 +2222,17 @@ mod tests {
         // plus a GBR flow (QFI 2) with a classifier.
         let v2 = serde_json::json!({ "default": {
             "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" } } },
-            "qosFlows": [
-                { "qfi": 1, "fiveQi": 9 },
-                { "qfi": 2, "fiveQi": 1, "gbr": {
+            "pccRules": {
+                "pcc-1": { "qfi": 1, "refQosData": "qos-1" },
+                "pcc-2": { "qfi": 2, "refQosData": "qos-2",
+                           "flowInfo": { "protocol": 17, "portLow": 5000, "portHigh": 5010 } }
+            },
+            "qosDecs": {
+                "qos-1": { "fiveQi": 9 },
+                "qos-2": { "fiveQi": 1, "gbr": {
                     "gfbrDl": "10 Mbps", "gfbrUl": "10 Mbps",
-                    "mfbrDl": "20 Mbps", "mfbrUl": "20 Mbps" },
-                  "filter": { "protocol": 17, "portLow": 5000, "portHigh": 5010 } }
-            ] } });
+                    "mfbrDl": "20 Mbps", "mfbrUl": "20 Mbps" } }
+            } } });
         udr.put_sm_policy_data("imsi-999700000000001", &v2).await.unwrap();
 
         // refresh-policy re-authorizes via Npcf Update → the changed decision.
@@ -2242,7 +2248,7 @@ mod tests {
         let updated: sbi_core::npcf::SmPolicyDecision = resp.json().await.unwrap();
         let ambr = updated.session_ambr().unwrap();
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("50 Mbps", "100 Mbps"));
-        assert_eq!(updated.qos_flows.len(), 2, "the mid-session change added a GBR flow");
+        assert_eq!(updated.qos_flows().len(), 2, "the mid-session change added a GBR flow");
         // The change reached the user plane: the SMF re-rated the UPF's QER...
         assert_eq!(
             upf_state.lock().unwrap().ambr_for(1),
@@ -2281,7 +2287,8 @@ mod tests {
         // Second mid-session change: v3 removes the GBR flow (back to non-GBR only).
         let v3 = serde_json::json!({ "default": {
             "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" } } },
-            "qosFlows": [ { "qfi": 1, "fiveQi": 9 } ] } });
+            "pccRules": { "pcc-1": { "qfi": 1, "refQosData": "qos-1" } },
+            "qosDecs": { "qos-1": { "fiveQi": 9 } } } });
         udr.put_sm_policy_data("imsi-999700000000001", &v3).await.unwrap();
         let status = client
             .post(format!(

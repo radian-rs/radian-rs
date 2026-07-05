@@ -146,22 +146,65 @@ pub struct SessionRule {
     pub auth_sess_ambr: Option<SessionAmbrPolicy>,
 }
 
+/// `QosData` (TS 29.512 §5.6.2.8), trimmed — the authorized QoS a PCC rule references
+/// (`refQosData`): 5QI, ARP, and an optional GBR/MBR rate set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QosData {
+    pub five_qi: u8,
+    #[serde(default = "default_arp_priority")]
+    pub arp_priority: u8,
+    #[serde(default)]
+    pub pre_empt_cap: bool,
+    #[serde(default)]
+    pub pre_empt_vuln: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gbr: Option<GbrPolicy>,
+}
+
+/// A `PccRule` (TS 29.512 §5.6.2.6), trimmed — a policy-and-charging-control rule the
+/// SMF binds to a QoS flow (`qfi`): its packet filter (`flowInfos`), precedence, and
+/// references to the QoS (`refQosData` → [`QosData`]) and charging (`refChgData` →
+/// [`ChargingData`]) decisions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PccRule {
+    /// The QoS flow (QFI) this rule is bound to — radian binds one rule per flow.
+    pub qfi: u8,
+    #[serde(default)]
+    pub precedence: u16,
+    /// The rule's packet classifier (`flowInfos`, trimmed to one SDF filter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_info: Option<PacketFilterPolicy>,
+    /// The QoS this rule authorizes (`refQosData` → [`SmPolicyDecision::qos_descs`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_qos_data: Option<String>,
+    /// The charging this rule is metered under (`refChgData` → [`SmPolicyDecision::charging_descs`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_chg_data: Option<String>,
+}
+
 /// `SmPolicyDecision` (TS 29.512 §5.6.2.5), trimmed to the **session rules** (session
-/// AMBR), the authorized QoS flows the SMF acts on, and the charging decisions
-/// (`chgDecs`) those flows are metered under.
+/// AMBR), the **PCC rules** (the authorized flows) with the **QoS** and **charging**
+/// decisions they reference — all keyed maps.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SmPolicyDecision {
     /// Session rules keyed by rule id (TS 29.512 `sessRules`) — the session AMBR lives
-    /// here. Conveyed as a keyed partial map in an Update (present = install/modify,
-    /// `null` = remove, absent = keep). Use [`Self::session_ambr`] to read the effective
-    /// AMBR without knowing the rule ids.
+    /// here. Use [`Self::session_ambr`] to read the effective AMBR.
     #[serde(rename = "sessRules", default, skip_serializing_if = "HashMap::is_empty")]
     pub session_rules: HashMap<String, SessionRule>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub qos_flows: Vec<QosFlowPolicy>,
+    /// PCC rules keyed by rule id (TS 29.512 `pccRules`) — the authorized flows, each
+    /// referencing a QoS decision (`qosDecs`) and optionally a charging one (`chgDecs`).
+    /// Use [`Self::qos_flows`] for the flattened per-flow view the SMF acts on.
+    #[serde(rename = "pccRules", default, skip_serializing_if = "HashMap::is_empty")]
+    pub pcc_rules: HashMap<String, PccRule>,
+    /// QoS decisions keyed by QoS id (TS 29.512 `qosDecs`), referenced by a PCC rule's
+    /// `refQosData`.
+    #[serde(rename = "qosDecs", default, skip_serializing_if = "HashMap::is_empty")]
+    pub qos_descs: HashMap<String, QosData>,
     /// Charging decisions keyed by charging-data id (TS 29.512 `chgDecs`), referenced by
-    /// a flow's [`QosFlowPolicy::ref_chg_data`]. Conveyed as a keyed partial map in an
+    /// a PCC rule's `refChgData`. Each map is conveyed as a keyed partial map in an
     /// Update (present = install/modify, `null` = remove, absent = keep).
     #[serde(rename = "chgDecs", default, skip_serializing_if = "HashMap::is_empty")]
     pub charging_descs: HashMap<String, ChargingData>,
@@ -183,76 +226,109 @@ impl SmPolicyDecision {
         }
     }
 
-    /// The rating group a QoS flow is charged under: the flow's referenced charging
-    /// data ([`QosFlowPolicy::ref_chg_data`] → [`Self::charging_descs`]). `None` when
-    /// the flow (or its reference) isn't found, so the caller keeps its fallback.
+    /// The flattened per-flow view the SMF acts on: each PCC rule resolved against its
+    /// referenced QoS decision, ordered by `(precedence, qfi)` for determinism. A rule
+    /// whose `refQosData` doesn't resolve gets default QoS (5QI 0 / ARP 8, no GBR).
+    pub fn qos_flows(&self) -> Vec<QosFlowPolicy> {
+        let mut rules: Vec<&PccRule> = self.pcc_rules.values().collect();
+        rules.sort_by_key(|r| (r.precedence, r.qfi));
+        rules
+            .into_iter()
+            .map(|r| {
+                let qos = r.ref_qos_data.as_ref().and_then(|id| self.qos_descs.get(id));
+                QosFlowPolicy {
+                    qfi: r.qfi,
+                    five_qi: qos.map(|q| q.five_qi).unwrap_or(0),
+                    arp_priority: qos.map(|q| q.arp_priority).unwrap_or_else(default_arp_priority),
+                    pre_empt_cap: qos.is_some_and(|q| q.pre_empt_cap),
+                    pre_empt_vuln: qos.is_some_and(|q| q.pre_empt_vuln),
+                    gbr: qos.and_then(|q| q.gbr.clone()),
+                    filter: r.flow_info,
+                    ref_chg_data: r.ref_chg_data.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Populate `pcc_rules` + `qos_descs` from a flat list of QoS flows (the sm-data /
+    /// demo bridge): each flow becomes a QoS decision `qos-{qfi}` and a PCC rule
+    /// `pcc-{qfi}` bound to that QFI (precedence = QFI, so the flattened order is stable).
+    pub fn set_flows(&mut self, flows: impl IntoIterator<Item = QosFlowPolicy>) {
+        for f in flows {
+            let qos_id = format!("qos-{}", f.qfi);
+            self.qos_descs.insert(
+                qos_id.clone(),
+                QosData {
+                    five_qi: f.five_qi,
+                    arp_priority: f.arp_priority,
+                    pre_empt_cap: f.pre_empt_cap,
+                    pre_empt_vuln: f.pre_empt_vuln,
+                    gbr: f.gbr,
+                },
+            );
+            self.pcc_rules.insert(
+                format!("pcc-{}", f.qfi),
+                PccRule {
+                    qfi: f.qfi,
+                    precedence: u16::from(f.qfi),
+                    flow_info: f.filter,
+                    ref_qos_data: Some(qos_id),
+                    ref_chg_data: f.ref_chg_data,
+                },
+            );
+        }
+    }
+
+    /// The rating group a QoS flow is charged under: the flow's PCC rule's `refChgData`
+    /// → [`Self::charging_descs`]. `None` when the rule (or its reference) isn't found,
+    /// so the caller keeps its fallback.
     pub fn rating_group_for(&self, qfi: u8) -> Option<u32> {
-        let chg_id = self.qos_flows.iter().find(|f| f.qfi == qfi)?.ref_chg_data.as_ref()?;
+        let chg_id = self.pcc_rules.values().find(|r| r.qfi == qfi)?.ref_chg_data.as_ref()?;
         Some(self.charging_descs.get(chg_id)?.rating_group)
     }
 }
 
 /// A **partial** SM policy decision — the Npcf_SMPolicyControl Update response is a
-/// delta, not a full replacement (TS 29.512 §5.6.2.5): the session AMBR as a
-/// three-way [`FieldUpdate`], and the QoS flows keyed by QFI where a present flow is
-/// installed/modified and a `null` one removed (a QFI absent from the map is kept).
+/// delta, not a full replacement (TS 29.512 §5.6.2.5). Each of the decision's keyed
+/// maps (session rules, PCC rules, QoS decisions, charging decisions) is a partial map:
+/// a present entry is installed/modified, a `null` one removed, an absent one kept.
 /// Built by [`SmPolicyDecision::diff`], merged by [`SmPolicyDecision::apply`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SmPolicyUpdate {
-    /// Session-rule id → `Some(rule)` to install/modify, `null` to remove; ids absent
-    /// from the map are kept unchanged (TS 29.512 `sessRules` partial update).
     #[serde(rename = "sessRules", default, skip_serializing_if = "HashMap::is_empty")]
     pub session_rules: HashMap<String, Option<SessionRule>>,
-    /// QFI → `Some(flow)` to install/modify, `null` to remove; QFIs absent from the
-    /// map are kept unchanged.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub qos_flows: HashMap<u8, Option<QosFlowPolicy>>,
-    /// Charging-data id → `Some(data)` to install/modify, `null` to remove; ids absent
-    /// from the map are kept unchanged (TS 29.512 `chgDecs` partial update).
+    #[serde(rename = "pccRules", default, skip_serializing_if = "HashMap::is_empty")]
+    pub pcc_rules: HashMap<String, Option<PccRule>>,
+    #[serde(rename = "qosDecs", default, skip_serializing_if = "HashMap::is_empty")]
+    pub qos_descs: HashMap<String, Option<QosData>>,
     #[serde(rename = "chgDecs", default, skip_serializing_if = "HashMap::is_empty")]
     pub charging_descs: HashMap<String, Option<ChargingData>>,
 }
 
 impl SmPolicyDecision {
-    /// The partial Update delta from `self` (the previous decision) to `next`: the
-    /// session AMBR as a `FieldUpdate`, plus per-QFI flow changes — a new or changed
-    /// flow as `Some`, a removed one as `None` (JSON `null`); unchanged flows omitted.
-    /// `None` when nothing changed.
+    /// The partial Update delta from `self` (the previous decision) to `next`: for each
+    /// keyed map (session rules, PCC rules, QoS decisions, charging decisions), a new or
+    /// changed entry is present (`Some`), a removed one `null` (`None`), an unchanged one
+    /// omitted. `None` when nothing changed.
     pub fn diff(&self, next: &SmPolicyDecision) -> Option<SmPolicyUpdate> {
-        // Session rules + charging decisions — id-keyed maps: new/changed → install,
-        // removed → `null` (a shared shape via `diff_keyed`).
         let session_rules = diff_keyed(&self.session_rules, &next.session_rules);
+        let pcc_rules = diff_keyed(&self.pcc_rules, &next.pcc_rules);
+        let qos_descs = diff_keyed(&self.qos_descs, &next.qos_descs);
         let charging_descs = diff_keyed(&self.charging_descs, &next.charging_descs);
-        let mut qos_flows = HashMap::new();
-        // New or changed flows → install (Some); unchanged QFIs omitted.
-        for nf in &next.qos_flows {
-            if self.qos_flows.iter().find(|of| of.qfi == nf.qfi) != Some(nf) {
-                qos_flows.insert(nf.qfi, Some(nf.clone()));
-            }
-        }
-        // Flows gone from `next` → remove (None / null).
-        for of in &self.qos_flows {
-            if !next.qos_flows.iter().any(|nf| nf.qfi == of.qfi) {
-                qos_flows.insert(of.qfi, None);
-            }
-        }
-        (!session_rules.is_empty() || !qos_flows.is_empty() || !charging_descs.is_empty())
-            .then_some(SmPolicyUpdate { session_rules, qos_flows, charging_descs })
+        (!session_rules.is_empty()
+            || !pcc_rules.is_empty()
+            || !qos_descs.is_empty()
+            || !charging_descs.is_empty())
+        .then_some(SmPolicyUpdate { session_rules, pcc_rules, qos_descs, charging_descs })
     }
 
-    /// Merge a partial Update onto this decision: for each session-rule id, QFI, and
-    /// charging-data id in the delta, install/replace (`Some`) or remove (`None`) the
-    /// entry. Entries the delta doesn't mention are kept. Flows stay QFI-ordered.
+    /// Merge a partial Update onto this decision: for each id in each keyed map's delta,
+    /// install/replace (`Some`) or remove (`None`) the entry; ids the delta omits are kept.
     pub fn apply(&mut self, update: &SmPolicyUpdate) {
         apply_keyed(&mut self.session_rules, &update.session_rules);
-        for (qfi, change) in &update.qos_flows {
-            self.qos_flows.retain(|f| f.qfi != *qfi);
-            if let Some(flow) = change {
-                self.qos_flows.push(flow.clone());
-            }
-        }
-        self.qos_flows.sort_by_key(|f| f.qfi);
+        apply_keyed(&mut self.pcc_rules, &update.pcc_rules);
+        apply_keyed(&mut self.qos_descs, &update.qos_descs);
         apply_keyed(&mut self.charging_descs, &update.charging_descs);
     }
 }
@@ -319,40 +395,11 @@ impl PolicyConfig {
     /// GBR flow (5QI 1, GFBR 100 Mbps / MFBR 200 Mbps) charged under rating group 100
     /// (via the "chg-voice" charging decision) — for any DNN.
     pub fn demo() -> Self {
-        let decision = SmPolicyDecision {
+        let mut decision = SmPolicyDecision {
             session_rules: SmPolicyDecision::session_rules_for(Some(SessionAmbrPolicy {
                 uplink: "1 Gbps".into(),
                 downlink: "2 Gbps".into(),
             })),
-            qos_flows: vec![
-                QosFlowPolicy {
-                    qfi: 1,
-                    five_qi: 9,
-                    arp_priority: 8,
-                    pre_empt_cap: false,
-                    pre_empt_vuln: false,
-                    gbr: None,
-                    filter: None,
-                    ref_chg_data: None,
-                },
-                QosFlowPolicy {
-                    qfi: 2,
-                    five_qi: 1,
-                    arp_priority: 5,
-                    pre_empt_cap: true,
-                    pre_empt_vuln: false,
-                    gbr: Some(GbrPolicy {
-                        gfbr_dl: "100 Mbps".into(),
-                        gfbr_ul: "100 Mbps".into(),
-                        mfbr_dl: "200 Mbps".into(),
-                        mfbr_ul: "200 Mbps".into(),
-                    }),
-                    // Conversational-voice-style classifier: UDP on ports 5000–5010.
-                    filter: Some(PacketFilterPolicy { protocol: 17, port_low: 5000, port_high: 5010 }),
-                    // Charged under the "chg-voice" decision (rating group 100).
-                    ref_chg_data: Some("chg-voice".into()),
-                },
-            ],
             charging_descs: HashMap::from([(
                 "chg-voice".to_string(),
                 ChargingData {
@@ -362,7 +409,39 @@ impl PolicyConfig {
                     offline: Some(true),
                 },
             )]),
+            ..Default::default()
         };
+        // Two flows via the sm-data bridge (→ pcc-{qfi} rules + qos-{qfi} decisions): a
+        // default non-GBR flow (5QI 9) and a GBR flow (5QI 1) charged under "chg-voice".
+        decision.set_flows([
+            QosFlowPolicy {
+                qfi: 1,
+                five_qi: 9,
+                arp_priority: 8,
+                pre_empt_cap: false,
+                pre_empt_vuln: false,
+                gbr: None,
+                filter: None,
+                ref_chg_data: None,
+            },
+            QosFlowPolicy {
+                qfi: 2,
+                five_qi: 1,
+                arp_priority: 5,
+                pre_empt_cap: true,
+                pre_empt_vuln: false,
+                gbr: Some(GbrPolicy {
+                    gfbr_dl: "100 Mbps".into(),
+                    gfbr_ul: "100 Mbps".into(),
+                    mfbr_dl: "200 Mbps".into(),
+                    mfbr_ul: "200 Mbps".into(),
+                }),
+                // Conversational-voice-style classifier: UDP on ports 5000–5010.
+                filter: Some(PacketFilterPolicy { protocol: 17, port_low: 5000, port_high: 5010 }),
+                // Charged under the "chg-voice" decision (rating group 100).
+                ref_chg_data: Some("chg-voice".into()),
+            },
+        ]);
         Self { per_dnn: HashMap::new(), default: decision }
     }
 
@@ -461,7 +540,7 @@ async fn create_sm_policy(
         supi = %ctx.supi,
         pdu_session_id = ctx.pdu_session_id,
         dnn = %ctx.dnn,
-        flows = decision.qos_flows.len(),
+        flows = decision.pcc_rules.len(),
         "created SM policy association {id}"
     );
     pcf.associations.lock().unwrap().insert(id.clone(), (ctx, decision.clone()));
@@ -489,8 +568,8 @@ async fn update_sm_policy(
     let delta = prev.diff(&fresh).unwrap_or_default();
     tracing::info!(
         %policy_id,
-        flows = fresh.qos_flows.len(),
-        flow_changes = delta.qos_flows.len(),
+        rules = fresh.pcc_rules.len(),
+        rule_changes = delta.pcc_rules.len(),
         "updated SM policy association (partial)"
     );
     // Store the fresh full decision (skip if the association was deleted meanwhile).
@@ -611,9 +690,10 @@ mod tests {
         // The demo decision: 1/2 Gbps AMBR + default (5QI 9) + GBR (5QI 1) flows.
         let ambr = created.decision.session_ambr().unwrap();
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("1 Gbps", "2 Gbps"));
-        assert_eq!(created.decision.qos_flows.len(), 2);
-        assert_eq!((created.decision.qos_flows[0].qfi, created.decision.qos_flows[0].five_qi), (1, 9));
-        assert!(created.decision.qos_flows[1].gbr.is_some(), "second flow is GBR");
+        let flows = created.decision.qos_flows();
+        assert_eq!(flows.len(), 2);
+        assert_eq!((flows[0].qfi, flows[0].five_qi), (1, 9));
+        assert!(flows[1].gbr.is_some(), "second flow is GBR");
         assert_eq!(state.association_count(), 1);
 
         pcf.delete_sm_policy(&created.policy_id).await.expect("deleted");
@@ -622,32 +702,33 @@ mod tests {
 
     #[test]
     fn per_dnn_override_wins_over_default() {
-        let ims = SmPolicyDecision {
+        let mut ims = SmPolicyDecision {
             session_rules: SmPolicyDecision::session_rules_for(Some(SessionAmbrPolicy {
                 uplink: "5 Mbps".into(),
                 downlink: "5 Mbps".into(),
             })),
-            qos_flows: vec![QosFlowPolicy {
-                qfi: 3,
-                five_qi: 5,
-                arp_priority: 1,
-                pre_empt_cap: true,
-                pre_empt_vuln: false,
-                gbr: None,
-                filter: None,
-                ref_chg_data: None,
-            }],
             ..Default::default()
         };
+        ims.set_flows([QosFlowPolicy {
+            qfi: 3,
+            five_qi: 5,
+            arp_priority: 1,
+            pre_empt_cap: true,
+            pre_empt_vuln: false,
+            gbr: None,
+            filter: None,
+            ref_chg_data: None,
+        }]);
         let config = PolicyConfig::demo().with_dnn("ims", ims);
         // The override applies to its DNN...
         let d = config.decide("ims");
-        assert_eq!(d.qos_flows.len(), 1);
-        assert_eq!(d.qos_flows[0].five_qi, 5);
+        assert_eq!(d.qos_flows().len(), 1);
+        assert_eq!(d.qos_flows()[0].five_qi, 5);
         // ...every other DNN gets the default (two flows incl. a GBR one).
         let d = config.decide("internet");
-        assert_eq!(d.qos_flows.len(), 2);
-        assert!(d.qos_flows.iter().any(|f| f.gbr.is_some()));
+        let flows = d.qos_flows();
+        assert_eq!(flows.len(), 2);
+        assert!(flows.iter().any(|f| f.gbr.is_some()));
     }
 
     #[tokio::test]
@@ -665,7 +746,8 @@ mod tests {
         let v1 = serde_json::json!({
             "default": {
                 "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" } } },
-                "qosFlows": [ { "qfi": 1, "fiveQi": 9 } ]
+                "pccRules": { "pcc-1": { "qfi": 1, "refQosData": "qos-1" } },
+                "qosDecs": { "qos-1": { "fiveQi": 9 } }
             }
         });
         udr.put_sm_policy_data("imsi-1", &v1).await.unwrap();
@@ -688,18 +770,22 @@ mod tests {
         let created = pcf.create_sm_policy(&ctx).await.unwrap();
         let ambr = created.decision.session_ambr().unwrap();
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("200 Mbps", "400 Mbps"));
-        assert_eq!(created.decision.qos_flows.len(), 1);
+        assert_eq!(created.decision.qos_flows().len(), 1);
 
         // Mid-session change: reprovision the UDR, then Update re-reads it.
         let v2 = serde_json::json!({
             "default": {
                 "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" } } },
-                "qosFlows": [
-                    { "qfi": 1, "fiveQi": 9 },
-                    { "qfi": 2, "fiveQi": 1, "gbr": {
+                "pccRules": {
+                    "pcc-1": { "qfi": 1, "refQosData": "qos-1" },
+                    "pcc-2": { "qfi": 2, "refQosData": "qos-2" }
+                },
+                "qosDecs": {
+                    "qos-1": { "fiveQi": 9 },
+                    "qos-2": { "fiveQi": 1, "gbr": {
                         "gfbrDl": "10 Mbps", "gfbrUl": "10 Mbps",
                         "mfbrDl": "20 Mbps", "mfbrUl": "20 Mbps" } }
-                ]
+                }
             }
         });
         udr.put_sm_policy_data("imsi-1", &v2).await.unwrap();
@@ -707,21 +793,22 @@ mod tests {
             .update_sm_policy(&created.policy_id, &SmPolicyUpdateContextData::default())
             .await
             .unwrap();
-        // A PARTIAL delta: the session rule's AMBR changed (installed) and only QFI 2
-        // was added; the unchanged QFI 1 is omitted (kept), not restated.
+        // A PARTIAL delta: the session rule's AMBR changed (installed) and only the new
+        // PCC rule + QoS decision (QFI 2) were added; the unchanged QFI 1 is omitted.
         let Some(Some(rule)) = update.session_rules.get("rule-1") else {
             panic!("session rule changed → installed")
         };
         let ambr = rule.auth_sess_ambr.as_ref().unwrap();
         assert_eq!((ambr.uplink.as_str(), ambr.downlink.as_str()), ("50 Mbps", "100 Mbps"));
-        assert_eq!(update.qos_flows.len(), 1, "only the added GBR flow is in the delta");
-        assert!(update.qos_flows.get(&2).unwrap().is_some(), "QFI 2 installed");
-        assert!(!update.qos_flows.contains_key(&1), "unchanged QFI 1 omitted (kept)");
+        assert_eq!(update.pcc_rules.len(), 1, "only the added PCC rule is in the delta");
+        assert!(update.pcc_rules.get("pcc-2").unwrap().is_some(), "pcc-2 installed");
+        assert!(!update.pcc_rules.contains_key("pcc-1"), "unchanged pcc-1 omitted (kept)");
+        assert!(update.qos_descs.get("qos-2").unwrap().is_some(), "qos-2 installed");
 
         // Merging the delta onto the previous decision recovers the full v2 policy.
         let mut merged = created.decision.clone();
         merged.apply(&update);
-        assert_eq!(merged.qos_flows.len(), 2, "merge keeps QFI 1 and installs QFI 2");
+        assert_eq!(merged.qos_flows().len(), 2, "merge keeps QFI 1 and installs QFI 2");
         assert_eq!(merged.session_ambr().unwrap().downlink, "100 Mbps");
 
         // Updating an unknown association → error (404).
@@ -730,19 +817,24 @@ mod tests {
         );
     }
 
-    /// The partial SM Update delta (TS 29.512): `diff` emits only the attributes that
-    /// changed — a new/changed flow as a value, a removed flow as JSON `null`, an
-    /// unchanged flow omitted; `apply` merges the delta back, keeping omitted flows.
+    /// The partial SM Update delta (TS 29.512): `diff` emits only the entries that
+    /// changed across the PCC-rule and QoS-decision maps — a new/changed one as a value,
+    /// a removed one as JSON `null`, an unchanged one omitted; `apply` merges the delta
+    /// back, and the derived `qos_flows()` view reflects the result.
     #[test]
     fn sm_policy_partial_diff_and_apply() {
-        let flow = |qfi, five_qi| QosFlowPolicy {
-            qfi,
+        let qos = |five_qi| QosData {
             five_qi,
             arp_priority: 8,
             pre_empt_cap: false,
             pre_empt_vuln: false,
             gbr: None,
-            filter: None,
+        };
+        let rule = |qfi| PccRule {
+            qfi,
+            precedence: u16::from(qfi),
+            flow_info: None,
+            ref_qos_data: Some(format!("qos-{qfi}")),
             ref_chg_data: None,
         };
         let prev = SmPolicyDecision {
@@ -750,41 +842,47 @@ mod tests {
                 uplink: "1 Gbps".into(),
                 downlink: "2 Gbps".into(),
             })),
-            qos_flows: vec![flow(1, 9), flow(2, 1)],
+            pcc_rules: HashMap::from([("pcc-1".into(), rule(1)), ("pcc-2".into(), rule(2))]),
+            qos_descs: HashMap::from([("qos-1".into(), qos(9)), ("qos-2".into(), qos(1))]),
             ..Default::default()
         };
-        // Next: session rule unchanged, QFI 1 re-rated (5QI 9→6), QFI 2 removed, QFI 3 added.
-        let next = SmPolicyDecision {
-            session_rules: prev.session_rules.clone(),
-            qos_flows: vec![flow(1, 6), flow(3, 5)],
-            ..Default::default()
-        };
+        // Next: session rule unchanged; qos-1 re-rated (5QI 9→6); flow 2 removed; flow 3 added.
+        let mut next = prev.clone();
+        next.qos_descs.insert("qos-1".into(), qos(6));
+        next.pcc_rules.remove("pcc-2");
+        next.qos_descs.remove("qos-2");
+        next.pcc_rules.insert("pcc-3".into(), rule(3));
+        next.qos_descs.insert("qos-3".into(), qos(5));
+
         let delta = prev.diff(&next).expect("something changed");
         assert!(delta.session_rules.is_empty(), "session rule unchanged → omitted");
-        assert_eq!(delta.qos_flows.len(), 3, "QFI 1 (changed), 2 (removed), 3 (added)");
-        assert_eq!(delta.qos_flows.get(&1).unwrap().as_ref().unwrap().five_qi, 6, "QFI 1 re-rated");
-        assert_eq!(*delta.qos_flows.get(&2).unwrap(), None, "QFI 2 removed → null");
-        assert!(delta.qos_flows.get(&3).unwrap().is_some(), "QFI 3 added");
+        // PCC rules: pcc-2 removed (null), pcc-3 added (Some); pcc-1 unchanged (omitted).
+        assert_eq!(delta.pcc_rules.len(), 2);
+        assert_eq!(*delta.pcc_rules.get("pcc-2").unwrap(), None, "pcc-2 removed → null");
+        assert!(delta.pcc_rules.get("pcc-3").unwrap().is_some(), "pcc-3 added");
+        assert!(!delta.pcc_rules.contains_key("pcc-1"), "unchanged pcc-1 omitted");
+        // QoS decisions: qos-1 re-rated (Some), qos-2 removed (null), qos-3 added (Some).
+        assert_eq!(delta.qos_descs.get("qos-1").unwrap().as_ref().unwrap().five_qi, 6, "qos-1 re-rated");
+        assert_eq!(*delta.qos_descs.get("qos-2").unwrap(), None, "qos-2 removed → null");
+        assert!(delta.qos_descs.get("qos-3").unwrap().is_some(), "qos-3 added");
 
-        // On the wire the removal is a JSON null; the unchanged session rule is absent.
+        // On the wire, removals are JSON null; the unchanged session rule is absent.
         let wire = serde_json::to_value(&delta).unwrap();
         assert!(wire.get("sessRules").is_none(), "unchanged session rule omitted");
-        assert!(wire.pointer("/qosFlows/2").unwrap().is_null(), "removed flow is null");
+        assert!(wire.pointer("/pccRules/pcc-2").unwrap().is_null(), "removed PCC rule is null");
+        assert!(wire.pointer("/qosDecs/qos-2").unwrap().is_null(), "removed QoS decision is null");
 
-        // apply merges the delta onto prev → exactly next (QFI-ordered).
+        // apply merges the delta onto prev → exactly next.
         let mut merged = prev.clone();
         merged.apply(&delta);
         assert_eq!(merged, next, "merge reconstructs the next decision");
+        // The derived per-flow view reflects it: QFI 1 (re-rated to 5QI 6) + QFI 3, no QFI 2.
+        let flows = merged.qos_flows();
+        assert_eq!(flows.iter().map(|f| f.qfi).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(flows[0].five_qi, 6, "QFI 1 re-rated via qos-1");
 
         // A no-op update (prev vs prev) → no delta.
         assert_eq!(prev.diff(&prev.clone()), None);
-        // Removing the session rule (clearing the AMBR) → the rule id maps to null.
-        let cleared = SmPolicyDecision { qos_flows: prev.qos_flows.clone(), ..Default::default() };
-        assert_eq!(
-            prev.diff(&cleared).unwrap().session_rules.get("default"),
-            Some(&None),
-            "session rule removed → null"
-        );
     }
 
     /// Charging decisions (`chgDecs`) are a keyed partial map — diff/apply install, modify
@@ -803,25 +901,27 @@ mod tests {
             filter: None,
             ref_chg_data: chg_id.map(String::from),
         };
-        // A flow charged under "chg-a" (rating group 100); an unreferenced "chg-b".
-        let prev = SmPolicyDecision {
-            qos_flows: vec![flow(2, Some("chg-a")), flow(3, None)],
+        // A flow charged under "chg-a" (rating group 100); an unreferenced "chg-b". The
+        // PCC rule bound to QFI 2 carries `refChgData = "chg-a"` (via set_flows).
+        let mut prev = SmPolicyDecision {
             charging_descs: HashMap::from([("chg-a".into(), chg(100)), ("chg-b".into(), chg(200))]),
             ..Default::default()
         };
-        // The flow's rating group resolves via refChgData → chgDecs.
+        prev.set_flows([flow(2, Some("chg-a")), flow(3, None)]);
+        // The flow's rating group resolves via the PCC rule's refChgData → chgDecs.
         assert_eq!(prev.rating_group_for(2), Some(100), "resolved from the charging decision");
         assert_eq!(prev.rating_group_for(3), None, "no refChgData → caller falls back");
         assert_eq!(prev.rating_group_for(9), None, "unknown QFI");
 
-        // Next: re-rate "chg-a" (100→150), remove "chg-b", add "chg-c".
+        // Next: re-rate "chg-a" (100→150), remove "chg-b", add "chg-c" — flows unchanged.
         let next = SmPolicyDecision {
-            qos_flows: prev.qos_flows.clone(),
+            pcc_rules: prev.pcc_rules.clone(),
+            qos_descs: prev.qos_descs.clone(),
             charging_descs: HashMap::from([("chg-a".into(), chg(150)), ("chg-c".into(), chg(300))]),
             ..Default::default()
         };
         let delta = prev.diff(&next).expect("charging changed");
-        assert_eq!(delta.qos_flows.len(), 0, "flows unchanged → omitted");
+        assert!(delta.pcc_rules.is_empty() && delta.qos_descs.is_empty(), "flows unchanged → omitted");
         assert_eq!(delta.charging_descs.len(), 3, "chg-a (changed), chg-b (removed), chg-c (added)");
         assert_eq!(delta.charging_descs.get("chg-a").unwrap().as_ref().unwrap().rating_group, 150);
         assert_eq!(*delta.charging_descs.get("chg-b").unwrap(), None, "removed → null");
@@ -835,6 +935,63 @@ mod tests {
         merged.apply(&delta);
         assert_eq!(merged, next, "merge reconstructs next");
         assert_eq!(merged.rating_group_for(2), Some(150), "re-rated group after merge");
+    }
+
+    /// A PCC rule resolves its referenced QoS decision (`refQosData` → `qosDecs`) and
+    /// charging decision (`refChgData` → `chgDecs`) into the flattened `qos_flows()`
+    /// view the SMF acts on; flows are ordered by precedence; an unresolved reference
+    /// yields default QoS rather than panicking.
+    #[test]
+    fn pcc_rule_resolves_referenced_qos_and_charging() {
+        let mut d = SmPolicyDecision::default();
+        d.qos_descs.insert(
+            "qos-gbr".into(),
+            QosData {
+                five_qi: 1,
+                arp_priority: 5,
+                pre_empt_cap: true,
+                pre_empt_vuln: false,
+                gbr: Some(GbrPolicy {
+                    gfbr_dl: "100 Mbps".into(),
+                    gfbr_ul: "100 Mbps".into(),
+                    mfbr_dl: "200 Mbps".into(),
+                    mfbr_ul: "200 Mbps".into(),
+                }),
+            },
+        );
+        d.charging_descs.insert(
+            "chg".into(),
+            ChargingData { rating_group: 42, metering_method: None, online: None, offline: None },
+        );
+        d.pcc_rules.insert(
+            "pcc-a".into(),
+            PccRule {
+                qfi: 5,
+                precedence: 10,
+                flow_info: Some(PacketFilterPolicy { protocol: 17, port_low: 5000, port_high: 5010 }),
+                ref_qos_data: Some("qos-gbr".into()),
+                ref_chg_data: Some("chg".into()),
+            },
+        );
+        // The derived flow resolves 5QI/ARP/GBR from the QoS decision + the rule's filter.
+        let flows = d.qos_flows();
+        assert_eq!(flows.len(), 1);
+        let f = &flows[0];
+        assert_eq!((f.qfi, f.five_qi, f.arp_priority), (5, 1, 5));
+        assert!(f.pre_empt_cap && f.gbr.is_some(), "pre-emption + GBR from the QoS decision");
+        assert_eq!(f.filter.unwrap().port_low, 5000, "filter from the PCC rule");
+        // The rating group resolves via the rule's refChgData.
+        assert_eq!(d.rating_group_for(5), Some(42));
+
+        // A rule whose refQosData doesn't resolve → default QoS (5QI 0), no panic; flows
+        // are ordered by precedence.
+        d.pcc_rules.insert(
+            "pcc-b".into(),
+            PccRule { qfi: 6, precedence: 20, flow_info: None, ref_qos_data: Some("missing".into()), ref_chg_data: None },
+        );
+        let flows = d.qos_flows();
+        assert_eq!(flows.iter().map(|f| f.qfi).collect::<Vec<_>>(), vec![5, 6], "ordered by precedence");
+        assert_eq!(flows[1].five_qi, 0, "unresolved QoS reference → default 5QI");
     }
 
     /// Session rules (`sessRules`) are a keyed partial map carrying the session AMBR:
