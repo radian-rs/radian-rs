@@ -2171,8 +2171,8 @@ mod tests {
         let udr = sbi_core::nudr::UdrClient::new(udr_base.clone());
         let v1 = serde_json::json!({ "default": {
             "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" } } },
-            "pccRules": { "pcc-1": { "qfi": 1, "refQosData": "qos-1" } },
-            "qosDecs": { "qos-1": { "fiveQi": 9 } } } });
+            "pccRules": { "pcc-1": { "refQosData": "qos-1" } },
+            "qosDecs": { "qos-1": { "qfi": 1, "fiveQi": 9 } } } });
         udr.put_sm_policy_data("imsi-999700000000001", &v1).await.unwrap();
         let _pcf = spin_pcf(&nrf_base, Some(&udr_base)).await;
         // A mock AMF records the SMF's Namf_Communication PDU-modify notification.
@@ -2223,13 +2223,13 @@ mod tests {
         let v2 = serde_json::json!({ "default": {
             "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" } } },
             "pccRules": {
-                "pcc-1": { "qfi": 1, "refQosData": "qos-1" },
-                "pcc-2": { "qfi": 2, "refQosData": "qos-2",
+                "pcc-1": { "refQosData": "qos-1" },
+                "pcc-2": { "refQosData": "qos-2",
                            "flowInfo": { "protocol": 17, "portLow": 5000, "portHigh": 5010 } }
             },
             "qosDecs": {
-                "qos-1": { "fiveQi": 9 },
-                "qos-2": { "fiveQi": 1, "gbr": {
+                "qos-1": { "qfi": 1, "fiveQi": 9 },
+                "qos-2": { "qfi": 2, "fiveQi": 1, "gbr": {
                     "gfbrDl": "10 Mbps", "gfbrUl": "10 Mbps",
                     "mfbrDl": "20 Mbps", "mfbrUl": "20 Mbps" } }
             } } });
@@ -2287,8 +2287,8 @@ mod tests {
         // Second mid-session change: v3 removes the GBR flow (back to non-GBR only).
         let v3 = serde_json::json!({ "default": {
             "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" } } },
-            "pccRules": { "pcc-1": { "qfi": 1, "refQosData": "qos-1" } },
-            "qosDecs": { "qos-1": { "fiveQi": 9 } } } });
+            "pccRules": { "pcc-1": { "refQosData": "qos-1" } },
+            "qosDecs": { "qos-1": { "qfi": 1, "fiveQi": 9 } } } });
         udr.put_sm_policy_data("imsi-999700000000001", &v3).await.unwrap();
         let status = client
             .post(format!(

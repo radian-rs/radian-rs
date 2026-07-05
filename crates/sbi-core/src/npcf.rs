@@ -146,11 +146,15 @@ pub struct SessionRule {
     pub auth_sess_ambr: Option<SessionAmbrPolicy>,
 }
 
-/// `QosData` (TS 29.512 §5.6.2.8), trimmed — the authorized QoS a PCC rule references
-/// (`refQosData`): 5QI, ARP, and an optional GBR/MBR rate set.
+/// `QosData` (TS 29.512 §5.6.2.8), trimmed — the authorized QoS of one **QoS flow**:
+/// its **QFI** (the flow identifier the SMF binds PCC rules to), 5QI, ARP, and an
+/// optional GBR/MBR rate set. Referenced by a PCC rule's `refQosData`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct QosData {
+    /// The QoS flow identifier this decision defines — the QFI PCC rules bind to (the
+    /// result of SMF QoS-flow binding, TS 23.501 §5.7.1.7).
+    pub qfi: u8,
     pub five_qi: u8,
     #[serde(default = "default_arp_priority")]
     pub arp_priority: u8,
@@ -162,21 +166,20 @@ pub struct QosData {
     pub gbr: Option<GbrPolicy>,
 }
 
-/// A `PccRule` (TS 29.512 §5.6.2.6), trimmed — a policy-and-charging-control rule the
-/// SMF binds to a QoS flow (`qfi`): its packet filter (`flowInfos`), precedence, and
-/// references to the QoS (`refQosData` → [`QosData`]) and charging (`refChgData` →
-/// [`ChargingData`]) decisions.
+/// A `PccRule` (TS 29.512 §5.6.2.6), trimmed — a policy-and-charging-control rule: its
+/// packet filter (`flowInfos`), precedence, and references to the QoS
+/// (`refQosData` → [`QosData`]) and charging (`refChgData` → [`ChargingData`])
+/// decisions. The SMF **binds** the rule to a QoS flow via `refQosData` (the QFI is a
+/// property of the referenced [`QosData`], not the rule).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PccRule {
-    /// The QoS flow (QFI) this rule is bound to — radian binds one rule per flow.
-    pub qfi: u8,
     #[serde(default)]
     pub precedence: u16,
     /// The rule's packet classifier (`flowInfos`, trimmed to one SDF filter).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_info: Option<PacketFilterPolicy>,
-    /// The QoS this rule authorizes (`refQosData` → [`SmPolicyDecision::qos_descs`]).
+    /// The QoS flow this rule binds to (`refQosData` → [`SmPolicyDecision::qos_descs`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ref_qos_data: Option<String>,
     /// The charging this rule is metered under (`refChgData` → [`SmPolicyDecision::charging_descs`]).
@@ -226,39 +229,50 @@ impl SmPolicyDecision {
         }
     }
 
-    /// The flattened per-flow view the SMF acts on: each PCC rule resolved against its
-    /// referenced QoS decision, ordered by `(precedence, qfi)` for determinism. A rule
-    /// whose `refQosData` doesn't resolve gets default QoS (5QI 0 / ARP 8, no GBR).
+    /// The flattened per-flow view the SMF acts on — the result of **QoS-flow binding**
+    /// (TS 23.501 §5.7.1.7): the PCC rules are bound to QoS flows by their `refQosData`,
+    /// so rules sharing a QoS decision share one flow (one QFI). Each referenced QoS
+    /// decision becomes one flow, carrying its QFI + QoS and the classifier + charging of
+    /// the **highest-precedence** rule bound to it. Ordered by QFI. A QoS decision no rule
+    /// binds to yields no flow; a rule referencing no/unknown QoS decision binds nothing.
     pub fn qos_flows(&self) -> Vec<QosFlowPolicy> {
-        let mut rules: Vec<&PccRule> = self.pcc_rules.values().collect();
-        rules.sort_by_key(|r| (r.precedence, r.qfi));
-        rules
-            .into_iter()
-            .map(|r| {
-                let qos = r.ref_qos_data.as_ref().and_then(|id| self.qos_descs.get(id));
-                QosFlowPolicy {
-                    qfi: r.qfi,
-                    five_qi: qos.map(|q| q.five_qi).unwrap_or(0),
-                    arp_priority: qos.map(|q| q.arp_priority).unwrap_or_else(default_arp_priority),
-                    pre_empt_cap: qos.is_some_and(|q| q.pre_empt_cap),
-                    pre_empt_vuln: qos.is_some_and(|q| q.pre_empt_vuln),
-                    gbr: qos.and_then(|q| q.gbr.clone()),
-                    filter: r.flow_info,
-                    ref_chg_data: r.ref_chg_data.clone(),
-                }
+        let mut flows: Vec<QosFlowPolicy> = self
+            .qos_descs
+            .iter()
+            .filter_map(|(id, qos)| {
+                // The rule bound to this QoS flow with the highest precedence (lowest
+                // number) provides the flow's SDF filter + charging reference.
+                let rep = self
+                    .pcc_rules
+                    .values()
+                    .filter(|r| r.ref_qos_data.as_deref() == Some(id.as_str()))
+                    .min_by_key(|r| r.precedence)?;
+                Some(QosFlowPolicy {
+                    qfi: qos.qfi,
+                    five_qi: qos.five_qi,
+                    arp_priority: qos.arp_priority,
+                    pre_empt_cap: qos.pre_empt_cap,
+                    pre_empt_vuln: qos.pre_empt_vuln,
+                    gbr: qos.gbr.clone(),
+                    filter: rep.flow_info,
+                    ref_chg_data: rep.ref_chg_data.clone(),
+                })
             })
-            .collect()
+            .collect();
+        flows.sort_by_key(|f| f.qfi);
+        flows
     }
 
     /// Populate `pcc_rules` + `qos_descs` from a flat list of QoS flows (the sm-data /
-    /// demo bridge): each flow becomes a QoS decision `qos-{qfi}` and a PCC rule
-    /// `pcc-{qfi}` bound to that QFI (precedence = QFI, so the flattened order is stable).
+    /// demo bridge): each flow becomes a QoS decision `qos-{qfi}` (carrying the QFI) and a
+    /// PCC rule `pcc-{qfi}` bound to it — one rule per QoS flow.
     pub fn set_flows(&mut self, flows: impl IntoIterator<Item = QosFlowPolicy>) {
         for f in flows {
             let qos_id = format!("qos-{}", f.qfi);
             self.qos_descs.insert(
                 qos_id.clone(),
                 QosData {
+                    qfi: f.qfi,
                     five_qi: f.five_qi,
                     arp_priority: f.arp_priority,
                     pre_empt_cap: f.pre_empt_cap,
@@ -269,7 +283,6 @@ impl SmPolicyDecision {
             self.pcc_rules.insert(
                 format!("pcc-{}", f.qfi),
                 PccRule {
-                    qfi: f.qfi,
                     precedence: u16::from(f.qfi),
                     flow_info: f.filter,
                     ref_qos_data: Some(qos_id),
@@ -279,11 +292,16 @@ impl SmPolicyDecision {
         }
     }
 
-    /// The rating group a QoS flow is charged under: the flow's PCC rule's `refChgData`
-    /// → [`Self::charging_descs`]. `None` when the rule (or its reference) isn't found,
-    /// so the caller keeps its fallback.
+    /// The rating group a QoS flow is charged under: the `refChgData` of a rule bound to
+    /// the QoS decision with this QFI → [`Self::charging_descs`]. `None` when unbound or
+    /// unreferenced, so the caller keeps its fallback.
     pub fn rating_group_for(&self, qfi: u8) -> Option<u32> {
-        let chg_id = self.pcc_rules.values().find(|r| r.qfi == qfi)?.ref_chg_data.as_ref()?;
+        let qos_id = self.qos_descs.iter().find(|(_, q)| q.qfi == qfi).map(|(id, _)| id)?;
+        let chg_id = self
+            .pcc_rules
+            .values()
+            .filter(|r| r.ref_qos_data.as_deref() == Some(qos_id.as_str()))
+            .find_map(|r| r.ref_chg_data.as_ref())?;
         Some(self.charging_descs.get(chg_id)?.rating_group)
     }
 }
@@ -746,8 +764,8 @@ mod tests {
         let v1 = serde_json::json!({
             "default": {
                 "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" } } },
-                "pccRules": { "pcc-1": { "qfi": 1, "refQosData": "qos-1" } },
-                "qosDecs": { "qos-1": { "fiveQi": 9 } }
+                "pccRules": { "pcc-1": { "refQosData": "qos-1" } },
+                "qosDecs": { "qos-1": { "qfi": 1, "fiveQi": 9 } }
             }
         });
         udr.put_sm_policy_data("imsi-1", &v1).await.unwrap();
@@ -777,12 +795,12 @@ mod tests {
             "default": {
                 "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "50 Mbps", "downlink": "100 Mbps" } } },
                 "pccRules": {
-                    "pcc-1": { "qfi": 1, "refQosData": "qos-1" },
-                    "pcc-2": { "qfi": 2, "refQosData": "qos-2" }
+                    "pcc-1": { "refQosData": "qos-1" },
+                    "pcc-2": { "refQosData": "qos-2" }
                 },
                 "qosDecs": {
-                    "qos-1": { "fiveQi": 9 },
-                    "qos-2": { "fiveQi": 1, "gbr": {
+                    "qos-1": { "qfi": 1, "fiveQi": 9 },
+                    "qos-2": { "qfi": 2, "fiveQi": 1, "gbr": {
                         "gfbrDl": "10 Mbps", "gfbrUl": "10 Mbps",
                         "mfbrDl": "20 Mbps", "mfbrUl": "20 Mbps" } }
                 }
@@ -823,15 +841,15 @@ mod tests {
     /// back, and the derived `qos_flows()` view reflects the result.
     #[test]
     fn sm_policy_partial_diff_and_apply() {
-        let qos = |five_qi| QosData {
+        let qos = |qfi: u8, five_qi: u8| QosData {
+            qfi,
             five_qi,
             arp_priority: 8,
             pre_empt_cap: false,
             pre_empt_vuln: false,
             gbr: None,
         };
-        let rule = |qfi| PccRule {
-            qfi,
+        let rule = |qfi: u8| PccRule {
             precedence: u16::from(qfi),
             flow_info: None,
             ref_qos_data: Some(format!("qos-{qfi}")),
@@ -843,16 +861,16 @@ mod tests {
                 downlink: "2 Gbps".into(),
             })),
             pcc_rules: HashMap::from([("pcc-1".into(), rule(1)), ("pcc-2".into(), rule(2))]),
-            qos_descs: HashMap::from([("qos-1".into(), qos(9)), ("qos-2".into(), qos(1))]),
+            qos_descs: HashMap::from([("qos-1".into(), qos(1, 9)), ("qos-2".into(), qos(2, 1))]),
             ..Default::default()
         };
         // Next: session rule unchanged; qos-1 re-rated (5QI 9→6); flow 2 removed; flow 3 added.
         let mut next = prev.clone();
-        next.qos_descs.insert("qos-1".into(), qos(6));
+        next.qos_descs.insert("qos-1".into(), qos(1, 6));
         next.pcc_rules.remove("pcc-2");
         next.qos_descs.remove("qos-2");
         next.pcc_rules.insert("pcc-3".into(), rule(3));
-        next.qos_descs.insert("qos-3".into(), qos(5));
+        next.qos_descs.insert("qos-3".into(), qos(3, 5));
 
         let delta = prev.diff(&next).expect("something changed");
         assert!(delta.session_rules.is_empty(), "session rule unchanged → omitted");
@@ -937,16 +955,18 @@ mod tests {
         assert_eq!(merged.rating_group_for(2), Some(150), "re-rated group after merge");
     }
 
-    /// A PCC rule resolves its referenced QoS decision (`refQosData` → `qosDecs`) and
-    /// charging decision (`refChgData` → `chgDecs`) into the flattened `qos_flows()`
-    /// view the SMF acts on; flows are ordered by precedence; an unresolved reference
-    /// yields default QoS rather than panicking.
+    /// SMF QoS-flow **binding** (TS 23.501 §5.7.1.7): PCC rules are bound to QoS flows by
+    /// their `refQosData`, so rules sharing a QoS decision share one flow (one QFI). The
+    /// flow resolves its QFI/5QI/ARP/GBR from the QoS decision, and its filter + charging
+    /// from the highest-precedence bound rule.
     #[test]
-    fn pcc_rule_resolves_referenced_qos_and_charging() {
+    fn pcc_rules_bind_to_qos_flows() {
         let mut d = SmPolicyDecision::default();
+        // One QoS flow (QFI 5) with GBR.
         d.qos_descs.insert(
             "qos-gbr".into(),
             QosData {
+                qfi: 5,
                 five_qi: 1,
                 arp_priority: 5,
                 pre_empt_cap: true,
@@ -963,35 +983,42 @@ mod tests {
             "chg".into(),
             ChargingData { rating_group: 42, metering_method: None, online: None, offline: None },
         );
+        // TWO PCC rules both binding to that QoS flow (same refQosData) — they bind to one
+        // QFI. The lower-precedence-number rule (pcc-hi) wins the flow's filter + charging.
         d.pcc_rules.insert(
-            "pcc-a".into(),
+            "pcc-hi".into(),
             PccRule {
-                qfi: 5,
                 precedence: 10,
                 flow_info: Some(PacketFilterPolicy { protocol: 17, port_low: 5000, port_high: 5010 }),
                 ref_qos_data: Some("qos-gbr".into()),
                 ref_chg_data: Some("chg".into()),
             },
         );
-        // The derived flow resolves 5QI/ARP/GBR from the QoS decision + the rule's filter.
+        d.pcc_rules.insert(
+            "pcc-lo".into(),
+            PccRule {
+                precedence: 20,
+                flow_info: Some(PacketFilterPolicy { protocol: 6, port_low: 80, port_high: 80 }),
+                ref_qos_data: Some("qos-gbr".into()),
+                ref_chg_data: None,
+            },
+        );
+        // Binding: two rules → ONE QoS flow (QFI 5), not two.
         let flows = d.qos_flows();
-        assert_eq!(flows.len(), 1);
+        assert_eq!(flows.len(), 1, "both rules bound to one QoS flow");
         let f = &flows[0];
-        assert_eq!((f.qfi, f.five_qi, f.arp_priority), (5, 1, 5));
+        assert_eq!((f.qfi, f.five_qi, f.arp_priority), (5, 1, 5), "QFI + QoS from the QoS decision");
         assert!(f.pre_empt_cap && f.gbr.is_some(), "pre-emption + GBR from the QoS decision");
-        assert_eq!(f.filter.unwrap().port_low, 5000, "filter from the PCC rule");
-        // The rating group resolves via the rule's refChgData.
+        assert_eq!(f.filter.unwrap().port_low, 5000, "filter from the highest-precedence rule");
+        // The rating group resolves via a bound rule's refChgData.
         assert_eq!(d.rating_group_for(5), Some(42));
 
-        // A rule whose refQosData doesn't resolve → default QoS (5QI 0), no panic; flows
-        // are ordered by precedence.
-        d.pcc_rules.insert(
-            "pcc-b".into(),
-            PccRule { qfi: 6, precedence: 20, flow_info: None, ref_qos_data: Some("missing".into()), ref_chg_data: None },
-        );
+        // A QoS decision that no rule binds to yields no flow; a rule with an unknown
+        // refQosData binds to nothing — neither produces a flow.
+        d.qos_descs.insert("qos-idle".into(), QosData { qfi: 9, five_qi: 9, arp_priority: 8, pre_empt_cap: false, pre_empt_vuln: false, gbr: None });
+        d.pcc_rules.insert("pcc-dangling".into(), PccRule { precedence: 30, flow_info: None, ref_qos_data: Some("missing".into()), ref_chg_data: None });
         let flows = d.qos_flows();
-        assert_eq!(flows.iter().map(|f| f.qfi).collect::<Vec<_>>(), vec![5, 6], "ordered by precedence");
-        assert_eq!(flows[1].five_qi, 0, "unresolved QoS reference → default 5QI");
+        assert_eq!(flows.iter().map(|f| f.qfi).collect::<Vec<_>>(), vec![5], "unbound QoS + dangling rule → still one flow");
     }
 
     /// Session rules (`sessRules`) are a keyed partial map carrying the session AMBR:
