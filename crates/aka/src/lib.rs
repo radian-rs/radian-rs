@@ -180,6 +180,23 @@ pub fn ue_authenticate(
     Ok((res_star, av.kausf))
 }
 
+/// UE/USIM side: verify AUTN and recover the network's **SQN** from it
+/// (`SQN = AUTN[0..6] ⊕ AK`, TS 33.102 §6.3.3). `None` when MAC-A doesn't verify.
+/// A USIM compares this against its stored SQN to decide whether the challenge is
+/// fresh or a synchronisation failure (→ [`compute_auts`]). Used by tests / a UE sim.
+pub fn ue_recover_sqn(
+    sub: &SubscriberKey,
+    rand: &[u8; 16],
+    autn: &[u8; 16],
+) -> Option<[u8; 6]> {
+    let mut m = Milenage::new_with_opc(sub.k, sub.opc);
+    let (_res, _ck, _ik, ak) = m.f2345(rand);
+    let sqn = xor6(&autn[..6], &ak);
+    let amf: [u8; 2] = autn[6..8].try_into().ok()?;
+    let mac_a = m.f1(rand, &sqn, &amf);
+    (mac_a[..] == autn[8..16]).then_some(sqn)
+}
+
 /// UE side: verify AUTN and compute RES* (TS 33.501). Used by tests / a UE simulator.
 pub fn ue_compute_res_star(
     sub: &SubscriberKey,
@@ -312,6 +329,20 @@ mod tests {
         let mut av = generate_5g_he_av(&sub, &sqn, &rand, "999", "70").unwrap();
         av.autn[15] ^= 0xff; // corrupt MAC-A
         assert!(ue_compute_res_star(&sub, &av.rand, &av.autn, "999", "70").is_err());
+    }
+
+    /// The UE recovers the exact SQN the network put in AUTN, and rejects a
+    /// tampered AUTN (so a USIM can tell a fresh challenge from a synch failure).
+    #[test]
+    fn ue_recovers_the_network_sqn() {
+        let sub = test_subscriber();
+        let sqn = hex!("000000010000");
+        let rand = hex!("23553cbe9637a89d218ae64dae47bf35");
+        let av = generate_5g_he_av(&sub, &sqn, &rand, "999", "70").unwrap();
+        assert_eq!(ue_recover_sqn(&sub, &av.rand, &av.autn), Some(sqn));
+        let mut bad = av.autn;
+        bad[15] ^= 0x01;
+        assert_eq!(ue_recover_sqn(&sub, &av.rand, &bad), None, "MAC-A mismatch");
     }
 
     /// The UE-side authenticate derives the SAME K_AUSF the network's vector

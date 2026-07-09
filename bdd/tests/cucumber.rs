@@ -409,7 +409,11 @@ async fn amf_challenges(world: &mut World) {
 #[when("the scripted UE answers the challenge with RES*")]
 async fn ue_answers_challenge(world: &mut World) {
     let challenge = world.pending_nas.take().expect("a pending Authentication Request");
-    let response = world.ue.as_mut().expect("UE").authenticate(&challenge).expect("the USIM answers");
+    let reply = world.ue.as_mut().expect("UE").authenticate(&challenge).expect("the USIM answers");
+    let response = match reply {
+        ran::ChallengeReply::Response(bytes) => bytes,
+        ran::ChallengeReply::SynchFailure(_) => panic!("the USIM unexpectedly failed synchronisation"),
+    };
     let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
     let gnb = world.gnb.as_ref().expect("gNB connected");
     gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, response))
@@ -526,6 +530,89 @@ async fn amf_nudges_config_update(world: &mut World) {
         nas::gmm_message_type(&msg),
         Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand)
     );
+}
+
+/// Parse a slice spec like `"1:010203,2"` into `(sst, optional 3-byte SD)` pairs.
+fn parse_slices(spec: &str) -> Vec<(u8, Option<[u8; 3]>)> {
+    spec.split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| match s.split_once(':') {
+            Some((sst, sd)) => {
+                let b: Vec<u8> = (0..6).step_by(2).map(|i| u8::from_str_radix(&sd[i..i + 2], 16).unwrap()).collect();
+                (sst.parse().unwrap(), Some([b[0], b[1], b[2]]))
+            }
+            None => (s.parse().unwrap(), None),
+        })
+        .collect()
+}
+
+#[when(regex = r#"^the scripted UE sends its registration request requesting slices "([^"]+)"$"#)]
+async fn scripted_ue_registers_requesting(world: &mut World, spec: String) {
+    let (gnb, ue) = (world.gnb.as_ref().expect("gNB connected"), world.ue.as_ref().expect("UE"));
+    let msg = ngap::initial_ue_message_with_nas_at(
+        SCRIPTED_RAN_UE_ID,
+        ue.registration_request_requesting(&parse_slices(&spec)),
+        "999",
+        "70",
+        &[0, 0, 1],
+    );
+    gnb.send(&msg).await.expect("send InitialUEMessage");
+}
+
+#[when("the scripted UE's USIM is ahead of the network")]
+async fn ue_usim_ahead(world: &mut World) {
+    // A large stored SQN so the network's next challenge is guaranteed stale,
+    // forcing the synchronisation-failure / AUTS resync path.
+    world.ue.as_mut().expect("UE").set_sqn_ms([0x00, 0x00, 0x00, 0x10, 0x00, 0x00]);
+}
+
+#[when("the scripted UE rejects the stale challenge with an AUTS")]
+async fn ue_rejects_stale_challenge(world: &mut World) {
+    let challenge = world.pending_nas.take().expect("a pending Authentication Request");
+    let reply = world.ue.as_mut().expect("UE").authenticate(&challenge).expect("the USIM answers");
+    let auts = match reply {
+        ran::ChallengeReply::SynchFailure(bytes) => bytes,
+        ran::ChallengeReply::Response(_) => panic!("the USIM accepted a stale challenge"),
+    };
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, auts))
+        .await
+        .expect("send AuthenticationFailure (synch)");
+}
+
+#[then(regex = r#"^the AMF rejects the registration with 5GMM cause (\d+) and a back-off timer$"#)]
+async fn amf_rejects_registration(world: &mut World, cause: u8) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let (amf_ue_id, bytes) = gnb.recv_downlink_nas().await.expect("the reject downlink");
+    assert_eq!(Some(amf_ue_id), world.amf_ue_id);
+    let msg = world.ue.as_mut().expect("UE").read_downlink(&bytes).expect("the reject verifies");
+    let (got_cause, rejected, t3346) =
+        nas::parse_registration_reject(&msg).expect("a Registration Reject");
+    assert_eq!(got_cause, cause, "5GMM reject cause");
+    assert!(!rejected.is_empty(), "the reject carries the rejected NSSAI");
+    assert!(t3346.is_some(), "the reject carries a T3346 back-off timer");
+    // The gNB is then told to release the UE context.
+    let pdu = gnb.recv().await.expect("the release command");
+    assert!(
+        ngap::parse_ue_context_release_command(&pdu).is_some(),
+        "expected a UEContextReleaseCommand after the reject"
+    );
+}
+
+#[then(regex = r#"^the accept allows slice "([^"]+)" and rejects slice "([^"]+)"$"#)]
+async fn accept_allows_and_rejects(world: &mut World, allowed_spec: String, rejected_spec: String) {
+    let accept = world.pending_nas.take().expect("the ICS NAS PDU");
+    let msg = world.ue.as_mut().expect("UE").read_downlink(&accept).expect("the accept verifies");
+    assert_eq!(nas::gmm_message_type(&msg), Some(nas::Nas5gmmMessageType::RegistrationAccept));
+    assert_eq!(
+        nas::allowed_nssai_from_registration_accept(&msg),
+        parse_slices(&allowed_spec),
+        "the allowed NSSAI is the requested ∩ subscribed"
+    );
+    let rejected: Vec<(u8, Option<[u8; 3]>)> =
+        nas::rejected_nssai_from_registration_accept(&msg).into_iter().map(|(s, _cause)| s).collect();
+    assert_eq!(rejected, parse_slices(&rejected_spec), "the unsubscribed slice is rejected");
 }
 
 #[then(regex = r#"^the "([a-z]+)" log should contain "([^"]+)"$"#)]
