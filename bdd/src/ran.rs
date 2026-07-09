@@ -262,6 +262,32 @@ impl ScriptedUe {
         Ok((nea, nia, replayed, complete))
     }
 
+    /// A NAS-protected **UL NAS Transport** carrying a PDU Session Establishment
+    /// Request for `psi` (PTI 1) — the UE asks the network for a PDU session.
+    pub fn pdu_session_request(&mut self, psi: u8) -> Result<Vec<u8>> {
+        let container = nas::pdu_session_establishment_request(psi, 1);
+        let transport = nas::ul_nas_transport_sm(psi, container, None, None);
+        let inner = nas::decode_nas_5gs_message(&transport).context("encode UL NAS Transport")?;
+        self.protected_uplink(&inner)
+    }
+
+    /// Read a **PDU Session Establishment Accept** the network relayed (the NAS-PDU
+    /// inside the N2 setup, a protected DL NAS Transport): returns
+    /// `(psi, assigned UE IPv4)`. Errors if it is not an accept for a session.
+    pub fn read_pdu_session_accept(&mut self, dl_nas: &[u8]) -> Result<(u8, std::net::Ipv4Addr)> {
+        let msg = self.read_downlink(dl_nas)?;
+        let (psi, container) =
+            nas::sm_container_from_dl_nas_transport(&msg).context("no SM container in the DL NAS")?;
+        anyhow::ensure!(
+            container.get(3) == Some(&0xc2),
+            "the SM container is not a PDU Session Establishment Accept (got type {:#x?})",
+            container.get(3)
+        );
+        let ip = nas::ue_ipv4_from_establishment_accept(&container)
+            .context("the accept carries no IPv4 PDU address")?;
+        Ok((psi, ip))
+    }
+
     /// Answer with a deliberately **wrong** RES* — the AUSF's confirmation must
     /// reject it (RES\* ≠ XRES\*). Drives the authentication-not-accepted path.
     pub fn wrong_challenge_response(&self, auth_req: &[u8]) -> Result<Vec<u8>> {

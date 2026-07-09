@@ -41,6 +41,8 @@ struct World {
     amf_ue_id: Option<u64>,
     /// The last downlink NAS the gNB received, awaiting the UE's handling.
     pending_nas: Option<Vec<u8>>,
+    /// The PDU session id the scripted UE established.
+    pdu_psi: Option<u8>,
 }
 
 impl World {
@@ -529,6 +531,66 @@ async fn amf_nudges_config_update(world: &mut World) {
     assert_eq!(
         nas::gmm_message_type(&msg),
         Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand)
+    );
+}
+
+/// The scripted gNB's DL N3 F-TEID reported in the setup response (control-plane
+/// slice — no GTP-U flows on it yet). Loopback, since the core runs on the host.
+const SCRIPTED_GNB_DL_TEID: u32 = 0x2001;
+
+#[when("the scripted UE requests a PDU session")]
+async fn ue_requests_pdu_session(world: &mut World) {
+    let psi = 1u8;
+    let request = world.ue.as_mut().expect("UE").pdu_session_request(psi).expect("build the request");
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, request))
+        .await
+        .expect("send UL NAS Transport (PDU session request)");
+    world.pdu_psi = Some(psi);
+}
+
+#[then("the AMF sets up the PDU session at the gNB")]
+async fn amf_sets_up_pdu_session(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let pdu = gnb.recv().await.expect("the PDU session resource setup");
+    let (amf_ue_id, ran_ue_id, sessions) =
+        ngap::pdu_session_resource_setup_request_params(&pdu).expect("a PDUSessionResourceSetupRequest");
+    assert_eq!(Some(amf_ue_id), world.amf_ue_id);
+    assert_eq!(ran_ue_id, SCRIPTED_RAN_UE_ID);
+    let (psi, upf_teid, _upf_addr, nas) = sessions.into_iter().next().expect("one PDU session");
+    assert_eq!(Some(psi), world.pdu_psi);
+    assert_ne!(upf_teid, 0, "the UPF allocated a non-zero uplink N3 F-TEID");
+    // The gNB accepts the session, reporting its own DL F-TEID (→ the AMF installs
+    // the downlink at the UPF via UpdateSMContext).
+    gnb.send(&ngap::pdu_session_resource_setup_response(
+        amf_ue_id,
+        ran_ue_id,
+        psi,
+        1, // QFI of the default non-GBR flow
+        SCRIPTED_GNB_DL_TEID,
+        Ipv4Addr::LOCALHOST,
+    ))
+    .await
+    .expect("send PDUSessionResourceSetupResponse");
+    // Hold the relayed NAS-PDU (the accept) for the UE to read.
+    world.pending_nas = Some(nas);
+}
+
+#[then(regex = r#"^the UE is assigned an IP address in "([^"]+)"$"#)]
+async fn ue_assigned_ip(world: &mut World, subnet: String) {
+    let accept = world.pending_nas.take().expect("the relayed accept NAS");
+    let (psi, ip) = world.ue.as_mut().expect("UE").read_pdu_session_accept(&accept).expect("read accept");
+    assert_eq!(Some(psi), world.pdu_psi);
+    // Assert the assigned address falls in the DN pool (e.g. "10.45.0.0/16").
+    let (net, prefix) = subnet.split_once('/').expect("subnet in CIDR form");
+    let base: Ipv4Addr = net.parse().expect("valid subnet base");
+    let bits: u32 = prefix.parse().expect("valid prefix length");
+    let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+    assert_eq!(
+        u32::from(ip) & mask,
+        u32::from(base) & mask,
+        "assigned UE IP {ip} is not in {subnet}"
     );
 }
 
