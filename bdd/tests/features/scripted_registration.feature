@@ -82,6 +82,25 @@ Feature: Scripted gNB/UE — full 5G-AKA registration against the live core
     Then the AMF sets up the PDU session at the gNB
     And the UE is assigned an IP address in "10.45.0.0/16"
 
+  Scenario: A UE goes CM-IDLE and resumes with a Service Request (116d)
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the scripted UE sends its registration request from TAC "000001"
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with RES*
+    Then the AMF selects NEA2/NIA2 in a security mode command
+    When the scripted UE completes the security mode procedure
+    Then the AMF sets up the initial context carrying the registration accept
+    When the gNB confirms the context and the UE completes the registration
+    Then the AMF nudges the registered UE with a configuration update
+    When the scripted UE requests a PDU session
+    Then the AMF sets up the PDU session at the gNB
+    And the UE is assigned an IP address in "10.45.0.0/16"
+    When the gNB releases the UE context via AN release
+    And the scripted UE resumes with a Service Request
+    Then the AMF re-establishes the context and reactivates the session
+    And the UE reads the service accept
+
   Scenario: Teardown topology
     Given the scripted core is running
     When I stop the radian core
