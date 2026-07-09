@@ -121,8 +121,15 @@ static ADVERTISE_ADDR: LazyLock<String> = LazyLock::new(|| {
 /// T3522 (TS 24.501 §10.2): the Deregistration Request (UE terminated) is
 /// retransmitted on each expiry, up to [`T3522_MAX_SENDS`] total transmissions,
 /// then the procedure is aborted and the contexts released anyway (§5.5.2.3.4).
+/// Override with `RADIAN_AMF_T3522_SECS` (the BDD suite shrinks it).
 const T3522_SECS: u64 = 6;
+const T3522_ENV: &str = "RADIAN_AMF_T3522_SECS";
 const T3522_MAX_SENDS: u8 = 5; // initial + 4 retransmissions
+
+/// The effective T3522 interval: the env override, else [`T3522_SECS`].
+fn t3522_secs() -> u64 {
+    std::env::var(T3522_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(T3522_SECS)
+}
 
 /// A command delivered to a gNB association's per-UE control channel (from the SBI
 /// callback surface into the association task that owns the NAS security context).
@@ -764,9 +771,9 @@ async fn serve_gnb(
             Some(cmd) = dereg_rx.recv() => {
                 let downlinks = match cmd {
                     UeCmd::Start(id) => {
-                        on_network_deregistration(&mut ues, &amf_smf, id, &dereg_tx, T3522_SECS).await
+                        on_network_deregistration(&mut ues, &amf_smf, id, &dereg_tx, t3522_secs()).await
                     }
-                    UeCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, T3522_SECS),
+                    UeCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, t3522_secs()),
                     UeCmd::T3555Expiry(id) => on_t3555_expiry(&mut ues, id, &dereg_tx),
                     UeCmd::ModifyPolicy(m) => on_network_modification(&mut ues, &m),
                     UeCmd::ReleaseSession { amf_ue_id, psis, cause } => {

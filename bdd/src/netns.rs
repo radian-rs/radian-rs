@@ -149,6 +149,38 @@ pub async fn spawn_host_env(
     c.spawn().with_context(|| format!("spawn host process {cmd}"))
 }
 
+/// Spawn a **host** process like [`spawn_host_env`], but with stdout+stderr captured to
+/// `log` (truncated first) — scenario steps then assert on the NF's log output.
+pub async fn spawn_host_env_logged(
+    root: bool,
+    env: &[(&str, &str)],
+    cmd: &str,
+    args: &[&str],
+    log: &std::path::Path,
+) -> Result<tokio::process::Child> {
+    let out = std::fs::File::create(log).with_context(|| format!("create log {}", log.display()))?;
+    let err = out.try_clone().context("clone log handle")?;
+    let mut c = if root {
+        let mut c = Command::new("sudo");
+        c.arg("env");
+        c
+    } else {
+        Command::new("env")
+    };
+    for (k, v) in env {
+        c.arg(format!("{k}={v}"));
+    }
+    c.arg(cmd).args(args);
+    c.stdout(Stdio::from(out)).stderr(Stdio::from(err));
+    c.spawn().with_context(|| format!("spawn host process {cmd}"))
+}
+
+/// Whether the captured log at `path` currently contains `needle` (a missing or
+/// unreadable file reads as "not yet").
+pub fn log_contains(path: &std::path::Path, needle: &str) -> bool {
+    std::fs::read_to_string(path).map(|s| s.contains(needle)).unwrap_or(false)
+}
+
 /// Wire a veth pair between two namespaces, assigning `/24` addresses and bringing both ends
 /// up. Used for the RAN↔UE link (both ends live inside namespaces).
 pub async fn connect_netns_pair(

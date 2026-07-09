@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bdd::{datapath, netns};
+use bdd::{datapath, netns, ran};
 use cucumber::{given, then, when, World as CucumberWorld};
 use tokio::time::{sleep, Instant};
 
@@ -35,6 +35,12 @@ struct World {
     ping_ok: bool,
     // e2e (simulator) state — spawned processes kept owned for the scenario's lifetime
     procs: Vec<tokio::process::Child>,
+    // scripted gNB/UE state (design/116 Tier B)
+    gnb: Option<ran::ScriptedGnb>,
+    ue: Option<ran::ScriptedUe>,
+    amf_ue_id: Option<u64>,
+    /// The last downlink NAS the gNB received, awaiting the UE's handling.
+    pending_nas: Option<Vec<u8>>,
 }
 
 impl World {
@@ -207,43 +213,53 @@ async fn start_core(world: &mut World) {
     let nrf = "http://127.0.0.1:8000";
     let db = format!("/tmp/{}_udr.redb", world.feature_tag);
     let _ = std::fs::remove_file(&db);
+    let tag = world.feature_tag.clone();
 
     // NRF first — the UDR, UDM, AUSF and SMF register with it on startup.
-    world.procs.push(spawn_core(false, &[], "nrf").await);
+    world.procs.push(spawn_core(&tag, false, &[], "nrf").await);
     assert!(wait_until(5, || netns::host_port_listening(8000, "tcp")).await, "NRF SBI not up");
 
     // UDR owns the subscriber store; the UDM is a stateless Nudr front-end.
     world.procs.push(
-        spawn_core(false, &[("RADIAN_UDR_PROVISION_DEMO", "1"), ("RADIAN_UDR_DB", &db), ("RADIAN_UDR_MASTER_KEY", UDR_KEK)], "udr").await,
+        spawn_core(&tag, false, &[("RADIAN_UDR_PROVISION_DEMO", "1"), ("RADIAN_UDR_DB", &db), ("RADIAN_UDR_MASTER_KEY", UDR_KEK)], "udr").await,
     );
-    world.procs.push(spawn_core(false, &[], "udm").await);
-    world.procs.push(spawn_core(false, &[("RADIAN_AUSF_NRF", nrf)], "ausf").await);
+    world.procs.push(spawn_core(&tag, false, &[], "udm").await);
+    world.procs.push(spawn_core(&tag, false, &[("RADIAN_AUSF_NRF", nrf)], "ausf").await);
     // PCF serves Npcf_SMPolicyControl; the SMF discovers it for the SM policy.
-    world.procs.push(spawn_core(false, &[("RADIAN_PCF_NRF", nrf)], "pcf").await);
+    world.procs.push(spawn_core(&tag, false, &[("RADIAN_PCF_NRF", nrf)], "pcf").await);
     // CHF serves Nchf_ConvergedCharging; the SMF opens a charging session per PDU session.
-    world.procs.push(spawn_core(false, &[("RADIAN_CHF_NRF", nrf)], "chf").await);
+    world.procs.push(spawn_core(&tag, false, &[("RADIAN_CHF_NRF", nrf)], "chf").await);
     // UPF needs CAP_NET_ADMIN for its N6 TUN → run under sudo; advertise the host N3 address.
-    world.procs.push(spawn_core(true, &[("RADIAN_UPF_N3_ADDR", &HOST_IP.to_string())], "upf").await);
+    world.procs.push(spawn_core(&tag, true, &[("RADIAN_UPF_N3_ADDR", &HOST_IP.to_string())], "upf").await);
     assert!(wait_until(6, || netns::host_iface_exists("n6upf0")).await, "UPF N6 TUN did not come up");
 
     world.procs.push(
-        spawn_core(false, &[("RADIAN_SMF_UPF_N4", "127.0.0.1:8805"), ("RADIAN_SMF_NRF", nrf)], "smf").await,
+        spawn_core(&tag, false, &[("RADIAN_SMF_UPF_N4", "127.0.0.1:8805"), ("RADIAN_SMF_NRF", nrf)], "smf").await,
     );
-    world.procs.push(spawn_core(false, &[], "amf").await);
+    world.procs.push(spawn_core(&tag, false, &[], "amf").await);
     let ready = wait_until(6, || async {
         netns::host_port_listening(8002, "tcp").await // SMF (registered before serving)
             && netns::host_port_listening(8003, "tcp").await // AUSF
+            && netns::host_port_listening(8006, "tcp").await // PCF (AM/SM policy source)
             && netns::host_port_listening(38412, "sctp").await // AMF N2
     })
     .await;
     assert!(ready, "radian core did not become ready");
 }
 
-/// Spawn one radian NF in the host namespace (under sudo when `root`), tracking it.
-async fn spawn_core(root: bool, env: &[(&str, &str)], name: &str) -> tokio::process::Child {
+/// Spawn one radian NF in the host namespace (under sudo when `root`), tracking it;
+/// its stdout+stderr are captured to `/tmp/<tag>_<nf>.log` for log-assertion steps.
+async fn spawn_core(tag: &str, root: bool, env: &[(&str, &str)], name: &str) -> tokio::process::Child {
     let bin = radian_bin(name);
     assert!(bin.exists(), "nf-{name} not found at {} — run `cargo build`", bin.display());
-    netns::spawn_host_env(root, env, &bin.to_string_lossy(), &[]).await.unwrap_or_else(|e| panic!("spawn nf-{name}: {e}"))
+    netns::spawn_host_env_logged(root, env, &bin.to_string_lossy(), &[], &nf_log(tag, name))
+        .await
+        .unwrap_or_else(|e| panic!("spawn nf-{name}: {e}"))
+}
+
+/// Path of the captured log for one core NF under this feature's tag.
+fn nf_log(tag: &str, nf: &str) -> PathBuf {
+    PathBuf::from(format!("/tmp/{tag}_{nf}.log"))
 }
 
 #[when("I start the gNB in the RAN namespace")]
@@ -343,6 +359,194 @@ async fn delete_ran_ue(world: &mut World) {
     netns::delete_netns(&world.ns("ue")).await.expect("delete UE namespace");
     netns::delete_netns(&world.ns("ran")).await.expect("delete RAN namespace");
     netns::delete_veth(&world.host_veth()).await.expect("delete host veth");
+}
+
+// ── feature: scripted_registration (@scripted, design/116 Tier B) ──────────────────────
+
+/// The RAN-UE-NGAP-ID the scripted gNB assigns its single UE.
+const SCRIPTED_RAN_UE_ID: u32 = 1;
+
+/// Parse a 6-hex-digit TAC string ("000001") into its 3 wire bytes.
+fn parse_tac(tac: &str) -> [u8; 3] {
+    let v: Vec<u8> = (0..6).step_by(2).map(|i| u8::from_str_radix(&tac[i..i + 2], 16).expect("hex TAC")).collect();
+    [v[0], v[1], v[2]]
+}
+
+#[when("the scripted gNB connects and completes NG Setup")]
+async fn scripted_gnb_connects(world: &mut World) {
+    let amf = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 38412);
+    let gnb = ran::ScriptedGnb::connect(amf.into()).await.expect("connect to the AMF N2");
+    gnb.ng_setup(0x314, "999", "70", &[[0, 0, 1]]).await.expect("NG Setup");
+    world.gnb = Some(gnb);
+    world.ue = Some(ran::ScriptedUe::demo());
+}
+
+#[when(regex = r#"^the scripted UE sends its registration request from TAC "([0-9a-fA-F]{6})"$"#)]
+async fn scripted_ue_registers(world: &mut World, tac: String) {
+    let (gnb, ue) = (world.gnb.as_ref().expect("gNB connected"), world.ue.as_ref().expect("UE"));
+    let msg = ngap::initial_ue_message_with_nas_at(
+        SCRIPTED_RAN_UE_ID,
+        ue.registration_request(),
+        "999",
+        "70",
+        &parse_tac(&tac),
+    );
+    gnb.send(&msg).await.expect("send InitialUEMessage");
+}
+
+#[then("the AMF challenges the UE with 5G-AKA")]
+async fn amf_challenges(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let (amf_ue_id, nas_pdu) = gnb.recv_downlink_nas().await.expect("the authentication downlink");
+    assert!(
+        nas::parse_authentication_request(&nas_pdu).is_some(),
+        "expected an Authentication Request NAS PDU"
+    );
+    world.amf_ue_id = Some(amf_ue_id);
+    world.pending_nas = Some(nas_pdu);
+}
+
+#[when("the scripted UE answers the challenge with RES*")]
+async fn ue_answers_challenge(world: &mut World) {
+    let challenge = world.pending_nas.take().expect("a pending Authentication Request");
+    let response = world.ue.as_mut().expect("UE").authenticate(&challenge).expect("the USIM answers");
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, response))
+        .await
+        .expect("send AuthenticationResponse");
+}
+
+#[then("the AMF selects NEA2/NIA2 in a security mode command")]
+async fn amf_commands_security(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let (amf_ue_id, smc) = gnb.recv_downlink_nas().await.expect("the security mode downlink");
+    assert_eq!(Some(amf_ue_id), world.amf_ue_id, "the SMC addresses the same UE");
+    assert_eq!(
+        smc.get(1),
+        Some(&nas::sht::INTEGRITY_NEW_CONTEXT),
+        "the SMC is integrity-protected with a new context"
+    );
+    // SHT 3 is not ciphered — the announcement is readable before the UE holds keys.
+    let inner = nas::decode_nas_5gs_message(&smc[7..]).expect("SMC payload decodes");
+    assert_eq!(
+        nas::security_mode_selection(&inner),
+        Some((2, 2, ran::ScriptedUe::SEC_CAP.to_vec())),
+        "NEA2/NIA2 selected and the UE's capability replayed for the bidding-down check"
+    );
+    world.pending_nas = Some(smc);
+}
+
+#[when("the scripted UE completes the security mode procedure")]
+async fn ue_completes_security(world: &mut World) {
+    let smc = world.pending_nas.take().expect("a pending Security Mode Command");
+    let ue = world.ue.as_mut().expect("UE");
+    let (nea, nia, _replayed, complete) =
+        ue.complete_security(&smc).expect("the UE verifies the SMC and derives its keys");
+    assert_eq!((nea, nia), (2, 2));
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, complete))
+        .await
+        .expect("send SecurityModeComplete");
+}
+
+#[then("the AMF sets up the initial context carrying the registration accept")]
+async fn amf_sets_up_context(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let pdu = gnb.recv().await.expect("the initial context setup");
+    let (amf_ue_id, ran_ue_id, ic) =
+        ngap::initial_context_setup_params(&pdu).expect("an InitialContextSetupRequest");
+    assert_eq!(Some(amf_ue_id), world.amf_ue_id);
+    assert_eq!(ran_ue_id, SCRIPTED_RAN_UE_ID);
+
+    let ue = world.ue.as_ref().expect("UE");
+    // The AS root key the AMF hands the gNB must equal the UE's own derivation —
+    // the whole K_AUSF → K_SEAF → K_AMF → K_gNB chain crosses here.
+    assert_eq!(ic.security_key, ue.kgnb.expect("UE-derived K_gNB"), "K_gNB mismatch");
+    assert_eq!(ic.ue_sec_cap, ran::ScriptedUe::SEC_CAP, "capabilities replayed to the RAN");
+    assert_eq!(ic.allowed_nssai, vec![(1, Some([1, 2, 3]))], "the subscribed slice is allowed");
+    assert_eq!(ic.rfsp, Some(5), "RFSP from the UDR AM policy");
+    assert_eq!(ic.ue_ambr, Some((600_000_000, 300_000_000)), "PCF UE-AMBR override (dl/ul)");
+    assert_eq!(
+        ic.area_restriction,
+        Some((vec![[0, 0, 1]], vec![])),
+        "the UDR servAreaRes rides as the Mobility Restriction List"
+    );
+    assert!(ic.pdu_sessions.is_empty(), "initial registration sets up no inline sessions");
+    world.pending_nas = Some(ic.nas);
+}
+
+#[then("the accept grants the subscribed slice, a GUTI, and the registration area")]
+async fn accept_grants(world: &mut World) {
+    let accept = world.pending_nas.take().expect("the ICS NAS PDU");
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let ue = world.ue.as_mut().expect("UE");
+    let msg = ue.read_downlink(&accept).expect("the accept verifies at the UE");
+    assert_eq!(nas::gmm_message_type(&msg), Some(nas::Nas5gmmMessageType::RegistrationAccept));
+    assert_eq!(nas::allowed_nssai_from_registration_accept(&msg), vec![(1, Some([1, 2, 3]))]);
+    assert_eq!(
+        nas::guti_tmsi_from_registration_accept(&msg),
+        Some(amf_ue_id as u32),
+        "a 5G-GUTI is assigned"
+    );
+    assert_eq!(
+        nas::registration_area_from_registration_accept(&msg),
+        Some(vec![[0, 0, 1]]),
+        "registration area = the serving gNB's TA ∪ the UE's TAI"
+    );
+    assert!(nas::t3512_octet_from_registration_accept(&msg).is_some(), "T3512 assigned");
+}
+
+#[when("the gNB confirms the context and the UE completes the registration")]
+async fn gnb_confirms_ue_completes(world: &mut World) {
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let complete = world
+        .ue
+        .as_mut()
+        .expect("UE")
+        .protected_uplink(&nas::registration_complete())
+        .expect("protect RegistrationComplete");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::initial_context_setup_response(amf_ue_id, SCRIPTED_RAN_UE_ID))
+        .await
+        .expect("send InitialContextSetupResponse");
+    gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, complete))
+        .await
+        .expect("send RegistrationComplete");
+}
+
+#[then("the AMF nudges the registered UE with a configuration update")]
+async fn amf_nudges_config_update(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let (amf_ue_id, bytes) = gnb.recv_downlink_nas().await.expect("the post-registration downlink");
+    assert_eq!(Some(amf_ue_id), world.amf_ue_id);
+    let msg = world.ue.as_mut().expect("UE").read_downlink(&bytes).expect("the CUC verifies");
+    assert_eq!(
+        nas::gmm_message_type(&msg),
+        Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand)
+    );
+}
+
+#[then(regex = r#"^the "([a-z]+)" log should contain "([^"]+)"$"#)]
+async fn log_should_contain(world: &mut World, nf: String, needle: String) {
+    let path = nf_log(&world.feature_tag, &nf);
+    let found = wait_until(5, || {
+        let (path, needle) = (path.clone(), needle.clone());
+        async move { netns::log_contains(&path, &needle) }
+    })
+    .await;
+    assert!(found, "{} does not contain {needle:?}", path.display());
+}
+
+#[given("the scripted core is running")]
+async fn scripted_core_running(_world: &mut World) {
+    assert!(netns::host_port_listening(38412, "sctp").await, "the AMF N2 is not up");
+}
+
+#[when("I stop the radian core")]
+async fn stop_core_only(_world: &mut World) {
+    netns::kill_host_procs("target/debug/nf-").await.expect("kill radian core");
 }
 
 #[tokio::main]

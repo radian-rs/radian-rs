@@ -1,0 +1,234 @@
+//! Scripted gNB + UE (design/116 Tier B): the test process speaks **real NGAP over
+//! SCTP** to the live AMF and real NAS through it, built from radian's own crates —
+//! `sctp-rs` (the same SCTP the AMF serves), `ngap` builders/parsers, the `nas` security
+//! context, and the `aka` USIM-side crypto with the demo subscriber's TS 35.208 key.
+//!
+//! This tier needs no external simulator binary, so it runs everywhere the core builds;
+//! it complements (never replaces) the `@sim` free-ran-ue tier, which keeps the
+//! wire-compat role — a symmetric encode/decode bug is invisible to a scripted peer.
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use sctp_rs::{ConnectedSocket, NotificationOrData, SendData, SendInfo, Socket, SocketToAssociation};
+
+const NGAP_PPID: u32 = 60;
+/// How long to wait for the AMF's next NGAP message before declaring the flow stuck.
+const RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ── scripted gNB ────────────────────────────────────────────────────────────────────────
+
+/// A gNB played by the test process: one SCTP association to the AMF's N2, sending and
+/// receiving APER-encoded NGAP PDUs.
+pub struct ScriptedGnb {
+    conn: ConnectedSocket,
+}
+
+impl std::fmt::Debug for ScriptedGnb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScriptedGnb")
+    }
+}
+
+impl ScriptedGnb {
+    /// Open the SCTP association to the AMF's N2 endpoint.
+    pub async fn connect(amf: SocketAddr) -> Result<Self> {
+        let socket = Socket::new_v4(SocketToAssociation::OneToOne).context("create SCTP socket")?;
+        let (conn, _assoc) = socket.connect(amf).await.context("connect N2 SCTP")?;
+        Ok(Self { conn })
+    }
+
+    /// Run NG Setup: send the request (gNB id, PLMN, supported TAs) and require the
+    /// AMF's NGSetupResponse.
+    pub async fn ng_setup(&self, gnb_id: u32, mcc: &str, mnc: &str, tacs: &[[u8; 3]]) -> Result<()> {
+        self.send(&ngap::ng_setup_request(gnb_id, mcc, mnc, tacs)).await?;
+        let pdu = self.recv().await?;
+        match &pdu {
+            ngap::NGAP_PDU::SuccessfulOutcome(o)
+                if matches!(o.value, ngap::SuccessfulOutcomeValue::Id_NGSetup(_)) =>
+            {
+                Ok(())
+            }
+            other => bail!("expected NGSetupResponse, got {other}"),
+        }
+    }
+
+    /// APER-encode and send one NGAP PDU with the NGAP PPID.
+    pub async fn send(&self, pdu: &ngap::NGAP_PDU) -> Result<()> {
+        let payload = pdu.encode().map_err(|e| anyhow!("NGAP encode failed: {e:?}"))?;
+        self.conn
+            .sctp_send(SendData {
+                payload,
+                snd_info: Some(SendInfo { ppid: NGAP_PPID, ..Default::default() }),
+            })
+            .await
+            .context("sctp_send")
+    }
+
+    /// Receive the next NGAP PDU (skipping SCTP notifications), bounded by
+    /// [`RECV_TIMEOUT`] so a silent AMF fails the step instead of hanging the run.
+    pub async fn recv(&self) -> Result<ngap::NGAP_PDU> {
+        tokio::time::timeout(RECV_TIMEOUT, async {
+            loop {
+                match self.conn.sctp_recv().await.context("sctp_recv")? {
+                    NotificationOrData::Notification(_) => continue,
+                    NotificationOrData::Data(data) => {
+                        if data.payload.is_empty() {
+                            bail!("the AMF closed the N2 association");
+                        }
+                        return ngap::NGAP_PDU::decode(&data.payload)
+                            .map_err(|e| anyhow!("NGAP decode failed: {e:?}"));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("timed out waiting for an NGAP message from the AMF"))?
+    }
+
+    /// Receive, requiring a DownlinkNASTransport: `(AMF-UE-NGAP-ID, raw NAS PDU)`.
+    pub async fn recv_downlink_nas(&self) -> Result<(u64, Vec<u8>)> {
+        let pdu = self.recv().await?;
+        downlink_nas(&pdu).ok_or_else(|| anyhow!("expected DownlinkNASTransport, got {pdu}"))
+    }
+}
+
+/// Extract `(AMF-UE-NGAP-ID, NAS PDU)` from a DownlinkNASTransport.
+pub fn downlink_nas(pdu: &ngap::NGAP_PDU) -> Option<(u64, Vec<u8>)> {
+    let ngap::NGAP_PDU::InitiatingMessage(m) = pdu else {
+        return None;
+    };
+    let ngap::InitiatingMessageValue::Id_DownlinkNASTransport(msg) = &m.value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut nas) = (None, None);
+    for ie in &msg.protocol_i_es.0 {
+        match &ie.value {
+            ngap::DownlinkNASTransportProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            ngap::DownlinkNASTransportProtocolIEs_EntryValue::Id_NAS_PDU(v) => {
+                nas = Some(v.0.clone())
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, nas?))
+}
+
+// ── scripted UE ─────────────────────────────────────────────────────────────────────────
+
+/// A UE/USIM played by the test process: the demo subscriber's long-term key, the
+/// UE-side 5G-AKA run, and the NAS security context it derives — the mirror image of
+/// what the AMF/AUSF/UDM hold.
+#[derive(Debug)]
+pub struct ScriptedUe {
+    sub: aka::SubscriberKey,
+    mcc: String,
+    mnc: String,
+    msin: String,
+    supi: String,
+    kseaf: Option<[u8; 32]>,
+    /// K_AMF — retained so the test can cross-check the K_gNB the AMF hands the gNB.
+    pub kamf: Option<[u8; 32]>,
+    /// The K_gNB bound to the Security Mode Complete's UL NAS COUNT (TS 33.501 A.9).
+    pub kgnb: Option<[u8; 32]>,
+    /// The NAS security context, established at the Security Mode procedure.
+    pub sec: Option<nas::NasSecurityContext>,
+}
+
+impl ScriptedUe {
+    /// The advertised UE security capability: EA0+EA2 / IA2 (`[EA, IA]`).
+    pub const SEC_CAP: [u8; 2] = [0xA0, 0x20];
+
+    /// The demo subscriber the BDD UDR provisions: `imsi-999700000000001` with the
+    /// TS 35.208 test-set-1 key.
+    pub fn demo() -> Self {
+        Self {
+            sub: aka::SubscriberKey {
+                k: [
+                    0x46, 0x5b, 0x5c, 0xe8, 0xb1, 0x99, 0xb4, 0x9f, 0xaa, 0x5f, 0x0a, 0x2e, 0xe2,
+                    0x38, 0xa6, 0xbc,
+                ],
+                opc: [
+                    0xcd, 0x63, 0xcb, 0x71, 0x95, 0x4a, 0x9f, 0x4e, 0x48, 0xa5, 0x99, 0x4e, 0x37,
+                    0xa0, 0x2b, 0xaf,
+                ],
+                amf: [0x80, 0x00],
+            },
+            mcc: "999".into(),
+            mnc: "70".into(),
+            msin: "0000000001".into(),
+            supi: "imsi-999700000000001".into(),
+            kseaf: None,
+            kamf: None,
+            kgnb: None,
+            sec: None,
+        }
+    }
+
+    /// The SUPI this UE's SUCI deconceals to.
+    pub fn supi(&self) -> &str {
+        &self.supi
+    }
+
+    /// The initial (plain) SUCI Registration Request.
+    pub fn registration_request(&self) -> Vec<u8> {
+        nas::registration_request_suci(&self.mcc, &self.mnc, &self.msin, &Self::SEC_CAP)
+    }
+
+    /// Answer the Authentication Request: verify AUTN, run the USIM, derive
+    /// K_AUSF → K_SEAF, and return the Authentication Response NAS (RES*).
+    pub fn authenticate(&mut self, auth_req: &[u8]) -> Result<Vec<u8>> {
+        let (rand, autn) = nas::parse_authentication_request(auth_req)
+            .context("not an Authentication Request")?;
+        let (res_star, kausf) = aka::ue_authenticate(&self.sub, &rand, &autn, &self.mcc, &self.mnc)
+            .map_err(|e| anyhow!("USIM refused the challenge: {e}"))?;
+        self.kseaf = Some(aka::kseaf(&kausf, &self.mcc, &self.mnc));
+        Ok(nas::authentication_response(&res_star))
+    }
+
+    /// Complete the Security Mode procedure: read the announced algorithm selection
+    /// from the (integrity-protected, new-context) command, derive the algorithm-bound
+    /// NAS keys, verify the command's MAC, and return
+    /// `(nea, nia, replayed capability, protected Security Mode Complete)`.
+    pub fn complete_security(&mut self, smc: &[u8]) -> Result<(u8, u8, Vec<u8>, Vec<u8>)> {
+        anyhow::ensure!(
+            smc.len() > 7 && smc[0] == 0x7E && smc[1] == nas::sht::INTEGRITY_NEW_CONTEXT,
+            "expected a Security Mode Command protected with a new context"
+        );
+        // SHT 3 is integrity-only, so the inner message is readable before keys exist —
+        // the UE must read it first to learn WHICH keys to derive.
+        let inner = nas::decode_nas_5gs_message(&smc[7..])
+            .map_err(|e| anyhow!("SMC payload decode failed: {e:?}"))?;
+        let (nea, nia, replayed) =
+            nas::security_mode_selection(&inner).context("not a Security Mode Command")?;
+
+        let kseaf = self.kseaf.context("authenticate before completing security")?;
+        let kamf = aka::kamf(&kseaf, &self.supi, &[0x00, 0x00]);
+        let keys = aka::nas_keys(&kamf, nea, nia);
+        let mut sec = nas::NasSecurityContext::new(keys.knas_int, keys.knas_enc, nia, nea);
+        sec.unprotect(smc, 1).context("the SMC failed the UE's integrity check")?;
+
+        let ul_count = sec.ul_count; // the COUNT the SM Complete goes out under
+        let complete =
+            sec.protect(&nas::security_mode_complete(), nas::sht::INTEGRITY_CIPHERED_NEW_CONTEXT, 0);
+        self.kamf = Some(kamf);
+        self.kgnb = Some(aka::kgnb(&kamf, ul_count));
+        self.sec = Some(sec);
+        Ok((nea, nia, replayed, complete))
+    }
+
+    /// Verify + decode a protected downlink NAS message.
+    pub fn read_downlink(&mut self, bytes: &[u8]) -> Result<nas::Nas5gsMessage> {
+        let sec = self.sec.as_mut().context("no NAS security context yet")?;
+        sec.unprotect(bytes, 1).context("downlink NAS failed the UE's check")
+    }
+
+    /// Protect an uplink NAS message under the established context.
+    pub fn protected_uplink(&mut self, msg: &nas::Nas5gsMessage) -> Result<Vec<u8>> {
+        let sec = self.sec.as_mut().context("no NAS security context yet")?;
+        Ok(sec.protect(msg, nas::sht::INTEGRITY_CIPHERED, 0))
+    }
+}

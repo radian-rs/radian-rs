@@ -117,6 +117,18 @@ pub fn security_mode_command(nea: u8, nia: u8, ngksi: u8, replayed_ue_sec_cap: &
     )
 }
 
+/// From a decoded **Security Mode Command**, the announced selection:
+/// `(NEA id, NIA id, replayed UE security capability value)` — what the UE reads
+/// to derive its algorithm-bound NAS keys and run its bidding-down check
+/// (TS 24.501 §8.2.25). UE side / tests.
+pub fn security_mode_selection(msg: &Nas5gsMessage) -> Option<(u8, u8, Vec<u8>)> {
+    let Nas5gsMessage::Gmm(_, Nas5gmmMessage::SecurityModeCommand(smc)) = msg else {
+        return None;
+    };
+    let algs = smc.selected_nas_security_algorithms.value;
+    Some((algs >> 4, algs & 0x0F, smc.replayed_ue_security_capabilities.value.clone()))
+}
+
 /// Build a 5GMM **Security Mode Complete** (TS 24.501 §8.2.26). UE side / tests.
 pub fn security_mode_complete() -> Nas5gsMessage {
     Nas5gsMessage::new_5gmm(
@@ -259,6 +271,29 @@ fn suci_mobile_identity(mcc: &str, mnc: &str, msin: &str) -> NasFGsMobileIdentit
         value.push((hi << 4) | pair[0]);
     }
     NasFGsMobileIdentity::new(value)
+}
+
+/// Build and encode a 5GMM **Registration Request** identifying by a
+/// null-scheme **SUCI** (UE side / tests): the initial registration of a UE
+/// holding no GUTI. `ue_sec_cap` is the UE security capability value
+/// (`[EA, IA, …]` bytes, TS 24.501 §9.11.3.54).
+pub fn registration_request_suci(
+    mcc: &str,
+    mnc: &str,
+    msin: &str,
+    ue_sec_cap: &[u8],
+) -> Vec<u8> {
+    let reg = messages::NasRegistrationRequest::new(
+        // Initial registration, ngKSI 7 (no key), no follow-on request.
+        NasFGsRegistrationType::from_parts(RegistrationType::InitialRegistration, false, 7, false),
+        suci_mobile_identity(mcc, mnc, msin),
+    )
+    .set_ue_security_capability(NasUeSecurityCapability::new(ue_sec_cap.to_vec()));
+    let msg = Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::RegistrationRequest,
+        Nas5gmmMessage::RegistrationRequest(reg),
+    );
+    encode_nas_5gs_message(&msg).expect("encode 5GMM RegistrationRequest (SUCI)")
 }
 
 /// Build and encode a 5GMM **Registration Request** identifying by 5G-GUTI
@@ -1753,6 +1788,33 @@ mod tests {
         assert_eq!(supi_from_identity_response(&msg).as_deref(), Some("imsi-999700000000001"));
         // Any other message yields nothing.
         assert_eq!(supi_from_identity_response(&deregistration_accept()), None);
+    }
+
+    /// The UE-side SUCI registration request carries an identity that deconceals
+    /// to the intended SUPI, and the advertised security capability reads back.
+    #[test]
+    fn suci_registration_request_roundtrips() {
+        let bytes = registration_request_suci("999", "70", "0000000001", &[0xA0, 0x20]);
+        let msg = decode_nas_5gs_message(&bytes).expect("decode");
+        assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::RegistrationRequest));
+        let Nas5gsMessage::Gmm(_, Nas5gmmMessage::RegistrationRequest(reg)) = &msg else {
+            panic!("expected a RegistrationRequest");
+        };
+        let suci = reg.fgs_mobile_identity.as_suci().expect("a SUCI identity");
+        assert_eq!(suci_to_supi(&suci), "imsi-999700000000001");
+        assert_eq!(
+            reg.ue_security_capability.as_ref().map(|c| [c.ea_byte(), c.ia_byte()]),
+            Some([0xA0, 0x20])
+        );
+    }
+
+    /// The UE reads the Security Mode Command's announced algorithms + replayed
+    /// capability (its bidding-down check input); a non-SMC yields nothing.
+    #[test]
+    fn security_mode_selection_reads_the_announcement() {
+        let smc = security_mode_command(2, 2, 0, &[0xA0, 0x20]);
+        assert_eq!(security_mode_selection(&smc), Some((2, 2, vec![0xA0, 0x20])));
+        assert_eq!(security_mode_selection(&security_mode_complete()), None);
     }
 
     #[test]
