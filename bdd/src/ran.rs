@@ -119,6 +119,16 @@ pub fn downlink_nas(pdu: &ngap::NGAP_PDU) -> Option<(u64, Vec<u8>)> {
 
 // ── scripted UE ─────────────────────────────────────────────────────────────────────────
 
+/// The USIM's reply to an Authentication Request.
+#[derive(Debug)]
+pub enum ChallengeReply {
+    /// AUTN verified and the challenge was fresh — the Authentication Response (RES*).
+    Response(Vec<u8>),
+    /// The challenge's SQN was not ahead of the USIM's — an Authentication Failure
+    /// with cause *synch failure* (#21) carrying AUTS (TS 33.102 §6.3.3).
+    SynchFailure(Vec<u8>),
+}
+
 /// A UE/USIM played by the test process: the demo subscriber's long-term key, the
 /// UE-side 5G-AKA run, and the NAS security context it derives — the mirror image of
 /// what the AMF/AUSF/UDM hold.
@@ -129,6 +139,9 @@ pub struct ScriptedUe {
     mnc: String,
     msin: String,
     supi: String,
+    /// The USIM's stored SQN (`SQNms`). When set, a challenge whose SQN is not
+    /// ahead of it triggers a synchronisation failure; `None` accepts any SQN.
+    sqn_ms: Option<[u8; 6]>,
     kseaf: Option<[u8; 32]>,
     /// K_AMF — retained so the test can cross-check the K_gNB the AMF hands the gNB.
     pub kamf: Option<[u8; 32]>,
@@ -136,6 +149,11 @@ pub struct ScriptedUe {
     pub kgnb: Option<[u8; 32]>,
     /// The NAS security context, established at the Security Mode procedure.
     pub sec: Option<nas::NasSecurityContext>,
+}
+
+/// A 6-byte SQN as a big-endian integer, for freshness comparison.
+fn sqn_u64(sqn: &[u8; 6]) -> u64 {
+    sqn.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64)
 }
 
 impl ScriptedUe {
@@ -161,6 +179,7 @@ impl ScriptedUe {
             mnc: "70".into(),
             msin: "0000000001".into(),
             supi: "imsi-999700000000001".into(),
+            sqn_ms: None,
             kseaf: None,
             kamf: None,
             kgnb: None,
@@ -173,20 +192,43 @@ impl ScriptedUe {
         &self.supi
     }
 
+    /// Give the USIM a stored SQN — a challenge whose SQN is not strictly ahead of
+    /// it fails synchronisation (drives the AUTS resync path, TS 33.102 §6.3.3). A
+    /// large value guarantees the first network challenge is stale.
+    pub fn set_sqn_ms(&mut self, sqn_ms: [u8; 6]) {
+        self.sqn_ms = Some(sqn_ms);
+    }
+
     /// The initial (plain) SUCI Registration Request.
     pub fn registration_request(&self) -> Vec<u8> {
         nas::registration_request_suci(&self.mcc, &self.mnc, &self.msin, &Self::SEC_CAP)
     }
 
-    /// Answer the Authentication Request: verify AUTN, run the USIM, derive
-    /// K_AUSF → K_SEAF, and return the Authentication Response NAS (RES*).
-    pub fn authenticate(&mut self, auth_req: &[u8]) -> Result<Vec<u8>> {
+    /// A SUCI Registration Request carrying a Requested NSSAI (the slices the UE asks
+    /// for; the AMF intersects them with the subscription).
+    pub fn registration_request_requesting(&self, slices: &[(u8, Option<[u8; 3]>)]) -> Vec<u8> {
+        nas::registration_request_suci_with_nssai(&self.mcc, &self.mnc, &self.msin, &Self::SEC_CAP, slices)
+    }
+
+    /// Answer the Authentication Request. The USIM verifies AUTN and — if it tracks
+    /// an SQN — checks freshness: a stale challenge yields a synch-failure AUTS,
+    /// otherwise it derives K_AUSF → K_SEAF and returns RES*.
+    pub fn authenticate(&mut self, auth_req: &[u8]) -> Result<ChallengeReply> {
         let (rand, autn) = nas::parse_authentication_request(auth_req)
             .context("not an Authentication Request")?;
+        if let Some(sqn_ms) = self.sqn_ms {
+            let net_sqn =
+                aka::ue_recover_sqn(&self.sub, &rand, &autn).context("AUTN failed the USIM's check")?;
+            if sqn_u64(&net_sqn) <= sqn_u64(&sqn_ms) {
+                let auts = aka::compute_auts(&self.sub, &rand, &sqn_ms);
+                return Ok(ChallengeReply::SynchFailure(nas::authentication_failure_synch(&auts)));
+            }
+            self.sqn_ms = Some(net_sqn); // adopt the network's fresher SQN
+        }
         let (res_star, kausf) = aka::ue_authenticate(&self.sub, &rand, &autn, &self.mcc, &self.mnc)
             .map_err(|e| anyhow!("USIM refused the challenge: {e}"))?;
         self.kseaf = Some(aka::kseaf(&kausf, &self.mcc, &self.mnc));
-        Ok(nas::authentication_response(&res_star))
+        Ok(ChallengeReply::Response(nas::authentication_response(&res_star)))
     }
 
     /// Complete the Security Mode procedure: read the announced algorithm selection

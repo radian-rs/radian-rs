@@ -283,12 +283,29 @@ pub fn registration_request_suci(
     msin: &str,
     ue_sec_cap: &[u8],
 ) -> Vec<u8> {
-    let reg = messages::NasRegistrationRequest::new(
+    registration_request_suci_with_nssai(mcc, mnc, msin, ue_sec_cap, &[])
+}
+
+/// [`registration_request_suci`] additionally carrying a **Requested NSSAI**
+/// (IEI 0x2F, TS 24.501 §9.11.3.37) — the slices the UE asks for, which the AMF
+/// intersects with the subscription to form the allowed/rejected NSSAI. An empty
+/// `requested` omits the IE. UE side / tests.
+pub fn registration_request_suci_with_nssai(
+    mcc: &str,
+    mnc: &str,
+    msin: &str,
+    ue_sec_cap: &[u8],
+    requested: &[(u8, Option<[u8; 3]>)],
+) -> Vec<u8> {
+    let mut reg = messages::NasRegistrationRequest::new(
         // Initial registration, ngKSI 7 (no key), no follow-on request.
         NasFGsRegistrationType::from_parts(RegistrationType::InitialRegistration, false, 7, false),
         suci_mobile_identity(mcc, mnc, msin),
     )
     .set_ue_security_capability(NasUeSecurityCapability::new(ue_sec_cap.to_vec()));
+    if !requested.is_empty() {
+        reg = reg.set_requested_nssai(NasNssai::new(nssai_value(requested)));
+    }
     let msg = Nas5gsMessage::new_5gmm(
         Nas5gmmMessageType::RegistrationRequest,
         Nas5gmmMessage::RegistrationRequest(reg),
@@ -1806,6 +1823,19 @@ mod tests {
             reg.ue_security_capability.as_ref().map(|c| [c.ea_byte(), c.ia_byte()]),
             Some([0xA0, 0x20])
         );
+    }
+
+    /// A SUCI registration request can carry a Requested NSSAI the AMF reads back.
+    #[test]
+    fn suci_registration_request_carries_requested_nssai() {
+        let slices = vec![(1u8, Some([1u8, 2, 3])), (2, None)];
+        let bytes = registration_request_suci_with_nssai("999", "70", "0000000001", &[0xA0, 0x20], &slices);
+        let msg = decode_nas_5gs_message(&bytes).expect("decode");
+        assert_eq!(requested_nssai_from_registration_request(&msg), slices);
+        // The plain builder omits the Requested NSSAI IE.
+        let plain = decode_nas_5gs_message(&registration_request_suci("999", "70", "0000000001", &[0xA0, 0x20]))
+            .expect("decode");
+        assert!(requested_nssai_from_registration_request(&plain).is_empty());
     }
 
     /// The UE reads the Security Mode Command's announced algorithms + replayed
