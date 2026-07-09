@@ -63,6 +63,19 @@ pub fn parse_authentication_request(bytes: &[u8]) -> Option<([u8; 16], [u8; 16])
     Some((rand, autn))
 }
 
+/// Build and encode a 5GMM **Authentication Reject** (TS 24.501 §8.2.5) — the
+/// AMF's response when authentication is **not accepted** (RES\* mismatch). On
+/// receiving it the UE deletes any native 5G NAS security context and enters
+/// 5GMM-DEREGISTERED (§5.4.1.3.7). No IEs; sent unprotected (no security context
+/// exists yet).
+pub fn authentication_reject() -> Vec<u8> {
+    let msg = Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::AuthenticationReject,
+        Nas5gmmMessage::AuthenticationReject(messages::NasAuthenticationReject::new()),
+    );
+    encode_nas_5gs_message(&msg).expect("encode AuthenticationReject")
+}
+
 /// Build and encode a 5GMM **Authentication Failure** with cause
 /// *synch failure* (#21) carrying the UE's **AUTS** (TS 24.501 §8.2.4). UE side
 /// / tests — the UE sends this when the network's SQN is out of range.
@@ -1823,6 +1836,14 @@ mod tests {
             reg.ue_security_capability.as_ref().map(|c| [c.ea_byte(), c.ia_byte()]),
             Some([0xA0, 0x20])
         );
+    }
+
+    /// The Authentication Reject encodes and decodes to the right 5GMM type.
+    #[test]
+    fn authentication_reject_roundtrips() {
+        let bytes = authentication_reject();
+        let msg = decode_nas_5gs_message(&bytes).expect("decode");
+        assert_eq!(gmm_message_type(&msg), Some(Nas5gmmMessageType::AuthenticationReject));
     }
 
     /// A SUCI registration request can carry a Requested NSSAI the AMF reads back.

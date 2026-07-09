@@ -48,6 +48,14 @@ Feature: Scripted gNB/UE — full 5G-AKA registration against the live core
     When the scripted UE completes the security mode procedure
     Then the AMF rejects the registration with 5GMM cause 62 and a back-off timer
 
+  Scenario: A UE that fails authentication is rejected and released (D6)
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the scripted UE sends its registration request from TAC "000001"
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with a wrong RES*
+    Then the AMF rejects authentication and releases the UE
+
   Scenario: A UE with a stale sequence number resynchronises via AUTS (D5)
     Given the scripted core is running
     When the scripted gNB connects and completes NG Setup

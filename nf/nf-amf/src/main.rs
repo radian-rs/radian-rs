@@ -3005,9 +3005,13 @@ async fn on_uplink_nas(
     };
 
     // These procedures answer with more than one downlink (or need the multi-PDU
-    // shape): Security Mode Complete (a Registration Reject may be followed by the
-    // UE Context Release Command) and Deregistration (Accept + Release Command).
+    // shape): Authentication Response (a rejected RES* → Authentication Reject + UE
+    // Context Release), Security Mode Complete (a Registration Reject may be followed
+    // by the release), and Deregistration (Accept + Release Command).
     match nas::gmm_message_type(&nas_msg) {
+        Some(Nas5gmmMessageType::AuthenticationResponse) => {
+            return complete_authentication(ues, amf_auth, amf_ue_id, &nas_msg).await;
+        }
         Some(Nas5gmmMessageType::SecurityModeComplete) => {
             return on_security_mode_complete(ues, amf_ue_id, &NRF_BASE).await;
         }
@@ -3084,10 +3088,6 @@ async fn dispatch_uplink_nas(
     dereg_tx: &UnboundedSender<UeCmd>,
 ) -> Option<(NGAP_PDU, &'static str)> {
     match nas::gmm_message_type(&nas_msg) {
-        Some(Nas5gmmMessageType::AuthenticationResponse) => {
-            let res_star = nas::res_star_from_authentication_response(&nas_msg)?.to_vec();
-            complete_authentication(ues, amf_auth, amf_ue_id, &res_star).await
-        }
         Some(Nas5gmmMessageType::AuthenticationFailure) => {
             on_authentication_failure(ues, amf_auth, amf_ue_id, &nas_msg).await
         }
@@ -3457,30 +3457,53 @@ async fn on_authentication_failure(
     }
 }
 
+/// On an **Authentication Response**: confirm RES* at the AUSF and either continue
+/// to the Security Mode Command (success) or, when authentication is **not accepted**
+/// (RES* mismatch), send an **Authentication Reject** and release the UE context
+/// (TS 24.501 §5.4.1.3.7) — dropping the UE from the AMF. An internal error after a
+/// successful confirm (missing K_SEAF/SUPI, no common integrity algorithm) is not an
+/// "authentication not accepted", so it is a silent drop rather than a reject.
 async fn complete_authentication(
     ues: &mut HashMap<u64, UeContext>,
     amf_auth: &auth::AmfAuth,
     amf_ue_id: u64,
-    res_star: &[u8],
-) -> Option<(NGAP_PDU, &'static str)> {
+    nas_msg: &Nas5gsMessage,
+) -> Vec<(NGAP_PDU, &'static str)> {
     let Some(pending) = ues.get_mut(&amf_ue_id).and_then(|c| c.auth.take()) else {
         warn!("UE {amf_ue_id}: Authentication Response with no pending authentication");
-        return None;
+        return Vec::new();
     };
-    let outcome = match amf_auth.finish(&pending, res_star).await {
-        Ok(o) => o,
-        Err(e) => {
-            warn!("UE {amf_ue_id}: authentication confirm failed: {e}");
-            return None;
+    // A confirm error or an explicit failure (or a response missing RES*) means
+    // authentication was not accepted → Authentication Reject + release.
+    let outcome = match nas::res_star_from_authentication_response(nas_msg) {
+        Some(res_star) => amf_auth.finish(&pending, res_star).await.ok(),
+        None => {
+            warn!("UE {amf_ue_id}: Authentication Response without RES*");
+            None
         }
     };
-    if !outcome.success {
-        warn!("UE {amf_ue_id}: authentication failed (RES* rejected)");
-        return None;
+    let accepted = outcome.as_ref().is_some_and(|o| o.success);
+    if !accepted {
+        warn!("UE {amf_ue_id}: authentication not accepted (RES* rejected) — Authentication Reject + release");
+        let ran_ue_id = ues.get(&amf_ue_id).map(|c| c.ran_ue_id).unwrap_or_default();
+        if let Some(supi) = ues.get(&amf_ue_id).and_then(|c| c.suci.clone()) {
+            UE_DIRECTORY.lock().unwrap().remove(&supi);
+        }
+        ues.remove(&amf_ue_id);
+        return vec![
+            (
+                ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, nas::authentication_reject()),
+                "DownlinkNASTransport (AuthenticationReject)",
+            ),
+            (
+                ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::NORMAL_RELEASE),
+                "UEContextReleaseCommand",
+            ),
+        ];
     }
-    let (Some(kseaf), Some(supi)) = (outcome.kseaf, outcome.supi) else {
+    let (Some(kseaf), Some(supi)) = outcome.map(|o| (o.kseaf, o.supi)).unwrap_or((None, None)) else {
         warn!("UE {amf_ue_id}: authenticated but AUSF returned no K_SEAF/SUPI");
-        return None;
+        return Vec::new();
     };
 
     info!("UE {amf_ue_id} authenticated ({supi}); establishing NAS security");
@@ -3494,19 +3517,21 @@ async fn complete_authentication(
     let Some((sec, smc_bytes, _nea, _nia, kamf)) = establish_security(&kseaf, &supi, ue_sec_cap)
     else {
         warn!("UE {amf_ue_id}: cannot establish NAS security (no common integrity algorithm?)");
-        return None;
+        return Vec::new();
     };
-    let ctx = ues.get_mut(&amf_ue_id)?;
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        return Vec::new();
+    };
     ctx.sec = Some(sec);
     // K_AMF is retained to derive K_gNB for the Initial Context Setup's Security
     // Key IE (TS 33.501 Annex A.9).
     ctx.kamf = Some(kamf);
     ctx.state = RegState::SecurityMode;
     let ran_ue_id = ctx.ran_ue_id;
-    Some((
+    vec![(
         ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, smc_bytes),
         "DownlinkNASTransport (SecurityModeCommand)",
-    ))
+    )]
 }
 
 /// Negotiate NAS algorithms from `ue_sec_cap`, derive K_AMF + the NAS keys for the

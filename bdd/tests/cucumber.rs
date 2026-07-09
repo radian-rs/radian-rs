@@ -581,6 +581,37 @@ async fn ue_rejects_stale_challenge(world: &mut World) {
         .expect("send AuthenticationFailure (synch)");
 }
 
+#[when("the scripted UE answers the challenge with a wrong RES*")]
+async fn ue_answers_wrong(world: &mut World) {
+    let challenge = world.pending_nas.take().expect("a pending Authentication Request");
+    let response =
+        world.ue.as_ref().expect("UE").wrong_challenge_response(&challenge).expect("a wrong response");
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, response))
+        .await
+        .expect("send AuthenticationResponse (wrong RES*)");
+}
+
+#[then("the AMF rejects authentication and releases the UE")]
+async fn amf_rejects_authentication(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let (amf_ue_id, bytes) = gnb.recv_downlink_nas().await.expect("the authentication-reject downlink");
+    assert_eq!(Some(amf_ue_id), world.amf_ue_id);
+    // The Authentication Reject is sent unprotected (no NAS security context exists).
+    let msg = nas::decode_nas_5gs_message(&bytes).expect("decode the reject");
+    assert_eq!(
+        nas::gmm_message_type(&msg),
+        Some(nas::Nas5gmmMessageType::AuthenticationReject),
+        "expected an Authentication Reject"
+    );
+    let pdu = gnb.recv().await.expect("the release command");
+    assert!(
+        ngap::parse_ue_context_release_command(&pdu).is_some(),
+        "expected a UEContextReleaseCommand after the reject"
+    );
+}
+
 #[then(regex = r#"^the AMF rejects the registration with 5GMM cause (\d+) and a back-off timer$"#)]
 async fn amf_rejects_registration(world: &mut World, cause: u8) {
     let gnb = world.gnb.as_ref().expect("gNB connected");
