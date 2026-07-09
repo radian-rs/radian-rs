@@ -262,6 +262,17 @@ impl ScriptedUe {
         Ok((nea, nia, replayed, complete))
     }
 
+    /// Answer with a deliberately **wrong** RES* — the AUSF's confirmation must
+    /// reject it (RES\* ≠ XRES\*). Drives the authentication-not-accepted path.
+    pub fn wrong_challenge_response(&self, auth_req: &[u8]) -> Result<Vec<u8>> {
+        let (rand, autn) = nas::parse_authentication_request(auth_req)
+            .context("not an Authentication Request")?;
+        let (mut res_star, _kausf) = aka::ue_authenticate(&self.sub, &rand, &autn, &self.mcc, &self.mnc)
+            .map_err(|e| anyhow!("USIM refused the challenge: {e}"))?;
+        res_star[0] ^= 0xFF; // corrupt RES* so it fails the network's check
+        Ok(nas::authentication_response(&res_star))
+    }
+
     /// Verify + decode a protected downlink NAS message.
     pub fn read_downlink(&mut self, bytes: &[u8]) -> Result<nas::Nas5gsMessage> {
         let sec = self.sec.as_mut().context("no NAS security context yet")?;
