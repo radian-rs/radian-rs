@@ -1085,6 +1085,26 @@ fn qos_flow_descriptions_value(flows: &[QosFlowDesc]) -> Vec<u8> {
 /// IPv4 (the field the UE reads to configure its stack), and the subscribed **S-NSSAI** +
 /// **DNN** (which the UE also reads). `pti` echoes the request's procedure transaction id;
 /// S-NSSAI/AMBR come from the subscriber's UDR sm-data (design/27).
+/// Build a 5GSM **PDU Session Establishment Request** N1 SM container (TS 24.501
+/// §8.3.1) — UE side / tests. Minimal: the mandatory Integrity Protection Maximum
+/// Data Rate IE at full rate (`0xFF 0xFF`); PDU session type / SSC mode take the
+/// network's defaults. Wrap it in [`ul_nas_transport_sm`] to send it.
+pub fn pdu_session_establishment_request(pdu_session_id: u8, pti: u8) -> Vec<u8> {
+    // 5GSM header (EPD, PDU session id, PTI, message type 0xC1) + Integrity
+    // Protection Maximum Data Rate (full data rate, both directions).
+    vec![0x2e, pdu_session_id, pti, 0xc1, 0xff, 0xff]
+}
+
+/// The UE IPv4 address from a 5GSM **PDU Session Establishment Accept** container
+/// (the PDU Address IE `[0x29, len=5, type=1(IPv4), a, b, c, d]`) — UE side /
+/// tests. `None` if absent (e.g. a non-IPv4 session).
+pub fn ue_ipv4_from_establishment_accept(container: &[u8]) -> Option<std::net::Ipv4Addr> {
+    container.windows(7).find_map(|w| {
+        (w[0] == 0x29 && w[1] == 0x05 && w[2] == 0x01)
+            .then(|| std::net::Ipv4Addr::new(w[3], w[4], w[5], w[6]))
+    })
+}
+
 pub fn pdu_session_establishment_accept(
     pdu_session_id: u8,
     pti: u8,
@@ -1835,6 +1855,32 @@ mod tests {
         assert_eq!(
             reg.ue_security_capability.as_ref().map(|c| [c.ea_byte(), c.ia_byte()]),
             Some([0xA0, 0x20])
+        );
+    }
+
+    /// The UE-side PDU Session Establishment Request is a well-formed 5GSM
+    /// container the AMF reads (psi/pti/type), and the UE reads its own IP back
+    /// out of the matching accept.
+    #[test]
+    fn pdu_session_establishment_request_and_accept_ip() {
+        let req = pdu_session_establishment_request(5, 1);
+        assert_eq!(&req[..4], &[0x2e, 5, 1, 0xc1], "5GSM Establishment Request header");
+        assert!(!is_pdu_session_release_complete(&req));
+
+        let ambr = session_ambr_from_bitrates("1 Gbps", "2 Gbps").unwrap();
+        let accept = pdu_session_establishment_accept(
+            5,
+            1,
+            std::net::Ipv4Addr::new(10, 45, 0, 7),
+            "internet",
+            1,
+            Some([1, 2, 3]),
+            ambr,
+            &[],
+        );
+        assert_eq!(
+            ue_ipv4_from_establishment_accept(&accept),
+            Some(std::net::Ipv4Addr::new(10, 45, 0, 7))
         );
     }
 

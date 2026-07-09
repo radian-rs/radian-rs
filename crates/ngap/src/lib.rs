@@ -2044,6 +2044,53 @@ pub fn gnb_fteid_from_setup_response(pdu: &NGAP_PDU) -> Option<(u8, u32, Ipv4Add
     Some((item.pdu_session_id.0, teid, addr))
 }
 
+/// gNB side: parse a `PDUSessionResourceSetupRequest` — `(AMF-UE-NGAP-ID,
+/// RAN-UE-NGAP-ID, per-session (psi, UPF UL N3 TEID, UPF N3 IPv4, NAS-PDU))`. The
+/// NAS-PDU is the (protected) DL NAS Transport the gNB relays to the UE; the F-TEID
+/// is where the gNB tunnels uplink. For tests / a gNB simulator.
+#[allow(clippy::type_complexity)]
+pub fn pdu_session_resource_setup_request_params(
+    pdu: &NGAP_PDU,
+) -> Option<(u64, u32, Vec<(u8, u32, Ipv4Addr, Vec<u8>)>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_PDUSessionResourceSetup(req) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id, mut list) = (None, None, None);
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => {
+                ran_ue_id = Some(v.0)
+            }
+            PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListSUReq(l) => {
+                list = Some(l)
+            }
+            _ => {}
+        }
+    }
+    let sessions = list?
+        .0
+        .iter()
+        .filter_map(|item| {
+            let mut codec =
+                PerCodecData::from_slice_aper(&item.pdu_session_resource_setup_request_transfer.0);
+            let transfer = PDUSessionResourceSetupRequestTransfer::aper_decode(&mut codec).ok()?;
+            let (teid, addr) = transfer.protocol_i_es.0.iter().find_map(|e| match &e.value {
+                PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_UL_NGU_UP_TNLInformation(u) => fteid_from_uptnl(u),
+                _ => None,
+            })?;
+            let nas = item.pdu_session_nas_pdu.as_ref().map(|n| n.0.clone()).unwrap_or_default();
+            Some((item.pdu_session_id.0, teid, addr, nas))
+        })
+        .collect();
+    Some((amf_ue_id?, ran_ue_id?, sessions))
+}
+
 /// The N2 SM info for a modification: the session AMBR, the add-or-modified QoS
 /// flows, and the released QoS flows (`released_qfis`).
 fn modify_request_transfer(
@@ -2354,6 +2401,30 @@ mod tests {
         let pdu = pdu_session_resource_setup_response(1, 2, 5, 1, 0x5678, gnb_addr);
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
         assert_eq!(gnb_fteid_from_setup_response(&back), Some((5, 0x5678, gnb_addr)));
+    }
+
+    /// The gNB-side parser recovers the AMF/RAN ids, the UPF UL F-TEID, and the
+    /// relayed NAS-PDU from a setup request the AMF built.
+    #[test]
+    fn setup_request_params_recovers_fteid_and_nas() {
+        let upf_addr = Ipv4Addr::new(127, 0, 0, 1);
+        let nas = vec![0x7e, 0x02, 0xde, 0xad, 0xbe, 0xef, 0x00];
+        let pdu = pdu_session_resource_setup_request(
+            9,
+            4,
+            5,
+            &[QosFlow::default_non_gbr()],
+            0x1234,
+            upf_addr,
+            2_000_000_000,
+            1_000_000_000,
+            nas.clone(),
+        );
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        let (amf_ue_id, ran_ue_id, sessions) =
+            pdu_session_resource_setup_request_params(&back).expect("params");
+        assert_eq!((amf_ue_id, ran_ue_id), (9, 4));
+        assert_eq!(sessions, vec![(5, 0x1234, upf_addr, nas)]);
     }
 
     #[test]
