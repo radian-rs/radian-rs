@@ -159,6 +159,27 @@ pub fn sqn_ms_from_auts(
     (mac_s[..] == auts[6..]).then_some(sqn_ms)
 }
 
+/// UE side: verify AUTN, compute RES\* **and** derive K_AUSF (TS 33.501 §6.1.3.2)
+/// — the full USIM/ME output of one 5G-AKA challenge, from which the UE continues
+/// the key chain ([`kseaf`] → [`kamf`] → [`nas_keys`]). Used by tests / a UE
+/// simulator that must hold the same keys the network derives.
+pub fn ue_authenticate(
+    sub: &SubscriberKey,
+    rand: &[u8; 16],
+    autn: &[u8; 16],
+    mcc: &str,
+    mnc: &str,
+) -> Result<([u8; 16], [u8; 32]), AkaError> {
+    let res_star = ue_compute_res_star(sub, rand, autn, mcc, mnc)?;
+    // Recover the SQN the network used (AUTN verified above), then re-derive the
+    // vector — same K/OPc/SQN/RAND ⇒ the same K_AUSF the ARPF computed.
+    let mut m = Milenage::new_with_opc(sub.k, sub.opc);
+    let (_res, _ck, _ik, ak) = m.f2345(rand);
+    let sqn = xor6(&autn[..6], &ak);
+    let av = generate_5g_he_av(sub, &sqn, rand, mcc, mnc)?;
+    Ok((res_star, av.kausf))
+}
+
 /// UE side: verify AUTN and compute RES* (TS 33.501). Used by tests / a UE simulator.
 pub fn ue_compute_res_star(
     sub: &SubscriberKey,
@@ -291,6 +312,24 @@ mod tests {
         let mut av = generate_5g_he_av(&sub, &sqn, &rand, "999", "70").unwrap();
         av.autn[15] ^= 0xff; // corrupt MAC-A
         assert!(ue_compute_res_star(&sub, &av.rand, &av.autn, "999", "70").is_err());
+    }
+
+    /// The UE-side authenticate derives the SAME K_AUSF the network's vector
+    /// carries (the key chains must meet), and still refuses a tampered AUTN.
+    #[test]
+    fn ue_authenticate_matches_the_network_key_chain() {
+        let sub = test_subscriber();
+        let sqn = hex!("000000000001");
+        let rand = hex!("23553cbe9637a89d218ae64dae47bf35");
+        let av = generate_5g_he_av(&sub, &sqn, &rand, "999", "70").unwrap();
+
+        let (res_star, kausf) = ue_authenticate(&sub, &av.rand, &av.autn, "999", "70").unwrap();
+        assert_eq!(res_star, av.xres_star, "RES* must equal XRES*");
+        assert_eq!(kausf, av.kausf, "UE K_AUSF must match the ARPF's");
+
+        let mut bad = av.autn;
+        bad[15] ^= 0xff;
+        assert!(ue_authenticate(&sub, &av.rand, &bad, "999", "70").is_err());
     }
 
     /// K_gNB (TS 33.501 Annex A.9): deterministic in (K_AMF, UL NAS COUNT), and a

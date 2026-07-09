@@ -12,6 +12,11 @@ authors.workspace = true
 # The datapath test drives the real N4 (PFCP) and N3 (GTP-U) codecs against a live UPF.
 pfcp.workspace = true
 gtpu.workspace = true
+# The scripted gNB/UE (design/116 Tier B) speaks real NGAP/NAS to the live AMF.
+ngap.workspace = true
+nas.workspace = true
+aka.workspace = true
+sctp-rs = "0.3"
 tokio = { workspace = true, features = ["process", "time"] }
 anyhow.workspace = true
 
