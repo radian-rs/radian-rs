@@ -3110,10 +3110,19 @@ async fn dispatch_uplink_nas(
             info!("UE {amf_ue_id} identified via Identity Response ({supi}); starting authentication");
             match amf_auth.begin(&supi).await {
                 Ok((pending, nas_req)) => {
+                    // Assign the registration area now that the SUPI is known — the
+                    // Identity-Request path skips `on_initial_ue`'s identified branch,
+                    // so without this the accept would carry no 5GS TAI list (paging
+                    // would have nothing to scope to).
+                    let registration_area = registration_area_for(
+                        ues.get(&amf_ue_id).and_then(|c| c.tac),
+                        dereg_tx,
+                    );
                     let ctx = ues.get_mut(&amf_ue_id)?;
                     ctx.suci = Some(supi.clone());
                     ctx.auth = Some(pending);
                     ctx.state = RegState::Authenticating;
+                    ctx.registration_area = registration_area;
                     // Reachable from the SBI callback surface from now on.
                     UE_DIRECTORY.lock().unwrap().insert(supi, (amf_ue_id, dereg_tx.clone()));
                     Some((

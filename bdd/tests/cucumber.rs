@@ -673,6 +673,54 @@ async fn ue_assigned_ip(world: &mut World, subnet: String) {
     );
 }
 
+#[when("the scripted UE re-registers with its 5G-GUTI")]
+async fn ue_reregisters_with_guti(world: &mut World) {
+    // The 5G-TMSI the AMF assigned at registration is this UE's AMF-UE-NGAP-ID.
+    let tmsi = world.amf_ue_id.expect("registered UE") as u32;
+    let req = world.ue.as_ref().expect("UE").guti_registration_request(tmsi);
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::initial_ue_message_with_nas_at(SCRIPTED_RAN_UE_ID, req, "999", "70", &[0, 0, 1]))
+        .await
+        .expect("send InitialUEMessage (GUTI re-registration)");
+    // The AMF assigns a fresh AMF-UE-NGAP-ID for the re-registration; the next
+    // downlink (the re-auth challenge) carries it — captured by the challenge step.
+}
+
+#[when("the scripted UE registers with an unknown 5G-GUTI")]
+async fn ue_registers_unknown_guti(world: &mut World) {
+    // A 5G-TMSI the AMF has never assigned — its GUTI directory misses, so it
+    // must ask for the SUCI.
+    let req = world.ue.as_ref().expect("UE").guti_registration_request(0xDEAD_BEEF);
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::initial_ue_message_with_nas_at(SCRIPTED_RAN_UE_ID, req, "999", "70", &[0, 0, 1]))
+        .await
+        .expect("send InitialUEMessage (unknown GUTI)");
+}
+
+#[then("the AMF requests the UE's identity")]
+async fn amf_requests_identity(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let (amf_ue_id, bytes) = gnb.recv_downlink_nas().await.expect("the identity-request downlink");
+    // The Identity Request is sent plain (no NAS security context yet).
+    let msg = nas::decode_nas_5gs_message(&bytes).expect("decode the identity request");
+    assert_eq!(
+        nas::gmm_message_type(&msg),
+        Some(nas::Nas5gmmMessageType::IdentityRequest),
+        "expected an Identity Request"
+    );
+    world.amf_ue_id = Some(amf_ue_id);
+}
+
+#[when("the scripted UE answers with its SUCI")]
+async fn ue_answers_with_suci(world: &mut World) {
+    let response = world.ue.as_ref().expect("UE").identity_response();
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, response))
+        .await
+        .expect("send IdentityResponse");
+}
+
 /// Parse a slice spec like `"1:010203,2"` into `(sst, optional 3-byte SD)` pairs.
 fn parse_slices(spec: &str) -> Vec<(u8, Option<[u8; 3]>)> {
     spec.split(',')

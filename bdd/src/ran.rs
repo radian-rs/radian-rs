@@ -210,6 +210,20 @@ impl ScriptedUe {
         nas::registration_request_suci_with_nssai(&self.mcc, &self.mnc, &self.msin, &Self::SEC_CAP, slices)
     }
 
+    /// A Registration Request identifying the UE by its **5G-GUTI** (`tmsi`) — a
+    /// returning UE that holds a GUTI a previous Registration Accept assigned. The
+    /// AMF resolves it via its GUTI directory (or asks for the SUCI on a miss) and
+    /// re-authenticates. Sent plain (ngKSI 7 — no key referenced).
+    pub fn guti_registration_request(&self, tmsi: u32) -> Vec<u8> {
+        nas::registration_request_with_guti(&self.mcc, &self.mnc, tmsi, &Self::SEC_CAP)
+    }
+
+    /// An **Identity Response** carrying the UE's SUCI — the answer to an Identity
+    /// Request (e.g. after the AMF fails to resolve an unknown GUTI). Sent plain.
+    pub fn identity_response(&self) -> Vec<u8> {
+        nas::identity_response_suci(&self.mcc, &self.mnc, &self.msin)
+    }
+
     /// Answer the Authentication Request. The USIM verifies AUTN and — if it tracks
     /// an SQN — checks freshness: a stale challenge yields a synch-failure AUTS,
     /// otherwise it derives K_AUSF → K_SEAF and returns RES*.
