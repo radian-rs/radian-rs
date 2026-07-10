@@ -101,6 +101,38 @@ Feature: Scripted gNB/UE — full 5G-AKA registration against the live core
     Then the AMF re-establishes the context and reactivates the session
     And the UE reads the service accept
 
+  Scenario: A UE re-registers with its 5G-GUTI and is re-authenticated (D3)
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the scripted UE sends its registration request from TAC "000001"
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with RES*
+    Then the AMF selects NEA2/NIA2 in a security mode command
+    When the scripted UE completes the security mode procedure
+    Then the AMF sets up the initial context carrying the registration accept
+    When the gNB confirms the context and the UE completes the registration
+    Then the AMF nudges the registered UE with a configuration update
+    When the scripted UE re-registers with its 5G-GUTI
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with RES*
+    Then the AMF selects NEA2/NIA2 in a security mode command
+    When the scripted UE completes the security mode procedure
+    Then the AMF sets up the initial context carrying the registration accept
+    And the accept grants the subscribed slice, a GUTI, and the registration area
+
+  Scenario: An unknown 5G-GUTI triggers an Identity Request, then registration (D4)
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the scripted UE registers with an unknown 5G-GUTI
+    Then the AMF requests the UE's identity
+    When the scripted UE answers with its SUCI
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with RES*
+    Then the AMF selects NEA2/NIA2 in a security mode command
+    When the scripted UE completes the security mode procedure
+    Then the AMF sets up the initial context carrying the registration accept
+    And the accept grants the subscribed slice, a GUTI, and the registration area
+
   Scenario: Teardown topology
     Given the scripted core is running
     When I stop the radian core
