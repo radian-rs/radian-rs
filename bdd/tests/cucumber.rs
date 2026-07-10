@@ -23,6 +23,11 @@ const RAN_UE_GW: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 1); // RAN end of the RAN↔
 const UE_NS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2); // UE end of the RAN↔UE veth (e2e)
 const N3_PORT: u16 = 2152;
 const N4_PORT: u16 = 8805;
+/// The scripted core runs on the host loopback. The UPF binds a **distinct**
+/// loopback alias so its N3 (GTP-U :2152) doesn't collide with the scripted gNB's
+/// N3 (:2152 on 127.0.0.1) — the two speak GTP-U to each other across 127.0.0.1↔.2.
+const UPF_N3_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+const GNB_N3_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 const GNB_TEID: u32 = 0x1001; // datapath feature: the downlink F-TEID we install and expect
 const UDR_KEK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
@@ -43,6 +48,8 @@ struct World {
     pending_nas: Option<Vec<u8>>,
     /// The PDU session id the scripted UE established.
     pdu_psi: Option<u8>,
+    /// The UPF's N3 F-TEID address learned from the N2 setup (datapath echo).
+    upf_n3_addr: Option<Ipv4Addr>,
 }
 
 impl World {
@@ -232,11 +239,26 @@ async fn start_core(world: &mut World) {
     // CHF serves Nchf_ConvergedCharging; the SMF opens a charging session per PDU session.
     world.procs.push(spawn_core(&tag, false, &[("RADIAN_CHF_NRF", nrf)], "chf").await);
     // UPF needs CAP_NET_ADMIN for its N6 TUN → run under sudo; advertise the host N3 address.
-    world.procs.push(spawn_core(&tag, true, &[("RADIAN_UPF_N3_ADDR", &HOST_IP.to_string())], "upf").await);
+    // The UPF binds a distinct loopback alias (127.0.0.2) for N3/N4 + advertises it
+    // as its N3 F-TEID address, so a scripted gNB can run real GTP-U on 127.0.0.1:2152
+    // without a port clash.
+    world.procs.push(
+        spawn_core(
+            &tag,
+            true,
+            &[
+                ("RADIAN_UPF_BIND", &UPF_N3_IP.to_string()),
+                ("RADIAN_UPF_N3_ADDR", &UPF_N3_IP.to_string()),
+            ],
+            "upf",
+        )
+        .await,
+    );
     assert!(wait_until(6, || netns::host_iface_exists("n6upf0")).await, "UPF N6 TUN did not come up");
 
+    let smf_n4 = format!("{UPF_N3_IP}:{N4_PORT}");
     world.procs.push(
-        spawn_core(&tag, false, &[("RADIAN_SMF_UPF_N4", "127.0.0.1:8805"), ("RADIAN_SMF_NRF", nrf)], "smf").await,
+        spawn_core(&tag, false, &[("RADIAN_SMF_UPF_N4", &smf_n4), ("RADIAN_SMF_NRF", nrf)], "smf").await,
     );
     world.procs.push(spawn_core(&tag, false, &[], "amf").await);
     let ready = wait_until(6, || async {
@@ -637,23 +659,26 @@ async fn amf_sets_up_pdu_session(world: &mut World) {
         ngap::pdu_session_resource_setup_request_params(&pdu).expect("a PDUSessionResourceSetupRequest");
     assert_eq!(Some(amf_ue_id), world.amf_ue_id);
     assert_eq!(ran_ue_id, SCRIPTED_RAN_UE_ID);
-    let (psi, upf_teid, _upf_addr, nas) = sessions.into_iter().next().expect("one PDU session");
+    let (psi, upf_teid, upf_addr, nas) = sessions.into_iter().next().expect("one PDU session");
     assert_eq!(Some(psi), world.pdu_psi);
     assert_ne!(upf_teid, 0, "the UPF allocated a non-zero uplink N3 F-TEID");
-    // The gNB accepts the session, reporting its own DL F-TEID (→ the AMF installs
-    // the downlink at the UPF via UpdateSMContext).
+    // The gNB accepts the session, reporting its own DL F-TEID at its real N3 address
+    // (→ the AMF installs the downlink at the UPF via UpdateSMContext, so a later
+    // datapath echo returns here).
     gnb.send(&ngap::pdu_session_resource_setup_response(
         amf_ue_id,
         ran_ue_id,
         psi,
         1, // QFI of the default non-GBR flow
         SCRIPTED_GNB_DL_TEID,
-        Ipv4Addr::LOCALHOST,
+        GNB_N3_IP,
     ))
     .await
     .expect("send PDUSessionResourceSetupResponse");
-    // Hold the relayed NAS-PDU (the accept) for the UE to read.
+    // Hold the relayed NAS-PDU (the accept) + the UPF's uplink F-TEID for the datapath.
     world.pending_nas = Some(nas);
+    world.uplink_teid = Some(upf_teid);
+    world.upf_n3_addr = Some(upf_addr);
 }
 
 #[then(regex = r#"^the UE is assigned an IP address in "([^"]+)"$"#)]
@@ -671,6 +696,28 @@ async fn ue_assigned_ip(world: &mut World, subnet: String) {
         u32::from(base) & mask,
         "assigned UE IP {ip} is not in {subnet}"
     );
+    world.ue_ip = Some(ip); // for a datapath echo from this UE address
+}
+
+#[then(regex = r#"^the UE can reach the data network gateway "([^"]+)" over the datapath$"#)]
+async fn ue_reaches_dn_over_datapath(world: &mut World, gw: String) {
+    let gw_ip: Ipv4Addr = gw.parse().expect("valid gateway IP");
+    let ue_ip = world.ue_ip.expect("the UE has an assigned IP");
+    let uplink_teid = world.uplink_teid.expect("the UPF uplink F-TEID was learned");
+    let upf_addr = world.upf_n3_addr.expect("the UPF N3 address was learned");
+    // Play the gNB's N3: GTP-U-encap an ICMP echo (UE → gateway) on the UPF's uplink
+    // F-TEID, and expect the reply back on our DL F-TEID — the full N3 → N6 → N3 trip.
+    let ok = datapath::ping_through_datapath(
+        SocketAddrV4::new(GNB_N3_IP, N3_PORT),
+        SocketAddrV4::new(upf_addr, N3_PORT),
+        uplink_teid,
+        SCRIPTED_GNB_DL_TEID,
+        ue_ip,
+        gw_ip,
+    )
+    .await
+    .expect("run the datapath echo");
+    assert!(ok, "no ICMP echo reply returned through the signalled N3/N6 datapath");
 }
 
 /// Parse a comma-separated TAC list like `"000001,000002"` into 3-byte TACs.
