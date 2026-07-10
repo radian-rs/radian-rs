@@ -699,6 +699,32 @@ async fn ue_assigned_ip(world: &mut World, subnet: String) {
     world.ue_ip = Some(ip); // for a datapath echo from this UE address
 }
 
+#[when("a downlink packet arrives for the UE on the data network")]
+async fn downlink_packet_for_ue(world: &mut World) {
+    let ue_ip = world.ue_ip.expect("the UE has an assigned IP");
+    // Send to the UE address: the host routes 10.45.0.0/16 to the UPF's N6 TUN, so
+    // the UPF sees a downlink packet for the (now CM-IDLE) UE — it buffers it and
+    // raises a Downlink Data Report, which drives paging.
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.expect("bind DN socket");
+    sock.send_to(b"radian-downlink", SocketAddrV4::new(ue_ip, 9999))
+        .await
+        .expect("send a downlink packet to the UE");
+}
+
+#[then(regex = r#"^the gNB is paged for the UE in TAC "([0-9a-fA-F]{6})"$"#)]
+async fn gnb_is_paged(world: &mut World, tac: String) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let pdu = gnb.recv().await.expect("the paging message");
+    let tmsi = world.amf_ue_id.expect("registered UE") as u32;
+    assert_eq!(
+        ngap::tmsi_from_paging(&pdu),
+        Some(tmsi),
+        "the Paging carries the UE's 5G-S-TMSI"
+    );
+    let tacs = ngap::tacs_from_paging(&pdu).unwrap_or_default();
+    assert!(tacs.contains(&parse_tac(&tac)), "the Paging TAI list covers TAC {tac}: {tacs:02x?}");
+}
+
 #[then(regex = r#"^the UE can reach the data network gateway "([^"]+)" over the datapath$"#)]
 async fn ue_reaches_dn_over_datapath(world: &mut World, gw: String) {
     let gw_ip: Ipv4Addr = gw.parse().expect("valid gateway IP");
