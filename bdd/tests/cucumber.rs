@@ -50,6 +50,9 @@ struct World {
     pdu_psi: Option<u8>,
     /// The UPF's N3 F-TEID address learned from the N2 setup (datapath echo).
     upf_n3_addr: Option<Ipv4Addr>,
+    /// The gNB's N3 (GTP-U) socket, bound early so it can receive a downlink G-PDU
+    /// the UPF flushes after a CM-IDLE resume.
+    gnb_n3: Option<tokio::net::UdpSocket>,
 }
 
 impl World {
@@ -699,6 +702,19 @@ async fn ue_assigned_ip(world: &mut World, subnet: String) {
     world.ue_ip = Some(ip); // for a datapath echo from this UE address
 }
 
+/// The marker payload of the injected downlink packet — checked when it flushes.
+const DL_MARKER: &[u8] = b"radian-downlink";
+
+#[when("the gNB opens its N3 tunnel")]
+async fn gnb_opens_n3(world: &mut World) {
+    // Bind the gNB's N3 socket now so it is already listening when the UPF flushes
+    // the buffered downlink after the CM-IDLE resume.
+    let sock = datapath::bind_gnb_n3(SocketAddrV4::new(GNB_N3_IP, N3_PORT))
+        .await
+        .expect("bind the gNB N3 socket");
+    world.gnb_n3 = Some(sock);
+}
+
 #[when("a downlink packet arrives for the UE on the data network")]
 async fn downlink_packet_for_ue(world: &mut World) {
     let ue_ip = world.ue_ip.expect("the UE has an assigned IP");
@@ -706,9 +722,29 @@ async fn downlink_packet_for_ue(world: &mut World) {
     // the UPF sees a downlink packet for the (now CM-IDLE) UE — it buffers it and
     // raises a Downlink Data Report, which drives paging.
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.expect("bind DN socket");
-    sock.send_to(b"radian-downlink", SocketAddrV4::new(ue_ip, 9999))
+    sock.send_to(DL_MARKER, SocketAddrV4::new(ue_ip, 9999))
         .await
         .expect("send a downlink packet to the UE");
+}
+
+#[then("the buffered downlink packet arrives on the gNB's N3 tunnel")]
+async fn buffered_packet_flushes(world: &mut World) {
+    let ue_ip = world.ue_ip.expect("the UE has an assigned IP");
+    let sock = world.gnb_n3.as_ref().expect("the gNB opened its N3 tunnel");
+    // On the resume, the AMF's ICS-response handling installs the downlink at the UPF,
+    // which flushes the buffered packet as a G-PDU on our DL F-TEID.
+    let inner = datapath::recv_downlink_gpdu(sock, SCRIPTED_GNB_DL_TEID, 5)
+        .await
+        .expect("receive the flushed downlink")
+        .expect("the buffered downlink packet did not flush to the N3 tunnel");
+    // The inner IP packet is the one we injected: destined for the UE, carrying the marker.
+    assert!(inner.len() >= 20, "flushed G-PDU carries an IPv4 packet");
+    let dst = Ipv4Addr::new(inner[16], inner[17], inner[18], inner[19]);
+    assert_eq!(dst, ue_ip, "the flushed packet is addressed to the UE");
+    assert!(
+        inner.windows(DL_MARKER.len()).any(|w| w == DL_MARKER),
+        "the flushed packet carries the injected payload"
+    );
 }
 
 #[then(regex = r#"^the gNB is paged for the UE in TAC "([0-9a-fA-F]{6})"$"#)]
