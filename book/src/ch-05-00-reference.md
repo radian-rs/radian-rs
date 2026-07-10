@@ -8,23 +8,40 @@ variables that configure them.
 | NF | Binary | Listens on | Notes |
 |----|--------|-----------|-------|
 | NRF | `nf-nrf` | SBI `:8000` (h2c) | discovery/registration |
+| AMF | `nf-amf` | N2 SCTP `:38412` (PPID 60), SBI `:8001` | terminates NGAP/NAS; `:8001` is the callback surface |
 | SMF | `nf-smf` | SBI `:8002` (h2c) | PFCP client to the UPF |
 | AUSF | `nf-ausf` | SBI `:8003` (h2c) | self-registers with NRF |
-| UDM | `nf-udm` | SBI `:8004` (h2c) | encrypted redb store |
-| AMF | `nf-amf` | N2 SCTP `:38412` (PPID 60) | terminates NGAP/NAS |
+| UDM | `nf-udm` | SBI `:8004` (h2c) | stateless `Nudr` front-end |
+| UDR | `nf-udr` | SBI `:8005` (h2c) | subscriber store (encrypted redb) + ARPF |
+| PCF | `nf-pcf` | SBI `:8006` (h2c) | SM + AM policy |
+| CHF | `nf-chf` | SBI `:8007` (h2c) | converged charging |
 | UPF | `nf-upf` | N4 UDP `:8805`, N3 UDP `:2152`, N6 TUN | needs `CAP_NET_ADMIN` |
 
-The `nf-udr` and `nf-pcf` binaries are scaffolding.
+Every SBI NF self-registers with the NRF on startup. All except the UPF speak SBI.
 
 ## Environment variables
 
-**UDM (`nf-udm`)**
+**UDR (`nf-udr`)** — owns the subscriber store + ARPF
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `RADIAN_UDM_PROVISION_DEMO` | unset | `1` provisions the TS 35.208 demo subscriber |
-| `RADIAN_UDM_DB` | `radian-udm.redb` | path to the encrypted store |
-| `RADIAN_UDM_MASTER_KEY` | ephemeral (warns) | 64-hex KEK for encryption at rest |
+| `RADIAN_UDR_PROVISION_DEMO` | unset | `1` provisions the TS 35.208 demo subscriber |
+| `RADIAN_UDR_DB` | `radian-udr.redb` | path to the encrypted store |
+| `RADIAN_UDR_MASTER_KEY` | ephemeral (warns) | 64-hex KEK for encryption at rest |
+| `RADIAN_UDR_NRF` | `http://127.0.0.1:8000` | the NRF base URL |
+
+**UDM (`nf-udm`)** — stateless front end, holds no store
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RADIAN_UDM_UDR` | `http://127.0.0.1:8005` | the UDR base URL to relay `Nudr` to |
+| `RADIAN_UDM_NRF` | `http://127.0.0.1:8000` | the NRF base URL |
+
+**PCF (`nf-pcf`)** and **CHF (`nf-chf`)**
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RADIAN_PCF_NRF` / `RADIAN_CHF_NRF` | `http://127.0.0.1:8000` | the NRF base URL |
 
 **SMF (`nf-smf`)**
 
