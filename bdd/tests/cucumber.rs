@@ -263,7 +263,10 @@ async fn start_core(world: &mut World) {
     world.procs.push(
         spawn_core(&tag, false, &[("RADIAN_SMF_UPF_N4", &smf_n4), ("RADIAN_SMF_NRF", nrf)], "smf").await,
     );
-    world.procs.push(spawn_core(&tag, false, &[], "amf").await);
+    // Shrink T3513 so the paging-retransmission scenario runs in a few seconds. It
+    // stays comfortably longer than a scripted resume takes, so scenarios whose UE
+    // resumes (the buffer-flush arc) still stop paging before the first retransmit.
+    world.procs.push(spawn_core(&tag, false, &[("RADIAN_AMF_T3513_SECS", "2")], "amf").await);
     let ready = wait_until(6, || async {
         netns::host_port_listening(8002, "tcp").await // SMF (registered before serving)
             && netns::host_port_listening(8003, "tcp").await // AUSF
@@ -745,6 +748,22 @@ async fn buffered_packet_flushes(world: &mut World) {
         inner.windows(DL_MARKER.len()).any(|w| w == DL_MARKER),
         "the flushed packet carries the injected payload"
     );
+}
+
+#[then(regex = r#"^the gNB is paged (\d+) times for the UE$"#)]
+async fn gnb_paged_n_times(world: &mut World, n: usize) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let tmsi = world.amf_ue_id.expect("registered UE") as u32;
+    // The UE never resumes, so the AMF retransmits the Paging under T3513 up to its
+    // max-sends; each attempt reaches this gNB (it serves the UE's registration area).
+    for i in 1..=n {
+        let pdu = gnb.recv().await.unwrap_or_else(|e| panic!("paging attempt {i} not received: {e}"));
+        assert_eq!(
+            ngap::tmsi_from_paging(&pdu),
+            Some(tmsi),
+            "paging attempt {i} carries the UE's 5G-S-TMSI"
+        );
+    }
 }
 
 #[then(regex = r#"^the gNB is paged for the UE in TAC "([0-9a-fA-F]{6})"$"#)]
