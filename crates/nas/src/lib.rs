@@ -1303,6 +1303,19 @@ pub fn pdu_session_establishment_reject(
     m
 }
 
+/// From a 5GSM **PDU Session Establishment Reject** container, the
+/// `(5GSM cause, optional T3396 back-off octet)` — UE side / tests. `None` if the
+/// container is not an Establishment Reject (message type 0xC3).
+pub fn pdu_session_reject_info(container: &[u8]) -> Option<(u8, Option<u8>)> {
+    // `[0x2E, psi, pti, 0xC3, cause, (0x37, 0x01, t3396)?]`.
+    if container.get(3) != Some(&0xc3) {
+        return None;
+    }
+    let cause = *container.get(4)?;
+    let t3396 = (container.get(5) == Some(&0x37)).then(|| container.get(7).copied()).flatten();
+    Some((cause, t3396))
+}
+
 /// Encode a DNN as RFC 1035 labels (each dot-separated label prefixed by its length),
 /// as TS 24.501 §9.11.2.1A specifies.
 fn rfc1035_labels(dnn: &str) -> Vec<u8> {
@@ -1882,6 +1895,27 @@ mod tests {
             ue_ipv4_from_establishment_accept(&accept),
             Some(std::net::Ipv4Addr::new(10, 45, 0, 7))
         );
+    }
+
+    /// A PDU Session Establishment Reject's cause and T3396 read back out of its
+    /// container.
+    #[test]
+    fn pdu_session_reject_info_reads_cause_and_backoff() {
+        let reject = pdu_session_establishment_reject(
+            5,
+            1,
+            sm_cause::MISSING_OR_UNKNOWN_DNN,
+            Some(GprsTimer3::from_secs(600)),
+        );
+        assert_eq!(
+            pdu_session_reject_info(&reject),
+            Some((sm_cause::MISSING_OR_UNKNOWN_DNN, Some(GprsTimer3::from_secs(600).octet())))
+        );
+        // No back-off timer → cause only.
+        let no_backoff = pdu_session_establishment_reject(5, 1, sm_cause::REQUEST_REJECTED_UNSPECIFIED, None);
+        assert_eq!(pdu_session_reject_info(&no_backoff), Some((sm_cause::REQUEST_REJECTED_UNSPECIFIED, None)));
+        // A non-reject container yields nothing.
+        assert_eq!(pdu_session_reject_info(&pdu_session_establishment_request(5, 1)), None);
     }
 
     /// The Authentication Reject encodes and decodes to the right 5GMM type.

@@ -673,6 +673,47 @@ async fn ue_assigned_ip(world: &mut World, subnet: String) {
     );
 }
 
+/// Parse a comma-separated TAC list like `"000001,000002"` into 3-byte TACs.
+fn parse_tacs(spec: &str) -> Vec<[u8; 3]> {
+    spec.split(',').filter(|s| !s.is_empty()).map(parse_tac).collect()
+}
+
+#[then(regex = r#"^the accept's registration area covers TACs "([0-9a-fA-F,]+)"$"#)]
+async fn accept_registration_area(world: &mut World, spec: String) {
+    let accept = world.pending_nas.take().expect("the ICS NAS PDU");
+    let msg = world.ue.as_mut().expect("UE").read_downlink(&accept).expect("the accept verifies");
+    assert_eq!(nas::gmm_message_type(&msg), Some(nas::Nas5gmmMessageType::RegistrationAccept));
+    assert_eq!(
+        nas::registration_area_from_registration_accept(&msg),
+        Some(parse_tacs(&spec)),
+        "registration area = the serving gNB's TA list ∪ the UE's TAI"
+    );
+}
+
+#[when(regex = r#"^the scripted UE requests a PDU session for DNN "([^"]+)"$"#)]
+async fn ue_requests_pdu_for_dnn(world: &mut World, dnn: String) {
+    let psi = 1u8;
+    let request =
+        world.ue.as_mut().expect("UE").pdu_session_request_for_dnn(psi, &dnn).expect("build the request");
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, request))
+        .await
+        .expect("send UL NAS Transport (PDU session request)");
+    world.pdu_psi = Some(psi);
+}
+
+#[then(regex = r#"^the AMF rejects the PDU session with 5GSM cause (\d+) and a back-off timer$"#)]
+async fn amf_rejects_pdu_session(world: &mut World, cause: u8) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let (amf_ue_id, bytes) = gnb.recv_downlink_nas().await.expect("the reject downlink");
+    assert_eq!(Some(amf_ue_id), world.amf_ue_id);
+    let (got_cause, t3396) =
+        world.ue.as_mut().expect("UE").read_pdu_session_reject(&bytes).expect("read the reject");
+    assert_eq!(got_cause, cause, "5GSM reject cause");
+    assert!(t3396.is_some(), "the reject carries a T3396 back-off timer");
+}
+
 #[when("the scripted UE re-registers with its 5G-GUTI")]
 async fn ue_reregisters_with_guti(world: &mut World) {
     // The 5G-TMSI the AMF assigned at registration is this UE's AMF-UE-NGAP-ID.
