@@ -28,7 +28,11 @@ Feature: Scripted gNB/UE — user-plane datapath through the signalled stack
     And the UE is assigned an IP address in "10.45.0.0/16"
     And the UE can reach the data network gateway "10.45.0.1" over the datapath
 
-  Scenario: A downlink packet to a CM-IDLE UE triggers paging
+  # The full CM-IDLE datapath arc: paging (a downlink packet to a CM-IDLE UE) AND
+  # the buffer flush on resume. The UE resumes here, so it leaves no dangling
+  # retained context — unlike a paging-only scenario, whose never-resumed UE would
+  # share the demo SUPI with a later scenario's UE and mis-resolve paging.
+  Scenario: A buffered downlink packet flushes to the UE on resume
     Given the scripted core is running
     When the scripted gNB connects and completes NG Setup
     And the scripted UE sends its registration request from TAC "000001"
@@ -42,9 +46,13 @@ Feature: Scripted gNB/UE — user-plane datapath through the signalled stack
     When the scripted UE requests a PDU session
     Then the AMF sets up the PDU session at the gNB
     And the UE is assigned an IP address in "10.45.0.0/16"
-    When the gNB releases the UE context via AN release
+    When the gNB opens its N3 tunnel
+    And the gNB releases the UE context via AN release
     And a downlink packet arrives for the UE on the data network
     Then the gNB is paged for the UE in TAC "000001"
+    When the scripted UE resumes with a Service Request
+    Then the AMF re-establishes the context and reactivates the session
+    And the buffered downlink packet arrives on the gNB's N3 tunnel
 
   Scenario: Teardown topology
     Given the scripted core is running

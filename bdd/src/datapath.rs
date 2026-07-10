@@ -136,6 +136,33 @@ pub async fn ping_through_datapath(
     Ok(false)
 }
 
+/// Bind a gNB N3 (GTP-U) socket at `addr` and keep it — used to receive a downlink
+/// G-PDU the UPF flushes after a CM-IDLE resume, which requires the socket to already
+/// be listening when the flush arrives.
+pub async fn bind_gnb_n3(addr: SocketAddrV4) -> Result<UdpSocket> {
+    UdpSocket::bind(addr).await.context("bind gNB N3 socket")
+}
+
+/// Receive a downlink G-PDU on an already-bound gNB N3 socket, returning the inner
+/// IP packet when its TEID matches `expected_teid`. `None` if none arrives within
+/// `secs`.
+pub async fn recv_downlink_gpdu(
+    sock: &UdpSocket,
+    expected_teid: u32,
+    secs: u64,
+) -> Result<Option<Vec<u8>>> {
+    let mut buf = vec![0u8; 2048];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while let Ok(Ok((n, _))) =
+        timeout(deadline.saturating_duration_since(tokio::time::Instant::now()), sock.recv_from(&mut buf)).await
+    {
+        if let Some((_, inner)) = gtpu::decap(&buf[..n]).filter(|(teid, _)| *teid == expected_teid) {
+            return Ok(Some(inner.to_vec()));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
