@@ -54,6 +54,27 @@ Feature: Scripted gNB/UE — user-plane datapath through the signalled stack
     Then the AMF re-establishes the context and reactivates the session
     And the buffered downlink packet arrives on the gNB's N3 tunnel
 
+  # This UE never answers the page, so the AMF retransmits under T3513 up to its
+  # max-sends. It runs last (before teardown): its unresumed context stays retained,
+  # so a later same-SUPI scenario would mis-resolve paging (see the flush scenario).
+  Scenario: An unanswered page is retransmitted under T3513
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the scripted UE sends its registration request from TAC "000001"
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with RES*
+    Then the AMF selects NEA2/NIA2 in a security mode command
+    When the scripted UE completes the security mode procedure
+    Then the AMF sets up the initial context carrying the registration accept
+    When the gNB confirms the context and the UE completes the registration
+    Then the AMF nudges the registered UE with a configuration update
+    When the scripted UE requests a PDU session
+    Then the AMF sets up the PDU session at the gNB
+    And the UE is assigned an IP address in "10.45.0.0/16"
+    When the gNB releases the UE context via AN release
+    And a downlink packet arrives for the UE on the data network
+    Then the gNB is paged 3 times for the UE
+
   Scenario: Teardown topology
     Given the scripted core is running
     When I stop the radian core
