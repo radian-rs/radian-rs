@@ -299,6 +299,21 @@ impl ScriptedUe {
         Ok(nas::authentication_response(&res_star))
     }
 
+    /// Build a NAS-protected **Service Request** (signalling, ngKSI 0) identifying
+    /// the UE by its 5G-TMSI — a CM-IDLE UE resuming its N2 connection. Records the
+    /// **resume K_gNB** derived from the NAS COUNT this message goes out under
+    /// (TS 33.501 §6.9.2.1.1); the AMF derives the same for the Initial Context Setup.
+    pub fn service_request(&mut self, tmsi: u32) -> Result<Vec<u8>> {
+        let plain = nas::service_request(0, 0, tmsi);
+        let inner = nas::decode_nas_5gs_message(&plain).context("decode Service Request")?;
+        let kamf = self.kamf.context("no K_AMF — register first")?;
+        let sec = self.sec.as_mut().context("no NAS security context")?;
+        let count = sec.ul_count; // the COUNT the Service Request is protected under
+        let protected = sec.protect(&inner, nas::sht::INTEGRITY_CIPHERED, 0);
+        self.kgnb = Some(aka::kgnb(&kamf, count));
+        Ok(protected)
+    }
+
     /// Verify + decode a protected downlink NAS message.
     pub fn read_downlink(&mut self, bytes: &[u8]) -> Result<nas::Nas5gsMessage> {
         let sec = self.sec.as_mut().context("no NAS security context yet")?;

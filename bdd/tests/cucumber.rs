@@ -538,6 +538,85 @@ async fn amf_nudges_config_update(world: &mut World) {
 /// slice — no GTP-U flows on it yet). Loopback, since the core runs on the host.
 const SCRIPTED_GNB_DL_TEID: u32 = 0x2001;
 
+/// The RAN-UE-NGAP-ID the gNB assigns when a CM-IDLE UE resumes (a fresh RAN
+/// context after the AN release tore down the old one).
+const SCRIPTED_RESUME_RAN_UE_ID: u32 = 2;
+
+#[when("the gNB releases the UE context via AN release")]
+async fn gnb_an_release(world: &mut World) {
+    let amf_ue_id = world.amf_ue_id.expect("registered UE");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    // Radio cause 20 = user-inactivity, what a real gNB sends for AN release.
+    gnb.send(&ngap::ue_context_release_request(amf_ue_id, SCRIPTED_RAN_UE_ID, 20))
+        .await
+        .expect("send UEContextReleaseRequest");
+    let pdu = gnb.recv().await.expect("the release command");
+    assert!(
+        ngap::parse_ue_context_release_command(&pdu).is_some(),
+        "expected a UEContextReleaseCommand for the AN release"
+    );
+}
+
+#[when("the scripted UE resumes with a Service Request")]
+async fn ue_resumes_with_service_request(world: &mut World) {
+    let tmsi = world.amf_ue_id.expect("registered UE") as u32;
+    let sr = world.ue.as_mut().expect("UE").service_request(tmsi).expect("build Service Request");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::initial_ue_message_with_stmsi_at(
+        SCRIPTED_RESUME_RAN_UE_ID,
+        tmsi,
+        sr,
+        "999",
+        "70",
+        &[0, 0, 1],
+    ))
+    .await
+    .expect("send InitialUEMessage (Service Request)");
+}
+
+#[then("the AMF re-establishes the context and reactivates the session")]
+async fn amf_reestablishes_on_resume(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let pdu = gnb.recv().await.expect("the resume initial context setup");
+    let (amf_ue_id, ran_ue_id, ic) =
+        ngap::initial_context_setup_params(&pdu).expect("an InitialContextSetupRequest");
+    assert_eq!(ran_ue_id, SCRIPTED_RESUME_RAN_UE_ID);
+    // A fresh K_gNB derived from the Service Request's NAS COUNT (TS 33.501
+    // §6.9.2.1.1) — the UE's own resume derivation must match.
+    assert_eq!(
+        ic.security_key,
+        world.ue.as_ref().expect("UE").kgnb.expect("resume K_gNB"),
+        "resume K_gNB mismatch"
+    );
+    // The PDU session comes back **inline** in the context setup, carrying the
+    // UPF's retained uplink F-TEID (the SMF/UPF reactivated the user plane).
+    let sessions = ngap::initial_context_setup_request_session_ids(&pdu);
+    let (psi, upf_teid, _addr) = sessions.into_iter().next().expect("the reactivated session");
+    assert_eq!(Some(psi), world.pdu_psi);
+    assert_ne!(upf_teid, 0, "the UPF returned a retained uplink F-TEID on reactivation");
+    // The gNB confirms the context, reporting its DL F-TEID for the session.
+    gnb.send(&ngap::initial_context_setup_response_with_sessions(
+        amf_ue_id,
+        ran_ue_id,
+        &[(psi, SCRIPTED_GNB_DL_TEID, Ipv4Addr::LOCALHOST)],
+    ))
+    .await
+    .expect("send InitialContextSetupResponse");
+    world.amf_ue_id = Some(amf_ue_id); // the resume assigned a fresh AMF-UE-NGAP-ID
+    world.pending_nas = Some(ic.nas);
+}
+
+#[then("the UE reads the service accept")]
+async fn ue_reads_service_accept(world: &mut World) {
+    let accept = world.pending_nas.take().expect("the ServiceAccept NAS");
+    let msg = world.ue.as_mut().expect("UE").read_downlink(&accept).expect("verify the accept");
+    assert_eq!(
+        nas::gmm_message_type(&msg),
+        Some(nas::Nas5gmmMessageType::ServiceAccept),
+        "expected a Service Accept"
+    );
+}
+
 #[when("the scripted UE requests a PDU session")]
 async fn ue_requests_pdu_session(world: &mut World) {
     let psi = 1u8;
