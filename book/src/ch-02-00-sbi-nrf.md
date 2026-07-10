@@ -48,19 +48,33 @@ The store is in-memory.
 
 | NF | Registers with NRF | Discovers via NRF |
 |----|--------------------|-------------------|
-| **SMF** | yes — `nsmf-pdusession` | — |
+| **AMF** | yes — `namf-callback` | AUSF, SMF, UDM, PCF |
+| **SMF** | yes — `nsmf-pdusession` | UDM, PCF, CHF |
 | **AUSF** | yes — `nausf-auth` | — |
-| **AMF** | — | AUSF (for auth), SMF (for sessions) |
+| **UDM** | yes — `nudm-ueau` / `nudm-sdm` | — |
+| **UDR** | yes — `nudr-dr` | — |
+| **PCF** | yes — `npcf-smpolicycontrol` / `npcf-am-policy-control` | — |
+| **CHF** | yes — `nchf-convergedcharging` | — |
 
-The SMF and AUSF **self-register** on startup. The AMF is a pure consumer: when a
-UE authenticates it does `discover("AUSF", "AMF")`, and when a UE starts a session
-it does `discover("SMF", "AMF")`, using whatever endpoint the NRF returns.
+Every SBI NF **self-registers** on startup and heartbeats to stay in the registry.
+The **AMF** and **SMF** are the discoverers: when a UE authenticates the AMF does
+`discover("AUSF", "AMF")`, when it starts a session the AMF does `discover("SMF",
+"AMF")`, and each in turn discovers the UDM/PCF/CHF it needs — always using
+whatever endpoint the NRF returns. The AMF also registers its own
+`namf-callback` service so SBI callbacks (a UDR subscription withdrawal, a PCF
+`UpdateNotify`) can find their way back to it.
 
-The NRF base each NF uses is configurable:
+A few backend links are still **configured static bases** rather than NRF-discovered:
+AUSF→UDM (`:8004`, fixed for now), UDM→UDR (`RADIAN_UDM_UDR`, default `:8005`), and
+PCF→UDR (`RADIAN_PCF_UDR`, default `:8005`). Moving these onto NRF discovery is
+incremental work behind the same client seam.
+
+The NRF base each NF uses is configurable — `RADIAN_<NF>_NRF`, e.g.:
 
 ```
 RADIAN_SMF_NRF=http://127.0.0.1:8000     # SMF
 RADIAN_AUSF_NRF=http://127.0.0.1:8000    # AUSF
+RADIAN_PCF_NRF=http://127.0.0.1:8000     # PCF   (likewise UDR, UDM, CHF)
 ```
 
 The AMF's NRF base is fixed at `http://127.0.0.1:8000`.
@@ -72,8 +86,13 @@ thin binaries:
 
 - `sbi_core::nnrf` — the NRF service (used by `nf-nrf`).
 - `sbi_core::nausf` — `Nausf_UEAuthentication` (used by `nf-ausf`).
-- `sbi_core::nudm` — `Nudm_UEAuthentication`, a stateless front end over the
-  subscriber store (used by `nf-udm`).
+- `sbi_core::nudm` — `Nudm_UEAuthentication` / `Nudm_SDM`, a stateless front end
+  that relays to the UDR over `Nudr` (used by `nf-udm`).
+- `sbi_core::nudr` — the `Nudr` data-repository service over the subscriber store
+  (used by `nf-udr`).
+- `sbi_core::npcf` / `npcf_am` — `Npcf_SMPolicyControl` / `Npcf_AMPolicyControl`
+  (used by `nf-pcf`).
+- `sbi_core::nchf` — `Nchf_ConvergedCharging` (used by `nf-chf`).
 
 The SMF's `Nsmf_PDUSession` server lives in the `nf-smf` binary itself, because it
 is tightly coupled to that NF's PFCP state.

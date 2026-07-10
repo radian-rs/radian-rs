@@ -14,7 +14,7 @@
 ## Service-Based Interface
 
 - [The SBI Spine and the NRF](ch-02-00-sbi-nrf.md)
-- [Subscriber Data (UDM) and Credentials](ch-02-01-subscriber-store.md)
+- [Subscriber Data (UDR) and Credentials](ch-02-01-subscriber-store.md)
 
 ## Session Management and the User Plane
 
