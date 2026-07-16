@@ -334,9 +334,14 @@ plan the phase implemented.
   against our own core in CI.
 
 ### Phase 3 — F1: Rust CU ↔ OCUDU DU (L/XL, the interop rung)
-- `crates/f1ap` (APER, same codec decision as RRC): F1 Setup, Initial UL RRC Transfer,
-  DL/UL RRC Transfer, UE Context Setup/Modification/Release, Paging — the subset OCUDU's
-  `odu` exercises against a CU.
+- **3a (LANDED)**: `crates/f1ap` — the TS 38.473 **APER** codec (Hampi over the six
+  Wireshark-vendored modules, TS 38.473 V19.3.0; APER is Hampi's strength — **zero**
+  extension-drop warnings, unlike RRC/UPER) + builders/parsers for **F1 Setup** and the
+  three **RRC-transfer** messages (Initial UL / DL / UL RRC Message Transfer, RRC carried
+  opaque as `RRCContainer`). Round-trip tested. UE Context Setup/Modification/Release +
+  Paging are the next sub-slice.
+- `crates/f1ap` remaining: UE Context Setup/Modification/Release, Paging — the subset
+  OCUDU's `odu` exercises against a CU.
 - F1-U: extend gtpu with the NR-U container (TS 38.425 DL user data / delivery status —
   OCUDU's `lib/nru` is 425 LOC) + `f1u` bearer glue.
 - Restructure `ran/gnb` as CU-shaped (it already is: RRC/PDCP/SDAP live CU-side; the
