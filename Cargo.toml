@@ -8,6 +8,7 @@ members = [
     "crates/pfcp",
     "crates/gtpu",
     "crates/rrc",
+    "crates/pdcp",
     "crates/n6",
     "crates/aka",
     "crates/subscriber-db",
@@ -39,6 +40,7 @@ nas = { path = "crates/nas" }
 pfcp = { path = "crates/pfcp" }
 gtpu = { path = "crates/gtpu" }
 rrc = { path = "crates/rrc" }
+pdcp = { path = "crates/pdcp" }
 n6 = { path = "crates/n6" }
 aka = { path = "crates/aka" }
 subscriber-db = { path = "crates/subscriber-db" }
