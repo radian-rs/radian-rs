@@ -11,10 +11,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use pdcp::{PdcpSrb, Role};
 use sctp_rs::{ConnectedSocket, NotificationOrData, SendData, SendInfo, Socket, SocketToAssociation};
 use tokio::net::UdpSocket;
 
-/// The fake-Uu message types, re-exported so the step code addresses them as
+/// The Uu message types, re-exported so the step code addresses them as
 /// `ran::UlMessage` / `ran::DlMessage` alongside the UE link.
 pub use radian_gnb::uu::{DlMessage, UlMessage};
 
@@ -63,14 +64,6 @@ impl GnbUeLink {
         DlMessage::decode(&buf[..n]).ok_or_else(|| anyhow!("undecodable downlink Uu datagram"))
     }
 
-    /// Receive, requiring a downlink NAS message, returning its raw NAS PDU.
-    pub async fn recv_nas(&self) -> Result<Vec<u8>> {
-        match self.recv().await? {
-            DlMessage::Nas { nas } => Ok(nas),
-            other => bail!("expected a downlink NAS message, got {other:?}"),
-        }
-    }
-
     /// Drain downlink messages up to `secs`, returning the first **user-plane
     /// Data** packet `(psi, packet)` — other messages are skipped. `None` on
     /// timeout. Used for the datapath echo, where the reply may take a retry.
@@ -92,6 +85,153 @@ impl GnbUeLink {
                 }
             }
         }
+    }
+}
+
+// ── UE running real RRC over PDCP (design/128 Phase 1) ────────────────────────────────────
+
+/// A UE speaking **real RRC over PDCP** to the standalone gNB (design/128 Phase 1). It
+/// owns the Uu link, the [`ScriptedUe`]'s NAS/USIM state (5G-AKA, NAS security), and the
+/// SRB1 PDCP entity. Steps drive it to open an RRC connection, relay NAS inside RRC
+/// InformationTransfers, and run the AS security-mode procedure that turns on PDCP
+/// integrity + ciphering with keys derived from the same K_gNB the AMF handed the gNB.
+pub struct UeRrc {
+    link: GnbUeLink,
+    /// The NAS/USIM side; public so steps drive NAS crypto directly.
+    pub ue: ScriptedUe,
+    srb1: PdcpSrb,
+    rrc_txn: u8,
+}
+
+impl std::fmt::Debug for UeRrc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UeRrc")
+    }
+}
+
+impl UeRrc {
+    /// Camp on the gNB's Uu endpoint as the demo subscriber.
+    pub async fn camp(gnb_uu: SocketAddr) -> Result<Self> {
+        Ok(Self {
+            link: GnbUeLink::connect(gnb_uu).await?,
+            ue: ScriptedUe::demo(),
+            srb1: PdcpSrb::new(Role::Ue, 1),
+            rrc_txn: 0,
+        })
+    }
+
+    fn next_txn(&mut self) -> u8 {
+        let t = self.rrc_txn;
+        self.rrc_txn = (self.rrc_txn + 1) & 0x3;
+        t
+    }
+
+    /// Open the RRC connection carrying the initial NAS: RRCSetupRequest (SRB0) → await
+    /// RRCSetup (SRB0) → RRCSetupComplete with `nas` (SRB1, before AS security).
+    pub async fn rrc_connect(&mut self, nas: Vec<u8>) -> Result<()> {
+        let req = rrc::rrc_setup_request(
+            0x1234_5678 & ((1 << 39) - 1),
+            rrc::establishment_cause::MO_SIGNALLING,
+        );
+        self.link.send(&UlMessage::Srb { srb_id: 0, payload: req }).await?;
+        let setup = self.recv_srb(0).await?;
+        match rrc::parse_dl_ccch(&setup) {
+            Some(rrc::DlCcch::RrcSetup { .. }) => {}
+            other => bail!("expected an RRCSetup on SRB0, got {other:?}"),
+        }
+        let txn = self.next_txn();
+        let complete = self.srb1.protect(&rrc::rrc_setup_complete(txn, 1, nas));
+        self.link.send(&UlMessage::Srb { srb_id: 1, payload: complete }).await
+    }
+
+    /// Send an uplink NAS message in an RRC ULInformationTransfer on SRB1.
+    pub async fn send_nas(&mut self, nas: Vec<u8>) -> Result<()> {
+        let pdu = self.srb1.protect(&rrc::ul_information_transfer(nas));
+        self.link.send(&UlMessage::Srb { srb_id: 1, payload: pdu }).await
+    }
+
+    /// Receive a downlink NAS message: SRB1 → PDCP-unprotect → RRC DLInformationTransfer.
+    pub async fn recv_nas(&mut self) -> Result<Vec<u8>> {
+        let rrc_bytes = self.recv_srb1_rrc().await?;
+        match rrc::parse_dl_dcch(&rrc_bytes) {
+            Some(rrc::DlDcch::DlInformationTransfer { nas, .. }) => Ok(nas),
+            other => bail!("expected a DLInformationTransfer, got {other:?}"),
+        }
+    }
+
+    /// Pre-activate SRB1 AS integrity once K_gNB is known (after NAS security) — so the
+    /// AS SecurityModeCommand, which arrives integrity-protected, verifies on receipt.
+    pub fn arm_as_security(&mut self) -> Result<()> {
+        let kgnb = self.ue.kgnb.context("no K_gNB — complete NAS security first")?;
+        self.srb1.activate_integrity(aka::rrc_keys(&kgnb, 2, 2).krrc_int, 2);
+        Ok(())
+    }
+
+    /// Run the AS security-mode procedure: verify + read the RRC SecurityModeCommand
+    /// (integrity active), activate ciphering, and send SecurityModeComplete (integrity +
+    /// ciphered). Returns the `(ciphering, integrity)` algorithms the gNB selected.
+    pub async fn complete_as_security(&mut self) -> Result<(u8, u8)> {
+        let rrc_bytes = self.recv_srb1_rrc().await?;
+        let (txn, nea, nia) = match rrc::parse_dl_dcch(&rrc_bytes) {
+            Some(rrc::DlDcch::SecurityModeCommand { transaction_id, ciphering, integrity }) => {
+                (transaction_id, ciphering, integrity)
+            }
+            other => bail!("expected a SecurityModeCommand, got {other:?}"),
+        };
+        let kgnb = self.ue.kgnb.context("no K_gNB")?;
+        self.srb1.activate_ciphering(aka::rrc_keys(&kgnb, nea, nia).krrc_enc, nea);
+        let complete = self.srb1.protect(&rrc::security_mode_complete(txn));
+        self.link.send(&UlMessage::Srb { srb_id: 1, payload: complete }).await?;
+        Ok((nea, nia))
+    }
+
+    /// Send an uplink user-plane packet on `psi` (raw IP — DRB PDCP/SDAP is Phase 2).
+    pub async fn send_data(&self, psi: u8, packet: Vec<u8>) -> Result<()> {
+        self.link.send(&UlMessage::Data { psi, packet }).await
+    }
+
+    /// Drain downlink messages up to `secs`, returning the first user-plane Data packet.
+    pub async fn recv_data(&self, secs: u64) -> Result<Option<(u8, Vec<u8>)>> {
+        self.link.recv_data(secs).await
+    }
+
+    /// Announce the UE went radio-idle (drives the gNB's AN release).
+    pub async fn go_idle(&self) -> Result<()> {
+        self.link.send(&UlMessage::Idle).await
+    }
+
+    /// Await the gNB's RRC release: it sends an RRCRelease on SRB1 then the Uu `Released`
+    /// marker. Consumes the RRCRelease, returns on `Released`.
+    pub async fn await_release(&mut self) -> Result<()> {
+        loop {
+            match self.link.recv().await? {
+                DlMessage::Released => return Ok(()),
+                DlMessage::Srb { srb_id: 1, payload } => {
+                    let _ = self.srb1.unprotect(&payload); // the (ciphered) RRCRelease
+                }
+                other => bail!("expected RRCRelease/Released, got {other:?}"),
+            }
+        }
+    }
+
+    /// Receive the next paging message, returning the paged 5G-TMSI.
+    pub async fn recv_paging(&self) -> Result<u32> {
+        match self.link.recv().await? {
+            DlMessage::Paging { tmsi } => Ok(tmsi),
+            other => bail!("expected a Paging, got {other:?}"),
+        }
+    }
+
+    async fn recv_srb(&self, srb_id: u8) -> Result<Vec<u8>> {
+        match self.link.recv().await? {
+            DlMessage::Srb { srb_id: got, payload } if got == srb_id => Ok(payload),
+            other => bail!("expected an SRB{srb_id} message, got {other:?}"),
+        }
+    }
+
+    async fn recv_srb1_rrc(&mut self) -> Result<Vec<u8>> {
+        let payload = self.recv_srb(1).await?;
+        self.srb1.unprotect(&payload).map_err(|e| anyhow!("SRB1 PDCP unprotect failed: {e}"))
     }
 }
 

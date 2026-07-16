@@ -285,7 +285,19 @@ from core `nf/`) and the state it needs. Content:
   scripted tier stays — it tests the core; the new tier tests the gNB.
 - Explicit non-goals: no RRC yet (fake Uu carries NAS directly), single AMF, no HO.
 
-### Phase 1 — RRC foundation (L)
+### Phase 1 — RRC foundation (L) — **LANDED**
+Delivered across four PRs: **1a** the codec spike (PR #104 → design/129, Hampi chosen);
+**1b** `crates/rrc` (PR #105, the TS 38.331 UPER codec + builders, golden RRCReconfiguration
+byte-identical); **1c** `crates/pdcp` + `aka::rrc_keys` (PR #106, SRB PDCP integrity/
+ciphering, NEA2/NIA2 reused from `oxirush-security`); and the **integration** (this branch):
+the Uu now carries real RRC over PDCP — SRB0 for RRCSetupRequest/Setup, SRB1 (PDCP) for
+NAS transport in UL/DL-InformationTransfer, and the **AS security-mode procedure** flipping
+on PDCP integrity then ciphering with keys derived from the K_gNB the AMF hands the gNB.
+The `@gnb` BDD tier now asserts the full RRC flow (connection setup → NAS auth → NAS
+security → AS security → registration accept → PDU session + datapath → idle/RRCRelease →
+paging) end to end against the live core (22 scenarios green). What follows is the original
+plan the phase implemented.
+
 - **1a. Codec spike (S/M, throwaway)**: Hampi vs rasn-compiler vs minimal-hand-rolled
   over TS 38.331 (rel pinned to what OCUDU targets). Exit criterion: round-trip the
   golden PDUs captured from an OCUDU `gnb` + srsUE ZMQ run (their codec = oracle).
