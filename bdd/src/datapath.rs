@@ -32,7 +32,7 @@ fn checksum(data: &[u8]) -> u16 {
 }
 
 /// Build an IPv4 ICMP **echo request** from `src` to `dst`, with both checksums filled in.
-fn icmp_echo_request(src: Ipv4Addr, dst: Ipv4Addr, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+pub fn icmp_echo_request(src: Ipv4Addr, dst: Ipv4Addr, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
     let mut icmp = vec![8u8, 0, 0, 0]; // type=echo request, code=0, checksum placeholder
     icmp.extend_from_slice(&id.to_be_bytes());
     icmp.extend_from_slice(&seq.to_be_bytes());
@@ -53,7 +53,7 @@ fn icmp_echo_request(src: Ipv4Addr, dst: Ipv4Addr, id: u16, seq: u16, payload: &
 }
 
 /// Whether `pkt` is an IPv4 ICMP **echo reply** from `from` to `to`.
-fn is_icmp_echo_reply(pkt: &[u8], from: Ipv4Addr, to: Ipv4Addr) -> bool {
+pub fn is_icmp_echo_reply(pkt: &[u8], from: Ipv4Addr, to: Ipv4Addr) -> bool {
     if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[9] != 1 {
         return false; // too short / not IPv4 / not ICMP
     }

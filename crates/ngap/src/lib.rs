@@ -2882,3 +2882,167 @@ mod release_tests {
         assert_eq!(ue_context_modification_params(&resp), None);
     }
 }
+
+// ── gNB-side helpers (the standalone RAN element — design/128 Phase 0) ─────────────────
+
+/// gNB side: `(AMF-UE-NGAP-ID, RAN-UE-NGAP-ID, NAS-PDU)` from a
+/// `DownlinkNASTransport`. Unlike the single-UE scripted tier, a standalone gNB
+/// needs the RAN-UE-NGAP-ID to route the NAS to the right UE context.
+pub fn downlink_nas_transport_params(pdu: &NGAP_PDU) -> Option<(u64, u32, Vec<u8>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_DownlinkNASTransport(msg) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id, mut nas) = (None, None, None);
+    for ie in &msg.protocol_i_es.0 {
+        match &ie.value {
+            DownlinkNASTransportProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            DownlinkNASTransportProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(v) => {
+                ran_ue_id = Some(v.0)
+            }
+            DownlinkNASTransportProtocolIEs_EntryValue::Id_NAS_PDU(v) => nas = Some(v.0.clone()),
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, ran_ue_id?, nas?))
+}
+
+/// Build a `UEContextReleaseComplete` (TS 38.413 §9.2.2.5) — the gNB's
+/// confirmation that it released the context a UEContextReleaseCommand named.
+pub fn ue_context_release_complete(amf_ue_id: u64, ran_ue_id: u32) -> NGAP_PDU {
+    build_ngap!(SuccessfulOutcome, UEContextRelease,
+        REJECT, UEContextReleaseComplete,
+        IGNORE AMF_UE_NGAP_ID(amf_ue_id),
+        IGNORE RAN_UE_NGAP_ID(ran_ue_id),
+    )
+}
+
+/// The first QoS flow's QFI in an encoded `PDUSessionResourceSetupRequestTransfer`.
+fn first_qfi_from_setup_transfer(bytes: &[u8]) -> Option<u8> {
+    let mut codec = PerCodecData::from_slice_aper(bytes);
+    let transfer = PDUSessionResourceSetupRequestTransfer::aper_decode(&mut codec).ok()?;
+    transfer.protocol_i_es.0.iter().find_map(|e| match &e.value {
+        PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_QosFlowSetupRequestList(l) => {
+            l.0.first().map(|f| f.qos_flow_identifier.0)
+        }
+        _ => None,
+    })
+}
+
+/// gNB side: `(psi, QFI)` per PDU session of a `PDUSessionResourceSetupRequest` —
+/// the QFI of each session's **first** QoS flow, aligned with
+/// [`pdu_session_resource_setup_request_params`]. The gNB marks uplink N3 G-PDUs
+/// with this QFI (TS 38.415 UL PDU SESSION INFORMATION).
+pub fn pdu_session_setup_request_qfis(pdu: &NGAP_PDU) -> Vec<(u8, u8)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return Vec::new();
+    };
+    let InitiatingMessageValue::Id_PDUSessionResourceSetup(req) = value else {
+        return Vec::new();
+    };
+    let Some(list) = req.protocol_i_es.0.iter().find_map(|e| match &e.value {
+        PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListSUReq(l) => Some(l),
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    list.0
+        .iter()
+        .filter_map(|item| {
+            let qfi = first_qfi_from_setup_transfer(&item.pdu_session_resource_setup_request_transfer.0)?;
+            Some((item.pdu_session_id.0, qfi))
+        })
+        .collect()
+}
+
+/// gNB side: `(psi, QFI)` per PDU session an `InitialContextSetupRequest` sets up
+/// inline (the Service Request resume path) — aligned with
+/// [`initial_context_setup_request_session_ids`].
+pub fn initial_context_setup_request_qfis(pdu: &NGAP_PDU) -> Vec<(u8, u8)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return Vec::new();
+    };
+    let InitiatingMessageValue::Id_InitialContextSetup(req) = value else {
+        return Vec::new();
+    };
+    let Some(list) = req.protocol_i_es.0.iter().find_map(|e| match &e.value {
+        InitialContextSetupRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListCxtReq(l) => Some(l),
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    list.0
+        .iter()
+        .filter_map(|item| {
+            let qfi = first_qfi_from_setup_transfer(&item.pdu_session_resource_setup_request_transfer.0)?;
+            Some((item.pdu_session_id.0, qfi))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod gnb_side_tests {
+    use super::*;
+
+    #[test]
+    fn downlink_nas_transport_params_roundtrips() {
+        let nas = vec![0x7e, 0x00, 0x56, 0x01];
+        let pdu = downlink_nas_transport(9, 4, nas.clone());
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(downlink_nas_transport_params(&back), Some((9, 4, nas)));
+        // An uplink transport is not misread as a downlink one.
+        assert_eq!(downlink_nas_transport_params(&uplink_nas_transport(9, 4, vec![0x7e])), None);
+    }
+
+    #[test]
+    fn ue_context_release_complete_roundtrips() {
+        let pdu = ue_context_release_complete(42, 7);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        // The AMF dispatches on the successful outcome of the UEContextRelease
+        // procedure — that is what the gNB's complete must decode to.
+        assert!(matches!(
+            &back,
+            NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+                value: SuccessfulOutcomeValue::Id_UEContextRelease(_),
+                ..
+            })
+        ));
+        assert_eq!(back.procedure_name(), "UEContextRelease");
+    }
+
+    #[test]
+    fn setup_request_qfis_extract_the_first_flow() {
+        let flows = [QosFlow { qfi: 5, ..QosFlow::default_non_gbr() }];
+        let pdu = pdu_session_resource_setup_request(
+            1, 2, 6, &flows, 0x1111, Ipv4Addr::LOCALHOST, 1_000_000, 1_000_000, vec![0x7e],
+        );
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(pdu_session_setup_request_qfis(&back), vec![(6, 5)]);
+        assert!(initial_context_setup_request_qfis(&back).is_empty(), "wrong PDU type");
+    }
+
+    #[test]
+    fn ics_inline_session_qfis_extract() {
+        let ic = InitialContext {
+            allowed_nssai: vec![(1, None)],
+            ue_sec_cap: [0xa0, 0x20],
+            security_key: [0x22u8; 32],
+            pdu_sessions: vec![IcsPduSession {
+                psi: 1,
+                flows: vec![QosFlow { qfi: 3, ..QosFlow::default_non_gbr() }],
+                upf_teid: 0x9,
+                upf_addr: Ipv4Addr::LOCALHOST,
+            }],
+            nas: vec![0x7e],
+            ..Default::default()
+        };
+        let pdu = initial_context_setup_request(1, 2, "999", "70", &ic);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        assert_eq!(initial_context_setup_request_qfis(&back), vec![(1, 3)]);
+        assert!(pdu_session_setup_request_qfis(&back).is_empty(), "wrong PDU type");
+    }
+}

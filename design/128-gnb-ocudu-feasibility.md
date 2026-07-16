@@ -259,7 +259,16 @@ whole point of basing this on OCUDU.
 Sizes: S ≈ days, M ≈ 1–2 weeks, L ≈ weeks, XL ≈ months. Each phase lands as one or
 more PR-sized slices with BDD coverage, per repo convention.
 
-### Phase 0 — `radian-gnb`: promote the scripted gNB to a network element (M)
+### Phase 0 — `radian-gnb`: promote the scripted gNB to a network element (M) — **LANDED**
+Delivered on branch `feat/gnb-p0-standalone`: `ran/gnb` is a live binary+library
+(`GnbConfig` from `RADIAN_GNB_*`, an `UuTransport` trait with a `UdpUu` fake-Uu adapter,
+per-UE context + RAN-UE-NGAP-ID/DL-TEID allocators, an N2/N3/Uu `select!` loop with
+NG-Setup reconnect). `crates/gtpu` grew a `psup` module (TS 38.415) and extension-header
+walking so uplink G-PDUs carry the QFI. A new `@gnb` BDD tier drives the standalone binary
+through full 5G-AKA registration, a PDU session with a real ICMP datapath echo, and
+idle/paging — all green alongside the retained `@scripted` tier. What follows is the
+original plan the slice implemented.
+
 New workspace members: `ran/gnb` (binary crate; `ran/` tree keeps RAN elements apart
 from core `nf/`) and the state it needs. Content:
 - Extract/adapt `bdd/src/ran.rs` + `datapath.rs` guts into `ran/gnb`: SCTP association
