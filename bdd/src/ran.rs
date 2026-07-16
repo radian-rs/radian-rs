@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use pdcp::{PdcpSrb, Role};
+use pdcp::{PdcpDrb, PdcpSrb, Role};
 use sctp_rs::{ConnectedSocket, NotificationOrData, SendData, SendInfo, Socket, SocketToAssociation};
 use tokio::net::UdpSocket;
 
@@ -101,6 +101,11 @@ pub struct UeRrc {
     pub ue: ScriptedUe,
     srb1: PdcpSrb,
     rrc_txn: u8,
+    /// The data radio bearer, established when a PDU session comes up (SDAP over a
+    /// ciphered PDCP DRB — design/128 Phase 2). `None` until then.
+    drb: Option<PdcpDrb>,
+    /// The QFI the UE marks its uplink user-plane packets with.
+    drb_qfi: u8,
 }
 
 impl std::fmt::Debug for UeRrc {
@@ -117,7 +122,21 @@ impl UeRrc {
             ue: ScriptedUe::demo(),
             srb1: PdcpSrb::new(Role::Ue, 1),
             rrc_txn: 0,
+            drb: None,
+            drb_qfi: 0,
         })
+    }
+
+    /// Establish the DRB for a PDU session: a PDCP DRB (id = `psi`) ciphered with the
+    /// user-plane key derived from K_gNB, carrying QoS flow `qfi`. Called once the UE
+    /// reads its PDU session accept.
+    pub fn establish_drb(&mut self, psi: u8, qfi: u8) -> Result<()> {
+        let kgnb = self.ue.kgnb.context("no K_gNB — register first")?;
+        let mut drb = PdcpDrb::new(Role::Ue, psi.max(1));
+        drb.activate_ciphering(aka::up_keys(&kgnb, 2, 2).kup_enc, 2);
+        self.drb = Some(drb);
+        self.drb_qfi = qfi;
+        Ok(())
     }
 
     fn next_txn(&mut self) -> u8 {
@@ -185,14 +204,25 @@ impl UeRrc {
         Ok((nea, nia))
     }
 
-    /// Send an uplink user-plane packet on `psi` (raw IP — DRB PDCP/SDAP is Phase 2).
-    pub async fn send_data(&self, psi: u8, packet: Vec<u8>) -> Result<()> {
-        self.link.send(&UlMessage::Data { psi, packet }).await
+    /// Send an uplink user-plane IP packet on `psi`: add the SDAP header (QFI) and cipher
+    /// it on the DRB, then send it over the Uu.
+    pub async fn send_data(&mut self, psi: u8, packet: Vec<u8>) -> Result<()> {
+        let qfi = self.drb_qfi;
+        let drb = self.drb.as_mut().context("no DRB established — set up a PDU session first")?;
+        let pdu = drb.protect(&sdap::encap_ul(qfi, &packet));
+        self.link.send(&UlMessage::Data { psi, packet: pdu }).await
     }
 
-    /// Drain downlink messages up to `secs`, returning the first user-plane Data packet.
-    pub async fn recv_data(&self, secs: u64) -> Result<Option<(u8, Vec<u8>)>> {
-        self.link.recv_data(secs).await
+    /// Drain downlink messages up to `secs`, returning the first user-plane packet — the
+    /// DRB PDU deciphered and the SDAP header stripped to the inner IP `(psi, ip)`.
+    pub async fn recv_data(&mut self, secs: u64) -> Result<Option<(u8, Vec<u8>)>> {
+        let Some((psi, pdu)) = self.link.recv_data(secs).await? else {
+            return Ok(None);
+        };
+        let drb = self.drb.as_mut().context("no DRB established")?;
+        let sdap_pdu = drb.unprotect(&pdu).map_err(|e| anyhow!("DRB PDCP unprotect failed: {e}"))?;
+        let (_hdr, ip) = sdap::decap_dl(&sdap_pdu).context("empty SDAP PDU on the DRB")?;
+        Ok(Some((psi, ip.to_vec())))
     }
 
     /// Announce the UE went radio-idle (drives the gNB's AN release).

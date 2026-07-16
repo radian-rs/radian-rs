@@ -1185,6 +1185,8 @@ async fn ue_assigned_ip_through_gnb(world: &mut World, subnet: String) {
     let bits: u32 = prefix.parse().expect("valid prefix length");
     let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
     assert_eq!(u32::from(ip) & mask, u32::from(base) & mask, "assigned UE IP {ip} is not in {subnet}");
+    // The session is up: establish the DRB (QFI 1, the default non-GBR flow the core uses).
+    ue_rrc.establish_drb(psi, 1).expect("establish the DRB");
     world.ue_ip = Some(ip);
 }
 
@@ -1193,9 +1195,10 @@ async fn ue_reaches_dn_through_gnb(world: &mut World, gw: String) {
     let gw_ip: Ipv4Addr = gw.parse().expect("valid gateway IP");
     let ue_ip = world.ue_ip.expect("the UE has an assigned IP");
     let psi = world.pdu_psi.expect("a PDU session");
-    let ue_rrc = world.ue_rrc.as_ref().expect("UE camped");
-    // The user plane is raw IP per PDU session (DRB PDCP is Phase 2): the gNB encaps it
-    // (with QFI) to the UPF's N3, and the reply returns down the Uu as a Data message.
+    let ue_rrc = world.ue_rrc.as_mut().expect("UE camped");
+    // The UE sends the ICMP echo up the DRB (SDAP header + ciphered PDCP); the gNB
+    // deciphers it, strips SDAP, and encaps it (with QFI) to the UPF's N3. The reply
+    // returns the same way — down the DRB — as a Data message.
     let mut reached = false;
     for seq in 1..=3u16 {
         let echo = datapath::icmp_echo_request(ue_ip, gw_ip, 0x4242, seq, b"radian-gnb-dp");
