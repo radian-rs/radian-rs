@@ -1,16 +1,23 @@
-//! radian-gnb — the standalone gNodeB (design/128 Phases 0–1). It terminates **N2**
-//! (NGAP over SCTP to the AMF, with NG Setup and reconnect), **N3** (GTP-U to the UPF,
-//! marking uplink G-PDUs with the QFI per TS 38.415), and a **Uu** toward UEs ([`uu`])
-//! that carries **real RRC over PDCP** on signalling radio bearers (Phase 1) — SRB0 for
-//! connection setup, SRB1 (PDCP) for NAS transport, the security-mode procedure, and
-//! release. NAS rides opaque inside the RRC. The [`UuTransport`] seam is unchanged (Phase
-//! 3 swaps it for F1).
+//! radian-gnb — the gNodeB (design/128 Phases 0–3). It terminates **N2** (NGAP over SCTP to
+//! the AMF, with NG Setup and reconnect), **N3** (GTP-U to the UPF, marking uplink G-PDUs
+//! with the QFI per TS 38.415), and — toward UEs — **real RRC over PDCP** on signalling
+//! radio bearers (Phase 1): SRB0 for connection setup, SRB1 (PDCP) for NAS transport, the
+//! security-mode procedure, and release, plus SDAP over a ciphered PDCP DRB for user data
+//! (Phase 2). NAS rides opaque inside the RRC.
+//!
+//! The UE-facing [`UuTransport`] seam has two implementations: the P0 fake Uu ([`UdpUu`],
+//! one message per UDP datagram) and — **CU-shaped**, `RADIAN_GNB_F1`=1 — a real **F1**
+//! south side to a gNB-DU ([`f1`], with [`du`] as the Rust DU standing in for OCUDU's `odu`).
+//! In F1 mode this binary is a gNB-CU: RRC/PDCP/SDAP/NGAP/N3 live here and the DU is reached
+//! over F1-C (F1AP/SCTP) and F1-U (GTP-U + NR-U) — design/128 Phase 3e.
 //!
 //! State per UE: the RAN/AMF UE-NGAP-IDs, the Uu peer, each PDU session's F-TEIDs + QFI,
 //! and the RRC/PDCP context — the SRB1 PDCP entity (integrity/ciphering activated at the
 //! security-mode procedure with keys derived from K_gNB) and the RRC transaction counter.
 //! Contexts die with the N2 association (or a release command).
 
+pub mod du;
+pub mod f1;
 pub mod uu;
 
 use std::collections::HashMap;
@@ -63,6 +70,15 @@ pub struct GnbConfig {
     /// The fake-Uu UDP endpoint UEs reach the gNB at (`RADIAN_GNB_UU_BIND`,
     /// default 127.0.0.1:4997).
     pub uu_bind: SocketAddr,
+    /// **F1 mode** (`RADIAN_GNB_F1`=1): act as a CU-shaped element, reaching UEs over F1 to a
+    /// gNB-DU instead of the fake Uu (design/128 Phase 3e). The addresses below then apply.
+    pub f1_mode: bool,
+    /// F1-C SCTP listen endpoint (the gNB-DU connects here) — `RADIAN_GNB_F1C_BIND`.
+    pub f1c_bind: SocketAddr,
+    /// F1-U GTP-U bind endpoint — `RADIAN_GNB_F1U_BIND`.
+    pub f1u_bind: SocketAddr,
+    /// The gNB-DU's F1-U endpoint (a fallback until learned) — `RADIAN_GNB_DU_F1U`.
+    pub du_f1u: SocketAddr,
 }
 
 impl Default for GnbConfig {
@@ -75,6 +91,10 @@ impl Default for GnbConfig {
             amf_addr: "127.0.0.1:38412".parse().unwrap(),
             n3_addr: Ipv4Addr::LOCALHOST,
             uu_bind: "127.0.0.1:4997".parse().unwrap(),
+            f1_mode: false,
+            f1c_bind: "127.0.0.1:38472".parse().unwrap(),
+            f1u_bind: "127.0.0.1:2153".parse().unwrap(),
+            du_f1u: "127.0.0.1:2154".parse().unwrap(),
         }
     }
 }
@@ -111,6 +131,19 @@ impl GnbConfig {
                 Some(v) => v.parse().context("RADIAN_GNB_UU_BIND")?,
                 None => d.uu_bind,
             },
+            f1_mode: var("RADIAN_GNB_F1").as_deref() == Some("1"),
+            f1c_bind: match var("RADIAN_GNB_F1C_BIND") {
+                Some(v) => v.parse().context("RADIAN_GNB_F1C_BIND")?,
+                None => d.f1c_bind,
+            },
+            f1u_bind: match var("RADIAN_GNB_F1U_BIND") {
+                Some(v) => v.parse().context("RADIAN_GNB_F1U_BIND")?,
+                None => d.f1u_bind,
+            },
+            du_f1u: match var("RADIAN_GNB_DU_F1U") {
+                Some(v) => v.parse().context("RADIAN_GNB_DU_F1U")?,
+                None => d.du_f1u,
+            },
         })
     }
 }
@@ -140,6 +173,13 @@ pub trait UuTransport {
     async fn recv(&mut self) -> Result<(Self::Peer, UlMessage)>;
     /// Send one downlink message to a peer.
     async fn send(&mut self, peer: Self::Peer, msg: &DlMessage) -> Result<()>;
+
+    /// Bring the transport up before the serve loop — for the F1 adapter, accept the gNB-DU
+    /// association and complete F1 Setup (the SCTP accept is not cancellation-safe, so it
+    /// must not run inside the `select!`). A no-op for the fake Uu, which needs no handshake.
+    async fn start(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The P0 fake Uu: one [`uu`] message per UDP datagram; a UE endpoint is its
@@ -418,13 +458,24 @@ pub async fn run<T: UuTransport>(cfg: GnbConfig, mut transport: T) -> Result<()>
     let n3 = UdpSocket::bind(SocketAddrV4::new(cfg.n3_addr, gtpu::GTPU_PORT))
         .await
         .with_context(|| format!("bind N3 GTP-U at {}:{}", cfg.n3_addr, gtpu::GTPU_PORT))?;
-    info!(n3 = %cfg.n3_addr, uu = %cfg.uu_bind, "gNB up: N3 (GTP-U) bound, Uu listening");
+    if cfg.f1_mode {
+        info!(n3 = %cfg.n3_addr, f1c = %cfg.f1c_bind, "gNB up (CU-shaped): N3 bound, F1 south side");
+    } else {
+        info!(n3 = %cfg.n3_addr, uu = %cfg.uu_bind, "gNB up: N3 (GTP-U) bound, Uu listening");
+    }
 
+    let mut started = false;
     loop {
         match connect_and_setup(&cfg).await {
             Ok(conn) => {
                 info!(amf = %cfg.amf_addr, gnb_id = format_args!("{:#x}", cfg.gnb_id),
                       "NG Setup complete");
+                // Bring the UE-facing transport up once, after NG Setup (so the F1 adapter's
+                // blocking gNB-DU accept can't stall NG Setup, which the harness waits on).
+                if !started {
+                    transport.start().await.context("bring the UE transport up")?;
+                    started = true;
+                }
                 let mut state = GnbState::new();
                 if let Err(e) = serve(&cfg, &conn, &mut transport, &n3, &mut state).await {
                     warn!("N2 association lost: {e:#}; reconnecting");

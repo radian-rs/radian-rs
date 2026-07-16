@@ -2247,6 +2247,7 @@ dependencies = [
  "aka",
  "anyhow",
  "common",
+ "f1ap",
  "gtpu",
  "ngap",
  "pdcp",

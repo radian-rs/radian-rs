@@ -1,20 +1,25 @@
 @serial
 @gnb
-Feature: Standalone radian-gnb — real RRC over PDCP between the UE and the core
+Feature: Standalone radian-gnb — real RRC over PDCP between the UE and the core, split over F1
   As a radian-rs developer
-  I want the standalone `radian-gnb` binary (design/128 Phase 1) to carry a scripted UE's
-  signalling in real RRC over PDCP on signalling radio bearers, activating AS security
+  I want the `radian-gnb` binary (design/128 Phases 1–3) to carry a scripted UE's signalling
+  in real RRC over PDCP on signalling radio bearers, activating AS security, across a real
+  CU/DU split
   So that the gNB is proven end to end as a network element — RRC connection setup, NAS
-  transport in RRC InformationTransfers, and the AS security-mode procedure — not just a
-  NAS relay.
+  transport in RRC InformationTransfers, the AS security-mode procedure, and a ciphered
+  datapath — and so the F1 interface itself is exercised, not just the CU internals.
 
   The whole radian core runs as host processes (loopback SBI; the AMF's N2 SCTP on
-  :38412; the UPF on the 127.0.0.2 alias). The `radian-gnb` binary connects to the AMF,
-  completes NG Setup, and listens on its Uu (127.0.0.1:4997) and N3 (127.0.0.1:2152).
+  :38412; the UPF on the 127.0.0.2 alias). `radian-gnb` runs **CU-shaped** (design/128
+  Phase 3e): it connects to the AMF, completes NG Setup, binds N3 (127.0.0.1:2152), and
+  serves an F1 south side — F1-C (F1AP/SCTP, 127.0.0.1:38472) and F1-U (GTP-U + NR-U,
+  127.0.0.1:2153). The `radian-du` stub (standing in for OCUDU's `odu`) completes F1 Setup
+  and terminates the Uu (127.0.0.1:4997) the UE camps on, bridging it to F1 — so every RRC
+  message below really crosses F1AP and every user packet really crosses F1-U.
   A scripted UE — holding the demo subscriber's USIM key — opens an RRC connection
   (SRB0), relays NAS inside RRC UL/DL-InformationTransfers (SRB1), and runs the AS
   security-mode procedure that turns on PDCP integrity + ciphering with keys derived
-  from the same K_gNB the AMF hands the gNB.
+  from the same K_gNB the AMF hands the gNB. RRC and PDCP stay in the CU; the DU is dumb.
 
   Scenario: A UE registers via 5G-AKA and AS security through the standalone gNB
     Given a clean test environment
