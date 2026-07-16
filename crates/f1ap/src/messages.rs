@@ -1,9 +1,10 @@
 //! F1AP message builders and parsers (design/128 Phase 3), over the generated TS 38.473
-//! codec. This first slice covers **F1 Setup** (the DU↔CU association) and the three
-//! **RRC-transfer** messages that carry RRC across the F1 split — the heart of a CU/DU
-//! deployment: the DU relays a UE's RRC up to the CU (where RRC/PDCP live), and the CU
-//! sends RRC down. RRC rides opaque (`RRCContainer = OCTET STRING`), exactly as NAS rides
-//! opaque inside NGAP. UE Context management + Paging are a follow-up slice.
+//! codec. Covers **F1 Setup** (the DU↔CU association), the three **RRC-transfer** messages
+//! that carry RRC across the F1 split (the heart of a CU/DU deployment — the DU relays a
+//! UE's RRC up to the CU, where RRC/PDCP live, and the CU sends RRC down), and **UE Context
+//! Setup / Release** (the CU establishes and tears down a UE's context at the DU — SpCell,
+//! SRB1, the cell-group config). RRC rides opaque (`RRCContainer = OCTET STRING`), exactly
+//! as NAS rides opaque inside NGAP. UE Context Modification + Paging are a follow-up slice.
 //!
 //! Encoding is APER; builders return the wire PDU bytes and parsers take them back to the
 //! fields (the F1AP UE IDs, the SRB id, the RRC container), mirroring `crates/ngap`.
@@ -406,6 +407,313 @@ pub fn parse_ul_rrc(pdu: &F1AP_PDU) -> Option<RrcTransfer> {
     })
 }
 
+// ── UE Context management (CU drives the DU) ──────────────────────────────────────────────
+
+const PC_UE_CONTEXT_SETUP: u8 = 5;
+const PC_UE_CONTEXT_RELEASE: u8 = 6;
+
+const IE_CAUSE: u16 = 0;
+const IE_CU_TO_DU_RRC_INFO: u16 = 9;
+const IE_DU_TO_CU_RRC_INFO: u16 = 39;
+const IE_SPCELL_ID: u16 = 63;
+const IE_SRBS_TO_BE_SETUP_ITEM: u16 = 73;
+const IE_SRBS_TO_BE_SETUP_LIST: u16 = 74;
+const IE_SERV_CELL_INDEX: u16 = 107;
+
+/// `UEContextSetupRequest` (CU → DU): the CU sets up a UE context at the DU — the serving
+/// cell (SpCell = NR-CGI), SRB1, and the RRC message to deliver to the UE (e.g. RRCSetup).
+/// The DU answers with the cell-group config it chose. A minimal single-SRB context, no
+/// DRBs (those ride a later modification / the full CU restructure).
+pub fn ue_context_setup_request(
+    gnb_cu_ue_id: u32,
+    mcc: &str,
+    mnc: &str,
+    nr_cell_identity: u64,
+    rrc: Vec<u8>,
+) -> Vec<u8> {
+    let spcell = NRCGI {
+        plmn_identity: plmn(mcc, mnc),
+        nr_cell_identity: NRCellIdentity(bits(nr_cell_identity, 36)),
+        ie_extensions: None,
+    };
+    let srb1 = SRBs_ToBeSetup_List(vec![SRBs_ToBeSetup_List_Entry {
+        id: ie_id(IE_SRBS_TO_BE_SETUP_ITEM),
+        criticality: Criticality(REJECT),
+        value: SRBs_ToBeSetup_List_EntryValue::Id_SRBs_ToBeSetup_Item(SRBs_ToBeSetup_Item {
+            srbid: SRBID(1),
+            duplication_indication: None,
+            ie_extensions: None,
+        }),
+    }]);
+    let cu_to_du = CUtoDURRCInformation {
+        cg_config_info: None,
+        ue_capability_rat_container_list: None,
+        meas_config: None,
+        ie_extensions: None,
+    };
+    let ies = vec![
+        UEContextSetupRequestProtocolIEs_Entry {
+            id: ie_id(IE_GNB_CU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextSetupRequestProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(
+                GNB_CU_UE_F1AP_ID(gnb_cu_ue_id),
+            ),
+        },
+        UEContextSetupRequestProtocolIEs_Entry {
+            id: ie_id(IE_SPCELL_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextSetupRequestProtocolIEs_EntryValue::Id_SpCell_ID(spcell),
+        },
+        UEContextSetupRequestProtocolIEs_Entry {
+            id: ie_id(IE_SERV_CELL_INDEX),
+            criticality: Criticality(REJECT),
+            value: UEContextSetupRequestProtocolIEs_EntryValue::Id_ServCellIndex(ServCellIndex(0)),
+        },
+        UEContextSetupRequestProtocolIEs_Entry {
+            id: ie_id(IE_CU_TO_DU_RRC_INFO),
+            criticality: Criticality(REJECT),
+            value: UEContextSetupRequestProtocolIEs_EntryValue::Id_CUtoDURRCInformation(cu_to_du),
+        },
+        UEContextSetupRequestProtocolIEs_Entry {
+            id: ie_id(IE_SRBS_TO_BE_SETUP_LIST),
+            criticality: Criticality(REJECT),
+            value: UEContextSetupRequestProtocolIEs_EntryValue::Id_SRBs_ToBeSetup_List(srb1),
+        },
+        UEContextSetupRequestProtocolIEs_Entry {
+            id: ie_id(IE_RRC_CONTAINER),
+            criticality: Criticality(REJECT),
+            value: UEContextSetupRequestProtocolIEs_EntryValue::Id_RRCContainer(RRCContainer(rrc)),
+        },
+    ];
+    encode(&F1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(PC_UE_CONTEXT_SETUP),
+        criticality: Criticality(REJECT),
+        value: InitiatingMessageValue::Id_UEContextSetup(UEContextSetupRequest {
+            protocol_i_es: UEContextSetupRequestProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// `UEContextSetupResponse` (DU → CU): the DU confirms the context and returns the
+/// **cell-group config** it built (which the CU embeds in the RRCSetup's masterCellGroup).
+pub fn ue_context_setup_response(
+    gnb_cu_ue_id: u32,
+    gnb_du_ue_id: u32,
+    cell_group_config: Vec<u8>,
+) -> Vec<u8> {
+    let du_to_cu = DUtoCURRCInformation {
+        cell_group_config: CellGroupConfig(cell_group_config),
+        meas_gap_config: None,
+        requested_p_max_fr1: None,
+        ie_extensions: None,
+    };
+    let ies = vec![
+        UEContextSetupResponseProtocolIEs_Entry {
+            id: ie_id(IE_GNB_CU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextSetupResponseProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(
+                GNB_CU_UE_F1AP_ID(gnb_cu_ue_id),
+            ),
+        },
+        UEContextSetupResponseProtocolIEs_Entry {
+            id: ie_id(IE_GNB_DU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextSetupResponseProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(
+                GNB_DU_UE_F1AP_ID(gnb_du_ue_id),
+            ),
+        },
+        UEContextSetupResponseProtocolIEs_Entry {
+            id: ie_id(IE_DU_TO_CU_RRC_INFO),
+            criticality: Criticality(REJECT),
+            value: UEContextSetupResponseProtocolIEs_EntryValue::Id_DUtoCURRCInformation(du_to_cu),
+        },
+    ];
+    encode(&F1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode(PC_UE_CONTEXT_SETUP),
+        criticality: Criticality(REJECT),
+        value: SuccessfulOutcomeValue::Id_UEContextSetup(UEContextSetupResponse {
+            protocol_i_es: UEContextSetupResponseProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// `UEContextReleaseCommand` (CU → DU): release a UE context, with a radio-network cause
+/// and optionally an RRC message (an RRCRelease) for the DU to deliver first.
+pub fn ue_context_release_command(
+    gnb_cu_ue_id: u32,
+    gnb_du_ue_id: u32,
+    cause_radio: u8,
+    rrc: Option<Vec<u8>>,
+) -> Vec<u8> {
+    let mut ies = vec![
+        UEContextReleaseCommandProtocolIEs_Entry {
+            id: ie_id(IE_GNB_CU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextReleaseCommandProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(
+                GNB_CU_UE_F1AP_ID(gnb_cu_ue_id),
+            ),
+        },
+        UEContextReleaseCommandProtocolIEs_Entry {
+            id: ie_id(IE_GNB_DU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextReleaseCommandProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(
+                GNB_DU_UE_F1AP_ID(gnb_du_ue_id),
+            ),
+        },
+        UEContextReleaseCommandProtocolIEs_Entry {
+            id: ie_id(IE_CAUSE),
+            criticality: Criticality(IGNORE),
+            value: UEContextReleaseCommandProtocolIEs_EntryValue::Id_Cause(Cause::RadioNetwork(
+                CauseRadioNetwork(cause_radio),
+            )),
+        },
+    ];
+    if let Some(rrc) = rrc {
+        ies.push(UEContextReleaseCommandProtocolIEs_Entry {
+            id: ie_id(IE_RRC_CONTAINER),
+            criticality: Criticality(IGNORE),
+            value: UEContextReleaseCommandProtocolIEs_EntryValue::Id_RRCContainer(RRCContainer(
+                rrc,
+            )),
+        });
+    }
+    encode(&F1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(PC_UE_CONTEXT_RELEASE),
+        criticality: Criticality(REJECT),
+        value: InitiatingMessageValue::Id_UEContextRelease(UEContextReleaseCommand {
+            protocol_i_es: UEContextReleaseCommandProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// `UEContextReleaseComplete` (DU → CU): the DU confirms the release.
+pub fn ue_context_release_complete(gnb_cu_ue_id: u32, gnb_du_ue_id: u32) -> Vec<u8> {
+    let ies = vec![
+        UEContextReleaseCompleteProtocolIEs_Entry {
+            id: ie_id(IE_GNB_CU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextReleaseCompleteProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(
+                GNB_CU_UE_F1AP_ID(gnb_cu_ue_id),
+            ),
+        },
+        UEContextReleaseCompleteProtocolIEs_Entry {
+            id: ie_id(IE_GNB_DU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextReleaseCompleteProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(
+                GNB_DU_UE_F1AP_ID(gnb_du_ue_id),
+            ),
+        },
+    ];
+    encode(&F1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode(PC_UE_CONTEXT_RELEASE),
+        criticality: Criticality(REJECT),
+        value: SuccessfulOutcomeValue::Id_UEContextRelease(UEContextReleaseComplete {
+            protocol_i_es: UEContextReleaseCompleteProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// `(gNB-CU-UE-F1AP-ID, RRC container)` from a `UEContextSetupRequest` — the DU side.
+pub fn parse_ue_context_setup_request(pdu: &F1AP_PDU) -> Option<(u32, Vec<u8>)> {
+    let F1AP_PDU::InitiatingMessage(InitiatingMessage {
+        value: InitiatingMessageValue::Id_UEContextSetup(m),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    let (mut cu, mut rrc) = (None, None);
+    for e in &m.protocol_i_es.0 {
+        match &e.value {
+            UEContextSetupRequestProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(v) => cu = Some(v.0),
+            UEContextSetupRequestProtocolIEs_EntryValue::Id_RRCContainer(v) => {
+                rrc = Some(v.0.clone())
+            }
+            _ => {}
+        }
+    }
+    Some((cu?, rrc?))
+}
+
+/// `(gNB-CU-UE-F1AP-ID, gNB-DU-UE-F1AP-ID, cell-group config)` from a
+/// `UEContextSetupResponse` — the CU side.
+pub fn parse_ue_context_setup_response(pdu: &F1AP_PDU) -> Option<(u32, u32, Vec<u8>)> {
+    let F1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        value: SuccessfulOutcomeValue::Id_UEContextSetup(m),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    let (mut cu, mut du, mut cg) = (None, None, None);
+    for e in &m.protocol_i_es.0 {
+        match &e.value {
+            UEContextSetupResponseProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(v) => cu = Some(v.0),
+            UEContextSetupResponseProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(v) => du = Some(v.0),
+            UEContextSetupResponseProtocolIEs_EntryValue::Id_DUtoCURRCInformation(v) => {
+                cg = Some(v.cell_group_config.0.clone())
+            }
+            _ => {}
+        }
+    }
+    Some((cu?, du?, cg?))
+}
+
+/// `(gNB-CU-UE-F1AP-ID, gNB-DU-UE-F1AP-ID, radio cause, optional RRC container)` from a
+/// `UEContextReleaseCommand` — the DU side.
+pub fn parse_ue_context_release_command(pdu: &F1AP_PDU) -> Option<(u32, u32, u8, Option<Vec<u8>>)> {
+    let F1AP_PDU::InitiatingMessage(InitiatingMessage {
+        value: InitiatingMessageValue::Id_UEContextRelease(m),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    let (mut cu, mut du, mut cause, mut rrc) = (None, None, 0, None);
+    for e in &m.protocol_i_es.0 {
+        match &e.value {
+            UEContextReleaseCommandProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(v) => {
+                cu = Some(v.0)
+            }
+            UEContextReleaseCommandProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(v) => {
+                du = Some(v.0)
+            }
+            UEContextReleaseCommandProtocolIEs_EntryValue::Id_Cause(Cause::RadioNetwork(c)) => {
+                cause = c.0
+            }
+            UEContextReleaseCommandProtocolIEs_EntryValue::Id_RRCContainer(v) => {
+                rrc = Some(v.0.clone())
+            }
+            _ => {}
+        }
+    }
+    Some((cu?, du?, cause, rrc))
+}
+
+/// `(gNB-CU-UE-F1AP-ID, gNB-DU-UE-F1AP-ID)` from a `UEContextReleaseComplete`.
+pub fn parse_ue_context_release_complete(pdu: &F1AP_PDU) -> Option<(u32, u32)> {
+    let F1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        value: SuccessfulOutcomeValue::Id_UEContextRelease(m),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    let (mut cu, mut du) = (None, None);
+    for e in &m.protocol_i_es.0 {
+        match &e.value {
+            UEContextReleaseCompleteProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(v) => {
+                cu = Some(v.0)
+            }
+            UEContextReleaseCompleteProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(v) => {
+                du = Some(v.0)
+            }
+            _ => {}
+        }
+    }
+    Some((cu?, du?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +779,52 @@ mod tests {
     fn malformed_input_is_none() {
         assert!(decode(&[]).is_none());
         assert!(parse_dl_rrc(&decode(&f1_setup_request(1, 1)).unwrap()).is_none());
+    }
+
+    #[test]
+    fn ue_context_setup_roundtrips() {
+        let rrc = vec![0x20, 0x40, 0x60]; // an opaque RRCSetup
+        let req = ue_context_setup_request(3, "999", "70", 0x12, rrc.clone());
+        let back = decode(&req).expect("decode UEContextSetupRequest");
+        assert_eq!(parse_ue_context_setup_request(&back), Some((3, rrc)));
+
+        // The DU replies with the cell-group config it built.
+        let cg = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let resp = ue_context_setup_response(3, 7, cg.clone());
+        let back = decode(&resp).expect("decode UEContextSetupResponse");
+        assert_eq!(parse_ue_context_setup_response(&back), Some((3, 7, cg)));
+    }
+
+    #[test]
+    fn ue_context_release_roundtrips_with_and_without_rrc() {
+        // With an RRCRelease to deliver.
+        let rrc = vec![0x2e, 0x02, 0x01]; // opaque RRCRelease
+        let cmd =
+            ue_context_release_command(3, 7, CauseRadioNetwork::UNSPECIFIED, Some(rrc.clone()));
+        let back = decode(&cmd).expect("decode UEContextReleaseCommand");
+        assert_eq!(
+            parse_ue_context_release_command(&back),
+            Some((3, 7, 0, Some(rrc)))
+        );
+
+        // Without.
+        let cmd = ue_context_release_command(3, 7, CauseRadioNetwork::UNSPECIFIED, None);
+        let back = decode(&cmd).expect("decode UEContextReleaseCommand");
+        assert_eq!(
+            parse_ue_context_release_command(&back),
+            Some((3, 7, 0, None))
+        );
+
+        let done = ue_context_release_complete(3, 7);
+        let back = decode(&done).expect("decode UEContextReleaseComplete");
+        assert_eq!(parse_ue_context_release_complete(&back), Some((3, 7)));
+    }
+
+    #[test]
+    fn ue_context_messages_are_not_cross_parsed() {
+        // A setup request is not misread as a release command, or as an RRC transfer.
+        let req = decode(&ue_context_setup_request(3, "999", "70", 1, vec![1])).unwrap();
+        assert!(parse_ue_context_release_command(&req).is_none());
+        assert!(parse_dl_rrc(&req).is_none());
     }
 }
