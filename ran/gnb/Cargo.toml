@@ -13,9 +13,10 @@ authors.workspace = true
 ngap.workspace = true
 gtpu.workspace = true
 common.workspace = true
-# RRC codec + PDCP SRB security + K_RRC derivation (design/128 Phase 1).
+# RRC codec + PDCP SRB/DRB security + K_RRC/K_UP derivation + SDAP (design/128 Phase 1–2).
 rrc.workspace = true
 pdcp.workspace = true
+sdap.workspace = true
 aka.workspace = true
 sctp-rs = "0.3"
 tokio.workspace = true

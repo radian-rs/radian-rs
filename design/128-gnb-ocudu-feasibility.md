@@ -314,15 +314,20 @@ plan the phase implemented.
 - BDD: registration now flows UE-RRC→gNB-RRC→NGAP with real ciphered/integrity-protected
   SRBs; assert against golden traces.
 
-### Phase 2 — user plane completion over fake Uu (M)
-- **2a (LANDED)**: `crates/sdap` (TS 37.324 QFI header codec) + PDCP **DRB** entities
-  (18-bit SN — `crates/pdcp` refactored to a shared `Bearer` core behind `PdcpSrb`/
-  `PdcpDrb`) + `aka::up_keys` (K_UPenc/int, distinguishers 0x05/0x06). Unit-tested + an
-  `aka→pdcp-DRB→sdap` user-plane round-trip integration test. In-order delivery assumed;
-  window reorder/discard still deferred. Not yet wired into `ran/gnb` (that's 2b).
-- **2b (next)**: DRB establishment in `ran/gnb` driven by PDU Session Resource Setup (QoS
-  flow → DRB mapping — the OCUDU `cu_up` PDU-session-manager logic, small); the Uu
-  user-plane path runs through SDAP + PDCP DRB.
+### Phase 2 — user plane completion over fake Uu (M) — **LANDED**
+- **2a**: `crates/sdap` (TS 37.324 QFI header codec) + PDCP **DRB** entities (18-bit SN —
+  `crates/pdcp` refactored to a shared `Bearer` core behind `PdcpSrb`/`PdcpDrb`) +
+  `aka::up_keys` (K_UPenc/int, distinguishers 0x05/0x06). Unit-tested + an
+  `aka→pdcp-DRB→sdap` user-plane round-trip integration test.
+- **2b**: DRB establishment wired into `ran/gnb` — on the Initial Context Setup the gNB
+  derives K_UP, and every PDU session gets a DRB (one per session, `drb-id = psi`,
+  ciphered with K_UPenc). The Uu user plane now runs through SDAP + PDCP DRB: downlink
+  N3 G-PDU → SDAP(QFI) → PDCP-DRB cipher → Uu; uplink Uu → PDCP decipher → SDAP strip →
+  N3 G-PDU+QFI. The `@gnb` datapath scenario's ICMP echo traverses the ciphered DRB, all
+  22 scenarios green. In-order delivery assumed; window reorder/discard still deferred,
+  and the DRB config (drb-id/QoS-flow→DRB) is a fake-Uu convention rather than signalled
+  in an RRCReconfiguration (a refinement for the F1/real-radio rungs). **This is the
+  UERANSIM-class gNB** — wire-correct above RLC, validated in CI.
 - Datapath echo BDD through the full chain: TUN-side ICMP → N3 G-PDU+QFI → PDCP(DRB,
   ciphered) → fake Uu → UE decap, and back.
 - This completes a **UERANSIM-class gNB** — but wire-correct above RLC and validated

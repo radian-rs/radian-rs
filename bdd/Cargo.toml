@@ -18,9 +18,10 @@ nas.workspace = true
 aka.workspace = true
 # The standalone gNB (design/128 Phase 0): the `@gnb` tier drives it over the Uu.
 radian-gnb.workspace = true
-# RRC over PDCP on the Uu (design/128 Phase 1): the UE-side codec + SRB security.
+# RRC/SDAP over PDCP on the Uu (design/128 Phase 1–2): the UE-side codec + SRB/DRB security.
 rrc.workspace = true
 pdcp.workspace = true
+sdap.workspace = true
 sctp-rs = "0.3"
 tokio = { workspace = true, features = ["process", "time"] }
 anyhow.workspace = true

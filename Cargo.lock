@@ -278,6 +278,7 @@ dependencies = [
  "radian-gnb",
  "rrc",
  "sctp-rs",
+ "sdap",
  "tokio",
 ]
 
@@ -2241,6 +2242,7 @@ dependencies = [
  "pdcp",
  "rrc",
  "sctp-rs",
+ "sdap",
  "tokio",
  "tracing",
 ]
