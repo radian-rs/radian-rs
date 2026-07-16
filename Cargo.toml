@@ -10,6 +10,7 @@ members = [
     "crates/rrc",
     "crates/pdcp",
     "crates/sdap",
+    "crates/f1ap",
     "crates/n6",
     "crates/aka",
     "crates/subscriber-db",
@@ -43,6 +44,7 @@ gtpu = { path = "crates/gtpu" }
 rrc = { path = "crates/rrc" }
 pdcp = { path = "crates/pdcp" }
 sdap = { path = "crates/sdap" }
+f1ap = { path = "crates/f1ap" }
 n6 = { path = "crates/n6" }
 aka = { path = "crates/aka" }
 subscriber-db = { path = "crates/subscriber-db" }

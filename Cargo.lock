@@ -950,6 +950,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "f1ap"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
