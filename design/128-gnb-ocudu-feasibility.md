@@ -338,10 +338,12 @@ plan the phase implemented.
   Wireshark-vendored modules, TS 38.473 V19.3.0; APER is Hampi's strength — **zero**
   extension-drop warnings, unlike RRC/UPER) + builders/parsers for **F1 Setup** and the
   three **RRC-transfer** messages (Initial UL / DL / UL RRC Message Transfer, RRC carried
-  opaque as `RRCContainer`). Round-trip tested. UE Context Setup/Modification/Release +
-  Paging are the next sub-slice.
-- `crates/f1ap` remaining: UE Context Setup/Modification/Release, Paging — the subset
-  OCUDU's `odu` exercises against a CU.
+  opaque as `RRCContainer`). Round-trip tested.
+- **3b (LANDED)**: `crates/f1ap` UE Context **Setup / Release** (SpCell = NR-CGI, SRB1,
+  CUtoDU/DUtoCU RRC info with the cell-group config, Cause + optional RRCRelease) —
+  round-trip tested. UE Context **Modification** + **Paging** are the last codec sub-slice.
+- `crates/f1ap` remaining: UE Context Modification, Paging — the subset OCUDU's `odu`
+  exercises against a CU.
 - F1-U: extend gtpu with the NR-U container (TS 38.425 DL user data / delivery status —
   OCUDU's `lib/nru` is 425 LOC) + `f1u` bearer glue.
 - Restructure `ran/gnb` as CU-shaped (it already is: RRC/PDCP/SDAP live CU-side; the
