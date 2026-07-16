@@ -340,10 +340,11 @@ plan the phase implemented.
   three **RRC-transfer** messages (Initial UL / DL / UL RRC Message Transfer, RRC carried
   opaque as `RRCContainer`). Round-trip tested.
 - **3b (LANDED)**: `crates/f1ap` UE Context **Setup / Release** (SpCell = NR-CGI, SRB1,
-  CUtoDU/DUtoCU RRC info with the cell-group config, Cause + optional RRCRelease) —
-  round-trip tested. UE Context **Modification** + **Paging** are the last codec sub-slice.
-- `crates/f1ap` remaining: UE Context Modification, Paging — the subset OCUDU's `odu`
-  exercises against a CU.
+  CUtoDU/DUtoCU RRC info with the cell-group config, Cause + optional RRCRelease).
+- **3c (LANDED)**: `crates/f1ap` UE Context **Modification** (deliver an RRCReconfiguration)
+  + **Paging** (by 5G-S-TMSI in a cell). **The F1AP codec subset is complete** — F1 Setup,
+  RRC transfer, full UE Context management, Paging — round-trip tested (10 tests). Next:
+  F1-U/NR-U, then the CU restructure, then the OCUDU-`odu` + srsUE interop.
 - F1-U: extend gtpu with the NR-U container (TS 38.425 DL user data / delivery status —
   OCUDU's `lib/nru` is 425 LOC) + `f1u` bearer glue.
 - Restructure `ran/gnb` as CU-shaped (it already is: RRC/PDCP/SDAP live CU-side; the

@@ -1,13 +1,16 @@
 //! F1AP message builders and parsers (design/128 Phase 3), over the generated TS 38.473
-//! codec. Covers **F1 Setup** (the DU↔CU association), the three **RRC-transfer** messages
-//! that carry RRC across the F1 split (the heart of a CU/DU deployment — the DU relays a
-//! UE's RRC up to the CU, where RRC/PDCP live, and the CU sends RRC down), and **UE Context
-//! Setup / Release** (the CU establishes and tears down a UE's context at the DU — SpCell,
-//! SRB1, the cell-group config). RRC rides opaque (`RRCContainer = OCTET STRING`), exactly
-//! as NAS rides opaque inside NGAP. UE Context Modification + Paging are a follow-up slice.
+//! codec. Covers the CU/DU message subset a UE attach exercises:
+//! - **F1 Setup** (the DU↔CU association),
+//! - the three **RRC-transfer** messages that carry RRC across the F1 split (the heart of
+//!   a CU/DU deployment — the DU relays a UE's RRC up to the CU, where RRC/PDCP live, and
+//!   the CU sends RRC down),
+//! - **UE Context** Setup / Modification / Release (the CU manages a UE's context at the
+//!   DU — SpCell, SRB1, the cell-group config, RRC reconfiguration),
+//! - **Paging** (the CU pages a CM-IDLE UE by 5G-S-TMSI in a cell).
 //!
-//! Encoding is APER; builders return the wire PDU bytes and parsers take them back to the
-//! fields (the F1AP UE IDs, the SRB id, the RRC container), mirroring `crates/ngap`.
+//! RRC rides opaque (`RRCContainer = OCTET STRING`), exactly as NAS rides opaque inside
+//! NGAP. Encoding is APER; builders return the wire PDU bytes and parsers take them back
+//! to the fields (the F1AP UE IDs, the SRB id, the RRC container), mirroring `crates/ngap`.
 
 use asn1_codecs::PerCodecData;
 use asn1_codecs::aper::AperCodec;
@@ -80,6 +83,11 @@ fn bits(value: u64, n: usize) -> BitVec<u8, Msb0> {
         bv.push((value >> i) & 1 == 1);
     }
     bv
+}
+
+/// A fixed-length `BIT STRING` read back as an integer.
+fn bits_to_u64(bv: &bitvec::slice::BitSlice<u8, Msb0>) -> u64 {
+    bv.iter().fold(0u64, |acc, b| (acc << 1) | (*b as u64))
 }
 
 /// A minimal `RRC-Version` IE (latest-RRC-Version 3-bit field = 0). The peers exchange it
@@ -411,6 +419,8 @@ pub fn parse_ul_rrc(pdu: &F1AP_PDU) -> Option<RrcTransfer> {
 
 const PC_UE_CONTEXT_SETUP: u8 = 5;
 const PC_UE_CONTEXT_RELEASE: u8 = 6;
+const PC_UE_CONTEXT_MODIFICATION: u8 = 7;
+const PC_PAGING: u8 = 18;
 
 const IE_CAUSE: u16 = 0;
 const IE_CU_TO_DU_RRC_INFO: u16 = 9;
@@ -714,6 +724,208 @@ pub fn parse_ue_context_release_complete(pdu: &F1AP_PDU) -> Option<(u32, u32)> {
     Some((cu?, du?))
 }
 
+// ── UE Context Modification (CU reconfigures the DU-side context) ──────────────────────────
+
+const IE_PAGING_CELL_ITEM: u16 = 112;
+const IE_PAGING_CELL_LIST: u16 = 113;
+const IE_UE_IDENTITY_INDEX_VALUE: u16 = 117;
+const IE_PAGING_IDENTITY: u16 = 127;
+
+/// `UEContextModificationRequest` (CU → DU): reconfigure a UE's context — here, deliver an
+/// RRC message (an RRCReconfiguration). Adding/releasing DRBs is a later refinement.
+pub fn ue_context_modification_request(
+    gnb_cu_ue_id: u32,
+    gnb_du_ue_id: u32,
+    rrc: Vec<u8>,
+) -> Vec<u8> {
+    let ies = vec![
+        UEContextModificationRequestProtocolIEs_Entry {
+            id: ie_id(IE_GNB_CU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextModificationRequestProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(
+                GNB_CU_UE_F1AP_ID(gnb_cu_ue_id),
+            ),
+        },
+        UEContextModificationRequestProtocolIEs_Entry {
+            id: ie_id(IE_GNB_DU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextModificationRequestProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(
+                GNB_DU_UE_F1AP_ID(gnb_du_ue_id),
+            ),
+        },
+        UEContextModificationRequestProtocolIEs_Entry {
+            id: ie_id(IE_RRC_CONTAINER),
+            criticality: Criticality(REJECT),
+            value: UEContextModificationRequestProtocolIEs_EntryValue::Id_RRCContainer(
+                RRCContainer(rrc),
+            ),
+        },
+    ];
+    encode(&F1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(PC_UE_CONTEXT_MODIFICATION),
+        criticality: Criticality(REJECT),
+        value: InitiatingMessageValue::Id_UEContextModification(UEContextModificationRequest {
+            protocol_i_es: UEContextModificationRequestProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// `UEContextModificationResponse` (DU → CU): the DU confirms the modification.
+pub fn ue_context_modification_response(gnb_cu_ue_id: u32, gnb_du_ue_id: u32) -> Vec<u8> {
+    let ies = vec![
+        UEContextModificationResponseProtocolIEs_Entry {
+            id: ie_id(IE_GNB_CU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextModificationResponseProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(
+                GNB_CU_UE_F1AP_ID(gnb_cu_ue_id),
+            ),
+        },
+        UEContextModificationResponseProtocolIEs_Entry {
+            id: ie_id(IE_GNB_DU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextModificationResponseProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(
+                GNB_DU_UE_F1AP_ID(gnb_du_ue_id),
+            ),
+        },
+    ];
+    encode(&F1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode(PC_UE_CONTEXT_MODIFICATION),
+        criticality: Criticality(REJECT),
+        value: SuccessfulOutcomeValue::Id_UEContextModification(UEContextModificationResponse {
+            protocol_i_es: UEContextModificationResponseProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// `(gNB-CU-UE-F1AP-ID, gNB-DU-UE-F1AP-ID, RRC container)` from a
+/// `UEContextModificationRequest` — the DU side.
+pub fn parse_ue_context_modification_request(pdu: &F1AP_PDU) -> Option<(u32, u32, Vec<u8>)> {
+    let F1AP_PDU::InitiatingMessage(InitiatingMessage {
+        value: InitiatingMessageValue::Id_UEContextModification(m),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    let (mut cu, mut du, mut rrc) = (None, None, None);
+    for e in &m.protocol_i_es.0 {
+        match &e.value {
+            UEContextModificationRequestProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(v) => {
+                cu = Some(v.0)
+            }
+            UEContextModificationRequestProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(v) => {
+                du = Some(v.0)
+            }
+            UEContextModificationRequestProtocolIEs_EntryValue::Id_RRCContainer(v) => {
+                rrc = Some(v.0.clone())
+            }
+            _ => {}
+        }
+    }
+    Some((cu?, du?, rrc?))
+}
+
+/// `(gNB-CU-UE-F1AP-ID, gNB-DU-UE-F1AP-ID)` from a `UEContextModificationResponse`.
+pub fn parse_ue_context_modification_response(pdu: &F1AP_PDU) -> Option<(u32, u32)> {
+    let F1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        value: SuccessfulOutcomeValue::Id_UEContextModification(m),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    let (mut cu, mut du) = (None, None);
+    for e in &m.protocol_i_es.0 {
+        match &e.value {
+            UEContextModificationResponseProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(v) => {
+                cu = Some(v.0)
+            }
+            UEContextModificationResponseProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(v) => {
+                du = Some(v.0)
+            }
+            _ => {}
+        }
+    }
+    Some((cu?, du?))
+}
+
+// ── Paging (CU → DU, non-UE-associated) ───────────────────────────────────────────────────
+
+/// `Paging` (CU → DU): page a CM-IDLE UE by its **5G-S-TMSI** in a cell (NR-CGI). Carries
+/// the UE Identity Index Value (which paging occasion), the CN paging identity (5G-S-TMSI,
+/// 48 bits), and the target cell.
+pub fn paging(
+    mcc: &str,
+    mnc: &str,
+    nr_cell_identity: u64,
+    five_g_s_tmsi: u64,
+    ue_identity_index: u16,
+) -> Vec<u8> {
+    let paging_cell = PagingCell_list(vec![PagingCell_list_Entry {
+        id: ie_id(IE_PAGING_CELL_ITEM),
+        criticality: Criticality(IGNORE),
+        value: PagingCell_list_EntryValue::Id_PagingCell_Item(PagingCell_Item {
+            nrcgi: NRCGI {
+                plmn_identity: plmn(mcc, mnc),
+                nr_cell_identity: NRCellIdentity(bits(nr_cell_identity, 36)),
+                ie_extensions: None,
+            },
+            ie_extensions: None,
+        }),
+    }]);
+    let ies = vec![
+        PagingProtocolIEs_Entry {
+            id: ie_id(IE_UE_IDENTITY_INDEX_VALUE),
+            criticality: Criticality(REJECT),
+            value: PagingProtocolIEs_EntryValue::Id_UEIdentityIndexValue(
+                UEIdentityIndexValue::IndexLength10(UEIdentityIndexValue_indexLength10(bits(
+                    ue_identity_index as u64,
+                    10,
+                ))),
+            ),
+        },
+        PagingProtocolIEs_Entry {
+            id: ie_id(IE_PAGING_IDENTITY),
+            criticality: Criticality(REJECT),
+            value: PagingProtocolIEs_EntryValue::Id_PagingIdentity(
+                PagingIdentity::CNUEPagingIdentity(CNUEPagingIdentity::FiveG_S_TMSI(
+                    CNUEPagingIdentity_fiveG_S_TMSI(bits(five_g_s_tmsi, 48)),
+                )),
+            ),
+        },
+        PagingProtocolIEs_Entry {
+            id: ie_id(IE_PAGING_CELL_LIST),
+            criticality: Criticality(REJECT),
+            value: PagingProtocolIEs_EntryValue::Id_PagingCell_List(paging_cell),
+        },
+    ];
+    encode(&F1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(PC_PAGING),
+        criticality: Criticality(IGNORE),
+        value: InitiatingMessageValue::Id_Paging(Paging {
+            protocol_i_es: PagingProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// The **5G-S-TMSI** (48 bits) a `Paging` targets, if it pages by CN identity — the DU
+/// side / tests.
+pub fn parse_paging_5g_s_tmsi(pdu: &F1AP_PDU) -> Option<u64> {
+    let F1AP_PDU::InitiatingMessage(InitiatingMessage {
+        value: InitiatingMessageValue::Id_Paging(m),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    m.protocol_i_es.0.iter().find_map(|e| match &e.value {
+        PagingProtocolIEs_EntryValue::Id_PagingIdentity(PagingIdentity::CNUEPagingIdentity(
+            CNUEPagingIdentity::FiveG_S_TMSI(t),
+        )) => Some(bits_to_u64(&t.0)),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,5 +1038,32 @@ mod tests {
         let req = decode(&ue_context_setup_request(3, "999", "70", 1, vec![1])).unwrap();
         assert!(parse_ue_context_release_command(&req).is_none());
         assert!(parse_dl_rrc(&req).is_none());
+    }
+
+    #[test]
+    fn ue_context_modification_roundtrips() {
+        let rrc = vec![0x2e, 0x01, 0x0c]; // opaque RRCReconfiguration
+        let req = ue_context_modification_request(3, 7, rrc.clone());
+        let back = decode(&req).expect("decode UEContextModificationRequest");
+        assert_eq!(
+            parse_ue_context_modification_request(&back),
+            Some((3, 7, rrc))
+        );
+        // Not misread as a setup request.
+        assert!(parse_ue_context_setup_request(&back).is_none());
+
+        let resp = ue_context_modification_response(3, 7);
+        let back = decode(&resp).expect("decode UEContextModificationResponse");
+        assert_eq!(parse_ue_context_modification_response(&back), Some((3, 7)));
+    }
+
+    #[test]
+    fn paging_carries_the_5g_s_tmsi() {
+        let tmsi = 0x0001_2345_6789 & ((1 << 48) - 1);
+        let pdu = paging("999", "70", 0x12, tmsi, 0x2AB);
+        let back = decode(&pdu).expect("decode Paging");
+        assert_eq!(parse_paging_5g_s_tmsi(&back), Some(tmsi));
+        // A paging is not misread as a UE-associated message.
+        assert!(parse_dl_rrc(&back).is_none());
     }
 }
