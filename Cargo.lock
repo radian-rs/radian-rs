@@ -2380,6 +2380,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rrc"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+]
+
+[[package]]
 name = "rs-pfcp"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
