@@ -12,10 +12,88 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use sctp_rs::{ConnectedSocket, NotificationOrData, SendData, SendInfo, Socket, SocketToAssociation};
+use tokio::net::UdpSocket;
+
+/// The fake-Uu message types, re-exported so the step code addresses them as
+/// `ran::UlMessage` / `ran::DlMessage` alongside the UE link.
+pub use radian_gnb::uu::{DlMessage, UlMessage};
 
 const NGAP_PPID: u32 = 60;
 /// How long to wait for the AMF's next NGAP message before declaring the flow stuck.
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ── UE ↔ standalone gNB link (design/128 Phase 0 `@gnb` tier) ─────────────────────────────
+
+/// A UE's fake-Uu link to the **standalone `radian-gnb`**: one [`UlMessage`] /
+/// [`DlMessage`] per UDP datagram (design/128 P0). Unlike [`ScriptedGnb`], the
+/// test does not play the gNB here — the real gNB binary terminates N2/N3 and this
+/// is only the radio link a UE camps on. The NAS/AKA logic stays in [`ScriptedUe`].
+pub struct GnbUeLink {
+    sock: UdpSocket,
+}
+
+impl std::fmt::Debug for GnbUeLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GnbUeLink")
+    }
+}
+
+impl GnbUeLink {
+    /// Open a UDP link to the gNB's Uu endpoint (an ephemeral local port — the
+    /// gNB keys UE context off this source address, so one link is one UE).
+    pub async fn connect(gnb_uu: SocketAddr) -> Result<Self> {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.context("bind UE Uu socket")?;
+        sock.connect(gnb_uu).await.context("connect to gNB Uu")?;
+        Ok(Self { sock })
+    }
+
+    /// Send one uplink Uu message to the gNB.
+    pub async fn send(&self, msg: &UlMessage) -> Result<()> {
+        self.sock.send(&msg.encode()).await.context("Uu send")?;
+        Ok(())
+    }
+
+    /// Receive the next downlink Uu message, bounded by [`RECV_TIMEOUT`].
+    pub async fn recv(&self) -> Result<DlMessage> {
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(RECV_TIMEOUT, self.sock.recv(&mut buf))
+            .await
+            .map_err(|_| anyhow!("timed out waiting for a downlink Uu message from the gNB"))?
+            .context("Uu recv")?;
+        DlMessage::decode(&buf[..n]).ok_or_else(|| anyhow!("undecodable downlink Uu datagram"))
+    }
+
+    /// Receive, requiring a downlink NAS message, returning its raw NAS PDU.
+    pub async fn recv_nas(&self) -> Result<Vec<u8>> {
+        match self.recv().await? {
+            DlMessage::Nas { nas } => Ok(nas),
+            other => bail!("expected a downlink NAS message, got {other:?}"),
+        }
+    }
+
+    /// Drain downlink messages up to `secs`, returning the first **user-plane
+    /// Data** packet `(psi, packet)` — other messages are skipped. `None` on
+    /// timeout. Used for the datapath echo, where the reply may take a retry.
+    pub async fn recv_data(&self, secs: u64) -> Result<Option<(u8, Vec<u8>)>> {
+        let mut buf = vec![0u8; 4096];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            match tokio::time::timeout(remaining, self.sock.recv(&mut buf)).await {
+                Err(_) => return Ok(None),
+                Ok(res) => {
+                    let n = res.context("Uu recv")?;
+                    if let Some(DlMessage::Data { psi, packet }) = DlMessage::decode(&buf[..n]) {
+                        return Ok(Some((psi, packet)));
+                    }
+                }
+            }
+        }
+    }
+}
 
 // ── scripted gNB ────────────────────────────────────────────────────────────────────────
 

@@ -53,6 +53,11 @@ struct World {
     /// The gNB's N3 (GTP-U) socket, bound early so it can receive a downlink G-PDU
     /// the UPF flushes after a CM-IDLE resume.
     gnb_n3: Option<tokio::net::UdpSocket>,
+    // standalone gNB tier (@gnb, design/128 Phase 0)
+    /// The scripted UE's fake-Uu link to the standalone `radian-gnb`.
+    ue_link: Option<ran::GnbUeLink>,
+    /// The 5G-TMSI the UE reads from its Registration Accept (its paging identity).
+    ue_tmsi: Option<u32>,
 }
 
 impl World {
@@ -81,6 +86,17 @@ fn radian_bin(name: &str) -> PathBuf {
     }
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(format!("target/debug/nf-{name}"))
 }
+
+/// Path to a RAN binary (e.g. `radian-gnb`); `RADIAN_TARGET_DIR` overrides the dir.
+fn radian_ran_bin(name: &str) -> PathBuf {
+    if let Ok(dir) = std::env::var("RADIAN_TARGET_DIR") {
+        return PathBuf::from(dir).join(format!("radian-{name}"));
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(format!("target/debug/radian-{name}"))
+}
+
+/// The standalone gNB's fake-Uu endpoint (its `RADIAN_GNB_UU_BIND` default).
+const GNB_UU_ADDR: &str = "127.0.0.1:4997";
 
 /// The free-ran-ue simulator binary (`FREE_RAN_UE_BIN`); `None` disables the `@sim` feature.
 fn free_ran_ue_bin() -> Option<PathBuf> {
@@ -116,6 +132,7 @@ async fn clean_environment(world: &mut World) {
     assert!(!world.feature_tag.is_empty(), "feature must declare a tag for resource scoping");
     // Sweep whatever a crashed prior run of this feature left behind.
     let _ = netns::kill_host_procs("target/debug/nf-").await;
+    let _ = netns::kill_host_procs("target/debug/radian-gnb").await;
     for ns in netns::list_netns_with_prefix(&format!("{}_", world.feature_tag)).await.unwrap_or_default() {
         let _ = netns::kill_netns_procs(&ns).await;
         let _ = netns::delete_netns(&ns).await;
@@ -1022,6 +1039,195 @@ async fn scripted_core_running(_world: &mut World) {
 
 #[when("I stop the radian core")]
 async fn stop_core_only(_world: &mut World) {
+    netns::kill_host_procs("target/debug/nf-").await.expect("kill radian core");
+}
+
+// ── feature: gnb_standalone (@gnb, design/128 Phase 0) ─────────────────────────────────
+
+#[when("the standalone gNB connects and completes NG Setup")]
+async fn start_standalone_gnb(world: &mut World) {
+    let bin = radian_ran_bin("gnb");
+    assert!(bin.exists(), "radian-gnb not found at {} — run `cargo build -p radian-gnb`", bin.display());
+    let log = nf_log(&world.feature_tag, "gnb");
+    // Defaults put N2 at 127.0.0.1:38412, N3 at 127.0.0.1:2152, Uu at 127.0.0.1:4997.
+    let child = netns::spawn_host_env_logged(false, &[], &bin.to_string_lossy(), &[], &log)
+        .await
+        .expect("spawn radian-gnb");
+    world.procs.push(child);
+    let up = wait_until(8, || {
+        let log = log.clone();
+        async move { netns::log_contains(&log, "NG Setup complete") }
+    })
+    .await;
+    assert!(up, "the standalone gNB did not complete NG Setup (see {})", log.display());
+}
+
+#[given("the standalone gNB is running")]
+async fn standalone_gnb_running(world: &mut World) {
+    // The gNB (like the core) is a host process started once and reused across a
+    // feature's scenarios — its NG Setup is recorded in its persistent log.
+    let log = nf_log(&world.feature_tag, "gnb");
+    assert!(
+        netns::log_contains(&log, "NG Setup complete"),
+        "the standalone gNB is not up (no NG Setup in {})",
+        log.display()
+    );
+}
+
+#[when(regex = r#"^a UE camps on the gNB and registers from TAC "([0-9a-fA-F]{6})"$"#)]
+async fn ue_camps_and_registers(world: &mut World, tac: String) {
+    let link = ran::GnbUeLink::connect(GNB_UU_ADDR.parse().unwrap()).await.expect("connect to gNB Uu");
+    let ue = ran::ScriptedUe::demo();
+    // The first uplink Uu message makes the gNB allocate a RAN context and send
+    // the NGAP InitialUEMessage carrying this registration request.
+    link.send(&ran::UlMessage::InitialUe { tac: parse_tac(&tac), s_tmsi: None, nas: ue.registration_request() })
+        .await
+        .expect("send InitialUe over the Uu");
+    world.ue_link = Some(link);
+    world.ue = Some(ue);
+}
+
+#[then("the gNB relays the AMF's 5G-AKA challenge to the UE")]
+async fn gnb_relays_challenge(world: &mut World) {
+    let nas = world.ue_link.as_ref().expect("UE camped").recv_nas().await.expect("the challenge downlink");
+    assert!(
+        nas::parse_authentication_request(&nas).is_some(),
+        "expected an Authentication Request relayed through the gNB"
+    );
+    world.pending_nas = Some(nas);
+}
+
+#[when("the UE answers the challenge through the gNB")]
+async fn ue_answers_through_gnb(world: &mut World) {
+    let challenge = world.pending_nas.take().expect("a pending Authentication Request");
+    let reply = world.ue.as_mut().expect("UE").authenticate(&challenge).expect("the USIM answers");
+    let response = match reply {
+        ran::ChallengeReply::Response(bytes) => bytes,
+        ran::ChallengeReply::SynchFailure(_) => panic!("the USIM unexpectedly failed synchronisation"),
+    };
+    world.ue_link.as_ref().expect("UE camped").send(&ran::UlMessage::Nas { nas: response }).await.expect("send RES*");
+}
+
+#[then("the gNB relays the security mode command to the UE")]
+async fn gnb_relays_smc(world: &mut World) {
+    let smc = world.ue_link.as_ref().expect("UE camped").recv_nas().await.expect("the security mode downlink");
+    assert_eq!(
+        smc.get(1),
+        Some(&nas::sht::INTEGRITY_NEW_CONTEXT),
+        "the SMC is integrity-protected with a new context"
+    );
+    world.pending_nas = Some(smc);
+}
+
+#[when("the UE completes the security mode procedure through the gNB")]
+async fn ue_completes_security_through_gnb(world: &mut World) {
+    let smc = world.pending_nas.take().expect("a pending Security Mode Command");
+    let (nea, nia, _replayed, complete) =
+        world.ue.as_mut().expect("UE").complete_security(&smc).expect("the UE derives its keys");
+    assert_eq!((nea, nia), (2, 2));
+    world.ue_link.as_ref().expect("UE camped").send(&ran::UlMessage::Nas { nas: complete }).await.expect("send SMC complete");
+}
+
+#[then("the gNB relays the registration accept to the UE")]
+async fn gnb_relays_accept(world: &mut World) {
+    // The AMF sends this in an InitialContextSetupRequest; the gNB establishes the
+    // context, answers the ICS, and relays the enclosed NAS accept out the Uu.
+    let accept = world.ue_link.as_ref().expect("UE camped").recv_nas().await.expect("the registration accept");
+    let msg = world.ue.as_mut().expect("UE").read_downlink(&accept).expect("the accept verifies at the UE");
+    assert_eq!(nas::gmm_message_type(&msg), Some(nas::Nas5gmmMessageType::RegistrationAccept));
+    // The UE's 5G-TMSI (from the assigned GUTI) is its paging identity later.
+    world.ue_tmsi = nas::guti_tmsi_from_registration_accept(&msg);
+    assert!(world.ue_tmsi.is_some(), "the accept assigns a 5G-GUTI");
+}
+
+#[when("the UE completes the registration through the gNB")]
+async fn ue_completes_registration_through_gnb(world: &mut World) {
+    let complete = world
+        .ue
+        .as_mut()
+        .expect("UE")
+        .protected_uplink(&nas::registration_complete())
+        .expect("protect RegistrationComplete");
+    world.ue_link.as_ref().expect("UE camped").send(&ran::UlMessage::Nas { nas: complete }).await.expect("send RegistrationComplete");
+}
+
+#[then("the gNB relays a configuration update to the UE")]
+async fn gnb_relays_config_update(world: &mut World) {
+    let bytes = world.ue_link.as_ref().expect("UE camped").recv_nas().await.expect("the post-registration downlink");
+    let msg = world.ue.as_mut().expect("UE").read_downlink(&bytes).expect("the CUC verifies");
+    assert_eq!(nas::gmm_message_type(&msg), Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand));
+}
+
+#[when("the UE requests a PDU session through the gNB")]
+async fn ue_requests_pdu_through_gnb(world: &mut World) {
+    let psi = 1u8;
+    let request = world.ue.as_mut().expect("UE").pdu_session_request(psi).expect("build the request");
+    world.ue_link.as_ref().expect("UE camped").send(&ran::UlMessage::Nas { nas: request }).await.expect("send PDU session request");
+    world.pdu_psi = Some(psi);
+}
+
+#[then(regex = r#"^the UE is assigned an IP address in "([^"]+)" through the gNB$"#)]
+async fn ue_assigned_ip_through_gnb(world: &mut World, subnet: String) {
+    // The gNB sets up the PDU session (allocating its DL F-TEID) and relays the
+    // establishment accept out the Uu.
+    let accept = world.ue_link.as_ref().expect("UE camped").recv_nas().await.expect("the session accept");
+    let (psi, ip) = world.ue.as_mut().expect("UE").read_pdu_session_accept(&accept).expect("read the accept");
+    assert_eq!(Some(psi), world.pdu_psi);
+    let (net, prefix) = subnet.split_once('/').expect("subnet in CIDR form");
+    let base: Ipv4Addr = net.parse().expect("valid subnet base");
+    let bits: u32 = prefix.parse().expect("valid prefix length");
+    let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+    assert_eq!(u32::from(ip) & mask, u32::from(base) & mask, "assigned UE IP {ip} is not in {subnet}");
+    world.ue_ip = Some(ip);
+}
+
+#[then(regex = r#"^the UE can reach the data network gateway "([^"]+)" through the gNB datapath$"#)]
+async fn ue_reaches_dn_through_gnb(world: &mut World, gw: String) {
+    let gw_ip: Ipv4Addr = gw.parse().expect("valid gateway IP");
+    let ue_ip = world.ue_ip.expect("the UE has an assigned IP");
+    let psi = world.pdu_psi.expect("a PDU session");
+    let link = world.ue_link.as_ref().expect("UE camped");
+    // Send an ICMP echo up the Uu as user-plane data; the gNB encaps it (with QFI)
+    // to the UPF's N3, and the reply returns down the Uu as a Data message.
+    let mut reached = false;
+    for seq in 1..=3u16 {
+        let echo = datapath::icmp_echo_request(ue_ip, gw_ip, 0x4242, seq, b"radian-gnb-dp");
+        link.send(&ran::UlMessage::Data { psi, packet: echo }).await.expect("send uplink data over the Uu");
+        if let Some((got_psi, packet)) = link.recv_data(2).await.expect("await a downlink data reply")
+            && got_psi == psi
+            && datapath::is_icmp_echo_reply(&packet, gw_ip, ue_ip)
+        {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "no ICMP echo reply returned through the gNB's N3/N6 datapath");
+}
+
+#[when("the UE goes idle and the gNB releases it")]
+async fn ue_goes_idle_through_gnb(world: &mut World) {
+    let link = world.ue_link.as_ref().expect("UE camped");
+    link.send(&ran::UlMessage::Idle).await.expect("send idle indication over the Uu");
+    // The gNB requests AN release; the AMF commands it; the gNB confirms and tells the UE.
+    let dl = link.recv().await.expect("the release notification");
+    assert!(matches!(dl, ran::DlMessage::Released), "expected a Released downlink, got {dl:?}");
+}
+
+#[then("the gNB pages the UE")]
+async fn gnb_pages_ue(world: &mut World) {
+    let tmsi = world.ue_tmsi.expect("the UE holds a 5G-TMSI");
+    let dl = world.ue_link.as_ref().expect("UE camped").recv().await.expect("the paging downlink");
+    match dl {
+        ran::DlMessage::Paging { tmsi: paged } => {
+            assert_eq!(paged, tmsi, "the gNB pages the UE's own 5G-TMSI");
+        }
+        other => panic!("expected a Paging downlink, got {other:?}"),
+    }
+}
+
+#[when("I stop the standalone gNB and the radian core")]
+async fn stop_gnb_and_core(_world: &mut World) {
+    netns::kill_host_procs("target/debug/radian-gnb").await.expect("kill the standalone gNB");
     netns::kill_host_procs("target/debug/nf-").await.expect("kill radian core");
 }
 

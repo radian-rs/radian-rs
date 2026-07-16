@@ -19,6 +19,7 @@ members = [
     "nf/nf-udr",
     "nf/nf-pcf",
     "nf/nf-chf",
+    "ran/gnb",
     "tools/radian-pki",
     "bdd",
 ]
@@ -39,6 +40,7 @@ gtpu = { path = "crates/gtpu" }
 n6 = { path = "crates/n6" }
 aka = { path = "crates/aka" }
 subscriber-db = { path = "crates/subscriber-db" }
+radian-gnb = { path = "ran/gnb" }
 
 # --- external ---
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }

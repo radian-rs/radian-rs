@@ -1,0 +1,19 @@
+[package]
+name = "radian-gnb"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+# The standalone gNodeB (design/128 Phase 0): NGAP/N2 to the AMF, GTP-U/N3 to the
+# UPF, and a UDP "fake Uu" toward UEs (NAS rides opaque — no RRC yet). Both a
+# binary (`radian-gnb`) and a library (the Uu wire protocol + gNB core, used by
+# the BDD `@gnb` tier's UE side).
+
+[dependencies]
+ngap.workspace = true
+gtpu.workspace = true
+common.workspace = true
+sctp-rs = "0.3"
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

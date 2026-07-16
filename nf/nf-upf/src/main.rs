@@ -245,7 +245,7 @@ async fn serve_n3(socket: Arc<tokio::net::UdpSocket>, state: Upf, tun: Option<Ar
                     warn!(%peer, "N3 echo send error: {e}");
                 }
             }
-            Some(gtpu::N3Message::GPdu { teid, payload }) => {
+            Some(gtpu::N3Message::GPdu { teid, qfi, payload }) => {
                 // Decide against the session table, then release the lock before any await.
                 let action = {
                     let mut s = state.lock().unwrap();
@@ -254,7 +254,7 @@ async fn serve_n3(socket: Arc<tokio::net::UdpSocket>, state: Upf, tun: Option<Ar
                 match action {
                     n6::Uplink::ToN6(inner) => match &tun {
                         Some(tun) => match tun.send(inner).await {
-                            Ok(()) => info!(teid, bytes = inner.len(), "N3→N6 uplink forwarded"),
+                            Ok(()) => info!(teid, qfi, bytes = inner.len(), "N3→N6 uplink forwarded"),
                             Err(e) => warn!(teid, "N6 send error: {e}"),
                         },
                         None => info!(teid, bytes = inner.len(), "N3 uplink decapped (N6 disabled)"),
