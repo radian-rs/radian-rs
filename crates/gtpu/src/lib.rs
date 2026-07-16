@@ -3,10 +3,12 @@
 //!
 //! Codec: the mandatory 8-byte header (+4 optional octets when any of the S/E/PN
 //! flags is set), **G-PDU** encapsulation/decapsulation, **Echo** path management,
-//! and the **extension header** chain (TS 29.281 §5.2.1). The one extension header
-//! interpreted is the **PDU Session Container** (type 0x85), whose content is a
+//! and the **extension header** chain (TS 29.281 §5.2.1). Two extension headers are
+//! interpreted: the **PDU Session Container** (type 0x85), whose content is a
 //! TS 38.415 PDU Session User Plane protocol frame — see [`psup`] — carrying the
-//! **QFI** that maps each G-PDU to its QoS flow on N3.
+//! **QFI** that maps each G-PDU to its QoS flow on N3; and the **NR RAN Container**
+//! (type 0x84), whose content is a TS 38.425 NR-U frame — see [`nru`] — carrying the
+//! CU-UP↔DU flow-control state on the F1-U tunnel.
 
 /// Default GTP-U UDP port (TS 29.281).
 pub const GTPU_PORT: u16 = 2152;
@@ -21,12 +23,17 @@ pub const MSG_G_PDU: u8 = 0xFF;
 /// content is a TS 38.415 [`psup`] frame.
 pub const EXT_PDU_SESSION_CONTAINER: u8 = 0x85;
 
+/// Extension header type: NR RAN Container (TS 29.281 §5.2.2.6), whose content is a
+/// TS 38.425 [`nru`] frame — GTP-U's carrier for NR-U on the F1-U (CU-UP↔DU) tunnel.
+pub const EXT_NR_RAN_CONTAINER: u8 = 0x84;
+
 const VERSION_PT: u8 = 0x30; // version=1 (bits 8-6), protocol type=1 (bit 5)
 const FLAG_S: u8 = 0x02; // sequence number present
 const FLAG_E: u8 = 0x04; // extension header present
 const FLAG_PN: u8 = 0x01; // N-PDU number present
 const RECOVERY_IE: u8 = 14; // GTPv1 Recovery IE type
 
+pub mod nru;
 pub mod psup;
 
 /// A decoded GTP-U message (borrowing the datagram for the G-PDU payload).
@@ -94,6 +101,36 @@ pub fn parse(data: &[u8]) -> Option<N3Message<'_>> {
     })
 }
 
+/// Parse an **F1-U** G-PDU, returning `(teid, NR-U frame, T-PDU)` when its extension chain
+/// carries an NR RAN Container (TS 38.425 over TS 29.281). The T-PDU is the downlink PDCP
+/// PDU on a DL USER DATA frame, and empty on a DL DATA DELIVERY STATUS report. Returns
+/// `None` for anything that is not a G-PDU with an NR RAN Container extension header.
+pub fn parse_nr_ran_container(data: &[u8]) -> Option<(u32, nru::NruFrame, &[u8])> {
+    if data.len() < 12 {
+        return None;
+    }
+    let flags = data[0];
+    if flags & 0xE0 != 0x20 || data[1] != MSG_G_PDU || flags & FLAG_E == 0 {
+        return None;
+    }
+    let teid = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let mut offset = 12;
+    let mut next = data[11];
+    let mut frame = None;
+    while next != 0 {
+        let len = 4 * (*data.get(offset)? as usize);
+        if len < 4 || data.len() < offset + len {
+            return None;
+        }
+        if next == EXT_NR_RAN_CONTAINER {
+            frame = nru::parse(&data[offset + 1..offset + len - 1]);
+        }
+        next = data[offset + len - 1];
+        offset += len;
+    }
+    Some((teid, frame?, &data[offset..]))
+}
+
 /// Encapsulate a user IP packet as a G-PDU for `teid` (the datapath).
 pub fn encap(teid: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + payload.len());
@@ -132,6 +169,41 @@ fn encap_with_container(teid: u32, frame: &[u8; 2], payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&[0, 0, 0, EXT_PDU_SESSION_CONTAINER]); // seq, N-PDU, next type
     out.push(1); // extension header length: one 4-octet unit
     out.extend_from_slice(frame);
+    out.push(0); // no further extension headers
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Encapsulate a **DL USER DATA** F1-U packet: a G-PDU for `teid` whose NR RAN Container
+/// carries the NR-U DL USER DATA frame for `nru_sn` (TS 38.425), with the downlink PDCP PDU
+/// as the T-PDU — how a gNB-CU-UP forwards a numbered downlink PDU to the gNB-DU.
+pub fn encap_f1u_dl_user_data(teid: u32, nru_sn: u32, pdcp_pdu: &[u8]) -> Vec<u8> {
+    encap_nr_ran_container(teid, &nru::dl_user_data(nru_sn), pdcp_pdu)
+}
+
+/// Encapsulate a **DL DATA DELIVERY STATUS** F1-U report: a payload-less G-PDU whose NR RAN
+/// Container reports the `desired_buffer_size` the DU wants for the bearer (TS 38.425) — the
+/// gNB-DU → gNB-CU-UP flow-control feedback on the F1-U tunnel.
+pub fn encap_f1u_delivery_status(teid: u32, desired_buffer_size: u32) -> Vec<u8> {
+    encap_nr_ran_container(teid, &nru::dl_data_delivery_status(desired_buffer_size), &[])
+}
+
+/// A G-PDU whose extension chain is exactly one NR RAN Container holding `container` (a
+/// [`nru`] frame, already padded to `(n*4-2)` octets), followed by `payload` as the T-PDU.
+fn encap_nr_ran_container(teid: u32, container: &[u8], payload: &[u8]) -> Vec<u8> {
+    // The container plus the 2 framing octets (length + next-type) is a whole number of
+    // 4-octet units — that count is the extension-header length field.
+    let units = (container.len() + 2) / 4;
+    let ext_bytes = units * 4;
+    let mut out = Vec::with_capacity(12 + ext_bytes + payload.len());
+    out.push(VERSION_PT | FLAG_E);
+    out.push(MSG_G_PDU);
+    // Length covers the 4 optional octets, the extension header, and the payload.
+    out.extend_from_slice(&((4 + ext_bytes + payload.len()) as u16).to_be_bytes());
+    out.extend_from_slice(&teid.to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0, EXT_NR_RAN_CONTAINER]); // seq, N-PDU, next type
+    out.push(units as u8); // extension header length in 4-octet units
+    out.extend_from_slice(container);
     out.push(0); // no further extension headers
     out.extend_from_slice(payload);
     out
@@ -276,5 +348,42 @@ mod tests {
         assert!(parse(&[0u8; 4]).is_none());
         assert!(parse(&[0x00, 0xFF, 0, 0, 0, 0, 0, 0]).is_none()); // GTP version 0
         assert!(decap(&echo_request(1)).is_none()); // Echo is not a G-PDU
+    }
+
+    #[test]
+    fn f1u_dl_user_data_roundtrips_and_matches_the_wire_layout() {
+        let pdcp = b"\x80\x00\x01ciphered-drb-pdu"; // a fake 18-bit-SN PDCP DRB PDU
+        let pkt = encap_f1u_dl_user_data(0x0F1A_0001, 0x000042, pdcp);
+        // E flag set; the extension chain is one 2-unit NR RAN Container (0x84).
+        assert_eq!(pkt[0], VERSION_PT | FLAG_E);
+        assert_eq!(pkt[11], EXT_NR_RAN_CONTAINER);
+        assert_eq!(pkt[12], 2, "6-octet NR-U frame + 2 framing octets = 2 units");
+        // Length covers 4 optional octets + 8 extension octets + the PDCP PDU.
+        assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]) as usize, 4 + 8 + pdcp.len());
+        assert_eq!(
+            parse_nr_ran_container(&pkt),
+            Some((0x0F1A_0001, nru::NruFrame::DlUserData { nru_sn: 0x000042 }, &pdcp[..]))
+        );
+    }
+
+    #[test]
+    fn f1u_delivery_status_roundtrips_with_no_payload() {
+        let pkt = encap_f1u_delivery_status(0x0F1A_0002, 0x0002_0000);
+        assert_eq!(
+            parse_nr_ran_container(&pkt),
+            Some((
+                0x0F1A_0002,
+                nru::NruFrame::DlDataDeliveryStatus { desired_buffer_size: 0x0002_0000 },
+                &[][..],
+            ))
+        );
+    }
+
+    #[test]
+    fn f1u_parse_rejects_plain_and_psup_gpdus() {
+        // A plain G-PDU (no extension header) is not F1-U.
+        assert!(parse_nr_ran_container(&encap(0x10, b"data")).is_none());
+        // A G-PDU whose only extension header is a PDU Session Container is N3, not F1-U.
+        assert!(parse_nr_ran_container(&encap_ul_qfi(0x10, 5, b"data")).is_none());
     }
 }

@@ -345,8 +345,12 @@ plan the phase implemented.
   + **Paging** (by 5G-S-TMSI in a cell). **The F1AP codec subset is complete** — F1 Setup,
   RRC transfer, full UE Context management, Paging — round-trip tested (10 tests). Next:
   F1-U/NR-U, then the CU restructure, then the OCUDU-`odu` + srsUE interop.
-- F1-U: extend gtpu with the NR-U container (TS 38.425 DL user data / delivery status —
-  OCUDU's `lib/nru` is 425 LOC) + `f1u` bearer glue.
+- **3d (LANDED)**: F1-U user plane in `crates/gtpu` — the TS 38.425 **NR-U** codec (`nru`
+  module: DL USER DATA / DL DATA DELIVERY STATUS frames, minimal fields, cross-checked
+  against OCUDU's `lib/nru`) + the GTP-U **NR RAN Container** extension header (type 0x84,
+  the F1-U counterpart to N3's 0x85 PSUP) — `encap_f1u_dl_user_data` / `encap_f1u_delivery_status`
+  / `parse_nr_ran_container`, round-trip tested (6 tests). The per-DRB `f1u` bearer glue
+  (NR-U SN state, buffer accounting) lands with the CU restructure, where F1-U tunnels exist.
 - Restructure `ran/gnb` as CU-shaped (it already is: RRC/PDCP/SDAP live CU-side; the
   fake-Uu adapter is replaced by an F1 adapter — same seam as Phase 0 designed in).
 - Interop target: `radian-gnb --f1` ↔ OCUDU `odu` (ru_dummy first, then ZMQ + srsUE):
