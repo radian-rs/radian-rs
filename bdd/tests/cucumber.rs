@@ -95,7 +95,8 @@ fn radian_ran_bin(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(format!("target/debug/radian-{name}"))
 }
 
-/// The standalone gNB's fake-Uu endpoint (its `RADIAN_GNB_UU_BIND` default).
+/// The Uu endpoint a UE camps on — bound by the gNB-DU (`RADIAN_DU_UU_BIND` default), which
+/// carries the UE's RRC/data over F1 to the CU (design/128 Phase 3e).
 const GNB_UU_ADDR: &str = "127.0.0.1:4997";
 
 /// The free-ran-ue simulator binary (`FREE_RAN_UE_BIN`); `None` disables the `@sim` feature.
@@ -132,6 +133,7 @@ async fn clean_environment(world: &mut World) {
     assert!(!world.feature_tag.is_empty(), "feature must declare a tag for resource scoping");
     // Sweep whatever a crashed prior run of this feature left behind.
     let _ = netns::kill_host_procs("target/debug/nf-").await;
+    let _ = netns::kill_host_procs("target/debug/radian-du").await;
     let _ = netns::kill_host_procs("target/debug/radian-gnb").await;
     for ns in netns::list_netns_with_prefix(&format!("{}_", world.feature_tag)).await.unwrap_or_default() {
         let _ = netns::kill_netns_procs(&ns).await;
@@ -1049,8 +1051,10 @@ async fn start_standalone_gnb(world: &mut World) {
     let bin = radian_ran_bin("gnb");
     assert!(bin.exists(), "radian-gnb not found at {} — run `cargo build -p radian-gnb`", bin.display());
     let log = nf_log(&world.feature_tag, "gnb");
-    // Defaults put N2 at 127.0.0.1:38412, N3 at 127.0.0.1:2152, Uu at 127.0.0.1:4997.
-    let child = netns::spawn_host_env_logged(false, &[], &bin.to_string_lossy(), &[], &log)
+    // The gNB runs **CU-shaped** (design/128 Phase 3e): N2 at 127.0.0.1:38412, N3 at
+    // 127.0.0.1:2152, and an F1 south side (F1-C 127.0.0.1:38472, F1-U 127.0.0.1:2153)
+    // instead of the fake Uu — the gNB-DU below terminates the Uu the UE camps on.
+    let child = netns::spawn_host_env_logged(false, &[("RADIAN_GNB_F1", "1")], &bin.to_string_lossy(), &[], &log)
         .await
         .expect("spawn radian-gnb");
     world.procs.push(child);
@@ -1060,17 +1064,43 @@ async fn start_standalone_gnb(world: &mut World) {
     })
     .await;
     assert!(up, "the standalone gNB did not complete NG Setup (see {})", log.display());
+    // The CU accepts the F1-C association only after NG Setup, so start the DU now.
+    start_gnb_du(world).await;
+}
+
+/// Start the Rust gNB-DU stub: it connects F1-C to the CU, runs F1 Setup, and binds the Uu
+/// ([`GNB_UU_ADDR`]) the scripted UE camps on. Stands in for OCUDU's `odu` in CI.
+async fn start_gnb_du(world: &mut World) {
+    let bin = radian_ran_bin("du");
+    assert!(bin.exists(), "radian-du not found at {} — run `cargo build -p radian-gnb`", bin.display());
+    let log = nf_log(&world.feature_tag, "du");
+    let child = netns::spawn_host_env_logged(false, &[], &bin.to_string_lossy(), &[], &log)
+        .await
+        .expect("spawn radian-du");
+    world.procs.push(child);
+    let up = wait_until(8, || {
+        let log = log.clone();
+        async move { netns::log_contains(&log, "gNB-DU up") }
+    })
+    .await;
+    assert!(up, "the gNB-DU did not complete F1 Setup (see {})", log.display());
 }
 
 #[given("the standalone gNB is running")]
 async fn standalone_gnb_running(world: &mut World) {
-    // The gNB (like the core) is a host process started once and reused across a
-    // feature's scenarios — its NG Setup is recorded in its persistent log.
+    // The gNB and its DU (like the core) are host processes started once and reused across a
+    // feature's scenarios — their bring-up is recorded in their persistent logs.
     let log = nf_log(&world.feature_tag, "gnb");
     assert!(
         netns::log_contains(&log, "NG Setup complete"),
         "the standalone gNB is not up (no NG Setup in {})",
         log.display()
+    );
+    let du_log = nf_log(&world.feature_tag, "du");
+    assert!(
+        netns::log_contains(&du_log, "gNB-DU up"),
+        "the gNB-DU is not up (no F1 Setup in {})",
+        du_log.display()
     );
 }
 
@@ -1232,6 +1262,7 @@ async fn gnb_pages_ue(world: &mut World) {
 
 #[when("I stop the standalone gNB and the radian core")]
 async fn stop_gnb_and_core(_world: &mut World) {
+    netns::kill_host_procs("target/debug/radian-du").await.expect("kill the gNB-DU");
     netns::kill_host_procs("target/debug/radian-gnb").await.expect("kill the standalone gNB");
     netns::kill_host_procs("target/debug/nf-").await.expect("kill radian core");
 }

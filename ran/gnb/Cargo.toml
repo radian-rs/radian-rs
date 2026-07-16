@@ -4,10 +4,12 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
-# The standalone gNodeB (design/128 Phase 0): NGAP/N2 to the AMF, GTP-U/N3 to the
-# UPF, and a UDP "fake Uu" toward UEs (NAS rides opaque — no RRC yet). Both a
-# binary (`radian-gnb`) and a library (the Uu wire protocol + gNB core, used by
-# the BDD `@gnb` tier's UE side).
+# The gNodeB (design/128 Phases 0–3): NGAP/N2 to the AMF, GTP-U/N3 to the UPF, and toward
+# UEs either a UDP "fake Uu" or — CU-shaped, RADIAN_GNB_F1=1 — a real F1 south side (F1AP
+# over SCTP + F1-U/NR-U) to a gNB-DU. Real RRC over PDCP rides the SRBs; SDAP over a
+# ciphered PDCP DRB carries user data. Ships two binaries — `radian-gnb` (the CU) and
+# `radian-du` (the Rust gNB-DU stub standing in for OCUDU's `odu`) — plus a library (the Uu
+# wire protocol + gNB core + F1 adapter, used by the BDD `@gnb` tier's UE side).
 
 [dependencies]
 ngap.workspace = true
@@ -18,6 +20,8 @@ rrc.workspace = true
 pdcp.workspace = true
 sdap.workspace = true
 aka.workspace = true
+# F1AP codec (F1-C) for the CU/DU split — design/128 Phase 3e.
+f1ap.workspace = true
 sctp-rs = "0.3"
 tokio.workspace = true
 tracing.workspace = true

@@ -420,6 +420,7 @@ pub fn parse_ul_rrc(pdu: &F1AP_PDU) -> Option<RrcTransfer> {
 const PC_UE_CONTEXT_SETUP: u8 = 5;
 const PC_UE_CONTEXT_RELEASE: u8 = 6;
 const PC_UE_CONTEXT_MODIFICATION: u8 = 7;
+const PC_UE_CONTEXT_RELEASE_REQUEST: u8 = 10;
 const PC_PAGING: u8 = 18;
 
 const IE_CAUSE: u16 = 0;
@@ -722,6 +723,65 @@ pub fn parse_ue_context_release_complete(pdu: &F1AP_PDU) -> Option<(u32, u32)> {
         }
     }
     Some((cu?, du?))
+}
+
+/// `UEContextReleaseRequest` (DU → CU): the DU asks the CU to release a UE context — the
+/// gNB-DU-initiated release, e.g. on detected radio inactivity (TS 38.473 §8.3.2). The CU
+/// answers by driving the NG release and then a `UEContextReleaseCommand`.
+pub fn ue_context_release_request(gnb_cu_ue_id: u32, gnb_du_ue_id: u32, cause_radio: u8) -> Vec<u8> {
+    let ies = vec![
+        UEContextReleaseRequestProtocolIEs_Entry {
+            id: ie_id(IE_GNB_CU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextReleaseRequestProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(
+                GNB_CU_UE_F1AP_ID(gnb_cu_ue_id),
+            ),
+        },
+        UEContextReleaseRequestProtocolIEs_Entry {
+            id: ie_id(IE_GNB_DU_UE_ID),
+            criticality: Criticality(REJECT),
+            value: UEContextReleaseRequestProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(
+                GNB_DU_UE_F1AP_ID(gnb_du_ue_id),
+            ),
+        },
+        UEContextReleaseRequestProtocolIEs_Entry {
+            id: ie_id(IE_CAUSE),
+            criticality: Criticality(IGNORE),
+            value: UEContextReleaseRequestProtocolIEs_EntryValue::Id_Cause(Cause::RadioNetwork(
+                CauseRadioNetwork(cause_radio),
+            )),
+        },
+    ];
+    encode(&F1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(PC_UE_CONTEXT_RELEASE_REQUEST),
+        criticality: Criticality(IGNORE),
+        value: InitiatingMessageValue::Id_UEContextReleaseRequest(UEContextReleaseRequest {
+            protocol_i_es: UEContextReleaseRequestProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// `(gNB-CU-UE-F1AP-ID, gNB-DU-UE-F1AP-ID, radio cause)` from a `UEContextReleaseRequest`.
+pub fn parse_ue_context_release_request(pdu: &F1AP_PDU) -> Option<(u32, u32, u8)> {
+    let F1AP_PDU::InitiatingMessage(InitiatingMessage {
+        value: InitiatingMessageValue::Id_UEContextReleaseRequest(m),
+        ..
+    }) = pdu
+    else {
+        return None;
+    };
+    let (mut cu, mut du, mut cause) = (None, None, 0);
+    for e in &m.protocol_i_es.0 {
+        match &e.value {
+            UEContextReleaseRequestProtocolIEs_EntryValue::Id_gNB_CU_UE_F1AP_ID(v) => cu = Some(v.0),
+            UEContextReleaseRequestProtocolIEs_EntryValue::Id_gNB_DU_UE_F1AP_ID(v) => du = Some(v.0),
+            UEContextReleaseRequestProtocolIEs_EntryValue::Id_Cause(Cause::RadioNetwork(c)) => {
+                cause = c.0
+            }
+            _ => {}
+        }
+    }
+    Some((cu?, du?, cause))
 }
 
 // ── UE Context Modification (CU reconfigures the DU-side context) ──────────────────────────
@@ -1038,6 +1098,19 @@ mod tests {
         let req = decode(&ue_context_setup_request(3, "999", "70", 1, vec![1])).unwrap();
         assert!(parse_ue_context_release_command(&req).is_none());
         assert!(parse_dl_rrc(&req).is_none());
+    }
+
+    #[test]
+    fn ue_context_release_request_roundtrips() {
+        // DU → CU: the gNB-DU asks for a release (radio inactivity).
+        let req = ue_context_release_request(4, 9, CauseRadioNetwork::NORMAL_RELEASE);
+        let back = decode(&req).expect("decode UEContextReleaseRequest");
+        assert_eq!(
+            parse_ue_context_release_request(&back),
+            Some((4, 9, CauseRadioNetwork::NORMAL_RELEASE))
+        );
+        // Not misread as the CU-initiated release command.
+        assert!(parse_ue_context_release_command(&back).is_none());
     }
 
     #[test]

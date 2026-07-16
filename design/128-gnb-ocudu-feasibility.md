@@ -343,16 +343,31 @@ plan the phase implemented.
   CUtoDU/DUtoCU RRC info with the cell-group config, Cause + optional RRCRelease).
 - **3c (LANDED)**: `crates/f1ap` UE Context **Modification** (deliver an RRCReconfiguration)
   + **Paging** (by 5G-S-TMSI in a cell). **The F1AP codec subset is complete** — F1 Setup,
-  RRC transfer, full UE Context management, Paging — round-trip tested (10 tests). Next:
-  F1-U/NR-U, then the CU restructure, then the OCUDU-`odu` + srsUE interop.
+  RRC transfer, full UE Context management, Paging — round-trip tested. (3e later added the
+  gNB-DU-initiated **UEContextReleaseRequest**, the DU's inactivity trigger.)
 - **3d (LANDED)**: F1-U user plane in `crates/gtpu` — the TS 38.425 **NR-U** codec (`nru`
   module: DL USER DATA / DL DATA DELIVERY STATUS frames, minimal fields, cross-checked
   against OCUDU's `lib/nru`) + the GTP-U **NR RAN Container** extension header (type 0x84,
   the F1-U counterpart to N3's 0x85 PSUP) — `encap_f1u_dl_user_data` / `encap_f1u_delivery_status`
   / `parse_nr_ran_container`, round-trip tested (6 tests). The per-DRB `f1u` bearer glue
   (NR-U SN state, buffer accounting) lands with the CU restructure, where F1-U tunnels exist.
-- Restructure `ran/gnb` as CU-shaped (it already is: RRC/PDCP/SDAP live CU-side; the
-  fake-Uu adapter is replaced by an F1 adapter — same seam as Phase 0 designed in).
+- **3e (LANDED)**: the **CU restructure** — `ran/gnb` now runs CU-shaped behind `RADIAN_GNB_F1=1`.
+  `ran/gnb/src/f1.rs` is an `F1Transport` at the Phase-0 `UuTransport` seam: F1-C (F1AP over
+  SCTP; the CU **listens**, the DU connects and sends F1 Setup) + F1-U (GTP-U + NR-U). The CU
+  core (`serve`/`handle_*`) is untouched — the seam only gained a default-no-op `start()`, which
+  F1 overrides to accept the gNB-DU **outside** the serve `select!` (SCTP accept is not
+  cancellation-safe) and after NG Setup. Uu↔F1 map: `Srb{0}`↔InitialULRRC, `Srb{n}`↔UL/DL RRC
+  Message Transfer, downlink `Data`→NR-U **DL USER DATA**, uplink `Data`→plain F1-U G-PDU (NR-U
+  is DL-only), `Idle`←DU-sent **UEContextReleaseRequest** (added to `crates/f1ap`), `Paging`→F1AP
+  Paging (cell-level: sent without a UE context, so a released — i.e. idle — UE stays pageable),
+  `Released`→UEContextReleaseCommand. Per-DRB F1-U TEIDs are derived (`(cu_ue_id<<8)|psi`) so both
+  ends agree without an F-TEID exchange; UEContextSetup is still sent for the DU to admit the DRB.
+  `ran/gnb/src/du.rs` + the `radian-du` binary are the **Rust gNB-DU stub** (standing in for
+  OCUDU's `odu`), bridging F1↔Uu and carrying RRC/PDCP opaquely — the DU holds no security state.
+  The `@gnb` BDD tier now runs **through** this split, so real F1AP and real F1-U cross the wire
+  in CI (whole suite: 22 scenarios / 237 steps green).
+- Remaining before interop: carry the F1-U F-TEIDs in UEContextSetup's DRB IEs (needed for a DU
+  that allocates its own), and pin the F1AP release against OCUDU's (Rel-19 vs ~Rel-17).
 - Interop target: `radian-gnb --f1` ↔ OCUDU `odu` (ru_dummy first, then ZMQ + srsUE):
   **a real UE registers on the radian core through a Rust CU.** Manual/nightly tier
   (needs the OCUDU checkout), mirroring the free-ran-ue `@sim` pattern.
@@ -378,10 +393,11 @@ standalone research project, not a slice.
 ### Crate map (target state through Phase 3)
 
 ```
-crates/ngap   (exists)      crates/rrc   (P1)      ran/gnb        (P0, binary)
-crates/nas    (exists)      crates/pdcp  (P1)      bdd @gnb tier  (P0)
-crates/gtpu   (+ext P0)     crates/sdap  (P2)
-crates/aka    (+KDF P1)     crates/f1ap  (P3)      [P4: fapi, rlc, mac, sched]
+crates/ngap   (exists)      crates/rrc   (P1)      ran/gnb → radian-gnb  (P0, the CU)
+crates/nas    (exists)      crates/pdcp  (P1)              → radian-du   (P3e, DU stub)
+crates/gtpu   (+ext P0,     crates/sdap  (P2)      bdd @gnb tier  (P0; over F1 since P3e)
+               +nru P3d)    crates/f1ap  (P3)      [P4: fapi, rlc, mac, sched]
+crates/aka    (+KDF P1)
 ```
 
 ## 6. Risks and open questions
