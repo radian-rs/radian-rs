@@ -131,6 +131,26 @@ pub fn rrc_keys(kgnb: &[u8; 32], nea: u8, nia: u8) -> RrcKeys {
     }
 }
 
+/// 128-bit **user-plane keys** derived from K_gNB (TS 33.501 Annex A.8) — the keys the
+/// PDCP layer uses to cipher (and optionally integrity-protect) DRB traffic
+/// (`crates/pdcp` + `crates/sdap`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpKeys {
+    pub kup_int: [u8; 16],
+    pub kup_enc: [u8; 16],
+}
+
+/// gNB/UE: derive the user-plane algorithm keys from **K_gNB** (TS 33.501 Annex A.8) —
+/// K_UPenc (distinguisher `0x05`) and K_UPint (`0x06`). Same shape as [`rrc_keys`] with
+/// the user-plane distinguishers. `nea`/`nia` are the selected algorithm identifiers.
+pub fn up_keys(kgnb: &[u8; 32], nea: u8, nia: u8) -> UpKeys {
+    use oxirush_security::{derive_nas_key, extract_128};
+    UpKeys {
+        kup_enc: extract_128(&derive_nas_key(kgnb, 0x05, nea)),
+        kup_int: extract_128(&derive_nas_key(kgnb, 0x06, nia)),
+    }
+}
+
 /// AMF: derive **K_gNB** from K_AMF (TS 33.501 Annex A.9, FC=0x6E) — the AS root
 /// key handed to the NG-RAN in the Initial Context Setup's Security Key IE.
 /// `ul_nas_count` is the uplink NAS COUNT of the trigger message (the Security
@@ -418,6 +438,21 @@ mod tests {
         let nas = nas_keys(&kgnb, 2, 2);
         assert_ne!(keys.krrc_enc, nas.knas_enc);
         assert_ne!(keys.krrc_int, nas.knas_int);
+    }
+
+    /// User-plane keys (TS 33.501 Annex A.8): deterministic, enc/int distinct, and
+    /// distinct from the RRC keys derived from the same K_gNB (the AS UP/RRC split).
+    #[test]
+    fn up_keys_are_deterministic_and_distinct_from_rrc() {
+        let kgnb = [0x42u8; 32];
+        let up = up_keys(&kgnb, 2, 2);
+        assert_eq!(up, up_keys(&kgnb, 2, 2), "deterministic");
+        assert_ne!(up.kup_enc, up.kup_int, "enc (0x05) and int (0x06) differ");
+        assert_ne!(up_keys(&[0x43u8; 32], 2, 2), up, "bound to K_gNB");
+        // K_UP is not K_RRC (distinguishers 0x05/0x06 vs 0x03/0x04).
+        let rrc = rrc_keys(&kgnb, 2, 2);
+        assert_ne!(up.kup_enc, rrc.krrc_enc);
+        assert_ne!(up.kup_int, rrc.krrc_int);
     }
 
     /// The NH chain (TS 33.501 Annex A.10): NH₁ from the initial K_gNB, NHₙ₊₁ from

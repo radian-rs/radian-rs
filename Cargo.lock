@@ -2588,6 +2588,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdap"
+version = "0.1.0"
+dependencies = [
+ "aka",
+ "pdcp",
+]
+
+[[package]]
 name = "sealed"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
