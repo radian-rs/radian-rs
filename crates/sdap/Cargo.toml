@@ -1,0 +1,18 @@
+[package]
+name = "sdap"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+# SDAP — Service Data Adaptation Protocol (TS 37.324), the top of the user-plane stack:
+# it maps QoS flows (QFI) to data radio bearers. This crate is the SDAP Data PDU header
+# codec (design/128 Phase 2) — a 1-octet header carrying the QFI (and, downlink, the
+# reflective-QoS bits). A DRB configured without an SDAP header is a pass-through, with
+# the QFI tracked per-DRB by configuration (as OCUDU does for a single-flow default DRB).
+
+[dependencies]
+
+[dev-dependencies]
+# The user-plane integration test drives the full DRB chain: aka (K_UP) + pdcp (DRB).
+aka.workspace = true
+pdcp.workspace = true

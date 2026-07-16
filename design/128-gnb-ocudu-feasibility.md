@@ -315,9 +315,14 @@ plan the phase implemented.
   SRBs; assert against golden traces.
 
 ### Phase 2 — user plane completion over fake Uu (M)
-- `crates/sdap` (QFI↔DRB, ~300 LOC), PDCP DRB entities (18-bit SN, reorder/discard),
-  DRB establishment driven by PDU Session Resource Setup (QoS flow → DRB mapping — the
-  OCUDU `cu_up` PDU-session-manager logic, small).
+- **2a (LANDED)**: `crates/sdap` (TS 37.324 QFI header codec) + PDCP **DRB** entities
+  (18-bit SN — `crates/pdcp` refactored to a shared `Bearer` core behind `PdcpSrb`/
+  `PdcpDrb`) + `aka::up_keys` (K_UPenc/int, distinguishers 0x05/0x06). Unit-tested + an
+  `aka→pdcp-DRB→sdap` user-plane round-trip integration test. In-order delivery assumed;
+  window reorder/discard still deferred. Not yet wired into `ran/gnb` (that's 2b).
+- **2b (next)**: DRB establishment in `ran/gnb` driven by PDU Session Resource Setup (QoS
+  flow → DRB mapping — the OCUDU `cu_up` PDU-session-manager logic, small); the Uu
+  user-plane path runs through SDAP + PDCP DRB.
 - Datapath echo BDD through the full chain: TUN-side ICMP → N3 G-PDU+QFI → PDCP(DRB,
   ciphered) → fake Uu → UE decap, and back.
 - This completes a **UERANSIM-class gNB** — but wire-correct above RLC and validated
