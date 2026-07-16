@@ -1,13 +1,15 @@
-//! radian-gnb — the standalone gNodeB, Phase 0 of design/128: the scripted BDD
-//! gNB promoted to a network element. It terminates **N2** (NGAP over SCTP to the
-//! AMF, with NG Setup and reconnect), **N3** (GTP-U to the UPF, marking uplink
-//! G-PDUs with the QFI per TS 38.415), and a **fake Uu** toward UEs ([`uu`]) that
-//! carries NAS opaquely — exactly like a real gNB, minus the RRC/PDCP layers that
-//! Phase 1 adds behind the same [`UuTransport`] seam (and Phase 3 swaps for F1).
+//! radian-gnb — the standalone gNodeB (design/128 Phases 0–1). It terminates **N2**
+//! (NGAP over SCTP to the AMF, with NG Setup and reconnect), **N3** (GTP-U to the UPF,
+//! marking uplink G-PDUs with the QFI per TS 38.415), and a **Uu** toward UEs ([`uu`])
+//! that carries **real RRC over PDCP** on signalling radio bearers (Phase 1) — SRB0 for
+//! connection setup, SRB1 (PDCP) for NAS transport, the security-mode procedure, and
+//! release. NAS rides opaque inside the RRC. The [`UuTransport`] seam is unchanged (Phase
+//! 3 swaps it for F1).
 //!
-//! State per UE: the RAN-UE-NGAP-ID the gNB allocates, the AMF-UE-NGAP-ID learned
-//! from the first UE-associated downlink, the Uu peer, and each PDU session's
-//! F-TEIDs + QFI. Contexts die with the N2 association (or a release command).
+//! State per UE: the RAN/AMF UE-NGAP-IDs, the Uu peer, each PDU session's F-TEIDs + QFI,
+//! and the RRC/PDCP context — the SRB1 PDCP entity (integrity/ciphering activated at the
+//! security-mode procedure with keys derived from K_gNB) and the RRC transaction counter.
+//! Contexts die with the N2 association (or a release command).
 
 pub mod uu;
 
@@ -16,6 +18,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use pdcp::{PdcpSrb, Role};
 use sctp_rs::{
     ConnectedSocket, NotificationOrData, SendData, SendInfo, Socket, SocketToAssociation,
 };
@@ -31,6 +34,13 @@ const NG_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 /// The first RAN-allocated downlink N3 F-TEID (then incrementing).
 const FIRST_DL_TEID: u32 = 0x2001;
+/// AS security algorithms this gNB selects — 128-NEA2 / 128-NIA2 (matching the NAS
+/// algorithms the core negotiates; the only pair we ship, per design/128 §6).
+const NEA2: u8 = 2;
+const NIA2: u8 = 2;
+/// Signalling radio bearer identities on the Uu.
+const SRB0: u8 = 0;
+const SRB1: u8 = 1;
 
 // ── configuration ───────────────────────────────────────────────────────────────────────
 
@@ -178,13 +188,60 @@ struct SessionCtx {
     dl_teid: u32,
 }
 
-/// One UE's RAN context.
-#[derive(Debug)]
+/// The N2 side of a pending Initial Context Setup, held while the AS security-mode
+/// procedure runs — replayed into the Initial Context Setup Response once the UE
+/// confirms security (so the response reflects the same admitted sessions).
+#[derive(Debug, Clone)]
+struct PendingIcs {
+    amf_ue_id: u64,
+    /// `(psi, gnb_dl_teid, gnb_dl_addr)` admitted inline (empty at initial registration).
+    admitted: Vec<(u8, u32, Ipv4Addr)>,
+}
+
+/// One UE's RAN context — the NGAP identities, its PDU sessions, and its RRC/PDCP state.
 struct UeCtx<P> {
     peer: P,
     /// Learned from the first UE-associated downlink (DL NAS / ICS).
     amf_ue_id: Option<u64>,
     sessions: Vec<SessionCtx>,
+    /// The SRB1 PDCP entity (gNB side): adds the SN, and — once the security-mode
+    /// procedure activates it — the MAC-I and ciphering.
+    srb1: PdcpSrb,
+    /// Next RRC transaction identifier for gNB-originated DCCH messages (2-bit).
+    rrc_txn: u8,
+    /// NAS to deliver to the UE once AS security is active (the ICS's Registration
+    /// Accept, held across the security-mode procedure).
+    pending_dl_nas: Vec<Vec<u8>>,
+    /// The ICS response to send once AS security completes.
+    pending_ics: Option<PendingIcs>,
+}
+
+impl<P> UeCtx<P> {
+    fn new(peer: P) -> Self {
+        Self {
+            peer,
+            amf_ue_id: None,
+            sessions: Vec::new(),
+            srb1: PdcpSrb::new(Role::Gnb, SRB1),
+            rrc_txn: 0,
+            pending_dl_nas: Vec::new(),
+            pending_ics: None,
+        }
+    }
+
+    /// The next 2-bit RRC transaction identifier.
+    fn next_txn(&mut self) -> u8 {
+        let t = self.rrc_txn;
+        self.rrc_txn = (self.rrc_txn + 1) & 0x3;
+        t
+    }
+
+    /// Build the SRB1 wire payload for a downlink NAS message: wrap it in an RRC
+    /// DLInformationTransfer and PDCP-protect it (protected once security is active).
+    fn dl_nas_srb1(&mut self, nas: Vec<u8>) -> Vec<u8> {
+        let txn = self.next_txn();
+        self.srb1.protect(&rrc::dl_information_transfer(txn, nas))
+    }
 }
 
 /// The gNB's mutable state: UE contexts and the ID/TEID allocators.
@@ -217,7 +274,7 @@ impl<P: Copy + Eq + std::hash::Hash> GnbState<P> {
         }
         let ran_ue_id = self.next_ran_ue_id;
         self.next_ran_ue_id += 1;
-        self.ues.insert(ran_ue_id, UeCtx { peer, amf_ue_id: None, sessions: Vec::new() });
+        self.ues.insert(ran_ue_id, UeCtx::new(peer));
         self.by_peer.insert(peer, ran_ue_id);
         if !self.camped.contains(&peer) {
             self.camped.push(peer);
@@ -339,7 +396,7 @@ async fn serve<T: UuTransport>(
             }
             msg = transport.recv() => {
                 let (peer, msg) = msg.context("Uu transport failed")?;
-                handle_uu(cfg, conn, n3, state, peer, msg).await?;
+                handle_uu(cfg, conn, transport, n3, state, peer, msg).await?;
             }
             recv = n3.recv_from(&mut n3_buf) => {
                 let (n, src) = recv.context("N3 recv")?;
@@ -359,30 +416,31 @@ async fn handle_ngap<T: UuTransport>(
     state: &mut GnbState<T::Peer>,
     pdu: &ngap::NGAP_PDU,
 ) -> Result<()> {
-    // DownlinkNASTransport → relay the NAS to the UE (and learn its AMF-UE-NGAP-ID).
+    // DownlinkNASTransport → relay the NAS to the UE in an RRC DLInformationTransfer on
+    // SRB1 (unprotected before AS security, ciphered after), learning its AMF-UE-NGAP-ID.
     if let Some((amf_ue_id, ran_ue_id, nas)) = ngap::downlink_nas_transport_params(pdu) {
         let Some(ue) = state.ues.get_mut(&ran_ue_id) else {
             warn!(ran_ue_id, "downlink NAS for an unknown UE context — dropped");
             return Ok(());
         };
         ue.amf_ue_id = Some(amf_ue_id);
-        let peer = ue.peer;
-        if let Err(e) = transport.send(peer, &DlMessage::Nas { nas }).await {
+        let (peer, payload) = (ue.peer, ue.dl_nas_srb1(nas));
+        if let Err(e) = transport.send(peer, &DlMessage::Srb { srb_id: SRB1, payload }).await {
             warn!(ran_ue_id, "Uu downlink NAS relay failed: {e:#}");
         }
         return Ok(());
     }
 
-    // InitialContextSetupRequest → confirm (admitting any inline sessions — the
-    // Service Request resume path) and relay the NAS it carries.
+    // InitialContextSetupRequest → the AMF hands us K_gNB. Run the AS **security-mode
+    // procedure** over SRB1 (derive K_RRC, send an integrity-protected RRC
+    // SecurityModeCommand), and hold the ICS's NAS (Registration Accept) + the ICS
+    // response until the UE confirms security. Any inline PDU sessions (Service Request
+    // resume) are admitted now and reflected in the deferred response.
     if let Some((amf_ue_id, ran_ue_id, ic)) = ngap::initial_context_setup_params(pdu) {
-        let Some(ue) = state.ues.get(&ran_ue_id) else {
+        if !state.ues.contains_key(&ran_ue_id) {
             warn!(ran_ue_id, "InitialContextSetupRequest for an unknown UE — ignored");
             return Ok(());
-        };
-        let peer = ue.peer;
-        // K_gNB arrives here (ic.security_key); it keys nothing until Phase 1
-        // brings PDCP — the fake Uu carries NAS with only NAS-level security.
+        }
         let qfis: HashMap<u8, u8> = ngap::initial_context_setup_request_qfis(pdu).into_iter().collect();
         let mut admitted = Vec::new();
         let mut sessions = Vec::new();
@@ -393,20 +451,25 @@ async fn handle_ngap<T: UuTransport>(
             admitted.push((psi, dl_teid, cfg.n3_addr));
             info!(ran_ue_id, psi, qfi, upf_teid, dl_teid, "PDU session restored at context setup");
         }
+        // Derive the AS keys from K_gNB and start the security-mode procedure: activate
+        // SRB1 integrity, send the SecurityModeCommand (integrity-protected, not yet
+        // ciphered), then activate ciphering for everything after.
+        let keys = aka::rrc_keys(&ic.security_key, NEA2, NIA2);
         let ue = state.ues.get_mut(&ran_ue_id).expect("context checked above");
         ue.amf_ue_id = Some(amf_ue_id);
         ue.sessions.extend(&sessions);
-        let response = if admitted.is_empty() {
-            ngap::initial_context_setup_response(amf_ue_id, ran_ue_id)
-        } else {
-            ngap::initial_context_setup_response_with_sessions(amf_ue_id, ran_ue_id, &admitted)
-        };
-        send_ngap(conn, &response).await?;
-        info!(ran_ue_id, amf_ue_id, sessions = sessions.len(), "initial context established");
-        if !ic.nas.is_empty()
-            && let Err(e) = transport.send(peer, &DlMessage::Nas { nas: ic.nas }).await
-        {
-            warn!(ran_ue_id, "Uu context-setup NAS relay failed: {e:#}");
+        ue.srb1.activate_integrity(keys.krrc_int, NIA2);
+        let txn = ue.next_txn();
+        let smc = ue.srb1.protect(&rrc::security_mode_command(txn, NEA2, NIA2));
+        ue.srb1.activate_ciphering(keys.krrc_enc, NEA2);
+        if !ic.nas.is_empty() {
+            ue.pending_dl_nas.push(ic.nas);
+        }
+        ue.pending_ics = Some(PendingIcs { amf_ue_id, admitted });
+        let peer = ue.peer;
+        info!(ran_ue_id, amf_ue_id, "AS security-mode procedure started (SecurityModeCommand sent)");
+        if let Err(e) = transport.send(peer, &DlMessage::Srb { srb_id: SRB1, payload: smc }).await {
+            warn!(ran_ue_id, "Uu SecurityModeCommand send failed: {e:#}");
         }
         return Ok(());
     }
@@ -428,31 +491,35 @@ async fn handle_ngap<T: UuTransport>(
         for (psi, upf_teid, upf_addr, nas) in sessions.into_iter().take(1) {
             let dl_teid = state.alloc_dl_teid();
             let qfi = qfis.get(&psi).copied().unwrap_or(1);
-            state.ues.get_mut(&ran_ue_id).expect("context checked above").sessions.push(SessionCtx {
-                psi,
-                qfi,
-                upf_teid,
-                upf_addr,
-                dl_teid,
-            });
+            let ue = state.ues.get_mut(&ran_ue_id).expect("context checked above");
+            ue.sessions.push(SessionCtx { psi, qfi, upf_teid, upf_addr, dl_teid });
             send_ngap(
                 conn,
                 &ngap::pdu_session_resource_setup_response(amf_ue_id, ran_ue_id, psi, qfi, dl_teid, cfg.n3_addr),
             )
             .await?;
             info!(ran_ue_id, psi, qfi, upf_teid, dl_teid, "PDU session set up");
-            if !nas.is_empty()
-                && let Err(e) = transport.send(peer, &DlMessage::Nas { nas }).await
-            {
-                warn!(ran_ue_id, "Uu session-accept NAS relay failed: {e:#}");
+            // Relay the PDU Session Establishment Accept to the UE over SRB1 (ciphered).
+            if !nas.is_empty() {
+                let payload = ue.dl_nas_srb1(nas);
+                if let Err(e) = transport.send(peer, &DlMessage::Srb { srb_id: SRB1, payload }).await {
+                    warn!(ran_ue_id, "Uu session-accept NAS relay failed: {e:#}");
+                }
             }
         }
         return Ok(());
     }
 
-    // UEContextReleaseCommand → drop the context, confirm, tell the UE.
+    // UEContextReleaseCommand → send an RRC Release on SRB1, drop the context, confirm.
     if let Some((amf_ue_id, ran_ue_id, _cause)) = ngap::parse_ue_context_release_command(pdu) {
         send_ngap(conn, &ngap::ue_context_release_complete(amf_ue_id, ran_ue_id)).await?;
+        // Tell the UE its RRC connection is released (RRCRelease on SRB1) before tearing
+        // the context down, then the Uu-level released marker.
+        if let Some(ue) = state.ues.get_mut(&ran_ue_id) {
+            let txn = ue.next_txn();
+            let (peer, payload) = (ue.peer, ue.srb1.protect(&rrc::rrc_release(txn)));
+            let _ = transport.send(peer, &DlMessage::Srb { srb_id: SRB1, payload }).await;
+        }
         match state.remove_ue(ran_ue_id) {
             Some(ctx) => {
                 info!(ran_ue_id, amf_ue_id, "UE context released");
@@ -480,37 +547,72 @@ async fn handle_ngap<T: UuTransport>(
     Ok(())
 }
 
-/// Dispatch one uplink Uu message from a UE. Generic over the peer type only —
-/// uplink handling emits on N2/N3, never back on the Uu transport.
-async fn handle_uu<P: Copy + Eq + std::hash::Hash + std::fmt::Debug>(
+/// Dispatch one uplink Uu message from a UE — the RRC/PDCP decode side of the gNB.
+async fn handle_uu<T: UuTransport>(
     cfg: &GnbConfig,
     conn: &ConnectedSocket,
+    transport: &mut T,
     n3: &UdpSocket,
-    state: &mut GnbState<P>,
-    peer: P,
+    state: &mut GnbState<T::Peer>,
+    peer: T::Peer,
     msg: UlMessage,
 ) -> Result<()> {
     match msg {
-        UlMessage::InitialUe { tac, s_tmsi, nas } => {
-            let ran_ue_id = state.new_ue(peer);
-            info!(ran_ue_id, ?peer, resumes = s_tmsi.is_some(), "initial UE message");
-            let pdu = match s_tmsi {
-                Some(tmsi) => ngap::initial_ue_message_with_stmsi_at(
-                    ran_ue_id, tmsi, nas, &cfg.mcc, &cfg.mnc, &tac,
-                ),
-                None => {
-                    ngap::initial_ue_message_with_nas_at(ran_ue_id, nas, &cfg.mcc, &cfg.mnc, &tac)
+        // SRB0 (CCCH, no PDCP): the UE opens an RRC connection.
+        UlMessage::Srb { srb_id: SRB0, payload } => match rrc::parse_ul_ccch(&payload) {
+            Some(rrc::UlCcch::RrcSetupRequest { ue_identity, cause }) => {
+                let ran_ue_id = state.new_ue(peer);
+                info!(ran_ue_id, ?peer, ue_identity, cause, "RRC connection request");
+                // RRCSetup configures SRB1 (an opaque masterCellGroup over the fake Uu).
+                let setup = rrc::rrc_setup(0, &[0x00]);
+                if let Err(e) = transport.send(peer, &DlMessage::Srb { srb_id: SRB0, payload: setup }).await
+                {
+                    warn!(ran_ue_id, "Uu RRCSetup send failed: {e:#}");
                 }
-            };
-            send_ngap(conn, &pdu).await?;
-        }
-        UlMessage::Nas { nas } => {
-            let Some((ran_ue_id, amf_ue_id)) = ue_ids_for_peer(state, peer) else {
-                warn!(?peer, "uplink NAS from a UE with no addressable context — dropped");
+            }
+            other => warn!(?peer, ?other, "unexpected UL-CCCH message — dropped"),
+        },
+        // SRB1 (DCCH, PDCP): NAS transport, the security-mode procedure, reconfiguration.
+        UlMessage::Srb { srb_id: SRB1, payload } => {
+            let Some(ran_ue_id) = state.by_peer.get(&peer).copied() else {
+                warn!(?peer, "SRB1 message from a UE with no context — dropped");
                 return Ok(());
             };
-            send_ngap(conn, &ngap::uplink_nas_transport(amf_ue_id, ran_ue_id, nas)).await?;
+            let rrc_bytes = {
+                let ue = state.ues.get_mut(&ran_ue_id).expect("context exists for a mapped peer");
+                match ue.srb1.unprotect(&payload) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        warn!(ran_ue_id, "SRB1 PDCP unprotect failed: {e}");
+                        return Ok(());
+                    }
+                }
+            };
+            match rrc::parse_ul_dcch(&rrc_bytes) {
+                Some(rrc::UlDcch::RrcSetupComplete { nas, .. }) => {
+                    // The first uplink NAS (Registration/Service Request) → InitialUEMessage.
+                    let tac = cfg.tacs.first().copied().unwrap_or([0, 0, 1]);
+                    let pdu = ngap::initial_ue_message_with_nas_at(ran_ue_id, nas, &cfg.mcc, &cfg.mnc, &tac);
+                    send_ngap(conn, &pdu).await?;
+                    info!(ran_ue_id, "RRC setup complete (InitialUEMessage sent)");
+                }
+                Some(rrc::UlDcch::UlInformationTransfer { nas }) => {
+                    let Some((_, amf_ue_id)) = ue_ids_for_peer(state, peer) else {
+                        warn!(ran_ue_id, "uplink NAS before the UE is AMF-addressable — dropped");
+                        return Ok(());
+                    };
+                    send_ngap(conn, &ngap::uplink_nas_transport(amf_ue_id, ran_ue_id, nas)).await?;
+                }
+                Some(rrc::UlDcch::SecurityModeComplete { .. }) => {
+                    on_as_security_complete(conn, transport, state, ran_ue_id).await?;
+                }
+                Some(rrc::UlDcch::RrcReconfigurationComplete { .. }) => {
+                    info!(ran_ue_id, "RRC reconfiguration complete");
+                }
+                other => warn!(ran_ue_id, ?other, "unhandled UL-DCCH message"),
+            }
         }
+        UlMessage::Srb { srb_id, .. } => warn!(?peer, srb_id, "message on an unsupported SRB — dropped"),
         UlMessage::Idle => {
             let Some((ran_ue_id, amf_ue_id)) = ue_ids_for_peer(state, peer) else {
                 warn!(?peer, "idle indication from a UE with no addressable context — ignored");
@@ -557,6 +659,42 @@ fn ue_ids_for_peer<P: Copy + Eq + std::hash::Hash>(
     let ran_ue_id = *state.by_peer.get(&peer)?;
     let amf_ue_id = state.ues.get(&ran_ue_id)?.amf_ue_id?;
     Some((ran_ue_id, amf_ue_id))
+}
+
+/// The UE confirmed AS security (SecurityModeComplete). Deliver the NAS held across the
+/// procedure (the Registration Accept, now ciphered) and send the deferred Initial
+/// Context Setup Response — completing the context establishment the AMF asked for.
+async fn on_as_security_complete<T: UuTransport>(
+    conn: &ConnectedSocket,
+    transport: &mut T,
+    state: &mut GnbState<T::Peer>,
+    ran_ue_id: u32,
+) -> Result<()> {
+    let (peer, payloads, ics) = {
+        let ue = state.ues.get_mut(&ran_ue_id).expect("context exists for a mapped peer");
+        let held = std::mem::take(&mut ue.pending_dl_nas);
+        let mut payloads = Vec::with_capacity(held.len());
+        for nas in held {
+            payloads.push(ue.dl_nas_srb1(nas));
+        }
+        (ue.peer, payloads, ue.pending_ics.take())
+    };
+    info!(ran_ue_id, "AS security active (SecurityModeComplete received)");
+    for payload in payloads {
+        if let Err(e) = transport.send(peer, &DlMessage::Srb { srb_id: SRB1, payload }).await {
+            warn!(ran_ue_id, "Uu post-security NAS relay failed: {e:#}");
+        }
+    }
+    if let Some(ics) = ics {
+        let resp = if ics.admitted.is_empty() {
+            ngap::initial_context_setup_response(ics.amf_ue_id, ran_ue_id)
+        } else {
+            ngap::initial_context_setup_response_with_sessions(ics.amf_ue_id, ran_ue_id, &ics.admitted)
+        };
+        send_ngap(conn, &resp).await?;
+        info!(ran_ue_id, "initial context established (ICS response sent)");
+    }
+    Ok(())
 }
 
 /// Dispatch one N3 (GTP-U) datagram from the UPF.

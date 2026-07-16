@@ -5,3 +5,7 @@ Cargo.lock.bak
 *.redb
 # mdbook build output
 book/book/
+
+# Editor lock files
+.\#*
+\#*\#

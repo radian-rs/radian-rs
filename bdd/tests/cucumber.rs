@@ -53,9 +53,9 @@ struct World {
     /// The gNB's N3 (GTP-U) socket, bound early so it can receive a downlink G-PDU
     /// the UPF flushes after a CM-IDLE resume.
     gnb_n3: Option<tokio::net::UdpSocket>,
-    // standalone gNB tier (@gnb, design/128 Phase 0)
-    /// The scripted UE's fake-Uu link to the standalone `radian-gnb`.
-    ue_link: Option<ran::GnbUeLink>,
+    // standalone gNB tier (@gnb, design/128 Phase 1)
+    /// A UE speaking real RRC over PDCP to the standalone `radian-gnb` (owns its NAS/USIM).
+    ue_rrc: Option<ran::UeRrc>,
     /// The 5G-TMSI the UE reads from its Registration Accept (its paging identity).
     ue_tmsi: Option<u32>,
 }
@@ -1075,24 +1075,22 @@ async fn standalone_gnb_running(world: &mut World) {
 }
 
 #[when(regex = r#"^a UE camps on the gNB and registers from TAC "([0-9a-fA-F]{6})"$"#)]
-async fn ue_camps_and_registers(world: &mut World, tac: String) {
-    let link = ran::GnbUeLink::connect(GNB_UU_ADDR.parse().unwrap()).await.expect("connect to gNB Uu");
-    let ue = ran::ScriptedUe::demo();
-    // The first uplink Uu message makes the gNB allocate a RAN context and send
-    // the NGAP InitialUEMessage carrying this registration request.
-    link.send(&ran::UlMessage::InitialUe { tac: parse_tac(&tac), s_tmsi: None, nas: ue.registration_request() })
-        .await
-        .expect("send InitialUe over the Uu");
-    world.ue_link = Some(link);
-    world.ue = Some(ue);
+async fn ue_camps_and_registers(world: &mut World, _tac: String) {
+    // The UE opens an RRC connection (RRCSetupRequest → RRCSetup on SRB0) and sends its
+    // Registration Request inside RRCSetupComplete on SRB1 — the gNB relays it as an
+    // NGAP InitialUEMessage from its own cell's TAC.
+    let mut ue_rrc = ran::UeRrc::camp(GNB_UU_ADDR.parse().unwrap()).await.expect("camp on the gNB Uu");
+    let registration_request = ue_rrc.ue.registration_request();
+    ue_rrc.rrc_connect(registration_request).await.expect("RRC connection + registration request");
+    world.ue_rrc = Some(ue_rrc);
 }
 
 #[then("the gNB relays the AMF's 5G-AKA challenge to the UE")]
 async fn gnb_relays_challenge(world: &mut World) {
-    let nas = world.ue_link.as_ref().expect("UE camped").recv_nas().await.expect("the challenge downlink");
+    let nas = world.ue_rrc.as_mut().expect("UE camped").recv_nas().await.expect("the challenge downlink");
     assert!(
         nas::parse_authentication_request(&nas).is_some(),
-        "expected an Authentication Request relayed through the gNB"
+        "expected an Authentication Request relayed through the gNB (in an RRC DLInformationTransfer)"
     );
     world.pending_nas = Some(nas);
 }
@@ -1100,78 +1098,87 @@ async fn gnb_relays_challenge(world: &mut World) {
 #[when("the UE answers the challenge through the gNB")]
 async fn ue_answers_through_gnb(world: &mut World) {
     let challenge = world.pending_nas.take().expect("a pending Authentication Request");
-    let reply = world.ue.as_mut().expect("UE").authenticate(&challenge).expect("the USIM answers");
+    let ue_rrc = world.ue_rrc.as_mut().expect("UE camped");
+    let reply = ue_rrc.ue.authenticate(&challenge).expect("the USIM answers");
     let response = match reply {
         ran::ChallengeReply::Response(bytes) => bytes,
         ran::ChallengeReply::SynchFailure(_) => panic!("the USIM unexpectedly failed synchronisation"),
     };
-    world.ue_link.as_ref().expect("UE camped").send(&ran::UlMessage::Nas { nas: response }).await.expect("send RES*");
+    ue_rrc.send_nas(response).await.expect("send RES* in an RRC ULInformationTransfer");
 }
 
-#[then("the gNB relays the security mode command to the UE")]
+#[then("the gNB relays the NAS security mode command to the UE")]
 async fn gnb_relays_smc(world: &mut World) {
-    let smc = world.ue_link.as_ref().expect("UE camped").recv_nas().await.expect("the security mode downlink");
+    let smc = world.ue_rrc.as_mut().expect("UE camped").recv_nas().await.expect("the NAS security mode downlink");
     assert_eq!(
         smc.get(1),
         Some(&nas::sht::INTEGRITY_NEW_CONTEXT),
-        "the SMC is integrity-protected with a new context"
+        "the NAS SMC is integrity-protected with a new context"
     );
     world.pending_nas = Some(smc);
 }
 
-#[when("the UE completes the security mode procedure through the gNB")]
+#[when("the UE completes NAS security through the gNB")]
 async fn ue_completes_security_through_gnb(world: &mut World) {
-    let smc = world.pending_nas.take().expect("a pending Security Mode Command");
+    let smc = world.pending_nas.take().expect("a pending NAS Security Mode Command");
+    let ue_rrc = world.ue_rrc.as_mut().expect("UE camped");
     let (nea, nia, _replayed, complete) =
-        world.ue.as_mut().expect("UE").complete_security(&smc).expect("the UE derives its keys");
+        ue_rrc.ue.complete_security(&smc).expect("the UE derives its NAS + K_gNB keys");
     assert_eq!((nea, nia), (2, 2));
-    world.ue_link.as_ref().expect("UE camped").send(&ran::UlMessage::Nas { nas: complete }).await.expect("send SMC complete");
+    ue_rrc.send_nas(complete).await.expect("send NAS Security Mode Complete");
+    // K_gNB is now known — arm SRB1 AS integrity so the coming AS SecurityModeCommand verifies.
+    ue_rrc.arm_as_security().expect("derive K_RRC and arm SRB1 integrity");
+}
+
+#[then("the gNB commands AS security over SRB1")]
+async fn gnb_commands_as_security(world: &mut World) {
+    // The gNB derived K_RRC from the K_gNB in the Initial Context Setup and sent an RRC
+    // SecurityModeCommand on SRB1 (integrity-protected). The UE verifies it, activates
+    // ciphering, and answers with SecurityModeComplete (integrity + ciphered).
+    let (nea, nia) = world.ue_rrc.as_mut().expect("UE camped").complete_as_security().await.expect("AS security");
+    assert_eq!((nea, nia), (2, 2), "the gNB selected NEA2/NIA2 for AS security");
 }
 
 #[then("the gNB relays the registration accept to the UE")]
 async fn gnb_relays_accept(world: &mut World) {
-    // The AMF sends this in an InitialContextSetupRequest; the gNB establishes the
-    // context, answers the ICS, and relays the enclosed NAS accept out the Uu.
-    let accept = world.ue_link.as_ref().expect("UE camped").recv_nas().await.expect("the registration accept");
-    let msg = world.ue.as_mut().expect("UE").read_downlink(&accept).expect("the accept verifies at the UE");
+    // Now over ciphered SRB1: the gNB delivers the Registration Accept the ICS carried.
+    let accept = world.ue_rrc.as_mut().expect("UE camped").recv_nas().await.expect("the registration accept");
+    let ue_rrc = world.ue_rrc.as_mut().expect("UE camped");
+    let msg = ue_rrc.ue.read_downlink(&accept).expect("the accept verifies at the UE");
     assert_eq!(nas::gmm_message_type(&msg), Some(nas::Nas5gmmMessageType::RegistrationAccept));
-    // The UE's 5G-TMSI (from the assigned GUTI) is its paging identity later.
     world.ue_tmsi = nas::guti_tmsi_from_registration_accept(&msg);
     assert!(world.ue_tmsi.is_some(), "the accept assigns a 5G-GUTI");
 }
 
 #[when("the UE completes the registration through the gNB")]
 async fn ue_completes_registration_through_gnb(world: &mut World) {
-    let complete = world
-        .ue
-        .as_mut()
-        .expect("UE")
-        .protected_uplink(&nas::registration_complete())
-        .expect("protect RegistrationComplete");
-    world.ue_link.as_ref().expect("UE camped").send(&ran::UlMessage::Nas { nas: complete }).await.expect("send RegistrationComplete");
+    let ue_rrc = world.ue_rrc.as_mut().expect("UE camped");
+    let complete = ue_rrc.ue.protected_uplink(&nas::registration_complete()).expect("protect RegistrationComplete");
+    ue_rrc.send_nas(complete).await.expect("send RegistrationComplete");
 }
 
 #[then("the gNB relays a configuration update to the UE")]
 async fn gnb_relays_config_update(world: &mut World) {
-    let bytes = world.ue_link.as_ref().expect("UE camped").recv_nas().await.expect("the post-registration downlink");
-    let msg = world.ue.as_mut().expect("UE").read_downlink(&bytes).expect("the CUC verifies");
+    let bytes = world.ue_rrc.as_mut().expect("UE camped").recv_nas().await.expect("the post-registration downlink");
+    let ue_rrc = world.ue_rrc.as_mut().expect("UE camped");
+    let msg = ue_rrc.ue.read_downlink(&bytes).expect("the CUC verifies");
     assert_eq!(nas::gmm_message_type(&msg), Some(nas::Nas5gmmMessageType::ConfigurationUpdateCommand));
 }
 
 #[when("the UE requests a PDU session through the gNB")]
 async fn ue_requests_pdu_through_gnb(world: &mut World) {
     let psi = 1u8;
-    let request = world.ue.as_mut().expect("UE").pdu_session_request(psi).expect("build the request");
-    world.ue_link.as_ref().expect("UE camped").send(&ran::UlMessage::Nas { nas: request }).await.expect("send PDU session request");
+    let ue_rrc = world.ue_rrc.as_mut().expect("UE camped");
+    let request = ue_rrc.ue.pdu_session_request(psi).expect("build the request");
+    ue_rrc.send_nas(request).await.expect("send the PDU session request");
     world.pdu_psi = Some(psi);
 }
 
 #[then(regex = r#"^the UE is assigned an IP address in "([^"]+)" through the gNB$"#)]
 async fn ue_assigned_ip_through_gnb(world: &mut World, subnet: String) {
-    // The gNB sets up the PDU session (allocating its DL F-TEID) and relays the
-    // establishment accept out the Uu.
-    let accept = world.ue_link.as_ref().expect("UE camped").recv_nas().await.expect("the session accept");
-    let (psi, ip) = world.ue.as_mut().expect("UE").read_pdu_session_accept(&accept).expect("read the accept");
+    let accept = world.ue_rrc.as_mut().expect("UE camped").recv_nas().await.expect("the session accept");
+    let ue_rrc = world.ue_rrc.as_mut().expect("UE camped");
+    let (psi, ip) = ue_rrc.ue.read_pdu_session_accept(&accept).expect("read the accept");
     assert_eq!(Some(psi), world.pdu_psi);
     let (net, prefix) = subnet.split_once('/').expect("subnet in CIDR form");
     let base: Ipv4Addr = net.parse().expect("valid subnet base");
@@ -1186,14 +1193,14 @@ async fn ue_reaches_dn_through_gnb(world: &mut World, gw: String) {
     let gw_ip: Ipv4Addr = gw.parse().expect("valid gateway IP");
     let ue_ip = world.ue_ip.expect("the UE has an assigned IP");
     let psi = world.pdu_psi.expect("a PDU session");
-    let link = world.ue_link.as_ref().expect("UE camped");
-    // Send an ICMP echo up the Uu as user-plane data; the gNB encaps it (with QFI)
-    // to the UPF's N3, and the reply returns down the Uu as a Data message.
+    let ue_rrc = world.ue_rrc.as_ref().expect("UE camped");
+    // The user plane is raw IP per PDU session (DRB PDCP is Phase 2): the gNB encaps it
+    // (with QFI) to the UPF's N3, and the reply returns down the Uu as a Data message.
     let mut reached = false;
     for seq in 1..=3u16 {
         let echo = datapath::icmp_echo_request(ue_ip, gw_ip, 0x4242, seq, b"radian-gnb-dp");
-        link.send(&ran::UlMessage::Data { psi, packet: echo }).await.expect("send uplink data over the Uu");
-        if let Some((got_psi, packet)) = link.recv_data(2).await.expect("await a downlink data reply")
+        ue_rrc.send_data(psi, echo).await.expect("send uplink data over the Uu");
+        if let Some((got_psi, packet)) = ue_rrc.recv_data(2).await.expect("await a downlink data reply")
             && got_psi == psi
             && datapath::is_icmp_echo_reply(&packet, gw_ip, ue_ip)
         {
@@ -1206,23 +1213,18 @@ async fn ue_reaches_dn_through_gnb(world: &mut World, gw: String) {
 
 #[when("the UE goes idle and the gNB releases it")]
 async fn ue_goes_idle_through_gnb(world: &mut World) {
-    let link = world.ue_link.as_ref().expect("UE camped");
-    link.send(&ran::UlMessage::Idle).await.expect("send idle indication over the Uu");
-    // The gNB requests AN release; the AMF commands it; the gNB confirms and tells the UE.
-    let dl = link.recv().await.expect("the release notification");
-    assert!(matches!(dl, ran::DlMessage::Released), "expected a Released downlink, got {dl:?}");
+    let ue_rrc = world.ue_rrc.as_mut().expect("UE camped");
+    ue_rrc.go_idle().await.expect("send the idle indication over the Uu");
+    // The gNB requests AN release; the AMF commands it; the gNB sends an RRCRelease on
+    // SRB1 then the Uu released marker.
+    ue_rrc.await_release().await.expect("the gNB releases the RRC connection");
 }
 
 #[then("the gNB pages the UE")]
 async fn gnb_pages_ue(world: &mut World) {
     let tmsi = world.ue_tmsi.expect("the UE holds a 5G-TMSI");
-    let dl = world.ue_link.as_ref().expect("UE camped").recv().await.expect("the paging downlink");
-    match dl {
-        ran::DlMessage::Paging { tmsi: paged } => {
-            assert_eq!(paged, tmsi, "the gNB pages the UE's own 5G-TMSI");
-        }
-        other => panic!("expected a Paging downlink, got {other:?}"),
-    }
+    let paged = world.ue_rrc.as_ref().expect("UE camped").recv_paging().await.expect("the paging downlink");
+    assert_eq!(paged, tmsi, "the gNB pages the UE's own 5G-TMSI");
 }
 
 #[when("I stop the standalone gNB and the radian core")]
