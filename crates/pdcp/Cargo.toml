@@ -1,0 +1,22 @@
+[package]
+name = "pdcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+# PDCP — Packet Data Convergence Protocol (TS 38.323), the sublayer between RRC/SDAP
+# and RLC. This crate implements the SRB data path (design/128 Phase 1c): the 12-bit-SN
+# Data PDU, integrity protection (mandatory once AS security is active) and ciphering,
+# using the AS keys derived by `crates/aka::rrc_keys`. NEA/NIA engines are reused from
+# `oxirush-security` (the same primitives `crates/nas` uses for NAS security). DRB
+# entities, 18-bit SN, and reordering are Phase 2.
+
+[dependencies]
+# The NEA (ciphering) / NIA (integrity) engines — generic over key/count/bearer/direction.
+oxirush-security = "0.1.0"
+thiserror.workspace = true
+
+[dev-dependencies]
+# The integration test drives the full AS chain: aka (K_gNB → RRC keys) + rrc (messages).
+aka.workspace = true
+rrc.workspace = true

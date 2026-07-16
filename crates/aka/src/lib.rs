@@ -110,6 +110,27 @@ pub fn nas_keys(kamf: &[u8; 32], nea: u8, nia: u8) -> NasKeys {
     }
 }
 
+/// 128-bit **AS (RRC) keys** derived from K_gNB (TS 33.501 Annex A.8) — the keys the
+/// PDCP layer uses to integrity-protect and cipher SRB traffic (`crates/pdcp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RrcKeys {
+    pub krrc_int: [u8; 16],
+    pub krrc_enc: [u8; 16],
+}
+
+/// gNB/UE: derive the RRC algorithm keys from **K_gNB** (TS 33.501 Annex A.8, FC=0x69) —
+/// K_RRCenc (algorithm-type distinguisher `0x03`) and K_RRCint (`0x04`), each the least
+/// significant 128 bits of the KDF output. Same derivation as [`nas_keys`], differing
+/// only in the input key (K_gNB, not K_AMF) and the distinguishers. `nea`/`nia` are the
+/// selected algorithm identifiers (e.g. 2 for 128-NEA2 / 128-NIA2).
+pub fn rrc_keys(kgnb: &[u8; 32], nea: u8, nia: u8) -> RrcKeys {
+    use oxirush_security::{derive_nas_key, extract_128};
+    RrcKeys {
+        krrc_enc: extract_128(&derive_nas_key(kgnb, 0x03, nea)),
+        krrc_int: extract_128(&derive_nas_key(kgnb, 0x04, nia)),
+    }
+}
+
 /// AMF: derive **K_gNB** from K_AMF (TS 33.501 Annex A.9, FC=0x6E) — the AS root
 /// key handed to the NG-RAN in the Initial Context Setup's Security Key IE.
 /// `ul_nas_count` is the uplink NAS COUNT of the trigger message (the Security
@@ -147,11 +168,7 @@ pub fn compute_auts(sub: &SubscriberKey, rand: &[u8; 16], sqn_ms: &[u8; 6]) -> [
 /// UDM/ARPF side: verify an **AUTS** against the challenge `rand` it answers and
 /// extract the UE's SQN (TS 33.102 §6.3.5). `None` when MAC-S doesn't verify —
 /// the AUTS is not from this subscriber's USIM (or not for this RAND).
-pub fn sqn_ms_from_auts(
-    sub: &SubscriberKey,
-    rand: &[u8; 16],
-    auts: &[u8; 14],
-) -> Option<[u8; 6]> {
+pub fn sqn_ms_from_auts(sub: &SubscriberKey, rand: &[u8; 16], auts: &[u8; 14]) -> Option<[u8; 6]> {
     let mut m = Milenage::new_with_opc(sub.k, sub.opc);
     let ak_star = m.f5star(rand);
     let sqn_ms = xor6(&auts[..6], &ak_star);
@@ -184,11 +201,7 @@ pub fn ue_authenticate(
 /// (`SQN = AUTN[0..6] ⊕ AK`, TS 33.102 §6.3.3). `None` when MAC-A doesn't verify.
 /// A USIM compares this against its stored SQN to decide whether the challenge is
 /// fresh or a synchronisation failure (→ [`compute_auts`]). Used by tests / a UE sim.
-pub fn ue_recover_sqn(
-    sub: &SubscriberKey,
-    rand: &[u8; 16],
-    autn: &[u8; 16],
-) -> Option<[u8; 6]> {
+pub fn ue_recover_sqn(sub: &SubscriberKey, rand: &[u8; 16], autn: &[u8; 16]) -> Option<[u8; 6]> {
     let mut m = Milenage::new_with_opc(sub.k, sub.opc);
     let (_res, _ck, _ik, ak) = m.f2345(rand);
     let sqn = xor6(&autn[..6], &ak);
@@ -261,10 +274,17 @@ mod tests {
         bad[13] ^= 0x01;
         assert_eq!(sqn_ms_from_auts(&sub, &rand, &bad), None, "MAC-S mismatch");
         let other_rand = hex!("00000000000000000000000000000001");
-        assert_eq!(sqn_ms_from_auts(&sub, &other_rand, &auts), None, "wrong RAND");
+        assert_eq!(
+            sqn_ms_from_auts(&sub, &other_rand, &auts),
+            None,
+            "wrong RAND"
+        );
 
         // A different subscriber's key can't forge it either.
-        let other = SubscriberKey { k: hex!("00000000000000000000000000000000"), ..sub };
+        let other = SubscriberKey {
+            k: hex!("00000000000000000000000000000000"),
+            ..sub
+        };
         assert_eq!(sqn_ms_from_auts(&other, &rand, &auts), None, "wrong K");
     }
 
@@ -373,6 +393,31 @@ mod tests {
         assert_eq!(k0, kgnb(&kamf, 0));
         assert_ne!(k0, kgnb(&kamf, 1));
         assert_ne!(k0, kgnb(&[0x43u8; 32], 0));
+    }
+
+    /// RRC keys (TS 33.501 Annex A.8): deterministic in (K_gNB, algorithms), the
+    /// enc/int keys differ (different distinguishers), and they are distinct from the
+    /// NAS keys derived from the same 32-byte value — the AS/NAS key split.
+    #[test]
+    fn rrc_keys_are_deterministic_distinct_and_split_from_nas() {
+        let kgnb = [0x42u8; 32];
+        let keys = rrc_keys(&kgnb, 2, 2);
+        assert_eq!(keys, rrc_keys(&kgnb, 2, 2), "deterministic");
+        assert_ne!(
+            keys.krrc_enc, keys.krrc_int,
+            "enc (0x03) and int (0x04) differ"
+        );
+        assert_ne!(rrc_keys(&[0x43u8; 32], 2, 2), keys, "bound to K_gNB");
+        // A different algorithm id changes the derived key.
+        assert_ne!(
+            rrc_keys(&kgnb, 1, 2).krrc_enc,
+            keys.krrc_enc,
+            "bound to the NEA id"
+        );
+        // AS keys are not NAS keys, even from the same input bytes (distinguisher split).
+        let nas = nas_keys(&kgnb, 2, 2);
+        assert_ne!(keys.krrc_enc, nas.knas_enc);
+        assert_ne!(keys.krrc_int, nas.knas_int);
     }
 
     /// The NH chain (TS 33.501 Annex A.10): NH₁ from the initial K_gNB, NHₙ₊₁ from

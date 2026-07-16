@@ -2068,6 +2068,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdcp"
+version = "0.1.0"
+dependencies = [
+ "aka",
+ "oxirush-security",
+ "rrc",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "peg"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
