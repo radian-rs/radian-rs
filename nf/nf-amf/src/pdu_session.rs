@@ -18,8 +18,13 @@ pub struct SmContextCreated {
     pub sm_ref: String,
     pub up_n3_teid: u32,
     pub up_n3_addr: Ipv4Addr,
-    /// The UE's assigned IPv4 address — placed in the N1 PDU Session Establishment Accept.
-    pub ue_ip: Ipv4Addr,
+    /// The PDU address placed in the N1 PDU Session Establishment Accept — the UE's
+    /// IPv4, its IPv6 interface identifier, or both (design/131).
+    pub pdu_address: nas::PduAddress,
+    /// The selected PDU session type, for the N2 PDU Session Type IE.
+    pub pdu_type: ngap::PduSessionType,
+    /// A 5GSM cause set on a session-type downgrade (#50/#51), for the N1 accept.
+    pub cause: Option<u8>,
     /// The subscribed slice (from the SMF's UDR sm-data lookup): SST + optional SD bytes.
     pub snssai_sst: u8,
     pub snssai_sd: Option<[u8; 3]>,
@@ -44,8 +49,37 @@ fn parse_sm_context_created(
     let up_n3_teid = u32::from_str_radix(&teid_hex, 16).map_err(|e| format!("bad upN3Teid: {e}"))?;
     let up_n3_addr =
         field("upN3Addr").ok_or("response missing upN3Addr")?.parse().map_err(|_| "bad upN3Addr")?;
-    let ue_ip =
-        field("ueIpv4Addr").ok_or("response missing ueIpv4Addr")?.parse().map_err(|_| "bad ueIpv4Addr")?;
+
+    // The PDU address for the N1 accept: assemble it from the selected session type and
+    // the IPv4 address / IPv6 interface identifier the SMF allocated (design/131). An
+    // older SMF (no selectedPduSessionType) defaults to IPv4.
+    let selected = body
+        .get("selectedPduSessionType")
+        .and_then(|v| v.as_str())
+        .and_then(nas::PduSessionType::from_name)
+        .unwrap_or(nas::PduSessionType::Ipv4);
+    let v4 = field("ueIpv4Addr").and_then(|s| s.parse::<Ipv4Addr>().ok());
+    let iid = body
+        .get("ueIpv6Iid")
+        .and_then(|v| v.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|b| <[u8; 8]>::try_from(b).ok());
+    let pdu_address = match selected {
+        nas::PduSessionType::Ipv4 => nas::PduAddress::Ipv4(v4.ok_or("IPv4 session without ueIpv4Addr")?),
+        nas::PduSessionType::Ipv6 => {
+            nas::PduAddress::Ipv6 { iid: iid.ok_or("IPv6 session without ueIpv6Iid")? }
+        }
+        nas::PduSessionType::Ipv4v6 => nas::PduAddress::Ipv4v6 {
+            iid: iid.ok_or("IPv4v6 session without ueIpv6Iid")?,
+            v4: v4.ok_or("IPv4v6 session without ueIpv4Addr")?,
+        },
+    };
+    let pdu_type = match selected {
+        nas::PduSessionType::Ipv4 => ngap::PduSessionType::Ipv4,
+        nas::PduSessionType::Ipv6 => ngap::PduSessionType::Ipv6,
+        nas::PduSessionType::Ipv4v6 => ngap::PduSessionType::Ipv4v6,
+    };
+    let cause = body.get("cause5gsm").and_then(|v| v.as_u64()).and_then(|v| u8::try_from(v).ok());
 
     // Subscribed session parameters for the N1 accept. Tolerate their absence
     // (defaults match the pre-subscription behaviour) so an older SMF still works.
@@ -74,7 +108,9 @@ fn parse_sm_context_created(
         sm_ref,
         up_n3_teid,
         up_n3_addr,
-        ue_ip,
+        pdu_address,
+        pdu_type,
+        cause,
         snssai_sst,
         snssai_sd,
         ambr,
@@ -198,6 +234,7 @@ impl AmfSmf {
         pdu_session_id: u8,
         dnn: &str,
         snssai: Option<(u8, Option<[u8; 3]>)>,
+        pdu_session_type: Option<nas::PduSessionType>,
     ) -> Result<SmContextCreated, CreateSmError> {
         let mut body = serde_json::json!({
             "supi": supi,
@@ -205,6 +242,11 @@ impl AmfSmf {
             "dnn": dnn,
             "servingNetwork": { "mcc": self.mcc, "mnc": self.mnc },
         });
+        // The UE's requested PDU session type (design/131); absent → the SMF applies
+        // the DNN default.
+        if let Some(ty) = pdu_session_type {
+            body["pduSessionType"] = serde_json::Value::String(ty.as_str().to_string());
+        }
         if let Some((sst, sd)) = snssai {
             let mut slice = serde_json::json!({ "sst": sst });
             if let Some(sd) = sd {
@@ -459,7 +501,7 @@ mod tests {
         let smf_base = amf_smf.select_smf(requested, "internet").await.expect("SMF selected");
         assert_eq!(smf_base, format!("http://{smf_addr}"), "the advertised SMF was selected");
         let created = amf_smf
-            .create_sm_context(&smf_base, "imsi-999700000000001", 5, "internet", requested)
+            .create_sm_context(&smf_base, "imsi-999700000000001", 5, "internet", requested, None)
             .await
             .expect("AMF creates SM context via the selected SMF");
         assert_eq!(created.up_n3_teid, 1, "UPF N3 F-TEID parsed from the response");
@@ -480,7 +522,7 @@ mod tests {
 
         // An SMF 403 (denied pair) surfaces as the typed Forbidden error.
         let err = amf_smf
-            .create_sm_context(&smf_base, "imsi-999700000000001", 5, "corporate", requested)
+            .create_sm_context(&smf_base, "imsi-999700000000001", 5, "corporate", requested, None)
             .await
             .expect_err("unsubscribed DNN must be refused");
         assert!(matches!(err, CreateSmError::Forbidden), "got {err:?}");

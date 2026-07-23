@@ -724,6 +724,84 @@ async fn ue_assigned_ip(world: &mut World, subnet: String) {
     world.ue_ip = Some(ip); // for a datapath echo from this UE address
 }
 
+/// Map a feature-file type name ("IPV4"/"IPV6"/"IPV4V6") to the NAS enum.
+fn pdu_type_from_name(name: &str) -> nas::PduSessionType {
+    nas::PduSessionType::from_name(name).unwrap_or_else(|| panic!("unknown PDU session type {name:?}"))
+}
+
+#[when(regex = r#"^the scripted UE requests an? "(IPV4|IPV6|IPV4V6)" PDU session$"#)]
+async fn ue_requests_typed_pdu_session(world: &mut World, ty: String) {
+    let psi = 1u8;
+    let request = world
+        .ue
+        .as_mut()
+        .expect("UE")
+        .pdu_session_request_typed(psi, pdu_type_from_name(&ty), None)
+        .expect("build the typed request");
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, request))
+        .await
+        .expect("send UL NAS Transport (typed PDU session request)");
+    world.pdu_psi = Some(psi);
+}
+
+#[when(regex = r#"^the scripted UE requests an? "(IPV4|IPV6|IPV4V6)" PDU session for DNN "([^"]+)"$"#)]
+async fn ue_requests_typed_pdu_for_dnn(world: &mut World, ty: String, dnn: String) {
+    let psi = 1u8;
+    let request = world
+        .ue
+        .as_mut()
+        .expect("UE")
+        .pdu_session_request_typed(psi, pdu_type_from_name(&ty), Some(&dnn))
+        .expect("build the typed request");
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, request))
+        .await
+        .expect("send UL NAS Transport (typed PDU session request)");
+    world.pdu_psi = Some(psi);
+}
+
+/// Assert the relayed accept carries the expected PDU address family (design/131):
+/// IPv4 (a v4 address), IPv6 (an interface identifier), or IPv4v6 (both).
+#[then(regex = r#"^the UE reads an? "(IPV4|IPV6|IPV4V6)" PDU address$"#)]
+async fn ue_reads_pdu_address(world: &mut World, family: String) {
+    let accept = world.pending_nas.take().expect("the relayed accept NAS");
+    let (psi, addr, _cause) =
+        world.ue.as_mut().expect("UE").read_pdu_session_accept_addr(&accept).expect("read accept");
+    assert_eq!(Some(psi), world.pdu_psi);
+    match (family.as_str(), addr) {
+        ("IPV4", nas::PduAddress::Ipv4(v4)) => {
+            world.ue_ip = Some(v4);
+        }
+        ("IPV6", nas::PduAddress::Ipv6 { iid }) => {
+            assert_ne!(iid, [0u8; 8], "the IPv6 interface identifier is non-zero");
+        }
+        ("IPV4V6", nas::PduAddress::Ipv4v6 { iid, v4 }) => {
+            assert_ne!(iid, [0u8; 8], "the IPv6 interface identifier is non-zero");
+            world.ue_ip = Some(v4);
+        }
+        (want, got) => panic!("expected a {want} PDU address, got {got:?}"),
+    }
+    world.pending_nas = Some(accept); // keep it for a following cause assertion
+}
+
+/// Assert the accept carries a session-type downgrade 5GSM cause (#50/#51).
+#[then(regex = r#"^the accept carries 5GSM cause (\d+)$"#)]
+async fn accept_carries_cause(world: &mut World, cause: u8) {
+    let accept = world.pending_nas.as_ref().expect("the relayed accept NAS");
+    let got = world
+        .ue
+        .as_mut()
+        .expect("UE")
+        .read_pdu_session_accept_addr(accept)
+        .expect("read accept")
+        .2
+        .expect("the accept carries a 5GSM cause");
+    assert_eq!(got, cause, "5GSM downgrade cause");
+}
+
 /// The marker payload of the injected downlink packet — checked when it flushes.
 const DL_MARKER: &[u8] = b"radian-downlink";
 
@@ -1289,7 +1367,16 @@ async fn main() {
         .fail_on_skipped()
         .filter_run_and_exit("tests/features", move |feature, _rule, scenario| {
             let is_sim = feature.tags.iter().chain(&scenario.tags).any(|t| t == "sim");
-            !is_sim || sim
+            if is_sim && !sim {
+                return false;
+            }
+            // Optional local filter: `BDD_TAG=<tag>` runs only features carrying that
+            // tag (e.g. `scripted_reg` — the loopback tier, no namespaces). Unset ⇒
+            // run everything (CI behaviour).
+            match std::env::var("BDD_TAG") {
+                Ok(tag) if !tag.is_empty() => feature.tags.iter().any(|t| *t == tag),
+                _ => true,
+            }
         })
         .await;
 }

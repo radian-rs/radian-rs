@@ -137,7 +137,9 @@ fn provision_demo(store: &RedbStore) -> anyhow::Result<()> {
         "singleNssai": { "sst": 1, "sd": "010203" },
         "dnnConfigurations": {
             "internet": {
-                "pduSessionTypes": { "defaultSessionType": "IPV4" },
+                // IPv4 default, but IPv6 (hence IPv4v6) is also allowed — the SMF
+                // negotiates the selected type against this set (design/131).
+                "pduSessionTypes": { "defaultSessionType": "IPV4", "allowedSessionTypes": ["IPV4", "IPV6"] },
                 "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
                 // Default QoS flow: non-GBR, 5QI 9. (ARP defaults to priority 8.)
                 "5gQosProfile": { "5qi": 9, "arp": { "priorityLevel": 8 } },
@@ -151,6 +153,13 @@ fn provision_demo(store: &RedbStore) -> anyhow::Result<()> {
                         "mfbrDl": "200 Mbps", "mfbrUl": "200 Mbps"
                     }
                 }]
+            },
+            // A second DNN allowing IPv4 only — a UE requesting IPv4v6 here is
+            // downgraded to IPv4 with 5GSM cause #50 (design/131 negotiation test).
+            "ims": {
+                "pduSessionTypes": { "defaultSessionType": "IPV4" },
+                "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+                "5gQosProfile": { "5qi": 9, "arp": { "priorityLevel": 8 } }
             }
         }
     }]);
@@ -158,7 +167,7 @@ fn provision_demo(store: &RedbStore) -> anyhow::Result<()> {
     // authorization gate for CreateSMContext.
     let smf_sel = serde_json::json!({
         "subscribedSnssaiInfos": {
-            "1-010203": { "dnnInfos": [ { "dnn": "internet" } ] }
+            "1-010203": { "dnnInfos": [ { "dnn": "internet" }, { "dnn": "ims" } ] }
         }
     });
     // SM policy data (TS 29.519) — the PCF's per-subscriber policy source. Shaped
