@@ -8,7 +8,7 @@
 //!   simulator (gNB + UE) register, establish a PDU session, and ping the data network.
 //!   Runs only when `FREE_RAN_UE_BIN` points at the simulator binary.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -36,6 +36,8 @@ struct World {
     feature_tag: String,
     // datapath (self-contained) state
     ue_ip: Option<Ipv4Addr>,
+    /// The IPv6 interface identifier the UE read from an IPv6/IPv4v6 accept (design/131).
+    ue_v6_iid: Option<[u8; 8]>,
     uplink_teid: Option<u32>,
     ping_ok: bool,
     // e2e (simulator) state — spawned processes kept owned for the scenario's lifetime
@@ -777,10 +779,12 @@ async fn ue_reads_pdu_address(world: &mut World, family: String) {
         }
         ("IPV6", nas::PduAddress::Ipv6 { iid }) => {
             assert_ne!(iid, [0u8; 8], "the IPv6 interface identifier is non-zero");
+            world.ue_v6_iid = Some(iid);
         }
         ("IPV4V6", nas::PduAddress::Ipv4v6 { iid, v4 }) => {
             assert_ne!(iid, [0u8; 8], "the IPv6 interface identifier is non-zero");
             world.ue_ip = Some(v4);
+            world.ue_v6_iid = Some(iid);
         }
         (want, got) => panic!("expected a {want} PDU address, got {got:?}"),
     }
@@ -896,6 +900,34 @@ async fn ue_reaches_dn_over_datapath(world: &mut World, gw: String) {
     .await
     .expect("run the datapath echo");
     assert!(ok, "no ICMP echo reply returned through the signalled N3/N6 datapath");
+}
+
+#[then(regex = r#"^the UE can reach the data network gateway "([^"]+)" over the IPv6 datapath$"#)]
+async fn ue_reaches_dn_over_datapath_v6(world: &mut World, gw: String) {
+    let gw_ip: Ipv6Addr = gw.parse().expect("valid IPv6 gateway");
+    // The scripted UE knows only the interface identifier from the accept (the RA that
+    // carries the prefix is design/131 Phase C). The SMF's pool is deterministic
+    // (2001:db8::/32, the /64 index == the IID's low 4 bytes), so the UE reconstructs
+    // its full address `2001:db8:<index>::<iid>` out-of-band (Phase B).
+    let iid = world.ue_v6_iid.expect("the UE read an IPv6 interface identifier");
+    let mut a = [0u8; 16];
+    a[0..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]); // 2001:db8::/32 pool base
+    a[4..8].copy_from_slice(&iid[4..8]); // the /64 index
+    a[8..16].copy_from_slice(&iid);
+    let ue_ip = Ipv6Addr::from(a);
+    let uplink_teid = world.uplink_teid.expect("the UPF uplink F-TEID was learned");
+    let upf_addr = world.upf_n3_addr.expect("the UPF N3 address was learned");
+    let ok = datapath::ping_through_datapath_v6(
+        SocketAddrV4::new(GNB_N3_IP, N3_PORT),
+        SocketAddrV4::new(upf_addr, N3_PORT),
+        uplink_teid,
+        SCRIPTED_GNB_DL_TEID,
+        ue_ip,
+        gw_ip,
+    )
+    .await
+    .expect("run the IPv6 datapath echo");
+    assert!(ok, "no ICMPv6 echo reply returned through the signalled N3/N6 datapath");
 }
 
 /// Parse a comma-separated TAC list like `"000001,000002"` into 3-byte TACs.
