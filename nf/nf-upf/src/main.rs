@@ -21,7 +21,7 @@
 //! assigned IP) as defense-in-depth; the listeners bind all interfaces for dev
 //! convenience — deploy only on isolated user-plane segments. Hardening is a deferred slice.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
@@ -52,6 +52,10 @@ const N6_TUN_NAME: &str = "n6upf0";
 const N6_UPF_ADDR: Ipv4Addr = Ipv4Addr::new(10, 45, 0, 1);
 const N6_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 0, 0);
 const N6_MTU: u16 = 1400; // headroom under 1500 for the N3 GTP-U/UDP/IP outer headers
+/// The UPF's N6 IPv6 gateway, covering the SMF's `2001:db8::/32` UE IPv6 pool
+/// (design/131) so the kernel routes UE return traffic to this TUN.
+const N6_UPF_ADDR6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+const N6_PREFIX_LEN6: u8 = 32;
 
 type Upf = Arc<Mutex<pfcp::UpfState>>;
 
@@ -81,9 +85,15 @@ async fn main() -> anyhow::Result<()> {
     info!(%bind, %node_ip, n4_port = pfcp::N4_PORT, n3_port = gtpu::GTPU_PORT, "UPF up: N4 (PFCP) + N3 (GTP-U)");
 
     // N6 is the privileged edge: opening a TUN needs CAP_NET_ADMIN. Degrade gracefully.
-    let tun = match N6Tun::open(N6_TUN_NAME, N6_UPF_ADDR, N6_NETMASK, N6_MTU) {
+    let tun = match N6Tun::open(
+        N6_TUN_NAME,
+        N6_UPF_ADDR,
+        N6_NETMASK,
+        N6_MTU,
+        Some((N6_UPF_ADDR6, N6_PREFIX_LEN6)),
+    ) {
         Ok(t) => {
-            info!(tun = t.name(), addr = %N6_UPF_ADDR, "N6 up: TUN open — user-plane forwarding live");
+            info!(tun = t.name(), addr = %N6_UPF_ADDR, addr6 = %N6_UPF_ADDR6, "N6 up: TUN open — user-plane forwarding live");
             Some(Arc::new(t))
         }
         Err(e) => {
@@ -299,9 +309,9 @@ async fn serve_n6_downlink(tun: Arc<N6Tun>, n3: Arc<tokio::net::UdpSocket>, stat
             }
             // A CM-IDLE session buffered the packet; the reporter task pages the UE.
             n6::Downlink::Buffered => info!(bytes = n, "N6 downlink buffered for a CM-IDLE UE (paging triggered)"),
-            // No session owns this destination / not IPv4 — background DN noise; don't spam.
+            // No session owns this destination — background DN noise; don't spam.
             n6::Downlink::NoRoute => trace!("N6 downlink with no matching session — dropped"),
-            n6::Downlink::NotIpv4 => trace!("N6 downlink not IPv4 — dropped"),
+            n6::Downlink::Unsupported => trace!("N6 downlink not IPv4/IPv6 — dropped"),
             n6::Downlink::RateLimited => trace!("N6 downlink over session AMBR — policed (dropped)"),
         }
     }

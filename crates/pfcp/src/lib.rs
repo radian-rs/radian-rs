@@ -8,7 +8,7 @@
 //! modification/deletion come in later slices.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::SystemTime;
 
 pub use rs_pfcp;
@@ -233,6 +233,29 @@ pub struct SessionAmbr {
     pub downlink_bps: u64,
 }
 
+/// The UE address(es) a PDU session carries — an IPv4 address, an IPv6 **/64
+/// prefix**, or both (design/131). The UPF keys downlink routing and anti-spoofing
+/// on these. `From<Ipv4Addr>` keeps the common IPv4-only call sites terse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UeAddr {
+    pub v4: Option<Ipv4Addr>,
+    /// The assigned IPv6 /64 prefix (low 64 bits zero); the UE forms its address
+    /// within it via SLAAC.
+    pub v6: Option<Ipv6Addr>,
+}
+
+impl From<Ipv4Addr> for UeAddr {
+    fn from(v4: Ipv4Addr) -> Self {
+        UeAddr { v4: Some(v4), v6: None }
+    }
+}
+
+/// Whether IPv6 address `addr` falls within the /64 `prefix` (top 64 bits match).
+fn ipv6_in_prefix64(addr: Ipv6Addr, prefix: Ipv6Addr) -> bool {
+    let (a, p) = (addr.octets(), prefix.octets());
+    a[..8] == p[..8]
+}
+
 /// A token-bucket rate limiter (bits), used to police a session's AMBR. Pure and
 /// clock-injected (the caller passes `now_nanos`) so the policing is unit-testable
 /// without real time. `rate_bps == 0` means *unlimited* (always admit).
@@ -299,6 +322,9 @@ struct Session {
     /// Session Report Request must carry (TS 29.244 messages address the peer).
     cp_seid: u64,
     ue_ip: Option<Ipv4Addr>,
+    /// The assigned IPv6 /64 prefix (design/131) — downlink packets whose destination
+    /// falls in it route to this session; `None` for an IPv4-only session.
+    ue_ipv6: Option<Ipv6Addr>,
     downlink: Option<(u32, Ipv4Addr)>,
     /// Session AMBR (from a Create/Update QER), when provisioned.
     ambr: Option<SessionAmbr>,
@@ -461,6 +487,16 @@ impl UpfState {
             .and_then(|s| s.downlink)
     }
 
+    /// Route an IPv6 downlink packet: find the session whose assigned /64 prefix
+    /// contains `dst` and return its installed gNB target `(TEID, IPv4 N3 addr)` — the
+    /// N3 transport stays IPv4 (design/131). `None` if unrouted / downlink not installed.
+    pub fn route_downlink_v6(&self, dst: Ipv6Addr) -> Option<(u32, Ipv4Addr)> {
+        self.sessions
+            .values()
+            .find(|s| s.ue_ipv6.is_some_and(|p| ipv6_in_prefix64(dst, p)))
+            .and_then(|s| s.downlink)
+    }
+
     /// The UE IP assigned to the session owning this uplink N3 TEID — the uplink datapath
     /// uses it to verify a decapsulated packet's source is the UE it claims to be (a basic
     /// anti-spoofing guard). `None` if the TEID is unknown or no UE IP was assigned.
@@ -470,6 +506,16 @@ impl UpfState {
             .find(|s| s.n3_teid == teid)
             .and_then(|s| s.ue_ip)
     }
+
+    /// The IPv6 /64 prefix assigned to the session owning this uplink N3 TEID — the
+    /// uplink datapath verifies a decapsulated IPv6 packet's source falls in it.
+    pub fn ue_ipv6_for_teid(&self, teid: u32) -> Option<Ipv6Addr> {
+        self.sessions
+            .values()
+            .find(|s| s.n3_teid == teid)
+            .and_then(|s| s.ue_ipv6)
+    }
+
 
     /// Remove a session (PFCP Session Deletion) — its TEID and UE-IP routes go with
     /// it. Returns the session's final volume usage: the session-level URR plus one
@@ -501,7 +547,7 @@ impl UpfState {
     fn establish(
         &mut self,
         cp_seid: u64,
-        ue_ip: Option<Ipv4Addr>,
+        ue: UeAddr,
         ambr: Option<SessionAmbr>,
         flows: &[FlowQer],
         usage_threshold: Option<u64>,
@@ -529,7 +575,8 @@ impl UpfState {
             Session {
                 n3_teid: teid,
                 cp_seid,
-                ue_ip,
+                ue_ip: ue.v4,
+                ue_ipv6: ue.v6,
                 downlink: None,
                 ambr,
                 ul_bucket,
@@ -743,6 +790,15 @@ impl UpfState {
             None => true,
         }
     }
+
+    /// Admit an IPv6 downlink packet destined into the /64 of the session owning
+    /// `dst`: classify + police against that session's AMBR (design/131).
+    pub fn admit_downlink_v6(&mut self, dst: Ipv6Addr, now_nanos: u64, pkt: &[u8]) -> bool {
+        match self.sessions.values_mut().find(|s| s.ue_ipv6.is_some_and(|p| ipv6_in_prefix64(dst, p))) {
+            Some(s) => s.admit(false, now_nanos, pkt),
+            None => true,
+        }
+    }
 }
 
 /// SMF: build a PFCP Association Setup Request advertising this node.
@@ -786,12 +842,13 @@ pub fn session_establishment_request(
     cp_seid: u64,
     seq: u32,
     smf_ip: Ipv4Addr,
-    ue_ip: Ipv4Addr,
+    ue: impl Into<UeAddr>,
     dnn: &str,
     ambr: Option<SessionAmbr>,
     flows: &[FlowQer],
     usage_threshold_bytes: Option<u64>,
 ) -> Vec<u8> {
+    let ue: UeAddr = ue.into();
     // When a session AMBR is authorized, provision a session-level QER (open gate +
     // MBR) and bind both PDRs to it, so the UPF polices the aggregate rate.
     let qer_id = ambr.map(|_| QerId::new(AMBR_QER_ID));
@@ -817,9 +874,10 @@ pub fn session_establishment_request(
         .build()
         .expect("build uplink Create FAR");
 
-    // Downlink: match packets destined to the UE's IP; its FAR (id 2) is where the
-    // Session Modification installs Outer Header Creation toward the gNB.
-    let dl_pdi = Pdi::downlink_core_with_ue_ip(UeIpAddress::new(Some(ue_ip), None));
+    // Downlink: match packets destined to the UE's IPv4 address and/or its IPv6 /64
+    // prefix (design/131); its FAR (id 2) is where the Session Modification installs
+    // Outer Header Creation toward the gNB.
+    let dl_pdi = Pdi::downlink_core_with_ue_ip(UeIpAddress::new(ue.v4, ue.v6));
     let mut dl_pdr = CreatePdrBuilder::new(PdrId::new(2))
         .precedence(Precedence::new(200))
         .pdi(dl_pdi)
@@ -1088,12 +1146,16 @@ pub fn handle_n4(
                 .ies(IeType::Fseid)
                 .next()
                 .and_then(|ie| Fseid::unmarshal(&ie.payload).ok())?;
-            // The SMF-allocated UE IP rides in a downlink PDR's PDI (UE IP Address IE);
-            // the UPF records it to route N6 downlink traffic back to this session.
-            let ue_ip = msg
+            // The SMF-allocated UE address(es) ride in a downlink PDR's PDI (UE IP
+            // Address IE); the UPF records them to route N6 downlink traffic back to
+            // this session — IPv4, an IPv6 /64 prefix, or both (design/131).
+            let ue = msg
                 .ies(IeType::CreatePdr)
                 .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
-                .find_map(|pdr| pdr.pdi.ue_ip_address.and_then(|u| u.ipv4_address));
+                .find_map(|pdr| {
+                    pdr.pdi.ue_ip_address.map(|u| UeAddr { v4: u.ipv4_address, v6: u.ipv6_address })
+                })
+                .unwrap_or_default();
             // The session-AMBR Create QER carries the aggregate MBR the UPF polices.
             let ambr = msg
                 .ies(IeType::CreateQer)
@@ -1112,7 +1174,7 @@ pub fn handle_n4(
                 .and_then(|u| u.volume_threshold)
                 .and_then(|t| t.total_volume);
             let (up_seid, teid) =
-                state.establish(cp_fseid.seid.into(), ue_ip, ambr, &flows, usage_threshold, now_nanos);
+                state.establish(cp_fseid.seid.into(), ue, ambr, &flows, usage_threshold, now_nanos);
             let created_pdr = CreatedPdr::new(PdrId::new(1), Fteid::ipv4(teid, node_ip)).to_ie();
             Some(
                 SessionEstablishmentResponseBuilder::new(
@@ -1433,6 +1495,46 @@ mod tests {
         assert_eq!(parsed.msg_type(), MsgType::SessionEstablishmentResponse);
         assert_eq!(parsed.ies(IeType::CreatedPdr).count(), 1, "Created PDR with allocated F-TEID");
         assert_eq!(parsed.ies(IeType::Fseid).count(), 1, "UP F-SEID returned");
+    }
+
+    /// An IPv6 (and IPv4v6) session's /64 prefix rides the PFCP PDI and drives the UPF's
+    /// downlink routing + uplink anti-spoofing by prefix membership (design/131).
+    #[test]
+    fn session_tracks_ipv6_prefix_and_routes_by_it() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let gnb_ip = Ipv4Addr::new(10, 0, 0, 9);
+        let prefix: Ipv6Addr = "2001:db8:a:1::".parse().unwrap();
+        let ue_v6: Ipv6Addr = "2001:db8:a:1::1".parse().unwrap(); // prefix::iid, in the /64
+        let stranger: Ipv6Addr = "2001:db8:a:2::1".parse().unwrap(); // a different /64
+
+        // Pure-IPv6 session: the establishment carries only the /64 prefix.
+        let mut state = UpfState::new();
+        let ue = UeAddr { v4: None, v6: Some(prefix) };
+        handle_n4(
+            &session_establishment_request(0xCAFE, 1, node_ip, ue, "internet", None, &[], None),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("establish v6");
+        // The prefix round-tripped through the PFCP PDI marshal/unmarshal.
+        assert_eq!(state.ue_ipv6_for_teid(1), Some(prefix), "the /64 prefix binds to the N3 TEID");
+        assert_eq!(state.ue_ip_for_teid(1), None, "a pure-IPv6 session has no IPv4");
+        // No downlink route until the gNB F-TEID is installed.
+        assert_eq!(state.route_downlink_v6(ue_v6), None, "no downlink before modification");
+        handle_n4(
+            &session_modification_request(1, 2, 2, 0x5678, gnb_ip, "internet", false),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("modify");
+        assert_eq!(
+            state.route_downlink_v6(ue_v6),
+            Some((0x5678, gnb_ip)),
+            "a downlink to any address in the /64 routes to the session's gNB"
+        );
+        assert_eq!(state.route_downlink_v6(stranger), None, "an address outside the /64 is unrouted");
     }
 
     #[test]

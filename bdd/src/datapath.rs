@@ -8,7 +8,7 @@
 //! the reply back by UE IP and GTP-U-encaps it to our gNB F-TEID. Receiving that reply proves
 //! the full N3→N6→N3 round trip.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -62,6 +62,49 @@ pub fn is_icmp_echo_reply(pkt: &[u8], from: Ipv4Addr, to: Ipv4Addr) -> bool {
     let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
     // ICMP type sits at the start of the payload; 0 = echo reply.
     matches!(pkt.get(ihl), Some(0)) && src == from && dst == to
+}
+
+/// The ICMPv6 checksum (RFC 4443 §2.3): the internet checksum over the IPv6
+/// pseudo-header (src, dst, upper-layer length, next header 58) plus the ICMPv6 message.
+fn icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, icmp: &[u8]) -> u16 {
+    let mut buf = Vec::with_capacity(40 + icmp.len());
+    buf.extend_from_slice(&src.octets());
+    buf.extend_from_slice(&dst.octets());
+    buf.extend_from_slice(&(icmp.len() as u32).to_be_bytes()); // upper-layer packet length
+    buf.extend_from_slice(&[0, 0, 0, 58]); // 3 zero bytes + next header (ICMPv6)
+    buf.extend_from_slice(icmp);
+    checksum(&buf)
+}
+
+/// Build an IPv6 ICMPv6 **echo request** (type 128) from `src` to `dst`, with the
+/// pseudo-header checksum filled in (design/131).
+pub fn icmpv6_echo_request(src: Ipv6Addr, dst: Ipv6Addr, id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+    let mut icmp = vec![128u8, 0, 0, 0]; // type=echo request, code=0, checksum placeholder
+    icmp.extend_from_slice(&id.to_be_bytes());
+    icmp.extend_from_slice(&seq.to_be_bytes());
+    icmp.extend_from_slice(payload);
+    let c = icmpv6_checksum(src, dst, &icmp);
+    icmp[2..4].copy_from_slice(&c.to_be_bytes());
+
+    // IPv6 header (40 bytes): version 6, payload length, next header 58 (ICMPv6), hop limit.
+    let mut ip = vec![0x60, 0x00, 0x00, 0x00];
+    ip.extend_from_slice(&(icmp.len() as u16).to_be_bytes()); // payload length
+    ip.push(58); // next header: ICMPv6
+    ip.push(64); // hop limit
+    ip.extend_from_slice(&src.octets());
+    ip.extend_from_slice(&dst.octets());
+    ip.extend_from_slice(&icmp);
+    ip
+}
+
+/// Whether `pkt` is an IPv6 ICMPv6 **echo reply** (type 129) from `from` to `to`.
+pub fn is_icmpv6_echo_reply(pkt: &[u8], from: Ipv6Addr, to: Ipv6Addr) -> bool {
+    if pkt.len() < 41 || pkt[0] >> 4 != 6 || pkt[6] != 58 {
+        return false; // too short / not IPv6 / not ICMPv6 (assumes no extension headers)
+    }
+    let Ok(src) = <[u8; 16]>::try_from(&pkt[8..24]) else { return false };
+    let Ok(dst) = <[u8; 16]>::try_from(&pkt[24..40]) else { return false };
+    pkt[40] == 129 && Ipv6Addr::from(src) == from && Ipv6Addr::from(dst) == to
 }
 
 /// Send one PFCP request and await its response (3s).
@@ -136,6 +179,38 @@ pub async fn ping_through_datapath(
     Ok(false)
 }
 
+/// The IPv6 analog of [`ping_through_datapath`] (design/131 Phase B): GTP-U-encap an
+/// ICMPv6 echo (UE's v6 address → the DN gateway) on the uplink TEID, and expect the
+/// reply back on our DL F-TEID — the full N3 → N6 → N3 round trip over IPv6.
+pub async fn ping_through_datapath_v6(
+    gnb_bind: SocketAddrV4,
+    upf_n3: SocketAddrV4,
+    uplink_teid: u32,
+    gnb_teid: u32,
+    ue_ip: Ipv6Addr,
+    gw_ip: Ipv6Addr,
+) -> Result<bool> {
+    let gnb = UdpSocket::bind(gnb_bind).await.context("bind gNB N3 socket")?;
+    let mut buf = vec![0u8; 2048];
+
+    for seq in 1..=3u16 {
+        let echo = icmpv6_echo_request(ue_ip, gw_ip, 0x1234, seq, b"radian-datapath-v6");
+        gnb.send_to(&gtpu::encap(uplink_teid, &echo), upf_n3).await.context("send uplink G-PDU")?;
+
+        let until = tokio::time::Instant::now() + Duration::from_secs(1);
+        while let Ok(Ok((n, _))) =
+            timeout(until.saturating_duration_since(tokio::time::Instant::now()), gnb.recv_from(&mut buf)).await
+        {
+            if let Some((teid, inner)) = gtpu::decap(&buf[..n]) {
+                if teid == gnb_teid && is_icmpv6_echo_reply(inner, gw_ip, ue_ip) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Bind a gNB N3 (GTP-U) socket at `addr` and keep it — used to receive a downlink
 /// G-PDU the UPF flushes after a CM-IDLE resume, which requires the socket to already
 /// be listening when the flush arrives.
@@ -189,5 +264,29 @@ mod tests {
         assert!(!is_icmp_echo_reply(&reply, ue, gw), "wrong direction");
         let request = icmp_echo_request(ue, gw, 1, 1, b"x"); // type 8
         assert!(!is_icmp_echo_reply(&request, ue, gw), "echo request is not a reply");
+    }
+
+    #[test]
+    fn icmpv6_echo_request_has_valid_checksum() {
+        let src: Ipv6Addr = "2001:db8:0:1::1".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let pkt = icmpv6_echo_request(src, dst, 0x1234, 1, b"hi");
+        assert_eq!(pkt[0] >> 4, 6, "IPv6");
+        assert_eq!(pkt[6], 58, "next header = ICMPv6");
+        assert_eq!(pkt[40], 128, "ICMPv6 echo request");
+        // Re-summing the pseudo-header + ICMPv6 message (checksum filled) yields 0.
+        assert_eq!(icmpv6_checksum(src, dst, &pkt[40..]), 0, "ICMPv6 checksum valid");
+    }
+
+    #[test]
+    fn recognises_icmpv6_echo_reply_by_addresses_and_type() {
+        let ue: Ipv6Addr = "2001:db8:0:1::1".parse().unwrap();
+        let gw: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut reply = icmpv6_echo_request(gw, ue, 1, 1, b"x");
+        reply[40] = 129; // echo reply (type not checked against checksum here)
+        assert!(is_icmpv6_echo_reply(&reply, gw, ue));
+        assert!(!is_icmpv6_echo_reply(&reply, ue, gw), "wrong direction");
+        let request = icmpv6_echo_request(ue, gw, 1, 1, b"x"); // type 128
+        assert!(!is_icmpv6_echo_reply(&request, ue, gw), "echo request is not a reply");
     }
 }

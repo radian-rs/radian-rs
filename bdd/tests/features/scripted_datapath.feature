@@ -28,6 +28,26 @@ Feature: Scripted gNB/UE — user-plane datapath through the signalled stack
     And the UE is assigned an IP address in "10.45.0.0/16"
     And the UE can reach the data network gateway "10.45.0.1" over the datapath
 
+  # design/131 Phase B: the same round trip over an IPv6 PDU session — the UPF routes
+  # the UE's /64 to its N6 TUN (v6 gateway 2001:db8::1) and back. The UE forms its
+  # address from the accept's interface identifier + the deterministic pool prefix
+  # (the RA that carries the prefix is Phase C).
+  Scenario: A registered UE moves a real IPv6 packet end-to-end
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the scripted UE sends its registration request from TAC "000001"
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with RES*
+    Then the AMF selects NEA2/NIA2 in a security mode command
+    When the scripted UE completes the security mode procedure
+    Then the AMF sets up the initial context carrying the registration accept
+    When the gNB confirms the context and the UE completes the registration
+    Then the AMF nudges the registered UE with a configuration update
+    When the scripted UE requests an "IPV6" PDU session
+    Then the AMF sets up the PDU session at the gNB
+    And the UE reads an "IPV6" PDU address
+    And the UE can reach the data network gateway "2001:db8::1" over the IPv6 datapath
+
   # The full CM-IDLE datapath arc: paging (a downlink packet to a CM-IDLE UE) AND
   # the buffer flush on resume. The UE resumes here, so it leaves no dangling
   # retained context — unlike a paging-only scenario, whose never-resumed UE would

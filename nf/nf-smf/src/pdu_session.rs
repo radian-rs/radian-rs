@@ -33,11 +33,11 @@ const FAR_ID: u32 = 2;
 /// coordinated with the UPF's N6 subnet; here one pool suffices.
 const UE_IP_POOL_START: u32 = 0x0A2D_0002; // 10.45.0.2
 
-/// The SMF hands each IPv6/IPv4v6 PDU session a unique **/64** from `2001:db8:a::/48`
-/// (the /64 index is a per-session counter in the 4th hextet) plus an interface
-/// identifier. TS 23.501 §5.8.2.2 (one /64 per PDU session). Datapath + RA/SLAAC are
-/// design/131 Phase B/C; Phase A allocates and signals the address only.
-const UE_IPV6_PREFIX_48: [u8; 6] = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x0a];
+/// The SMF hands each IPv6/IPv4v6 PDU session a unique **/64** from `2001:db8::/32`
+/// (the /64 index is the full per-session `u32` counter in the 3rd+4th hextets, so the
+/// space matches the IPv4 pool and can't truncate) plus an interface identifier.
+/// TS 23.501 §5.8.2.2 (one /64 per PDU session). The UPF's N6 gateway covers this /32.
+const UE_IPV6_PREFIX_32: [u8; 4] = [0x20, 0x01, 0x0d, 0xb8];
 
 /// This SMF's stable NF instance id — the `smfInstanceId` in every UECM
 /// smf-registration.
@@ -55,10 +55,9 @@ struct SmContext {
     /// N2 SM info at establishment and again on a Service Request re-activation.
     n3_teid: u32,
     n3_addr: Ipv4Addr,
-    /// The UE's assigned IPv4 address. Always allocated (the N4 downlink PDR matches
-    /// it); surfaced to the UE only for IPv4 / IPv4v6 sessions (design/131 — a pure
-    /// IPv6 session keeps this for the Phase A datapath plumbing, unused on the wire).
-    ue_ip: Ipv4Addr,
+    /// The UE's assigned IPv4 address (its PDU session address). Present for IPv4 /
+    /// IPv4v6 sessions; `None` for a pure-IPv6 session (design/131).
+    ue_ip: Option<Ipv4Addr>,
     /// The selected PDU session type — echoed on a Service Request resume.
     pdu_type: nas::PduSessionType,
     /// The assigned IPv6 `(/64 prefix, interface identifier)` for IPv6 / IPv4v6
@@ -248,17 +247,20 @@ impl SmfState {
         Ipv4Addr::from(self.next_ue_ip.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Allocate a unique **/64** prefix (`2001:db8:a:n::/64`) and an interface
-    /// identifier (`::n`) for an IPv6/IPv4v6 PDU session (TS 23.501 §5.8.2.2 — one
-    /// /64 per session). The UE forms its global address `prefix ‖ iid` via SLAAC
-    /// once the Router Advertisement lands (design/131 Phase C).
+    /// Allocate a unique **/64** prefix (`2001:db8:H:L::/64`, where `HL` is the full
+    /// `u32` session counter) and an interface identifier (`::n`) for an IPv6/IPv4v6
+    /// PDU session (TS 23.501 §5.8.2.2 — one /64 per session). The UE forms its global
+    /// address `prefix ‖ iid` via SLAAC once the Router Advertisement lands (design/131
+    /// Phase C). The counter starts at 1, so no session gets the `::0` identifier and
+    /// the interface identifier `::n` sits within the session's own /64.
     fn alloc_ue_ipv6(&self) -> (std::net::Ipv6Addr, [u8; 8]) {
-        let n = self.next_ue_ipv6.fetch_add(1, Ordering::Relaxed) as u16;
+        let n = self.next_ue_ipv6.fetch_add(1, Ordering::Relaxed);
         let mut seg = [0u8; 16];
-        seg[..6].copy_from_slice(&UE_IPV6_PREFIX_48);
-        seg[6..8].copy_from_slice(&n.to_be_bytes()); // /64 index → 4th hextet
+        seg[..4].copy_from_slice(&UE_IPV6_PREFIX_32);
+        seg[4..8].copy_from_slice(&n.to_be_bytes()); // /64 index → full u32 (3rd+4th hextets)
         let prefix = std::net::Ipv6Addr::from(seg);
-        let iid = [0, 0, 0, 0, 0, 0, (n >> 8) as u8, n as u8]; // interface identifier ::n
+        let mut iid = [0u8; 8];
+        iid[4..8].copy_from_slice(&n.to_be_bytes()); // interface identifier ::n
         (prefix, iid)
     }
 
@@ -551,12 +553,11 @@ async fn create_sm_context(
 
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
     let seq = smf.next_seq();
-    // The SMF owns UE IP allocation; the address rides into the UPF's downlink PDR so it
-    // can route N6 traffic back to this session. A v4 is always allocated for the N4
-    // downlink PDR (Phase A plumbing); an IPv6 /64 + interface identifier is allocated
-    // when the selected type includes IPv6 (surfaced in the accept; the v6 datapath is
-    // design/131 Phase B).
-    let ue_ip = smf.alloc_ue_ip();
+    // The SMF owns UE address allocation; the address(es) ride into the UPF's downlink
+    // PDR so it can route N6 traffic back to this session (design/131). An IPv4 address
+    // is allocated when the selected type includes IPv4; an IPv6 /64 + interface
+    // identifier when it includes IPv6 — a pure-IPv6 session carries no v4.
+    let ue_ip = selected_type.has_ipv4().then(|| smf.alloc_ue_ip());
     let ue_ipv6 = selected_type.has_ipv6().then(|| smf.alloc_ue_ipv6());
     // Install the authorized session AMBR (a QER for the aggregate rate) plus a
     // per-flow QER + classifier for each GBR flow, so the UPF polices them.
@@ -567,7 +568,7 @@ async fn create_sm_context(
             cp_seid,
             seq,
             smf.smf_ip,
-            ue_ip,
+            pfcp::UeAddr { v4: ue_ip, v6: ue_ipv6.map(|(prefix, _)| prefix) },
             &req.dnn,
             ambr,
             &flows,
@@ -668,7 +669,8 @@ async fn create_sm_context(
         snssai = ?sub.snssai,
         up_seid = est.up_seid,
         n3_teid = est.n3_teid,
-        %ue_ip,
+        ue_ip = ?ue_ip,
+        ue_ipv6 = ?ue_ipv6.map(|(p, _)| p),
         "created SM context; N4 session established"
     );
     Ok((
@@ -678,7 +680,7 @@ async fn create_sm_context(
             up_n3_teid: format!("{:08x}", est.n3_teid),
             up_n3_addr: est.n3_addr,
             selected_pdu_session_type: selected_type.as_str().to_string(),
-            ue_ipv4_addr: selected_type.has_ipv4().then_some(ue_ip),
+            ue_ipv4_addr: ue_ip,
             ue_ipv6_prefix: ue_ipv6.map(|(p, _)| format!("{p}/64")),
             ue_ipv6_iid: ue_ipv6.map(|(_, iid)| hex::encode(iid)),
             cause5gsm,
@@ -933,7 +935,7 @@ async fn update_sm_context(
                     up_n3_teid: format!("{:08x}", c.n3_teid),
                     up_n3_addr: c.n3_addr,
                     selected_pdu_session_type: c.pdu_type.as_str().to_string(),
-                    ue_ipv4_addr: c.pdu_type.has_ipv4().then_some(c.ue_ip),
+                    ue_ipv4_addr: c.ue_ip,
                     ue_ipv6_prefix: c.ue_ipv6.map(|(p, _)| format!("{p}/64")),
                     ue_ipv6_iid: c.ue_ipv6.map(|(_, iid)| hex::encode(iid)),
                     cause5gsm: None,
@@ -994,7 +996,7 @@ async fn update_sm_context(
         c.gnb = Some((gnb_teid, gnb_addr));
         tracing::info!(
             %sm_ref,
-            ue_ip = %c.ue_ip,
+            ue_ip = ?c.ue_ip,
             uplink_teid = c.n3_teid,
             gnb_teid,
             "updated SM context; N4 downlink installed"

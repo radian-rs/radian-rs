@@ -15,15 +15,14 @@
 //! the privileged edge (needs `CAP_NET_ADMIN`) and is kept deliberately thin so the
 //! routing logic here stays testable without any special privileges.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use pfcp::UpfState;
 
 pub mod tun;
 
 /// Parse the source and destination addresses of a bare IPv4 packet (as carried on N3/N6,
-/// with no L2 header). `None` if it is too short or not IPv4 — the only family these
-/// single-stack PDU sessions carry.
+/// with no L2 header). `None` if it is too short or not IPv4.
 pub fn ipv4_addrs(pkt: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
     // Smallest IPv4 header is 20 bytes; the version is the high nibble of byte 0.
     if pkt.len() < 20 || pkt[0] >> 4 != 4 {
@@ -34,6 +33,23 @@ pub fn ipv4_addrs(pkt: &[u8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
     Some((src, dst))
 }
 
+/// Parse the source and destination addresses of a bare IPv6 packet (the fixed 40-byte
+/// header, no L2). `None` if too short or not IPv6 (design/131). Extension headers, if
+/// any, follow the fixed header and don't affect the addresses.
+pub fn ipv6_addrs(pkt: &[u8]) -> Option<(Ipv6Addr, Ipv6Addr)> {
+    if pkt.len() < 40 || pkt[0] >> 4 != 6 {
+        return None;
+    }
+    let src = Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[8..24]).ok()?);
+    let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[24..40]).ok()?);
+    Some((src, dst))
+}
+
+/// Whether IPv6 address `addr` falls within the /64 `prefix` (top 64 bits match).
+fn in_prefix64(addr: Ipv6Addr, prefix: Ipv6Addr) -> bool {
+    addr.octets()[..8] == prefix.octets()[..8]
+}
+
 /// What to do with an uplink packet decapsulated from an N3 G-PDU.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Uplink<'a> {
@@ -41,8 +57,9 @@ pub enum Uplink<'a> {
     ToN6(&'a [u8]),
     /// The G-PDU's TEID matches no established session — drop.
     UnknownTeid,
-    /// The inner packet's source is not the UE's assigned IP — likely spoofing; drop.
-    Spoofed { claimed: Ipv4Addr, assigned: Ipv4Addr },
+    /// The inner packet's source is not the UE's assigned address — likely spoofing;
+    /// drop. For IPv6 `assigned` is the session's /64 prefix.
+    Spoofed { claimed: IpAddr, assigned: IpAddr },
     /// The session's uplink AMBR is exceeded — policed (dropped).
     RateLimited,
 }
@@ -50,18 +67,25 @@ pub enum Uplink<'a> {
 /// Decide the fate of an uplink packet (`inner`) that arrived on N3 under `teid`,
 /// at `now_nanos` (the UPF's monotonic clock, for AMBR policing).
 ///
-/// Anti-spoofing is best-effort at L3: if the inner packet parses as IPv4, its source
-/// must equal the UE's assigned address; a non-IPv4 inner is forwarded as-is (an IPv4
-/// PDU session shouldn't carry one, and the DN device drops what it can't route).
-/// A packet that passes the checks is then metered against the session's uplink AMBR.
+/// Anti-spoofing is best-effort at L3: an IPv4 inner's source must equal the UE's
+/// assigned IPv4; an IPv6 inner's source must fall in the UE's assigned /64 (the UE
+/// forms its address there via SLAAC); anything else is forwarded as-is (the DN device
+/// drops what it can't route). A packet that passes is metered against the uplink AMBR.
 pub fn uplink<'a>(state: &mut UpfState, teid: u32, inner: &'a [u8], now_nanos: u64) -> Uplink<'a> {
-    let Some(ue_ip) = state.ue_ip_for_teid(teid) else {
+    if !state.knows_teid(teid) {
         return Uplink::UnknownTeid;
-    };
-    if let Some((src, _dst)) = ipv4_addrs(inner)
-        && src != ue_ip
+    }
+    if let Some((src, _dst)) = ipv4_addrs(inner) {
+        if let Some(ue_ip) = state.ue_ip_for_teid(teid)
+            && src != ue_ip
+        {
+            return Uplink::Spoofed { claimed: src.into(), assigned: ue_ip.into() };
+        }
+    } else if let Some((src, _dst)) = ipv6_addrs(inner)
+        && let Some(prefix) = state.ue_ipv6_for_teid(teid)
+        && !in_prefix64(src, prefix)
     {
-        return Uplink::Spoofed { claimed: src, assigned: ue_ip };
+        return Uplink::Spoofed { claimed: src.into(), assigned: prefix.into() };
     }
     if !state.admit_uplink(teid, now_nanos, inner) {
         return Uplink::RateLimited;
@@ -77,10 +101,10 @@ pub enum Downlink {
     /// The owning session is **CM-IDLE**: the packet was buffered and a Downlink
     /// Data Report raised (paging trigger) — nothing to send now.
     Buffered,
-    /// No session owns the destination UE IP, or its downlink isn't installed yet — drop.
+    /// No session owns the destination UE address, or its downlink isn't installed yet — drop.
     NoRoute,
-    /// The packet is not IPv4 (only IPv4 PDU sessions are supported) — drop.
-    NotIpv4,
+    /// The packet is neither IPv4 nor IPv6 — drop.
+    Unsupported,
     /// The session's downlink AMBR is exceeded — policed (dropped).
     RateLimited,
 }
@@ -88,19 +112,31 @@ pub enum Downlink {
 /// Decide the fate of a downlink IP packet (`pkt`) that arrived from N6 at
 /// `now_nanos`: route it by destination to the owning session, meter it against
 /// that session's downlink AMBR, and encapsulate it toward the session's gNB tunnel.
+/// Handles IPv4 (by exact UE address) and IPv6 (by the session's /64, design/131).
 pub fn downlink(state: &mut UpfState, pkt: &[u8], now_nanos: u64) -> Downlink {
-    let Some((_src, dst)) = ipv4_addrs(pkt) else {
-        return Downlink::NotIpv4;
-    };
-    let Some((gnb_teid, gnb_ip)) = state.route_downlink(dst) else {
-        // No installed tunnel: a CM-IDLE (buffering) session holds the packet and
-        // triggers paging; otherwise there's no route.
-        return if state.buffer_downlink(dst, pkt) { Downlink::Buffered } else { Downlink::NoRoute };
-    };
-    if !state.admit_downlink(dst, now_nanos, pkt) {
-        return Downlink::RateLimited;
+    if let Some((_src, dst)) = ipv4_addrs(pkt) {
+        let Some((gnb_teid, gnb_ip)) = state.route_downlink(dst) else {
+            // No installed tunnel: a CM-IDLE (buffering) session holds the packet and
+            // triggers paging; otherwise there's no route.
+            return if state.buffer_downlink(dst, pkt) { Downlink::Buffered } else { Downlink::NoRoute };
+        };
+        if !state.admit_downlink(dst, now_nanos, pkt) {
+            return Downlink::RateLimited;
+        }
+        Downlink::ToN3 { gnb_ip, gpdu: gtpu::encap(gnb_teid, pkt) }
+    } else if let Some((_src, dst)) = ipv6_addrs(pkt) {
+        // IPv6 CM-IDLE buffering/paging is a later design/131 phase — an idle v6
+        // session simply has no route for now.
+        let Some((gnb_teid, gnb_ip)) = state.route_downlink_v6(dst) else {
+            return Downlink::NoRoute;
+        };
+        if !state.admit_downlink_v6(dst, now_nanos, pkt) {
+            return Downlink::RateLimited;
+        }
+        Downlink::ToN3 { gnb_ip, gpdu: gtpu::encap(gnb_teid, pkt) }
+    } else {
+        Downlink::Unsupported
     }
-    Downlink::ToN3 { gnb_ip, gpdu: gtpu::encap(gnb_teid, pkt) }
 }
 
 #[cfg(test)]
@@ -183,7 +219,7 @@ mod tests {
         let (mut state, _) = established_upf();
         let stranger = ipv4_packet(Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(10, 45, 0, 3), b"x");
         assert_eq!(downlink(&mut state, &stranger, 0), Downlink::NoRoute, "no session owns that UE IP");
-        assert_eq!(downlink(&mut state, &[0x60; 20], 0), Downlink::NotIpv4, "IPv6 dropped");
+        assert_eq!(downlink(&mut state, &[0u8; 20], 0), Downlink::Unsupported, "non-IP dropped");
     }
 
     #[test]
@@ -202,9 +238,90 @@ mod tests {
         let spoofed = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(8, 8, 8, 8), b"x");
         assert_eq!(
             uplink(&mut state, teid, &spoofed, 0),
-            Uplink::Spoofed { claimed: Ipv4Addr::new(1, 2, 3, 4), assigned: UE_IP },
+            Uplink::Spoofed { claimed: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), assigned: IpAddr::V4(UE_IP) },
             "source that isn't the UE's assigned IP is rejected"
         );
+    }
+
+    // ── IPv6 datapath (design/131 Phase B) ──────────────────────────────────────────
+
+    const UE_V6_PREFIX: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0xa, 1, 0, 0, 0, 0); // /64
+    const UE_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0xa, 1, 0, 0, 0, 1); // prefix::iid
+    const GW_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+
+    /// A minimal well-formed IPv6 packet (40-byte fixed header + payload).
+    fn ipv6_packet(src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x60; // version 6
+        pkt[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        pkt[6] = 59; // next header: no next header
+        pkt[7] = 64; // hop limit
+        pkt[8..24].copy_from_slice(&src.octets());
+        pkt[24..40].copy_from_slice(&dst.octets());
+        pkt.extend_from_slice(payload);
+        pkt
+    }
+
+    /// A UPF with one established + downlink-installed **IPv6** session (a /64 prefix).
+    fn established_upf_v6() -> (UpfState, u32) {
+        let mut state = UpfState::new();
+        let ue = pfcp::UeAddr { v4: None, v6: Some(UE_V6_PREFIX) };
+        pfcp::handle_n4(
+            &pfcp::session_establishment_request(0xCAFE, 1, UPF_IP, ue, "internet", None, &[], None),
+            UPF_IP,
+            &mut state,
+            0,
+        )
+        .expect("establish");
+        pfcp::handle_n4(
+            &pfcp::session_modification_request(1, 2, 2, GNB_TEID, GNB_IP, "internet", false),
+            UPF_IP,
+            &mut state,
+            0,
+        )
+        .expect("modify");
+        (state, 1)
+    }
+
+    #[test]
+    fn parses_ipv6_addrs() {
+        let pkt = ipv6_packet(UE_V6, GW_V6, b"hi");
+        assert_eq!(ipv6_addrs(&pkt), Some((UE_V6, GW_V6)));
+        assert_eq!(ipv6_addrs(&[0x60; 20]), None, "too short for IPv6");
+        assert_eq!(ipv6_addrs(&[0x45; 40]), None, "IPv4, not IPv6");
+    }
+
+    #[test]
+    fn ipv6_uplink_forwards_in_prefix_source_and_rejects_spoof() {
+        let (mut state, teid) = established_upf_v6();
+        // Source in the UE's /64 → forwarded.
+        let good = ipv6_packet(UE_V6, GW_V6, b"uplink");
+        assert_eq!(uplink(&mut state, teid, &good, 0), Uplink::ToN6(&good[..]));
+        // Source outside the /64 → spoofing.
+        let bad_src = Ipv6Addr::new(0x2001, 0xdb8, 0xb, 1, 0, 0, 0, 1);
+        let spoofed = ipv6_packet(bad_src, GW_V6, b"x");
+        assert_eq!(
+            uplink(&mut state, teid, &spoofed, 0),
+            Uplink::Spoofed { claimed: IpAddr::V6(bad_src), assigned: IpAddr::V6(UE_V6_PREFIX) },
+            "an IPv6 source outside the assigned /64 is rejected"
+        );
+    }
+
+    #[test]
+    fn ipv6_downlink_routes_by_prefix_and_encaps() {
+        let (mut state, _) = established_upf_v6();
+        // Any destination in the /64 routes to the session's gNB.
+        let inner = ipv6_packet(GW_V6, UE_V6, b"downlink");
+        match downlink(&mut state, &inner, 0) {
+            Downlink::ToN3 { gnb_ip, gpdu } => {
+                assert_eq!(gnb_ip, GNB_IP);
+                assert_eq!(gtpu::decap(&gpdu), Some((GNB_TEID, &inner[..])), "encapped to the gNB TEID");
+            }
+            other => panic!("expected ToN3, got {other:?}"),
+        }
+        // A destination outside any session's /64 is unrouted.
+        let stranger = ipv6_packet(GW_V6, Ipv6Addr::new(0x2001, 0xdb8, 0xff, 1, 0, 0, 0, 1), b"x");
+        assert_eq!(downlink(&mut state, &stranger, 0), Downlink::NoRoute);
     }
 
     /// A session AMBR provisioned via QER polices both directions: a burst is
