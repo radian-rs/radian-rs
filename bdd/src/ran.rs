@@ -542,6 +542,42 @@ impl ScriptedUe {
         self.protected_uplink(&inner)
     }
 
+    /// A NAS-protected UL NAS Transport requesting a PDU session that **signals a
+    /// requested PDU session type** (IPv4/IPv6/IPv4v6, design/131), optionally on a
+    /// specific `dnn`.
+    pub fn pdu_session_request_typed(
+        &mut self,
+        psi: u8,
+        ty: nas::PduSessionType,
+        dnn: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let container = nas::pdu_session_establishment_request_typed(psi, 1, ty);
+        let transport = nas::ul_nas_transport_sm(psi, container, dnn, None);
+        let inner = nas::decode_nas_5gs_message(&transport).context("encode UL NAS Transport")?;
+        self.protected_uplink(&inner)
+    }
+
+    /// Read a relayed **PDU Session Establishment Accept**, returning `(psi, PDU
+    /// address, optional 5GSM cause)` — handles IPv4, IPv6 (interface identifier),
+    /// and IPv4v6, plus the session-type downgrade cause (design/131).
+    pub fn read_pdu_session_accept_addr(
+        &mut self,
+        dl_nas: &[u8],
+    ) -> Result<(u8, nas::PduAddress, Option<u8>)> {
+        let msg = self.read_downlink(dl_nas)?;
+        let (psi, container) =
+            nas::sm_container_from_dl_nas_transport(&msg).context("no SM container in the DL NAS")?;
+        anyhow::ensure!(
+            container.get(3) == Some(&0xc2),
+            "the SM container is not a PDU Session Establishment Accept (got type {:#x?})",
+            container.get(3)
+        );
+        let addr = nas::pdu_address_from_establishment_accept(&container)
+            .context("the accept carries no PDU address")?;
+        let cause = nas::accept_5gsm_cause(&container);
+        Ok((psi, addr, cause))
+    }
+
     /// Read a **PDU Session Establishment Reject** the network relayed in a protected
     /// DL NAS Transport: returns `(5GSM cause, optional T3396 back-off octet)`.
     pub fn read_pdu_session_reject(&mut self, dl_nas: &[u8]) -> Result<(u8, Option<u8>)> {

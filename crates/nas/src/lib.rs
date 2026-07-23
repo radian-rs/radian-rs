@@ -1078,13 +1078,89 @@ fn qos_flow_descriptions_value(flows: &[QosFlowDesc]) -> Vec<u8> {
     v
 }
 
-/// Build a 5GSM **PDU Session Establishment Accept** (TS 24.501 §8.3.2) as the raw N1 SM
-/// container bytes. Hand-encoded to the exact TS 24.501 layout (so it interoperates with a
-/// free5GC UE regardless of codec quirks): SSC mode 1 + IPv4, one default *match-all* QoS
-/// rule, the subscribed **Session-AMBR**, the **PDU address** carrying the UE's assigned
-/// IPv4 (the field the UE reads to configure its stack), and the subscribed **S-NSSAI** +
-/// **DNN** (which the UE also reads). `pti` echoes the request's procedure transaction id;
-/// S-NSSAI/AMBR come from the subscriber's UDR sm-data (design/27).
+/// PDU session type (TS 24.501 §9.11.4.11) — the IP family of a PDU session, encoded
+/// in the low 3 bits of a session-type field. Ethernet/Unstructured are not yet
+/// supported (design/131).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PduSessionType {
+    Ipv4,
+    Ipv6,
+    Ipv4v6,
+}
+
+impl PduSessionType {
+    /// The 3-bit type value (IPv4 = 1, IPv6 = 2, IPv4v6 = 3).
+    pub fn value(self) -> u8 {
+        match self {
+            PduSessionType::Ipv4 => 1,
+            PduSessionType::Ipv6 => 2,
+            PduSessionType::Ipv4v6 => 3,
+        }
+    }
+
+    /// Parse the 3-bit type value; `None` for Ethernet/Unstructured/reserved.
+    pub fn from_value(v: u8) -> Option<Self> {
+        match v & 0x07 {
+            1 => Some(PduSessionType::Ipv4),
+            2 => Some(PduSessionType::Ipv6),
+            3 => Some(PduSessionType::Ipv4v6),
+            _ => None,
+        }
+    }
+
+    /// Whether this type includes an IPv4 address.
+    pub fn has_ipv4(self) -> bool {
+        matches!(self, PduSessionType::Ipv4 | PduSessionType::Ipv4v6)
+    }
+
+    /// Whether this type includes an IPv6 prefix.
+    pub fn has_ipv6(self) -> bool {
+        matches!(self, PduSessionType::Ipv6 | PduSessionType::Ipv4v6)
+    }
+
+    /// The TS 29.571 `PduSessionType` enum name (the SBI JSON form).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PduSessionType::Ipv4 => "IPV4",
+            PduSessionType::Ipv6 => "IPV6",
+            PduSessionType::Ipv4v6 => "IPV4V6",
+        }
+    }
+
+    /// Parse the TS 29.571 `PduSessionType` name (case-insensitive; accepts the
+    /// `IPV4_V6` spelling free5gc uses). `None` for Ethernet/Unstructured/unknown.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "IPV4" => Some(PduSessionType::Ipv4),
+            "IPV6" => Some(PduSessionType::Ipv6),
+            "IPV4V6" | "IPV4_V6" => Some(PduSessionType::Ipv4v6),
+            _ => None,
+        }
+    }
+}
+
+/// The address(es) the network assigned to a PDU session, as carried in the PDU
+/// Address IE (TS 24.501 §9.11.4.10). For IPv6/IPv4v6 the IE carries the 8-byte
+/// **interface identifier** — the UE forms its global address via SLAAC from the /64
+/// prefix delivered in a Router Advertisement (design/131), never a full IPv6 address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PduAddress {
+    Ipv4(std::net::Ipv4Addr),
+    Ipv6 { iid: [u8; 8] },
+    Ipv4v6 { iid: [u8; 8], v4: std::net::Ipv4Addr },
+}
+
+impl PduAddress {
+    /// The selected PDU session type this address implies.
+    pub fn session_type(&self) -> PduSessionType {
+        match self {
+            PduAddress::Ipv4(_) => PduSessionType::Ipv4,
+            PduAddress::Ipv6 { .. } => PduSessionType::Ipv6,
+            PduAddress::Ipv4v6 { .. } => PduSessionType::Ipv4v6,
+        }
+    }
+}
+
 /// Build a 5GSM **PDU Session Establishment Request** N1 SM container (TS 24.501
 /// §8.3.1) — UE side / tests. Minimal: the mandatory Integrity Protection Maximum
 /// Data Rate IE at full rate (`0xFF 0xFF`); PDU session type / SSC mode take the
@@ -1095,31 +1171,109 @@ pub fn pdu_session_establishment_request(pdu_session_id: u8, pti: u8) -> Vec<u8>
     vec![0x2e, pdu_session_id, pti, 0xc1, 0xff, 0xff]
 }
 
+/// Like [`pdu_session_establishment_request`] but signalling a requested PDU Session
+/// Type via the Type-1 IE (IEI 9, `0x9_`; TS 24.501 §9.11.4.11) — UE side / tests.
+pub fn pdu_session_establishment_request_typed(
+    pdu_session_id: u8,
+    pti: u8,
+    ty: PduSessionType,
+) -> Vec<u8> {
+    let mut m = pdu_session_establishment_request(pdu_session_id, pti);
+    // PDU session type (Type-1 IE): high nibble = IEI 9, low nibble = the type value.
+    m.push(0x90 | ty.value());
+    m
+}
+
+/// The requested PDU Session Type from a PDU Session Establishment Request container
+/// (the Type-1 IE `0x9_` in the optional part), if the UE included one; `None` ⇒ the
+/// network applies its default. This stack's requests carry at most the
+/// PDU-session-type and SSC-mode Type-1 IEs, so a scan for the `0x9_` IEI is
+/// unambiguous — a full IEI walk is a later refinement.
+pub fn requested_pdu_session_type(container: &[u8]) -> Option<PduSessionType> {
+    // Fixed part (6 octets): EPD, PDU session id, PTI, message type, Integrity
+    // Protection Maximum Data Rate (2 octets). Optional IEs follow.
+    container
+        .get(6..)?
+        .iter()
+        .find_map(|&b| (b >> 4 == 0x9).then(|| PduSessionType::from_value(b & 0x0f)).flatten())
+}
+
 /// The UE IPv4 address from a 5GSM **PDU Session Establishment Accept** container
 /// (the PDU Address IE `[0x29, len=5, type=1(IPv4), a, b, c, d]`) — UE side /
 /// tests. `None` if absent (e.g. a non-IPv4 session).
 pub fn ue_ipv4_from_establishment_accept(container: &[u8]) -> Option<std::net::Ipv4Addr> {
-    container.windows(7).find_map(|w| {
-        (w[0] == 0x29 && w[1] == 0x05 && w[2] == 0x01)
-            .then(|| std::net::Ipv4Addr::new(w[3], w[4], w[5], w[6]))
+    match pdu_address_from_establishment_accept(container)? {
+        PduAddress::Ipv4(v4) | PduAddress::Ipv4v6 { v4, .. } => Some(v4),
+        PduAddress::Ipv6 { .. } => None,
+    }
+}
+
+/// Parse the PDU Address IE from a 5GSM **PDU Session Establishment Accept** into a
+/// [`PduAddress`] — UE side / tests. Handles IPv4 (`[0x29, 5, 1, a,b,c,d]`), IPv6
+/// (`[0x29, 9, 2, iid×8]`), and IPv4v6 (`[0x29, 13, 3, iid×8, a,b,c,d]`). `None` if
+/// the accept carries no (recognised) PDU address.
+pub fn pdu_address_from_establishment_accept(container: &[u8]) -> Option<PduAddress> {
+    container.iter().enumerate().find_map(|(i, &b)| {
+        if b != 0x29 {
+            return None;
+        }
+        // The IE length counts the type octet + the address bytes.
+        let len = *container.get(i + 1)? as usize;
+        let ty = *container.get(i + 2)?;
+        let body = container.get(i + 3..i + 2 + len)?;
+        match (ty & 0x07, len) {
+            (1, 5) => Some(PduAddress::Ipv4(std::net::Ipv4Addr::new(body[0], body[1], body[2], body[3]))),
+            (2, 9) => Some(PduAddress::Ipv6 { iid: body.try_into().ok()? }),
+            (3, 13) => Some(PduAddress::Ipv4v6 {
+                iid: body[0..8].try_into().ok()?,
+                v4: std::net::Ipv4Addr::new(body[8], body[9], body[10], body[11]),
+            }),
+            _ => None,
+        }
     })
 }
 
+/// The IPv6 interface identifier from an IPv6/IPv4v6 Establishment Accept's PDU
+/// Address IE — UE side / tests. `None` for an IPv4-only (or absent) PDU address.
+pub fn ue_ipv6_iid_from_establishment_accept(container: &[u8]) -> Option<[u8; 8]> {
+    match pdu_address_from_establishment_accept(container)? {
+        PduAddress::Ipv6 { iid } | PduAddress::Ipv4v6 { iid, .. } => Some(iid),
+        PduAddress::Ipv4(_) => None,
+    }
+}
+
+/// The 5GSM cause (IEI 0x59, TV) from an Establishment Accept, if present — set on a
+/// PDU-session-type downgrade (#50/#51, [`sm_cause`]). UE side / tests. Scans by IEI,
+/// which is unambiguous for the accepts this stack builds.
+pub fn accept_5gsm_cause(container: &[u8]) -> Option<u8> {
+    // Skip the fixed header + selected-type octet before scanning for the TV IE.
+    container.get(5..)?.windows(2).find_map(|w| (w[0] == 0x59).then_some(w[1]))
+}
+
+/// Build a 5GSM **PDU Session Establishment Accept** (TS 24.501 §8.3.2) as the raw N1
+/// SM container bytes. Hand-encoded to the exact TS 24.501 layout (so it interoperates
+/// with a free5GC UE regardless of codec quirks): SSC mode 1 + the selected PDU
+/// session type, one default *match-all* QoS rule, the subscribed **Session-AMBR**, an
+/// optional **5GSM cause** (a session-type downgrade, #50/#51), the **PDU address**
+/// (the UE's IPv4, or the IPv6 interface identifier, or both — [`PduAddress`]), and the
+/// subscribed **S-NSSAI** + **DNN**. `pti` echoes the request's procedure transaction
+/// id; S-NSSAI/AMBR come from the subscriber's UDR sm-data (design/27).
 pub fn pdu_session_establishment_accept(
     pdu_session_id: u8,
     pti: u8,
-    ue_ip: std::net::Ipv4Addr,
+    addr: &PduAddress,
     dnn: &str,
     snssai_sst: u8,
     snssai_sd: Option<[u8; 3]>,
     ambr: SessionAmbr,
     flows: &[QosFlowDesc],
+    cause: Option<u8>,
 ) -> Vec<u8> {
     let mut m = Vec::with_capacity(48);
     // 5GSM header: EPD, PDU session id, PTI, message type (0xC2 = Establishment Accept).
     m.extend_from_slice(&[0x2e, pdu_session_id, pti, 0xc2]);
-    // Selected SSC mode (1, bits 5-7) + selected PDU session type (IPv4 = 1, bits 1-3).
-    m.push(0x11);
+    // Selected SSC mode (1, bits 5-7) + selected PDU session type (bits 1-3).
+    m.push(0x10 | addr.session_type().value());
     // Authorized QoS rules (LV-E, 2-byte length): one "create new" default (DQR) rule with a
     // single bidirectional match-all packet filter, precedence 0xFF, QFI 1.
     let qos_rules: [u8; 9] = [0x01, 0x00, 0x06, 0x31, 0x31, 0x01, 0x01, 0xff, 0x01];
@@ -1131,11 +1285,32 @@ pub fn pdu_session_establishment_accept(
     m.extend_from_slice(&ambr.dl.to_be_bytes());
     m.push(ambr.ul_unit);
     m.extend_from_slice(&ambr.ul.to_be_bytes());
-    // PDU address (IEI 0x29, length 5): PDU session type IPv4 (1) + the UE's IPv4 address.
+    // 5GSM cause (IEI 0x59, TV) — set on a PDU-session-type downgrade (#50/#51).
+    if let Some(c) = cause {
+        m.push(0x59);
+        m.push(c);
+    }
+    // PDU address (IEI 0x29): type value + IPv4 (len 5), IPv6 interface identifier
+    // (len 9), or IPv6 IID ‖ IPv4 (len 13) per TS 24.501 §9.11.4.10.
     m.push(0x29);
-    m.push(5);
-    m.push(0x01);
-    m.extend_from_slice(&ue_ip.octets());
+    match addr {
+        PduAddress::Ipv4(v4) => {
+            m.push(5);
+            m.push(0x01);
+            m.extend_from_slice(&v4.octets());
+        }
+        PduAddress::Ipv6 { iid } => {
+            m.push(9);
+            m.push(0x02);
+            m.extend_from_slice(iid);
+        }
+        PduAddress::Ipv4v6 { iid, v4 } => {
+            m.push(13);
+            m.push(0x03);
+            m.extend_from_slice(iid);
+            m.extend_from_slice(&v4.octets());
+        }
+    }
     // S-NSSAI (IEI 0x22): SST, plus the SD when the slice has one.
     m.push(0x22);
     match snssai_sd {
@@ -1241,6 +1416,11 @@ pub mod sm_cause {
     pub const REQUEST_REJECTED_UNSPECIFIED: u8 = 31;
     /// #70 — the (S-NSSAI, DNN) pair the UE requested is not valid together.
     pub const MISSING_OR_UNKNOWN_DNN_IN_SLICE: u8 = 70;
+    /// #50 — the requested PDU session type is not allowed; only IPv4 was granted
+    /// (TS 24.501 §9.11.4.2) — a downgrade carried in the Establishment Accept.
+    pub const PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED: u8 = 50;
+    /// #51 — the requested PDU session type is not allowed; only IPv6 was granted.
+    pub const PDU_SESSION_TYPE_IPV6_ONLY_ALLOWED: u8 = 51;
 }
 
 /// GPRS Timer 3 (TS 24.008 §10.5.7.4a): one octet holding a 3-bit unit (bits 6-8)
@@ -1574,8 +1754,17 @@ mod tests {
     fn dl_nas_transport_carries_pdu_session_accept() {
         let ue_ip = std::net::Ipv4Addr::new(10, 45, 0, 2);
         let ambr = session_ambr_from_bitrates("1 Gbps", "2 Gbps").expect("bitrates parse");
-        let accept =
-            pdu_session_establishment_accept(5, 1, ue_ip, "internet", 1, Some([1, 2, 3]), ambr, &[]);
+        let accept = pdu_session_establishment_accept(
+            5,
+            1,
+            &PduAddress::Ipv4(ue_ip),
+            "internet",
+            1,
+            Some([1, 2, 3]),
+            ambr,
+            &[],
+            None,
+        );
         // A 5GSM Establishment Accept: header, the UE's IPv4 in the PDU address, and the DNN.
         assert_eq!(&accept[..4], &[0x2e, 5, 1, 0xc2]);
         assert!(accept.windows(7).any(|w| w == [0x29, 5, 0x01, 10, 45, 0, 2]), "PDU address = UE IPv4");
@@ -1653,13 +1842,31 @@ mod tests {
         // flow set present, DNN still last.
         let ue_ip = std::net::Ipv4Addr::new(10, 45, 0, 2);
         let ambr = session_ambr_from_bitrates("1 Gbps", "2 Gbps").unwrap();
-        let accept =
-            pdu_session_establishment_accept(5, 1, ue_ip, "internet", 1, Some([1, 2, 3]), ambr, &[default]);
+        let accept = pdu_session_establishment_accept(
+            5,
+            1,
+            &PduAddress::Ipv4(ue_ip),
+            "internet",
+            1,
+            Some([1, 2, 3]),
+            ambr,
+            &[default],
+            None,
+        );
         assert!(accept.windows(3).any(|w| w == [0x79, 0x00, 0x06]), "0x79 IE header (len 6)");
         assert!(accept.ends_with(&[0x25, 0x09, 0x08, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't']), "DNN still last");
         // An empty flow list omits the IE entirely (single-flow accept stays minimal).
-        let bare =
-            pdu_session_establishment_accept(5, 1, ue_ip, "internet", 1, Some([1, 2, 3]), ambr, &[]);
+        let bare = pdu_session_establishment_accept(
+            5,
+            1,
+            &PduAddress::Ipv4(ue_ip),
+            "internet",
+            1,
+            Some([1, 2, 3]),
+            ambr,
+            &[],
+            None,
+        );
         assert!(!bare.windows(1).any(|w| w == [0x79]), "no QoS flow descriptions IE when empty");
     }
 
@@ -1884,17 +2091,92 @@ mod tests {
         let accept = pdu_session_establishment_accept(
             5,
             1,
-            std::net::Ipv4Addr::new(10, 45, 0, 7),
+            &PduAddress::Ipv4(std::net::Ipv4Addr::new(10, 45, 0, 7)),
             "internet",
             1,
             Some([1, 2, 3]),
             ambr,
             &[],
+            None,
         );
         assert_eq!(
             ue_ipv4_from_establishment_accept(&accept),
             Some(std::net::Ipv4Addr::new(10, 45, 0, 7))
         );
+    }
+
+    /// IPv6 and IPv4v6 accepts carry the correct PDU Address IE (interface identifier
+    /// / IID‖IPv4) + selected type, and a session-type downgrade carries a 5GSM cause.
+    #[test]
+    fn establishment_accept_ipv6_and_ipv4v6_and_downgrade() {
+        let ambr = session_ambr_from_bitrates("1 Gbps", "2 Gbps").unwrap();
+        let iid = [0, 0, 0, 0, 0, 0, 0x12, 0x34];
+        let v4 = std::net::Ipv4Addr::new(10, 45, 0, 9);
+
+        // Pure IPv6: selected-type nibble 2, PDU Address = 0x29,len 9,type 2,IID×8.
+        let v6 = pdu_session_establishment_accept(
+            5,
+            1,
+            &PduAddress::Ipv6 { iid },
+            "internet",
+            1,
+            None,
+            ambr,
+            &[],
+            None,
+        );
+        assert_eq!(v6[4] & 0x0f, 2, "selected PDU session type = IPv6");
+        assert!(v6.windows(3).any(|w| w == [0x29, 9, 0x02]), "IPv6 PDU Address IE (len 9, type 2)");
+        assert_eq!(pdu_address_from_establishment_accept(&v6), Some(PduAddress::Ipv6 { iid }));
+        assert_eq!(ue_ipv6_iid_from_establishment_accept(&v6), Some(iid));
+        assert_eq!(ue_ipv4_from_establishment_accept(&v6), None, "no IPv4 in a pure-v6 accept");
+
+        // IPv4v6: selected-type nibble 3, PDU Address = 0x29,len 13,type 3,IID×8,IPv4×4.
+        let v46 = pdu_session_establishment_accept(
+            5,
+            1,
+            &PduAddress::Ipv4v6 { iid, v4 },
+            "internet",
+            1,
+            None,
+            ambr,
+            &[],
+            None,
+        );
+        assert_eq!(v46[4] & 0x0f, 3, "selected PDU session type = IPv4v6");
+        assert!(v46.windows(3).any(|w| w == [0x29, 13, 0x03]), "IPv4v6 PDU Address IE (len 13, type 3)");
+        assert_eq!(
+            pdu_address_from_establishment_accept(&v46),
+            Some(PduAddress::Ipv4v6 { iid, v4 })
+        );
+        assert_eq!(ue_ipv4_from_establishment_accept(&v46), Some(v4), "IPv4 half readable");
+        assert_eq!(ue_ipv6_iid_from_establishment_accept(&v46), Some(iid), "IPv6 IID readable");
+
+        // A downgrade (requested IPv4v6, only IPv4 granted) carries 5GSM cause #50.
+        let down = pdu_session_establishment_accept(
+            5,
+            1,
+            &PduAddress::Ipv4(v4),
+            "internet",
+            1,
+            None,
+            ambr,
+            &[],
+            Some(sm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED),
+        );
+        assert_eq!(down[4] & 0x0f, 1, "downgraded to IPv4");
+        assert_eq!(accept_5gsm_cause(&down), Some(50), "5GSM cause #50 present");
+    }
+
+    /// The requested PDU session type is parsed from the Type-1 IE in a request; a
+    /// bare request (no IE) reads as `None` (network default applies).
+    #[test]
+    fn requested_pdu_session_type_roundtrips() {
+        assert_eq!(requested_pdu_session_type(&pdu_session_establishment_request(5, 1)), None);
+        for ty in [PduSessionType::Ipv4, PduSessionType::Ipv6, PduSessionType::Ipv4v6] {
+            let req = pdu_session_establishment_request_typed(5, 1, ty);
+            assert_eq!(requested_pdu_session_type(&req), Some(ty), "round-trip {ty:?}");
+        }
     }
 
     /// A PDU Session Establishment Reject's cause and T3396 read back out of its

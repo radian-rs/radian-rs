@@ -558,7 +558,14 @@ pub fn initial_context_setup_request(
             ic.pdu_sessions
                 .iter()
                 .map(|s| {
-                    let transfer = encode_aper(&setup_request_transfer(&s.flows, s.upf_teid, s.upf_addr));
+                    // Resume/ICS-inline sessions carry IPv4 today; threading the
+                    // session's real PDU type through resume is a design/131 Phase B item.
+                    let transfer = encode_aper(&setup_request_transfer(
+                        &s.flows,
+                        s.upf_teid,
+                        s.upf_addr,
+                        PduSessionType::Ipv4,
+                    ));
                     PDUSessionResourceSetupItemCxtReq {
                         pdu_session_id: PDUSessionID(s.psi),
                         nas_pdu: None, // no per-session N1 on resume; the accept is the ICS NAS-PDU
@@ -1185,7 +1192,10 @@ pub fn handover_request(
         sessions
             .iter()
             .map(|(psi, flows, ul_teid, ul_addr)| {
-                let transfer = encode_aper(&setup_request_transfer(flows, *ul_teid, *ul_addr));
+                // Handover sessions carry IPv4 today; threading the real PDU type
+                // through the handover path is a design/131 Phase B item.
+                let transfer =
+                    encode_aper(&setup_request_transfer(flows, *ul_teid, *ul_addr, PduSessionType::Ipv4));
                 PDUSessionResourceSetupItemHOReq {
                     pdu_session_id: PDUSessionID(*psi),
                     s_nssai: s_nssai(1, None),
@@ -1929,12 +1939,32 @@ fn encode_aper<T: AperCodec>(pdu: &T) -> Vec<u8> {
     codec.into_bytes()
 }
 
+/// The IP family of a PDU session, for the N2 PDU Session Type IE (TS 38.413
+/// §9.3.1.51). Mirrors the NAS `PduSessionType` the SMF negotiates (design/131).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PduSessionType {
+    #[default]
+    Ipv4,
+    Ipv6,
+    Ipv4v6,
+}
+
 /// The N2 SM info the SMF gives the gNB: the UPF's UL N3 F-TEID + PDU type + QoS.
-fn setup_request_transfer(flows: &[QosFlow], upf_teid: u32, upf_addr: Ipv4Addr) -> PDUSessionResourceSetupRequestTransfer {
+fn setup_request_transfer(
+    flows: &[QosFlow],
+    upf_teid: u32,
+    upf_addr: Ipv4Addr,
+    pdu_type: PduSessionType,
+) -> PDUSessionResourceSetupRequestTransfer {
+    let pdu_type_value = match pdu_type {
+        PduSessionType::Ipv4 => PDUSessionType::IPV4,
+        PduSessionType::Ipv6 => PDUSessionType::IPV6,
+        PduSessionType::Ipv4v6 => PDUSessionType::IPV4V6,
+    };
     PDUSessionResourceSetupRequestTransfer {
         protocol_i_es: PDUSessionResourceSetupRequestTransferProtocolIEs(vec![
             build_ngap_ie!(PDUSessionResourceSetupRequestTransfer, REJECT UL_NGU_UP_TNLInformation(gtp_tunnel(upf_teid, upf_addr))),
-            build_ngap_ie!(PDUSessionResourceSetupRequestTransfer, REJECT PDUSessionType(PDUSessionType(PDUSessionType::IPV4))),
+            build_ngap_ie!(PDUSessionResourceSetupRequestTransfer, REJECT PDUSessionType(PDUSessionType(pdu_type_value))),
             build_ngap_ie!(PDUSessionResourceSetupRequestTransfer, REJECT QosFlowSetupRequestList(qos_flow_setup_list(flows))),
         ]),
     }
@@ -1971,9 +2001,10 @@ pub fn pdu_session_resource_setup_request(
     upf_addr: Ipv4Addr,
     ue_ambr_dl_bps: u64,
     ue_ambr_ul_bps: u64,
+    pdu_type: PduSessionType,
     nas: Vec<u8>,
 ) -> NGAP_PDU {
-    let transfer = encode_aper(&setup_request_transfer(flows, upf_teid, upf_addr));
+    let transfer = encode_aper(&setup_request_transfer(flows, upf_teid, upf_addr, pdu_type));
     build_ngap!(InitiatingMessage, PDUSessionResourceSetup,
         REJECT, PDUSessionResourceSetupRequest,
         REJECT AMF_UE_NGAP_ID(amf_ue_id),
@@ -2387,6 +2418,7 @@ mod tests {
             Ipv4Addr::new(127, 0, 0, 1),
             2_000_000_000,
             1_000_000_000,
+            PduSessionType::Ipv4,
             vec![0x2e, 0x05, 0x01, 0xc2],
         );
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
@@ -2418,6 +2450,7 @@ mod tests {
             upf_addr,
             2_000_000_000,
             1_000_000_000,
+            PduSessionType::Ipv4,
             nas.clone(),
         );
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
@@ -3018,7 +3051,8 @@ mod gnb_side_tests {
     fn setup_request_qfis_extract_the_first_flow() {
         let flows = [QosFlow { qfi: 5, ..QosFlow::default_non_gbr() }];
         let pdu = pdu_session_resource_setup_request(
-            1, 2, 6, &flows, 0x1111, Ipv4Addr::LOCALHOST, 1_000_000, 1_000_000, vec![0x7e],
+            1, 2, 6, &flows, 0x1111, Ipv4Addr::LOCALHOST, 1_000_000, 1_000_000, PduSessionType::Ipv4,
+            vec![0x7e],
         );
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
         assert_eq!(pdu_session_setup_request_qfis(&back), vec![(6, 5)]);

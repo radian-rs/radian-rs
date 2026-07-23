@@ -1864,6 +1864,7 @@ dependencies = [
  "anyhow",
  "axum",
  "common",
+ "hex",
  "nas",
  "ngap",
  "pfcp",

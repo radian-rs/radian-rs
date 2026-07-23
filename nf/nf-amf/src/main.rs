@@ -2076,8 +2076,11 @@ async fn on_service_request(
                 let (ambr_dl, ambr_ul) = ue_ambr.unwrap_or(DEFAULT_UE_AMBR_BPS);
                 for s in &ics_sessions {
                     downlinks.push((
+                        // Resume carries IPv4 today; the session's real PDU type on
+                        // resume is a design/131 Phase B item.
                         ngap::pdu_session_resource_setup_request(
-                            amf_ue_id, ran_ue_id, s.psi, &s.flows, s.upf_teid, s.upf_addr, ambr_dl, ambr_ul, Vec::new(),
+                            amf_ue_id, ran_ue_id, s.psi, &s.flows, s.upf_teid, s.upf_addr, ambr_dl,
+                            ambr_ul, ngap::PduSessionType::Ipv4, Vec::new(),
                         ),
                         "PDUSessionResourceSetupRequest (resume)",
                     ));
@@ -3293,7 +3296,13 @@ async fn dispatch_uplink_nas(
                     ));
                 }
             };
-            match amf_smf.create_sm_context(&smf_base, &supi, psi, &dnn, snssai).await {
+            // The UE's requested PDU session type (design/131) rides in the container's
+            // Type-1 IE; the SMF negotiates the selected type against the subscription.
+            let requested_pdu_type = nas::requested_pdu_session_type(&container);
+            match amf_smf
+                .create_sm_context(&smf_base, &supi, psi, &dnn, snssai, requested_pdu_type)
+                .await
+            {
                 Ok(created) => {
                     // Build the N1 PDU Session Establishment Accept (UE IP from the SMF,
                     // echoing the request's PTI) and NAS-protect a DL NAS Transport carrying
@@ -3313,12 +3322,13 @@ async fn dispatch_uplink_nas(
                     let accept = nas::pdu_session_establishment_accept(
                         psi,
                         pti,
-                        created.ue_ip,
+                        &created.pdu_address,
                         &dnn,
                         created.snssai_sst,
                         created.snssai_sd,
                         created.ambr,
                         &created.nas_flows,
+                        created.cause,
                     );
                     let dl = nas::dl_nas_transport_sm(psi, accept);
                     let Some(ctx) = ues.get_mut(&amf_ue_id) else { return None };
@@ -3339,11 +3349,12 @@ async fn dispatch_uplink_nas(
                         created.up_n3_addr,
                         ambr_dl,
                         ambr_ul,
+                        created.pdu_type,
                         nas_accept,
                     );
                     info!(
-                        "UE {amf_ue_id}: PDU session {psi} SM context created (UE IP {}); sending N2 setup",
-                        created.ue_ip
+                        "UE {amf_ue_id}: PDU session {psi} SM context created (addr {:?}); sending N2 setup",
+                        created.pdu_address
                     );
                     Some((setup, "PDUSessionResourceSetupRequest"))
                 }

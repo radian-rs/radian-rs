@@ -33,6 +33,12 @@ const FAR_ID: u32 = 2;
 /// coordinated with the UPF's N6 subnet; here one pool suffices.
 const UE_IP_POOL_START: u32 = 0x0A2D_0002; // 10.45.0.2
 
+/// The SMF hands each IPv6/IPv4v6 PDU session a unique **/64** from `2001:db8:a::/48`
+/// (the /64 index is a per-session counter in the 4th hextet) plus an interface
+/// identifier. TS 23.501 §5.8.2.2 (one /64 per PDU session). Datapath + RA/SLAAC are
+/// design/131 Phase B/C; Phase A allocates and signals the address only.
+const UE_IPV6_PREFIX_48: [u8; 6] = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x0a];
+
 /// This SMF's stable NF instance id — the `smfInstanceId` in every UECM
 /// smf-registration.
 static SMF_INSTANCE_ID: std::sync::LazyLock<String> =
@@ -49,8 +55,15 @@ struct SmContext {
     /// N2 SM info at establishment and again on a Service Request re-activation.
     n3_teid: u32,
     n3_addr: Ipv4Addr,
-    /// The UE's assigned IP (this session's PDU address).
+    /// The UE's assigned IPv4 address. Always allocated (the N4 downlink PDR matches
+    /// it); surfaced to the UE only for IPv4 / IPv4v6 sessions (design/131 — a pure
+    /// IPv6 session keeps this for the Phase A datapath plumbing, unused on the wire).
     ue_ip: Ipv4Addr,
+    /// The selected PDU session type — echoed on a Service Request resume.
+    pdu_type: nas::PduSessionType,
+    /// The assigned IPv6 `(/64 prefix, interface identifier)` for IPv6 / IPv4v6
+    /// sessions (design/131). `None` for IPv4-only.
+    ue_ipv6: Option<(std::net::Ipv6Addr, [u8; 8])>,
     /// The DNN this session is for — carried as the PFCP **Network Instance** on the
     /// forwarding rules (establishment + every downlink re-point), the name an
     /// operator binds to a VRF.
@@ -105,6 +118,9 @@ pub struct SmfState {
     next_ref: AtomicU64,
     /// Next UE IPv4 address to hand out (as a host-order u32), from the pool above.
     next_ue_ip: AtomicU32,
+    /// Next IPv6 /64 index (and interface-identifier seed) to hand out, from
+    /// `2001:db8:a::/48`. Starts at 1 so no session gets the `::0` identifier.
+    next_ue_ipv6: AtomicU32,
     contexts: Mutex<HashMap<String, SmContext>>,
     /// GFBR admission control: the guaranteed-bit-rate budget `(downlink, uplink)`
     /// in bits/sec and the currently reserved total. A session whose GBR flows'
@@ -170,6 +186,7 @@ impl SmfState {
             cp_seid: AtomicU64::new(1),
             next_ref: AtomicU64::new(1),
             next_ue_ip: AtomicU32::new(UE_IP_POOL_START),
+            next_ue_ipv6: AtomicU32::new(1),
             contexts: Mutex::new(HashMap::new()),
             // Generous default so plain operation isn't gated; override for admission
             // control (config / tests).
@@ -231,6 +248,20 @@ impl SmfState {
         Ipv4Addr::from(self.next_ue_ip.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Allocate a unique **/64** prefix (`2001:db8:a:n::/64`) and an interface
+    /// identifier (`::n`) for an IPv6/IPv4v6 PDU session (TS 23.501 §5.8.2.2 — one
+    /// /64 per session). The UE forms its global address `prefix ‖ iid` via SLAAC
+    /// once the Router Advertisement lands (design/131 Phase C).
+    fn alloc_ue_ipv6(&self) -> (std::net::Ipv6Addr, [u8; 8]) {
+        let n = self.next_ue_ipv6.fetch_add(1, Ordering::Relaxed) as u16;
+        let mut seg = [0u8; 16];
+        seg[..6].copy_from_slice(&UE_IPV6_PREFIX_48);
+        seg[6..8].copy_from_slice(&n.to_be_bytes()); // /64 index → 4th hextet
+        let prefix = std::net::Ipv6Addr::from(seg);
+        let iid = [0, 0, 0, 0, 0, 0, (n >> 8) as u8, n as u8]; // interface identifier ::n
+        (prefix, iid)
+    }
+
     /// Send one PFCP request and await *its* response — correlated by sequence number
     /// (PFCP responses echo the request's) via the reader task. 2s overall; on
     /// timeout the pending entry is withdrawn (a late response is then dropped).
@@ -281,6 +312,11 @@ struct SmContextCreateData {
     /// The UE's requested slice (TS 29.502 `sNssai`). Absent → the subscribed
     /// slice serving the DNN is used.
     s_nssai: Option<Snssai>,
+    /// The UE's requested PDU session type ("IPV4" | "IPV6" | "IPV4V6"). Absent →
+    /// the DNN's default; the SMF negotiates the selected type against the
+    /// subscription's allowed set (design/131).
+    #[serde(default)]
+    pdu_session_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,10 +359,28 @@ struct SmContextCreatedData {
     /// The UPF's N3 F-TEID — carried to the gNB in the N2 SM info.
     up_n3_teid: String,
     up_n3_addr: Ipv4Addr,
-    /// The UE's assigned IPv4 address (its PDU session address). Delivered to the UE in
-    /// the NAS PDU Session Establishment Accept (a later NAS-SM slice); the UPF already
-    /// routes downlink traffic to it.
-    ue_ipv4_addr: Ipv4Addr,
+    /// The selected PDU session type ("IPV4" | "IPV6" | "IPV4V6"), negotiated from the
+    /// UE's request and the subscription (design/131). The AMF encodes it in the N1
+    /// accept + the N2 PDU Session Type IE.
+    selected_pdu_session_type: String,
+    /// The UE's assigned IPv4 address (its PDU session address). Present for IPv4 /
+    /// IPv4v6 only. Delivered to the UE in the NAS PDU Session Establishment Accept;
+    /// the UPF routes downlink traffic to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ue_ipv4_addr: Option<Ipv4Addr>,
+    /// The UE's assigned IPv6 /64 prefix (`2001:db8:a:n::/64`) — present for IPv6 /
+    /// IPv4v6. The UE forms its global address from this via SLAAC (design/131 RA is
+    /// Phase C); carried for the AMF/UPF, not the NAS accept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ue_ipv6_prefix: Option<String>,
+    /// The IPv6 interface identifier (hex, 8 bytes) — present for IPv6 / IPv4v6. The
+    /// AMF puts this in the N1 accept's PDU Address IE.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ue_ipv6_iid: Option<String>,
+    /// A 5GSM cause set on a PDU-session-type downgrade (#50 IPv4-only / #51
+    /// IPv6-only) — the AMF carries it in the N1 accept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause5gsm: Option<u8>,
     /// The subscribed slice serving this DNN (from the UDR sm-data) — the AMF puts it
     /// in the N1 accept.
     s_nssai: Snssai,
@@ -346,6 +400,12 @@ struct SessionSubscription {
     snssai: Snssai,
     ambr: Option<SessionAmbrPolicy>,
     qos_flows: Vec<QosFlowPolicy>,
+    /// The DNN's allowed PDU session types (from sm-data `pduSessionTypes`), as
+    /// (allows-IPv4, allows-IPv6), plus the default — the SMF negotiates the
+    /// selected type against these (design/131).
+    allow_v4: bool,
+    allow_v6: bool,
+    default_type: nas::PduSessionType,
 }
 
 #[derive(Deserialize)]
@@ -429,6 +489,16 @@ async fn create_sm_context(
     )
     .await?;
 
+    // Negotiate the PDU session type (design/131): the UE's requested type against the
+    // DNN's allowed families. A downgrade (e.g. IPv4v6 requested, only IPv4 allowed)
+    // carries a 5GSM cause (#50/#51) in the Establishment Accept.
+    let requested_type = req
+        .pdu_session_type
+        .as_deref()
+        .and_then(nas::PduSessionType::from_name)
+        .unwrap_or(sub.default_type);
+    let (selected_type, cause5gsm) = negotiate_pdu_type(requested_type, sub.allow_v4, sub.allow_v6);
+
     // Ask the PCF for the SM policy (authorized session AMBR + QoS flows). When a
     // PCF is registered it is authoritative (TS 23.503 §6.1.3.5); otherwise fall
     // back to the sm-data policy fetched above. Done before the N4 establishment so
@@ -482,8 +552,12 @@ async fn create_sm_context(
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
     let seq = smf.next_seq();
     // The SMF owns UE IP allocation; the address rides into the UPF's downlink PDR so it
-    // can route N6 traffic back to this session.
+    // can route N6 traffic back to this session. A v4 is always allocated for the N4
+    // downlink PDR (Phase A plumbing); an IPv6 /64 + interface identifier is allocated
+    // when the selected type includes IPv6 (surfaced in the accept; the v6 datapath is
+    // design/131 Phase B).
     let ue_ip = smf.alloc_ue_ip();
+    let ue_ipv6 = selected_type.has_ipv6().then(|| smf.alloc_ue_ipv6());
     // Install the authorized session AMBR (a QER for the aggregate rate) plus a
     // per-flow QER + classifier for each GBR flow, so the UPF polices them.
     let ambr = ambr_bps(&decision);
@@ -564,6 +638,8 @@ async fn create_sm_context(
             n3_teid: est.n3_teid,
             n3_addr: est.n3_addr,
             ue_ip,
+            pdu_type: selected_type,
+            ue_ipv6,
             dnn: req.dnn.clone(),
             snssai: sub.snssai.clone(),
             gnb: None,
@@ -601,7 +677,11 @@ async fn create_sm_context(
             sm_context_ref: sm_ref,
             up_n3_teid: format!("{:08x}", est.n3_teid),
             up_n3_addr: est.n3_addr,
-            ue_ipv4_addr: ue_ip,
+            selected_pdu_session_type: selected_type.as_str().to_string(),
+            ue_ipv4_addr: selected_type.has_ipv4().then_some(ue_ip),
+            ue_ipv6_prefix: ue_ipv6.map(|(p, _)| format!("{p}/64")),
+            ue_ipv6_iid: ue_ipv6.map(|(_, iid)| hex::encode(iid)),
+            cause5gsm,
             s_nssai: sub.snssai,
             session_ambr: decision.session_ambr().cloned(),
             qos_flows: decision.qos_flows(),
@@ -614,6 +694,54 @@ fn dnn_in_info(info: &serde_json::Value, dnn: &str) -> bool {
     info.get("dnnInfos")
         .and_then(|v| v.as_array())
         .is_some_and(|dnns| dnns.iter().any(|d| d.get("dnn").and_then(|v| v.as_str()) == Some(dnn)))
+}
+
+/// The DNN's allowed PDU session types from sm-data `pduSessionTypes`: the
+/// `defaultSessionType` plus any `allowedSessionTypes`. Returns
+/// `(allows-IPv4, allows-IPv6, default)`, defaulting to IPv4-only when unset.
+fn parse_pdu_session_types(dnn_config: &serde_json::Value) -> (bool, bool, nas::PduSessionType) {
+    let pt = dnn_config.get("pduSessionTypes");
+    let default_type = pt
+        .and_then(|p| p.get("defaultSessionType"))
+        .and_then(|v| v.as_str())
+        .and_then(nas::PduSessionType::from_name)
+        .unwrap_or(nas::PduSessionType::Ipv4);
+    let mut allow_v4 = default_type.has_ipv4();
+    let mut allow_v6 = default_type.has_ipv6();
+    if let Some(arr) = pt.and_then(|p| p.get("allowedSessionTypes")).and_then(|v| v.as_array()) {
+        for t in arr.iter().filter_map(|v| v.as_str()).filter_map(nas::PduSessionType::from_name) {
+            allow_v4 |= t.has_ipv4();
+            allow_v6 |= t.has_ipv6();
+        }
+    }
+    (allow_v4, allow_v6, default_type)
+}
+
+/// Negotiate the selected PDU session type from the UE's requested type and the DNN's
+/// allowed families (TS 24.501; mirrors free5gc's `IsAllowedPDUSessionType`). Returns
+/// the selected type and, on a downgrade, the 5GSM cause (#50 IPv4-only / #51
+/// IPv6-only) the Establishment Accept carries.
+fn negotiate_pdu_type(
+    requested: nas::PduSessionType,
+    allow_v4: bool,
+    allow_v6: bool,
+) -> (nas::PduSessionType, Option<u8>) {
+    use nas::PduSessionType::{Ipv4, Ipv4v6, Ipv6};
+    use nas::sm_cause::{
+        PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED as V4_ONLY, PDU_SESSION_TYPE_IPV6_ONLY_ALLOWED as V6_ONLY,
+    };
+    match requested {
+        Ipv4v6 => match (allow_v4, allow_v6) {
+            (true, true) => (Ipv4v6, None),
+            (true, false) => (Ipv4, Some(V4_ONLY)),
+            (false, true) => (Ipv6, Some(V6_ONLY)),
+            (false, false) => (Ipv4, Some(V4_ONLY)), // nothing allowed — default to IPv4
+        },
+        Ipv4 if allow_v4 => (Ipv4, None),
+        Ipv4 => (Ipv6, Some(V6_ONLY)),
+        Ipv6 if allow_v6 => (Ipv6, None),
+        Ipv6 => (Ipv4, Some(V4_ONLY)),
+    }
 }
 
 /// Fetch and authorize the session-management subscription for (`supi`, `plmn`,
@@ -735,7 +863,8 @@ async fn fetch_session_subscription(
             extra.iter().filter_map(|f| serde_json::from_value::<QosFlowPolicy>(f.clone()).ok()),
         );
     }
-    Ok(SessionSubscription { snssai, ambr, qos_flows })
+    let (allow_v4, allow_v6, default_type) = parse_pdu_session_types(dnn_config);
+    Ok(SessionSubscription { snssai, ambr, qos_flows, allow_v4, allow_v6, default_type })
 }
 
 /// Discover the base URL of the first registered NF of `nf_type` via the NRF.
@@ -803,7 +932,11 @@ async fn update_sm_context(
                     sm_context_ref: sm_ref.clone(),
                     up_n3_teid: format!("{:08x}", c.n3_teid),
                     up_n3_addr: c.n3_addr,
-                    ue_ipv4_addr: c.ue_ip,
+                    selected_pdu_session_type: c.pdu_type.as_str().to_string(),
+                    ue_ipv4_addr: c.pdu_type.has_ipv4().then_some(c.ue_ip),
+                    ue_ipv6_prefix: c.ue_ipv6.map(|(p, _)| format!("{p}/64")),
+                    ue_ipv6_iid: c.ue_ipv6.map(|(_, iid)| hex::encode(iid)),
+                    cause5gsm: None,
                     s_nssai: c.snssai.clone(),
                     session_ambr: c.policy.session_ambr().cloned(),
                     qos_flows: c.policy.qos_flows(),
@@ -1449,7 +1582,8 @@ fn masked_supi(supi: &str) -> String {
 /// The `(sst, optional SD, DNN)` triples this SMF serves — advertised in its NRF
 /// profile so the AMF can select it by `(S-NSSAI, DNN)`. Config in production;
 /// here the demo slice + DNN, matching the UDR's smf-selection provisioning.
-const SERVED_SLICES: &[(u8, Option<&str>, &str)] = &[(1, Some("010203"), "internet")];
+const SERVED_SLICES: &[(u8, Option<&str>, &str)] =
+    &[(1, Some("010203"), "internet"), (1, Some("010203"), "ims")];
 
 /// Register this SMF's `nsmf-pdusession` service with the NRF (advertising the
 /// slices/DNNs it serves so the AMF can select it), keeping it alive via the
@@ -1474,6 +1608,43 @@ pub async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PDU-session-type negotiation (design/131): the selected type + downgrade cause
+    /// for every (requested × allowed) combination.
+    #[test]
+    fn negotiates_pdu_session_type() {
+        use nas::PduSessionType::{Ipv4, Ipv4v6, Ipv6};
+        let v4_only = 50;
+        let v6_only = 51;
+        // Dual-stack allowed: requests are granted as-is.
+        assert_eq!(negotiate_pdu_type(Ipv4v6, true, true), (Ipv4v6, None));
+        assert_eq!(negotiate_pdu_type(Ipv4, true, true), (Ipv4, None));
+        assert_eq!(negotiate_pdu_type(Ipv6, true, true), (Ipv6, None));
+        // IPv4-only DNN: IPv4v6/IPv6 downgrade to IPv4 with cause #50.
+        assert_eq!(negotiate_pdu_type(Ipv4v6, true, false), (Ipv4, Some(v4_only)));
+        assert_eq!(negotiate_pdu_type(Ipv6, true, false), (Ipv4, Some(v4_only)));
+        assert_eq!(negotiate_pdu_type(Ipv4, true, false), (Ipv4, None));
+        // IPv6-only DNN: IPv4v6/IPv4 downgrade to IPv6 with cause #51.
+        assert_eq!(negotiate_pdu_type(Ipv4v6, false, true), (Ipv6, Some(v6_only)));
+        assert_eq!(negotiate_pdu_type(Ipv4, false, true), (Ipv6, Some(v6_only)));
+        assert_eq!(negotiate_pdu_type(Ipv6, false, true), (Ipv6, None));
+    }
+
+    /// The DNN's allowed families are read from sm-data `pduSessionTypes`
+    /// (default + allowed list); an unset config is IPv4-only.
+    #[test]
+    fn parses_allowed_session_types() {
+        let dual = serde_json::json!({
+            "pduSessionTypes": { "defaultSessionType": "IPV4", "allowedSessionTypes": ["IPV4", "IPV6"] }
+        });
+        assert_eq!(parse_pdu_session_types(&dual), (true, true, nas::PduSessionType::Ipv4));
+        let v4 = serde_json::json!({ "pduSessionTypes": { "defaultSessionType": "IPV4" } });
+        assert_eq!(parse_pdu_session_types(&v4), (true, false, nas::PduSessionType::Ipv4));
+        // IPV4V6 default implies both families; a bare config defaults to IPv4-only.
+        let both = serde_json::json!({ "pduSessionTypes": { "defaultSessionType": "IPV4V6" } });
+        assert_eq!(parse_pdu_session_types(&both), (true, true, nas::PduSessionType::Ipv4v6));
+        assert_eq!(parse_pdu_session_types(&serde_json::json!({})), (true, false, nas::PduSessionType::Ipv4));
+    }
 
     #[test]
     fn rejects_bogus_gnb_targets() {
@@ -1729,9 +1900,10 @@ mod tests {
         assert!(created.qos_flows[1].gbr.is_some(), "the second flow is GBR");
         assert_eq!(
             created.ue_ipv4_addr,
-            Ipv4Addr::new(10, 45, 0, 2),
+            Some(Ipv4Addr::new(10, 45, 0, 2)),
             "SMF allocated a UE IP from the pool"
         );
+        assert_eq!(created.selected_pdu_session_type, "IPV4", "default session type");
         assert_eq!(upf_state.lock().unwrap().session_count(), 1, "N4 session established");
 
         // AMF → SMF: UpdateSMContext with the gNB's downlink F-TEID (from N2 setup).
