@@ -140,10 +140,10 @@ async fn serve_n4(
         };
         // Remember the control plane's address for UPF-initiated reports.
         *smf_addr.lock().unwrap() = Some(peer);
-        let (resp, flush, end_markers) = {
+        let (resp, flush, end_markers, ras) = {
             let mut g = state.lock().unwrap();
             let resp = pfcp::handle_n4(&buf[..n], node_ip, &mut g, now_nanos());
-            (resp, g.take_flush(), g.take_end_markers())
+            (resp, g.take_flush(), g.take_end_markers(), g.take_pending_ra())
         };
         // A re-activation (Service Request resume) flushes the packets buffered while
         // the UE was CM-IDLE onto its restored gNB tunnel.
@@ -164,6 +164,17 @@ async fn serve_n4(
                 warn!(%gnb_ip, "End Marker send error: {e}");
             } else {
                 info!(%gnb_ip, gnb_teid, "sent a GTP-U End Marker on the old downlink tunnel (path switch)");
+            }
+        }
+        // A v6 session's downlink just came up: send an unsolicited Router Advertisement
+        // over N3 so the UE can form its address via SLAAC (design/131 Phase C).
+        for (gnb_teid, gnb_ip, prefix) in ras {
+            let dst = SocketAddrV4::new(gnb_ip, gtpu::GTPU_PORT);
+            let ra = n6::router_advertisement(prefix, 64, n6::ALL_NODES);
+            if let Err(e) = n3.send_to(&gtpu::encap(gnb_teid, &ra), dst).await {
+                warn!(%gnb_ip, "unsolicited RA send error: {e}");
+            } else {
+                info!(%gnb_ip, %prefix, "sent an unsolicited Router Advertisement (SLAAC) to the UE");
             }
         }
         match resp {
@@ -275,6 +286,23 @@ async fn serve_n3(socket: Arc<tokio::net::UdpSocket>, state: Upf, tun: Option<Ar
                     }
                     n6::Uplink::RateLimited => {
                         trace!(teid, "N3 uplink over session AMBR — policed (dropped)")
+                    }
+                    // Answer the UE's Router Solicitation with a Router Advertisement
+                    // over N3 (design/131 Phase C) — its /64 + gNB target from the table.
+                    n6::Uplink::RouterSolicitation => {
+                        let target = { state.lock().unwrap().ra_target_for_teid(teid) };
+                        match target {
+                            Some((prefix, gnb_teid, gnb_ip)) => {
+                                let ra = n6::router_advertisement(prefix, 64, n6::ALL_NODES);
+                                let dst = SocketAddrV4::new(gnb_ip, gtpu::GTPU_PORT);
+                                if let Err(e) = socket.send_to(&gtpu::encap(gnb_teid, &ra), dst).await {
+                                    warn!(teid, "RA send error: {e}");
+                                } else {
+                                    info!(teid, %prefix, "answered a Router Solicitation with an RA (SLAAC)");
+                                }
+                            }
+                            None => trace!(teid, "Router Solicitation but no v6 downlink target — dropped"),
+                        }
                     }
                 }
             }

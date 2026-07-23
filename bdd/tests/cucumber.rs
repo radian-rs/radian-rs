@@ -930,6 +930,28 @@ async fn ue_reaches_dn_over_datapath_v6(world: &mut World, gw: String) {
     assert!(ok, "no ICMPv6 echo reply returned through the signalled N3/N6 datapath");
 }
 
+#[then(regex = r#"^the UE configures its IPv6 address via SLAAC and reaches the gateway "([^"]+)"$"#)]
+async fn ue_slaac_and_reaches_gw(world: &mut World, gw: String) {
+    let gw_ip: Ipv6Addr = gw.parse().expect("valid IPv6 gateway");
+    // Only the interface identifier is known from the accept; the /64 prefix must come
+    // from the Router Advertisement the UPF sends in answer to a Router Solicitation
+    // (design/131 Phase C) — real SLAAC, no out-of-band prefix.
+    let iid = world.ue_v6_iid.expect("the UE read an IPv6 interface identifier");
+    let uplink_teid = world.uplink_teid.expect("the UPF uplink F-TEID was learned");
+    let upf_addr = world.upf_n3_addr.expect("the UPF N3 address was learned");
+    let ok = datapath::slaac_and_ping_v6(
+        SocketAddrV4::new(GNB_N3_IP, N3_PORT),
+        SocketAddrV4::new(upf_addr, N3_PORT),
+        uplink_teid,
+        SCRIPTED_GNB_DL_TEID,
+        iid,
+        gw_ip,
+    )
+    .await
+    .expect("run SLAAC + the datapath echo");
+    assert!(ok, "the UE did not SLAAC from a Router Advertisement and reach the gateway");
+}
+
 /// Parse a comma-separated TAC list like `"000001,000002"` into 3-byte TACs.
 fn parse_tacs(spec: &str) -> Vec<[u8; 3]> {
     spec.split(',').filter(|s| !s.is_empty()).map(parse_tac).collect()

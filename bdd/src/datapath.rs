@@ -211,6 +211,110 @@ pub async fn ping_through_datapath_v6(
     Ok(false)
 }
 
+/// A minimal ICMPv6 **Router Solicitation** (type 133) from a UE link-local to the
+/// all-routers multicast — the UE asks the UPF for a prefix (design/131 Phase C).
+fn router_solicitation() -> Vec<u8> {
+    let src: Ipv6Addr = "fe80::1234".parse().unwrap();
+    let dst: Ipv6Addr = "ff02::2".parse().unwrap();
+    let mut icmp = vec![133u8, 0, 0, 0, 0, 0, 0, 0]; // type, code, checksum, reserved(4)
+    let c = icmpv6_checksum(src, dst, &icmp);
+    icmp[2..4].copy_from_slice(&c.to_be_bytes());
+    let mut ip = vec![0x60, 0x00, 0x00, 0x00];
+    ip.extend_from_slice(&(icmp.len() as u16).to_be_bytes());
+    ip.push(58); // next header: ICMPv6
+    ip.push(255); // hop limit (RFC 4861)
+    ip.extend_from_slice(&src.octets());
+    ip.extend_from_slice(&dst.octets());
+    ip.extend_from_slice(&icmp);
+    ip
+}
+
+/// Parse the /64 prefix from an ICMPv6 **Router Advertisement** (type 134) Prefix
+/// Information option — the UE's own parser (independent of the UPF's builder, so the
+/// wire format is validated, not round-tripped through shared code).
+fn ra_prefix_of(pkt: &[u8]) -> Option<Ipv6Addr> {
+    if pkt.len() < 41 || pkt[0] >> 4 != 6 || pkt[6] != 58 || pkt[40] != 134 {
+        return None;
+    }
+    let mut i = 40 + 16; // options follow the IPv6 header + the RA header
+    while i + 32 <= pkt.len() {
+        let opt_len = pkt[i + 1] as usize * 8;
+        if opt_len == 0 {
+            break;
+        }
+        if pkt[i] == 3 {
+            // Prefix Information option: the prefix is octets 16..32.
+            return <[u8; 16]>::try_from(&pkt[i + 16..i + 32]).ok().map(Ipv6Addr::from);
+        }
+        i += opt_len;
+    }
+    None
+}
+
+/// Perform real **SLAAC** and then a datapath echo over IPv6 (design/131 Phase C): send
+/// a Router Solicitation, receive the Router Advertisement answer, form the address
+/// `prefix ‖ iid` from the RA's prefix alone (no out-of-band prefix), and ping the
+/// gateway. Returns `true` only if the RA arrived *and* the echo reply came back.
+pub async fn slaac_and_ping_v6(
+    gnb_bind: SocketAddrV4,
+    upf_n3: SocketAddrV4,
+    uplink_teid: u32,
+    gnb_teid: u32,
+    iid: [u8; 8],
+    gw_ip: Ipv6Addr,
+) -> Result<bool> {
+    let gnb = UdpSocket::bind(gnb_bind).await.context("bind gNB N3 socket")?;
+    let mut buf = vec![0u8; 2048];
+
+    // Solicit a Router Advertisement and read the prefix from its answer.
+    let rs = router_solicitation();
+    let mut prefix = None;
+    for _ in 0..3 {
+        gnb.send_to(&gtpu::encap(uplink_teid, &rs), upf_n3).await.context("send Router Solicitation")?;
+        let until = tokio::time::Instant::now() + Duration::from_secs(1);
+        while let Ok(Ok((n, _))) =
+            timeout(until.saturating_duration_since(tokio::time::Instant::now()), gnb.recv_from(&mut buf)).await
+        {
+            if let Some((teid, inner)) = gtpu::decap(&buf[..n])
+                && teid == gnb_teid
+                && let Some(p) = ra_prefix_of(inner)
+            {
+                prefix = Some(p);
+                break;
+            }
+        }
+        if prefix.is_some() {
+            break;
+        }
+    }
+    let Some(prefix) = prefix else {
+        return Ok(false); // the Router Solicitation was not answered — SLAAC failed
+    };
+
+    // Form the global address from the RA's prefix + the network-suggested IID.
+    let mut a = prefix.octets();
+    a[8..16].copy_from_slice(&iid);
+    let ue_ip = Ipv6Addr::from(a);
+
+    // Ping the gateway using the SLAAC-configured address.
+    for seq in 1..=3u16 {
+        let echo = icmpv6_echo_request(ue_ip, gw_ip, 0x5100, seq, b"radian-slaac");
+        gnb.send_to(&gtpu::encap(uplink_teid, &echo), upf_n3).await.context("send uplink G-PDU")?;
+        let until = tokio::time::Instant::now() + Duration::from_secs(1);
+        while let Ok(Ok((n, _))) =
+            timeout(until.saturating_duration_since(tokio::time::Instant::now()), gnb.recv_from(&mut buf)).await
+        {
+            if let Some((teid, inner)) = gtpu::decap(&buf[..n])
+                && teid == gnb_teid
+                && is_icmpv6_echo_reply(inner, gw_ip, ue_ip)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Bind a gNB N3 (GTP-U) socket at `addr` and keep it — used to receive a downlink
 /// G-PDU the UPF flushes after a CM-IDLE resume, which requires the socket to already
 /// be listening when the flush arrives.
