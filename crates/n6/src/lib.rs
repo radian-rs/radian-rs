@@ -62,6 +62,9 @@ pub enum Uplink<'a> {
     Spoofed { claimed: IpAddr, assigned: IpAddr },
     /// The session's uplink AMBR is exceeded — policed (dropped).
     RateLimited,
+    /// The UE sent an ICMPv6 **Router Solicitation** — the UPF answers it with a Router
+    /// Advertisement (design/131 Phase C) rather than forwarding it to N6.
+    RouterSolicitation,
 }
 
 /// Decide the fate of an uplink packet (`inner`) that arrived on N3 under `teid`,
@@ -74,6 +77,11 @@ pub enum Uplink<'a> {
 pub fn uplink<'a>(state: &mut UpfState, teid: u32, inner: &'a [u8], now_nanos: u64) -> Uplink<'a> {
     if !state.knows_teid(teid) {
         return Uplink::UnknownTeid;
+    }
+    // A Router Solicitation (from the UE's link-local, so it fails the /64 spoof check)
+    // is answered with a Router Advertisement, not forwarded (design/131 Phase C).
+    if state.ue_ipv6_for_teid(teid).is_some() && is_router_solicitation(inner) {
+        return Uplink::RouterSolicitation;
     }
     if let Some((src, _dst)) = ipv4_addrs(inner) {
         if let Some(ue_ip) = state.ue_ip_for_teid(teid)
@@ -137,6 +145,106 @@ pub fn downlink(state: &mut UpfState, pkt: &[u8], now_nanos: u64) -> Downlink {
     } else {
         Downlink::Unsupported
     }
+}
+
+// ── IPv6 Router Advertisement / SLAAC (design/131 Phase C, RFC 4861) ─────────────────
+
+/// The UPF's link-local address acting as the on-link router (RFC 4861 §6).
+const ROUTER_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+/// The IPv6 all-nodes multicast address — the destination of an unsolicited RA.
+pub const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+
+/// The internet checksum (RFC 1071): one's-complement sum of 16-bit words.
+fn checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut chunks = data.chunks_exact(2);
+    for c in &mut chunks {
+        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+    }
+    if let [last] = chunks.remainder() {
+        sum += (*last as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// The ICMPv6 checksum (RFC 4443 §2.3): over the IPv6 pseudo-header + the message.
+fn icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, icmp: &[u8]) -> u16 {
+    let mut buf = Vec::with_capacity(40 + icmp.len());
+    buf.extend_from_slice(&src.octets());
+    buf.extend_from_slice(&dst.octets());
+    buf.extend_from_slice(&(icmp.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&[0, 0, 0, 58]); // zeros + next header (ICMPv6)
+    buf.extend_from_slice(icmp);
+    checksum(&buf)
+}
+
+/// Wrap an ICMPv6 message in a 40-byte IPv6 header from `src` to `dst`.
+fn ipv6_icmp_packet(src: Ipv6Addr, dst: Ipv6Addr, hop_limit: u8, icmp: &[u8]) -> Vec<u8> {
+    let mut ip = vec![0x60, 0x00, 0x00, 0x00];
+    ip.extend_from_slice(&(icmp.len() as u16).to_be_bytes()); // payload length
+    ip.push(58); // next header: ICMPv6
+    ip.push(hop_limit);
+    ip.extend_from_slice(&src.octets());
+    ip.extend_from_slice(&dst.octets());
+    ip.extend_from_slice(icmp);
+    ip
+}
+
+/// Build an ICMPv6 **Router Advertisement** (RFC 4861 §4.2) carrying `prefix`/`prefix_len`
+/// as a Prefix Information option with the **A** (autonomous SLAAC) + **L** (on-link)
+/// flags, so a UE forms its global address `prefix ‖ IID`. Sent from the router
+/// link-local to `dst` (the all-nodes multicast for an unsolicited RA, or the
+/// solicitor). M=O=0 (no DHCPv6); hop limit 255 (RFC 4861 requires it).
+pub fn router_advertisement(prefix: Ipv6Addr, prefix_len: u8, dst: Ipv6Addr) -> Vec<u8> {
+    let mut icmp = Vec::with_capacity(48);
+    icmp.extend_from_slice(&[134, 0, 0, 0]); // type=134 (RA), code=0, checksum placeholder
+    icmp.push(64); // cur hop limit advertised to hosts
+    icmp.push(0x00); // flags: M=0, O=0
+    icmp.extend_from_slice(&1800u16.to_be_bytes()); // router lifetime (s)
+    icmp.extend_from_slice(&0u32.to_be_bytes()); // reachable time
+    icmp.extend_from_slice(&0u32.to_be_bytes()); // retransmit timer
+    // Prefix Information option (type 3, length 4×8 = 32 bytes).
+    icmp.extend_from_slice(&[3, 4, prefix_len, 0xC0]); // type, len, prefix len, flags L|A
+    icmp.extend_from_slice(&86_400u32.to_be_bytes()); // valid lifetime (s)
+    icmp.extend_from_slice(&14_400u32.to_be_bytes()); // preferred lifetime (s)
+    icmp.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    icmp.extend_from_slice(&prefix.octets()); // the /64 prefix
+    let c = icmpv6_checksum(ROUTER_LINK_LOCAL, dst, &icmp);
+    icmp[2..4].copy_from_slice(&c.to_be_bytes());
+    ipv6_icmp_packet(ROUTER_LINK_LOCAL, dst, 255, &icmp)
+}
+
+/// Whether a bare IP packet is an ICMPv6 **Router Solicitation** (type 133). Assumes
+/// no extension headers (the UE's ND packets carry none).
+pub fn is_router_solicitation(pkt: &[u8]) -> bool {
+    pkt.len() >= 41 && pkt[0] >> 4 == 6 && pkt[6] == 58 && pkt[40] == 133
+}
+
+/// The Prefix Information `(prefix, prefix_len)` from an ICMPv6 **Router Advertisement**
+/// (type 134) — a UE reads the /64 to run SLAAC. `None` if `pkt` is not an RA or carries
+/// no Prefix Information option.
+pub fn ra_prefix(pkt: &[u8]) -> Option<(Ipv6Addr, u8)> {
+    if pkt.len() < 41 || pkt[0] >> 4 != 6 || pkt[6] != 58 || pkt[40] != 134 {
+        return None;
+    }
+    // Options follow the 40-byte IPv6 header + the 16-byte RA header.
+    let mut i = 40 + 16;
+    while i + 8 <= pkt.len() {
+        let opt_len = pkt[i + 1] as usize * 8; // ND option length is in units of 8 octets
+        if opt_len == 0 {
+            break;
+        }
+        if pkt[i] == 3 && i + 32 <= pkt.len() {
+            let prefix_len = pkt[i + 2];
+            let prefix = Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[i + 16..i + 32]).ok()?);
+            return Some((prefix, prefix_len));
+        }
+        i += opt_len;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -322,6 +430,47 @@ mod tests {
         // A destination outside any session's /64 is unrouted.
         let stranger = ipv6_packet(GW_V6, Ipv6Addr::new(0x2001, 0xdb8, 0xff, 1, 0, 0, 0, 1), b"x");
         assert_eq!(downlink(&mut state, &stranger, 0), Downlink::NoRoute);
+    }
+
+    /// A minimal ICMPv6 Router Solicitation (type 133) from a UE link-local.
+    fn router_solicitation() -> Vec<u8> {
+        let src = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x1234);
+        let dst = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2); // all-routers
+        let mut icmp = vec![133u8, 0, 0, 0, 0, 0, 0, 0]; // type, code, checksum, reserved(4)
+        let c = icmpv6_checksum(src, dst, &icmp);
+        icmp[2..4].copy_from_slice(&c.to_be_bytes());
+        ipv6_icmp_packet(src, dst, 255, &icmp)
+    }
+
+    #[test]
+    fn router_advertisement_roundtrips_and_checksum_valid() {
+        let ra = router_advertisement(UE_V6_PREFIX, 64, ALL_NODES);
+        assert_eq!(ra[0] >> 4, 6, "IPv6");
+        assert_eq!(ra[6], 58, "ICMPv6");
+        assert_eq!(ra[40], 134, "Router Advertisement");
+        assert_eq!(ra_prefix(&ra), Some((UE_V6_PREFIX, 64)), "the Prefix Information round-trips");
+        // The A + L flags are set (autonomous SLAAC + on-link) at the option's 4th byte.
+        assert_eq!(ra[40 + 16 + 3], 0xC0, "prefix flags: L|A");
+        assert_eq!(icmpv6_checksum(ROUTER_LINK_LOCAL, ALL_NODES, &ra[40..]), 0, "ICMPv6 checksum valid");
+    }
+
+    #[test]
+    fn detects_router_solicitation() {
+        let rs = router_solicitation();
+        assert!(is_router_solicitation(&rs));
+        let ra = router_advertisement(UE_V6_PREFIX, 64, ALL_NODES);
+        assert!(!is_router_solicitation(&ra), "an RA is not an RS");
+        assert_eq!(ra_prefix(&rs), None, "an RS carries no prefix");
+    }
+
+    #[test]
+    fn uplink_router_solicitation_is_answered_not_forwarded() {
+        let (mut state, teid) = established_upf_v6();
+        assert_eq!(
+            uplink(&mut state, teid, &router_solicitation(), 0),
+            Uplink::RouterSolicitation,
+            "a Router Solicitation on a v6 session is answered with an RA"
+        );
     }
 
     /// A session AMBR provisioned via QER polices both directions: a burst is

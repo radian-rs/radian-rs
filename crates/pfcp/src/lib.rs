@@ -441,6 +441,10 @@ pub struct UpfState {
     /// GTP-U End Markers to send on N3 after a downlink path switch, as the **old**
     /// `(gNB TEID, gNB IP)` — drained by [`take_end_markers`](UpfState::take_end_markers).
     pending_end_markers: Vec<(u32, Ipv4Addr)>,
+    /// Unsolicited IPv6 Router Advertisements to send on N3 once a v6 session's
+    /// downlink is installed, as `(gNB TEID, gNB IP, /64 prefix)` — drained by
+    /// [`take_pending_ra`](UpfState::take_pending_ra) (design/131 Phase C).
+    pending_ra: Vec<(u32, Ipv4Addr, Ipv6Addr)>,
 }
 
 impl Default for UpfState {
@@ -458,6 +462,7 @@ impl UpfState {
             sessions: HashMap::new(),
             pending_flush: Vec::new(),
             pending_end_markers: Vec::new(),
+            pending_ra: Vec::new(),
         }
     }
 
@@ -640,10 +645,16 @@ impl UpfState {
         s.downlink = Some((gnb_teid, gnb_ip));
         s.buffering = false;
         s.dl_data_report_due = false;
+        let ue_ipv6 = s.ue_ipv6;
         let flushed: Vec<(u32, Ipv4Addr, Vec<u8>)> =
             s.dl_buffer.drain(..).map(|pkt| (gnb_teid, gnb_ip, pkt)).collect();
         if !flushed.is_empty() {
             self.pending_flush.extend(flushed);
+        }
+        // Queue an unsolicited Router Advertisement so a v6 UE can SLAAC as soon as its
+        // downlink tunnel is up (design/131 Phase C) — also re-sent on a resume.
+        if let Some(prefix) = ue_ipv6 {
+            self.pending_ra.push((gnb_teid, gnb_ip, prefix));
         }
         true
     }
@@ -700,6 +711,24 @@ impl UpfState {
     /// [`gtpu::end_marker`] for each and sends it to the gNB's N3 address.
     pub fn take_end_markers(&mut self) -> Vec<(u32, Ipv4Addr)> {
         std::mem::take(&mut self.pending_end_markers)
+    }
+
+    /// Drain the pending unsolicited **Router Advertisements** to send on N3, as
+    /// `(gNB TEID, gNB IP, /64 prefix)` — the caller builds `n6::router_advertisement`
+    /// for each and GTP-U-encapsulates it toward the gNB (design/131 Phase C).
+    pub fn take_pending_ra(&mut self) -> Vec<(u32, Ipv4Addr, Ipv6Addr)> {
+        std::mem::take(&mut self.pending_ra)
+    }
+
+    /// For a Router Solicitation arriving on uplink `teid`: the session's /64 prefix and
+    /// its installed gNB downlink target `(prefix, gNB TEID, gNB IP)`, so the caller can
+    /// build + send the answering Router Advertisement. `None` if the TEID is unknown,
+    /// the session has no IPv6 prefix, or its downlink isn't installed yet.
+    pub fn ra_target_for_teid(&self, teid: u32) -> Option<(Ipv6Addr, u32, Ipv4Addr)> {
+        let s = self.sessions.values().find(|s| s.n3_teid == teid)?;
+        let prefix = s.ue_ipv6?;
+        let (gnb_teid, gnb_ip) = s.downlink?;
+        Some((prefix, gnb_teid, gnb_ip))
     }
 
     /// Whether a session owning `dst` is currently buffering (test/inspection).
@@ -1535,6 +1564,20 @@ mod tests {
             "a downlink to any address in the /64 routes to the session's gNB"
         );
         assert_eq!(state.route_downlink_v6(stranger), None, "an address outside the /64 is unrouted");
+
+        // Installing the downlink queued an unsolicited Router Advertisement for SLAAC
+        // (design/131 Phase C), and an RS on the uplink TEID can be answered.
+        assert_eq!(
+            state.take_pending_ra(),
+            vec![(0x5678, gnb_ip, prefix)],
+            "installing a v6 downlink queues an unsolicited RA"
+        );
+        assert!(state.take_pending_ra().is_empty(), "the RA queue drains once");
+        assert_eq!(
+            state.ra_target_for_teid(1),
+            Some((prefix, 0x5678, gnb_ip)),
+            "an RS on the uplink TEID resolves to the /64 + gNB target"
+        );
     }
 
     #[test]
