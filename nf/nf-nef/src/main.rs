@@ -17,6 +17,9 @@ const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 /// Reach the SMF at an explicit base URL instead of via NRF discovery (a deployment
 /// without an NRF, or a test rig).
 const SMF_ENV: &str = "RADIAN_NEF_SMF";
+/// Authorize influences through this PCF instead of discovering one. Set to `none` to
+/// force the PCF-less path (drive the SMF directly, design/135 Phase 1).
+const PCF_ENV: &str = "RADIAN_NEF_PCF";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,18 +39,29 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => warn!("NRF registration failed (continuing without discovery): {e}"),
     }
 
-    // Prefer an explicit SMF base if set; otherwise discover the SMF via the NRF.
-    let state = match std::env::var(SMF_ENV) {
+    // Prefer an explicit SMF base if set; otherwise discover peers via the NRF.
+    let mut state = match std::env::var(SMF_ENV) {
         Ok(smf) => {
             let smf = sbi_core::sbi_base(smf);
-            info!(%smf, "NEF up: AF traffic influence → SMF (explicit base)");
+            info!(%smf, "NEF up: AF traffic influence (explicit SMF base)");
             sbi_core::nnef::NefState::with_smf_base(smf)
         }
         Err(_) => {
-            info!("NEF up: AF traffic influence → SMF (via NRF discovery)");
+            info!("NEF up: AF traffic influence (peers via NRF discovery)");
             sbi_core::nnef::NefState::new(nrf_base)
         }
     };
+    // With a PCF, an influence is authorized through it (Npcf_PolicyAuthorization) so the
+    // route lands in the SM policy and composes with QoS (design/135 Phase 2b).
+    match std::env::var(PCF_ENV).as_deref() {
+        Ok("none") => info!("PCF path disabled — influences drive the SMF directly"),
+        Ok(pcf) => {
+            let pcf = sbi_core::sbi_base(pcf);
+            info!(%pcf, "influences authorized through the PCF");
+            state = state.with_pcf_base(pcf);
+        }
+        Err(_) => {}
+    }
 
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     match tls {

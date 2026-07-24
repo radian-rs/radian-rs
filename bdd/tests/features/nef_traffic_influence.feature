@@ -3,15 +3,17 @@
 Feature: NEF — AF traffic influence steers a live session's traffic to a local edge
   As a radian-rs developer
   I want an AF's traffic-influence request, through the NEF, to change the datapath live
-  So that design/135 Phase 1 (NEF → SMF → ULCL) is proven end-to-end with real packets —
-  the production front door for the mid-session breakout of design/134 Phase 3e.
+  So that the full AF → NEF → PCF → SMF → ULCL chain (design/135) is proven end-to-end with
+  real packets — the production front door for the mid-session breakout of design/134 3e.
 
   Same three UPFs as @ulcl_mid_session — the anchor (10.45.0.1), the classifier, and the
   breakout anchor (10.99.0.1 on n6upf1) exposing DNAI "mec" — plus a running NEF. The
   topology carries no route, so the session is a plain chain reaching the default DN. Then
   an AF posts a traffic-influence subscription to the NEF ("steer 10.99.0.0/16 to DNAI
-  mec"); the NEF resolves it to the SMF's breakout trigger, and the UE reaches the edge DN
-  that was unreachable a moment earlier — the NEF drove a live ULCL insertion.
+  mec"). The NEF authorizes it at the PCF (Npcf_PolicyAuthorization), which folds the route
+  into the session's SM policy and notifies the SMF on the notificationUri it registered;
+  the SMF re-authorizes, resolves the DNAI through its topology, and splices the breakout.
+  The UE then reaches the edge DN that was unreachable a moment earlier.
 
   Scenario: An AF influences a live session's traffic to a breakout edge
     Given a clean test environment

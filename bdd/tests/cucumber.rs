@@ -523,9 +523,21 @@ async fn start_core_inner(world: &mut World, mode: UpMode) {
 
     // A NEF (design/135) front-doors AF traffic influence onto the SMF's breakout trigger.
     // Point it straight at the SMF (RADIAN_NEF_SMF) so it needs no NRF discovery timing.
+    // The NEF authorizes the influence at the PCF (Npcf_PolicyAuthorization, design/135
+    // Phase 2b), which folds the route into the session's SM policy and notifies the SMF —
+    // the full AF → NEF → PCF → SMF production chain, rather than the NEF→SMF shortcut.
     if mode == UpMode::BreakoutViaNef {
         world.procs.push(
-            spawn_core(&tag, false, &[("RADIAN_NEF_SMF", "http://127.0.0.1:8002")], "nef").await,
+            spawn_core(
+                &tag,
+                false,
+                &[
+                    ("RADIAN_NEF_SMF", "http://127.0.0.1:8002"),
+                    ("RADIAN_NEF_PCF", "http://127.0.0.1:8006"),
+                ],
+                "nef",
+            )
+            .await,
         );
         assert!(
             wait_until(5, || netns::host_port_listening(8009, "tcp")).await,
