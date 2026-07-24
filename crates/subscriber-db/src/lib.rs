@@ -106,6 +106,17 @@ pub trait ProvisionedDataStore: Send + Sync {
     ) -> Result<(), String>;
     /// Purge a serving-SMF registration. Returns whether one existed.
     fn remove_smf_registration(&self, supi: &str, pdu_session_id: u8) -> bool;
+    /// Store (create or replace) an **application influence-data** document
+    /// (TS 29.519 `/application-data/influenceData/{influenceId}`) — an AF's traffic
+    /// influence for a *group of UEs or any UE*, so it is keyed by influence id rather
+    /// than by subscriber (design/135 Phase 3).
+    fn put_influence_data(&self, influence_id: &str, doc: &serde_json::Value)
+    -> Result<(), String>;
+    /// Purge an influence-data document. Returns whether one existed.
+    fn remove_influence_data(&self, influence_id: &str) -> bool;
+    /// Every influence-data document as `(influenceId, document)` — the PCF scans these
+    /// to find the ones that apply to a session's DNN/slice.
+    fn list_influence_data(&self) -> Vec<(String, serde_json::Value)>;
     /// Every serving-AMF registration as `(SUPI, document)` — for stale-eviction
     /// sweeps that check each `amfInstanceId` against NF liveness.
     fn list_amf_registrations(&self) -> Vec<(String, serde_json::Value)>;
@@ -186,6 +197,8 @@ struct InMemoryInner {
     docs: HashMap<(DataSet, String, String), serde_json::Value>,
     amf_reg: HashMap<String, serde_json::Value>,
     smf_reg: HashMap<(String, u8), serde_json::Value>,
+    /// Application influence data by influence id (design/135 Phase 3).
+    influence: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Default)]
@@ -302,6 +315,29 @@ impl ProvisionedDataStore for InMemoryStore {
         self.inner.lock().unwrap().smf_reg.remove(&(supi.to_string(), pdu_session_id)).is_some()
     }
 
+    fn put_influence_data(
+        &self,
+        influence_id: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.inner.lock().unwrap().influence.insert(influence_id.to_string(), doc.clone());
+        Ok(())
+    }
+
+    fn remove_influence_data(&self, influence_id: &str) -> bool {
+        self.inner.lock().unwrap().influence.remove(influence_id).is_some()
+    }
+
+    fn list_influence_data(&self) -> Vec<(String, serde_json::Value)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .influence
+            .iter()
+            .map(|(id, doc)| (id.clone(), doc.clone()))
+            .collect()
+    }
+
     fn list_amf_registrations(&self) -> Vec<(String, serde_json::Value)> {
         self.inner
             .lock()
@@ -356,6 +392,9 @@ const AM_POLICY_DATA: TableDefinition<(&str, &str), &[u8]> = TableDefinition::ne
 /// Dynamic context data: the serving AMF's registration (TS 29.505
 /// `amf-3gpp-access`), keyed by SUPI, JSON value.
 const AMF_3GPP_REG: TableDefinition<&str, &[u8]> = TableDefinition::new("amf_3gpp_reg");
+/// Application influence data by influence id (TS 29.519 application-data) — an AF's
+/// traffic influence for a group of UEs / any UE, not scoped to a subscriber (design/135).
+const INFLUENCE_DATA: TableDefinition<&str, &[u8]> = TableDefinition::new("influence_data");
 /// Dynamic context data: the serving SMF's registration per PDU session
 /// (`smf-registrations`), keyed (SUPI, PDU session id), JSON value.
 const SMF_REG: TableDefinition<(&str, u8), &[u8]> = TableDefinition::new("smf_registrations");
@@ -661,6 +700,51 @@ impl ProvisionedDataStore for RedbStore {
             }
         }
         w.commit().is_ok() && existed
+    }
+
+    fn put_influence_data(
+        &self,
+        influence_id: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), String> {
+        let bytes = serde_json::to_vec(doc).map_err(|e| e.to_string())?;
+        let w = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = w.open_table(INFLUENCE_DATA).map_err(|e| e.to_string())?;
+            table.insert(influence_id, bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        w.commit().map_err(|e| e.to_string())
+    }
+
+    fn remove_influence_data(&self, influence_id: &str) -> bool {
+        let Ok(w) = self.db.begin_write() else {
+            return false;
+        };
+        let mut existed = false;
+        {
+            if let Ok(mut t) = w.open_table(INFLUENCE_DATA) {
+                existed = t.remove(influence_id).map(|old| old.is_some()).unwrap_or(false);
+            }
+        }
+        w.commit().is_ok() && existed
+    }
+
+    fn list_influence_data(&self) -> Vec<(String, serde_json::Value)> {
+        let Ok(r) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(table) = r.open_table(INFLUENCE_DATA) else {
+            return Vec::new();
+        };
+        table
+            .iter()
+            .into_iter()
+            .flatten()
+            .filter_map(|kv| kv.ok())
+            .filter_map(|(k, v)| {
+                serde_json::from_slice(v.value()).ok().map(|doc| (k.value().to_string(), doc))
+            })
+            .collect()
     }
 
     fn list_amf_registrations(&self) -> Vec<(String, serde_json::Value)> {

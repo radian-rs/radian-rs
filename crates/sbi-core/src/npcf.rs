@@ -252,6 +252,41 @@ pub struct AppSessionContext {
     pub asc_req_data: AppSessionContextReqData,
 }
 
+/// `TrafficInfluData` (TS 29.519 application-data) — an AF traffic influence stored in the
+/// UDR for a **UE group or any UE**, rather than authorized per session. The NEF writes it;
+/// every PCF reads it, so it also applies to sessions established later (design/135 Phase 3).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrafficInfluData {
+    /// The DNN this influence applies to. Absent ⇒ any DNN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnn: Option<String>,
+    /// Apply to **any** UE (TS 29.522 `anyUeInd`).
+    #[serde(default)]
+    pub any_ue_ind: bool,
+    /// The SUPIs this influence covers when it targets a group — `anyUeInd` wins over it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supis: Vec<String>,
+    /// An opaque group identifier, recorded for traceability (membership is resolved
+    /// through `supis` here — a real deployment resolves it at the UDM/UDR).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_to_locs: Vec<RouteToLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_prefix: Option<String>,
+}
+
+impl TrafficInfluData {
+    /// Whether this influence covers a session for `supi` on `dnn`: the DNN must match
+    /// (or be unset), and the UE must be in scope — any UE, or a listed SUPI.
+    pub fn applies_to(&self, supi: &str, dnn: &str) -> bool {
+        let dnn_ok = self.dnn.as_deref().is_none_or(|d| d == dnn);
+        let ue_ok = self.any_ue_ind || self.supis.iter().any(|s| s == supi);
+        dnn_ok && ue_ok
+    }
+}
+
 /// One stored AF influence: which UE/DN it targets and the route it asks for.
 #[derive(Debug, Clone)]
 struct AfInfluence {
@@ -622,7 +657,49 @@ impl PcfState {
     async fn decide_for(&self, ctx: &SmPolicyContextData) -> SmPolicyDecision {
         let mut decision = self.base_decision_for(ctx).await;
         self.apply_influences(ctx, &mut decision);
+        self.apply_group_influences(ctx, &mut decision).await;
         decision
+    }
+
+    /// Fold the UDR's **application influence data** — an AF influence targeting a UE
+    /// *group* or *any UE* rather than one subscriber (design/135 Phase 3). Unlike the
+    /// per-session app-session influences, these live in the UDR (written by the NEF), so
+    /// they are picked up by whichever PCF authorizes a session — including sessions
+    /// established long after the AF made its request.
+    async fn apply_group_influences(
+        &self,
+        ctx: &SmPolicyContextData,
+        decision: &mut SmPolicyDecision,
+    ) {
+        let Some(udr) = &self.udr else { return };
+        let docs = match udr.list_influence_data().await {
+            Ok(docs) => docs,
+            Err(e) => {
+                tracing::warn!("influence-data fetch failed ({e}); ignoring group influences");
+                return;
+            }
+        };
+        for (id, doc) in docs {
+            let Ok(data) = serde_json::from_value::<TrafficInfluData>(doc) else {
+                tracing::warn!(influence_id = %id, "malformed influence data — ignored");
+                continue;
+            };
+            if !data.applies_to(&ctx.supi, &ctx.dnn) {
+                continue;
+            }
+            let (Some(prefix), Some(dnai)) =
+                (data.traffic_prefix, data.route_to_locs.first().map(|r| r.dnai.clone()))
+            else {
+                continue;
+            };
+            decision.traffic_control_data.insert(
+                format!("influence-{id}"),
+                TrafficControlData {
+                    route_to_locs: vec![RouteToLocation { dnai }],
+                    traffic_prefix: Some(prefix),
+                },
+            );
+        }
     }
 
     /// The subscriber's policy before AF influence — UDR policy-data when provisioned,
