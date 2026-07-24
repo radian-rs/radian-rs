@@ -245,21 +245,48 @@ async fn setup_ran_ue(world: &mut World) {
     netns::add_route(&ue, "default", &["via", &RAN_UE_GW.to_string()]).await.expect("UE default route");
 }
 
-#[when("I start the radian core")]
-async fn start_core(world: &mut World) {
-    start_core_inner(world, false).await;
+/// How the SMF's user plane is wired at startup (design/134).
+#[derive(Clone, Copy, PartialEq)]
+enum UpMode {
+    /// One anchor UPF; the gNB tunnels straight to it (`RADIAN_SMF_UPF_N4`).
+    Single,
+    /// An intermediate UPF chained in front, configured by env var (`RADIAN_SMF_IUPF_N4`).
+    ChainedEnv,
+    /// The same chain, but described by a JSON UP-topology config the SMF loads via
+    /// `RADIAN_SMF_TOPOLOGY` and routes per DNN (Phase 3b).
+    ChainedTopology,
 }
 
-/// design/134 Phase 3: start the core with an **intermediate UPF** (I-UPF) chained in
+impl UpMode {
+    /// Whether a second (intermediate) UPF is spawned.
+    fn chained(self) -> bool {
+        self != UpMode::Single
+    }
+}
+
+#[when("I start the radian core")]
+async fn start_core(world: &mut World) {
+    start_core_inner(world, UpMode::Single).await;
+}
+
+/// design/134 Phase 3a: start the core with an **intermediate UPF** (I-UPF) chained in
 /// front of the anchor, so every PDU session runs gNB → I-UPF → N9 → anchor → N6. A
 /// second `nf-upf` binds [`IUPF_N3_IP`] and the SMF is pointed at it via
 /// `RADIAN_SMF_IUPF_N4`; the signalling is otherwise identical.
 #[when("I start the radian core with an intermediate UPF")]
 async fn start_core_chained(world: &mut World) {
-    start_core_inner(world, true).await;
+    start_core_inner(world, UpMode::ChainedEnv).await;
 }
 
-async fn start_core_inner(world: &mut World, chained: bool) {
+/// design/134 Phase 3b: the same chain, but the SMF is driven by a JSON **UP-topology
+/// config** (`RADIAN_SMF_TOPOLOGY`) rather than the env vars — proving the operator-facing
+/// config file loads and routes real traffic end to end.
+#[when("I start the radian core from a UP topology config")]
+async fn start_core_from_topology(world: &mut World) {
+    start_core_inner(world, UpMode::ChainedTopology).await;
+}
+
+async fn start_core_inner(world: &mut World, mode: UpMode) {
     let nrf = "http://127.0.0.1:8000";
     let db = format!("/tmp/{}_udr.redb", world.feature_tag);
     let _ = std::fs::remove_file(&db);
@@ -306,7 +333,7 @@ async fn start_core_inner(world: &mut World, chained: bool) {
     // then degrades and it serves N3/N4 alone (§D3). Its log is keyed "iupf" so it
     // doesn't clobber the anchor's `/tmp/<tag>_upf.log`, and — having no TUN to wait on —
     // its readiness is the N4/N3 banner rather than an interface.
-    if chained {
+    if mode.chained() {
         world.procs.push(
             spawn_core_as(
                 &tag,
@@ -331,11 +358,35 @@ async fn start_core_inner(world: &mut World, chained: bool) {
 
     let smf_n4 = format!("{UPF_N3_IP}:{N4_PORT}");
     let iupf_n4 = format!("{IUPF_N3_IP}:{N4_PORT}");
-    let mut smf_env = vec![("RADIAN_SMF_UPF_N4", smf_n4.as_str()), ("RADIAN_SMF_NRF", nrf)];
-    if chained {
-        // Every session then chains gNB → I-UPF → N9 → anchor; the SMF hands the gNB the
-        // I-UPF's N3 F-TEID, so the datapath steps drive the whole chain unchanged.
-        smf_env.push(("RADIAN_SMF_IUPF_N4", iupf_n4.as_str()));
+    // A JSON topology file, written only in `ChainedTopology` mode — describes the same
+    // gNB → I-UPF → anchor chain the env vars would, and is passed via RADIAN_SMF_TOPOLOGY.
+    let topology_path = format!("/tmp/{tag}_topology.json");
+    let mut smf_env = vec![("RADIAN_SMF_NRF", nrf)];
+    match mode {
+        UpMode::Single => smf_env.push(("RADIAN_SMF_UPF_N4", smf_n4.as_str())),
+        UpMode::ChainedEnv => {
+            // Every session chains gNB → I-UPF → N9 → anchor; the SMF hands the gNB the
+            // I-UPF's N3 F-TEID, so the datapath steps drive the whole chain unchanged.
+            smf_env.push(("RADIAN_SMF_UPF_N4", smf_n4.as_str()));
+            smf_env.push(("RADIAN_SMF_IUPF_N4", iupf_n4.as_str()));
+        }
+        UpMode::ChainedTopology => {
+            let topology = format!(
+                r#"{{
+  "upNodes": {{
+    "gNB":    {{ "type": "AN" }},
+    "iupf":   {{ "type": "UPF", "n4": "{IUPF_N3_IP}:{N4_PORT}" }},
+    "anchor": {{ "type": "UPF", "n4": "{UPF_N3_IP}:{N4_PORT}", "dnns": ["internet"] }}
+  }},
+  "links": [
+    {{ "a": "gNB",  "b": "iupf" }},
+    {{ "a": "iupf", "b": "anchor" }}
+  ]
+}}"#
+            );
+            std::fs::write(&topology_path, topology).expect("write UP topology config");
+            smf_env.push(("RADIAN_SMF_TOPOLOGY", topology_path.as_str()));
+        }
     }
     world.procs.push(spawn_core(&tag, false, &smf_env, "smf").await);
     // Shrink T3513 so the paging-retransmission scenario runs in a few seconds. It

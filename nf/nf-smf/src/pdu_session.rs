@@ -9,7 +9,7 @@
 //! Request/response bodies are simplified: TS 29.502 uses multipart with binary N1/N2
 //! SM containers, which arrive with the NAS-SM and N2-SM-info slices.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
+
+use crate::topology::{NodeKind, Topology};
 
 /// FAR id the downlink Update FAR targets. Establishment provisions FAR 2 (downlink,
 /// forward to Access); the Session Modification points it at the gNB with Outer Header
@@ -76,6 +78,12 @@ struct SmContext {
     /// single-UPF session. When set, the downlink FAR the gNB target goes into lives on
     /// *this* leg, not on `up_seid`.
     chain: Option<ChainedLeg>,
+    /// The UP path this session was established on (design/134 Phase 3b): the anchor peer,
+    /// plus the intermediate and breakout peers when chained. Resolved once from the DNN
+    /// at establishment and held here so modification/deletion address the very UPFs the
+    /// session was built on, not an SMF-global default — which is what makes per-DNN path
+    /// selection work.
+    path: SessionPath,
     /// The UE's assigned IPv4 address (its PDU session address). Present for IPv4 /
     /// IPv4v6 sessions; `None` for a pure-IPv6 session (design/131).
     ue_ip: Option<Ipv4Addr>,
@@ -251,20 +259,45 @@ impl UserPlane {
     }
 }
 
+/// The user-plane path a session runs on — the peers it addresses across its lifetime.
+/// Resolved once from the DNN at establishment (see [`SmfState::resolve_path`]) and held
+/// on the [`SmContext`], so every later operation reaches the very UPFs the session was
+/// built on rather than an SMF-global default (design/134 Phase 3b).
+#[derive(Clone)]
+struct SessionPath {
+    /// The anchor (PSA): terminates N6, carries the URRs, so it is the node that reports
+    /// usage and can be paged. Its socket also acks that session's Session Reports.
+    anchor: Arc<N4Peer>,
+    /// An intermediate UPF (I-UPF) chained in front of the anchor over N9, when the path
+    /// has one; `None` for a single-UPF session.
+    intermediate: Option<Arc<N4Peer>>,
+    /// A breakout anchor + the destination prefix the classifier steers to it (Phase 2).
+    breakout: Option<(Arc<N4Peer>, pfcp::IpPrefix)>,
+}
+
+/// How the SMF turns a DNN into a [`SessionPath`].
+enum Routing {
+    /// Env-var topology (design/134 Phases 1–2): every session takes the same path,
+    /// regardless of DNN. The strings key into [`SmfState::peers`].
+    Fixed { anchor: String, intermediate: Option<String>, breakout: Option<(String, pfcp::IpPrefix)> },
+    /// A config-file UP topology (Phase 3b): the path — anchor, and any intermediate — is
+    /// selected per DNN by walking the graph. Breakout is not yet expressed in config, so
+    /// a graph-routed session has none.
+    Graph(Topology),
+}
+
 /// SMF runtime: PFCP client(s) toward the user plane plus the SM-context table.
 pub struct SmfState {
     smf_ip: Ipv4Addr,
     /// NRF base URL — used to discover the UDM for Nudm_SDM subscription fetches.
     nrf_base: String,
-    /// The **anchor** UPF (PSA): the node that terminates the session on N6 and carries
-    /// the URRs, so it is the one that reports usage.
-    anchor: Arc<N4Peer>,
-    /// An optional **intermediate** UPF (I-UPF). When present every session is chained
-    /// gNB → I-UPF → N9 → anchor → N6 (design/134).
-    iupf: Option<Arc<N4Peer>>,
-    /// A second anchor plus the destination prefix the I-UPF steers to it — the uplink
-    /// classifier (design/134 Phase 2). `None` ⇒ every session takes one anchor.
-    breakout: Option<(Arc<N4Peer>, pfcp::IpPrefix)>,
+    /// Every UPF the topology names, keyed by node name → its N4 association. In env-var
+    /// mode the names are synthetic (`anchor`/`intermediate`/`breakout`); in config mode
+    /// they are the `upNodes` keys. [`Routing`] turns a DNN into a subset of these.
+    peers: BTreeMap<String, Arc<N4Peer>>,
+    /// How a DNN maps to a [`SessionPath`] over `peers` — fixed (env vars) or graph-walked
+    /// (config, design/134 Phase 3b).
+    routing: Routing,
     /// UPF-initiated Session Report Requests, consumed by
     /// [`handle_usage_reports`].
     reports_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
@@ -289,7 +322,8 @@ pub struct SmfState {
 
 impl SmfState {
     /// Bind an N4 client socket to each node of `up` — the anchor, plus an intermediate
-    /// UPF and/or a second anchor when the topology has them (design/134).
+    /// UPF and/or a second anchor when the topology has them (design/134). Every session
+    /// then takes this same fixed path, regardless of DNN.
     ///
     /// Each peer gets its own socket, sequence space and pending map; only the anchor
     /// carries URRs, so only its reader forwards Session Reports.
@@ -299,27 +333,74 @@ impl SmfState {
         nrf_base: impl Into<String>,
     ) -> std::io::Result<Self> {
         let (reports_tx, reports_rx) = tokio::sync::mpsc::unbounded_channel();
-        let anchor = N4Peer::connect(up.anchor, Some(reports_tx)).await?;
-        let iupf = match up.intermediate {
-            Some(addr) => Some(N4Peer::connect(addr, None).await?),
+        let mut peers = BTreeMap::new();
+        peers.insert("anchor".to_string(), N4Peer::connect(up.anchor, Some(reports_tx)).await?);
+        let intermediate = match up.intermediate {
+            Some(addr) => {
+                peers.insert("intermediate".to_string(), N4Peer::connect(addr, None).await?);
+                Some("intermediate".to_string())
+            }
             None => None,
         };
         // A breakout anchor is only reachable *through* the classifier, so it is
         // meaningless without an intermediate UPF to host it.
-        let breakout = match (&iupf, up.breakout) {
-            (Some(_), Some((addr, prefix))) => Some((N4Peer::connect(addr, None).await?, prefix)),
+        let breakout = match (&intermediate, up.breakout) {
+            (Some(_), Some((addr, prefix))) => {
+                peers.insert("breakout".to_string(), N4Peer::connect(addr, None).await?);
+                Some(("breakout".to_string(), prefix))
+            }
             (None, Some(_)) => {
                 tracing::warn!("a breakout anchor needs an intermediate UPF — ignoring it");
                 None
             }
             _ => None,
         };
-        Ok(Self {
+        let routing = Routing::Fixed { anchor: "anchor".to_string(), intermediate, breakout };
+        Ok(Self::with_peers(peers, routing, reports_rx, smf_ip, nrf_base.into()))
+    }
+
+    /// Bind an N4 client socket to every UPF in a config-file topology (design/134
+    /// Phase 3b). Anchors — UPFs that serve a DNN — carry URRs, so their readers forward
+    /// Session Reports; pure intermediates connect with none. The DNN → path mapping is
+    /// then graph-walked per session.
+    pub async fn connect_with_topology(
+        topo: Topology,
+        smf_ip: Ipv4Addr,
+        nrf_base: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let (reports_tx, reports_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut peers = BTreeMap::new();
+        for (name, node) in &topo.up_nodes {
+            if node.kind != NodeKind::Upf {
+                continue; // the AN is a BFS source only, not an N4 peer
+            }
+            let n4 = node
+                .n4
+                .ok_or_else(|| anyhow::anyhow!("UPF node {name:?} has no n4 address"))?;
+            // Only anchors report; an intermediate (no DNNs) gets no reports channel.
+            let reports = (!node.dnns.is_empty()).then(|| reports_tx.clone());
+            let peer = N4Peer::connect(n4, reports)
+                .await
+                .map_err(|e| anyhow::anyhow!("N4 connect to UPF {name:?} ({n4}): {e}"))?;
+            peers.insert(name.clone(), peer);
+        }
+        Ok(Self::with_peers(peers, Routing::Graph(topo), reports_rx, smf_ip, nrf_base.into()))
+    }
+
+    /// Assemble the runtime around an already-connected peer set — the tail both
+    /// constructors share.
+    fn with_peers(
+        peers: BTreeMap<String, Arc<N4Peer>>,
+        routing: Routing,
+        reports_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        smf_ip: Ipv4Addr,
+        nrf_base: String,
+    ) -> Self {
+        Self {
             smf_ip,
-            nrf_base: nrf_base.into(),
-            anchor,
-            iupf,
-            breakout,
+            nrf_base,
+            peers,
+            routing,
             reports_rx: tokio::sync::Mutex::new(reports_rx),
             cp_seid: AtomicU64::new(1),
             next_ref: AtomicU64::new(1),
@@ -331,7 +412,45 @@ impl SmfState {
             gfbr_budget_bps: (u64::MAX, u64::MAX),
             reserved_gfbr_bps: Mutex::new((0, 0)),
             usage_threshold_bytes: None,
-        })
+        }
+    }
+
+    /// Resolve the [`SessionPath`] a session on `dnn` runs — the peers its whole lifetime
+    /// addresses. Fixed routing returns the same path for every DNN; graph routing walks
+    /// the topology to the anchor serving `dnn`. radian supports at most one intermediate,
+    /// so a deeper graph path is rejected here rather than silently truncated.
+    fn resolve_path(&self, dnn: &str) -> anyhow::Result<SessionPath> {
+        let peer = |name: &str| {
+            self.peers
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("UP node {name:?} is not connected"))
+        };
+        match &self.routing {
+            Routing::Fixed { anchor, intermediate, breakout } => Ok(SessionPath {
+                anchor: peer(anchor)?,
+                intermediate: intermediate.as_deref().map(peer).transpose()?,
+                breakout: match breakout {
+                    Some((name, prefix)) => Some((peer(name)?, *prefix)),
+                    None => None,
+                },
+            }),
+            Routing::Graph(topo) => {
+                let path = topo
+                    .path_for_dnn(dnn)
+                    .ok_or_else(|| anyhow::anyhow!("no UP path for DNN {dnn:?}"))?;
+                let (anchor, intermediate) = match path.nodes.as_slice() {
+                    [a] => (a.as_str(), None),
+                    [i, a] => (a.as_str(), Some(i.as_str())),
+                    _ => anyhow::bail!("UP path for DNN {dnn:?} has more than one intermediate"),
+                };
+                Ok(SessionPath {
+                    anchor: peer(anchor)?,
+                    intermediate: intermediate.map(peer).transpose()?,
+                    breakout: None,
+                })
+            }
+        }
     }
 
     /// Set the GFBR admission-control budget `(downlink_bps, uplink_bps)`.
@@ -377,10 +496,6 @@ impl SmfState {
         r.1 = r.1.saturating_sub(old.1).saturating_add(new.1);
     }
 
-    fn next_seq(&self) -> u32 {
-        self.anchor.next_seq()
-    }
-
     /// Allocate the next UE IPv4 address from the pool.
     fn alloc_ue_ip(&self) -> Ipv4Addr {
         Ipv4Addr::from(self.next_ue_ip.fetch_add(1, Ordering::Relaxed))
@@ -403,21 +518,13 @@ impl SmfState {
         (prefix, iid)
     }
 
-    /// Send one PFCP request to the **anchor** and await its response. Chain-specific
-    /// exchanges address their peer directly ([`N4Peer::transact`]).
-    async fn transact(&self, req: &[u8], expect_seq: u32) -> Option<Vec<u8>> {
-        self.anchor.transact(req, expect_seq).await
-    }
-
     /// PFCP Association Setup toward every UPF in the topology — required before any
     /// session.
     pub async fn associate(&self) -> anyhow::Result<()> {
-        self.anchor.associate(self.smf_ip).await?;
-        if let Some(iupf) = &self.iupf {
-            iupf.associate(self.smf_ip).await?;
-        }
-        if let Some((psa2, _)) = &self.breakout {
-            psa2.associate(self.smf_ip).await?;
+        for (name, peer) in &self.peers {
+            peer.associate(self.smf_ip)
+                .await
+                .map_err(|e| anyhow::anyhow!("association with UP node {name:?}: {e}"))?;
         }
         Ok(())
     }
@@ -685,8 +792,19 @@ async fn create_sm_context(
         ));
     }
 
+    // Select the UP path for this DNN (design/134 Phase 3b). In env-var mode it is the
+    // one fixed path; in config mode the topology graph is walked. An unroutable DNN
+    // fails the establishment before any UPF state is created.
+    let path = match smf.resolve_path(&req.dnn) {
+        Ok(p) => p,
+        Err(e) => {
+            smf.release_gfbr(reserved_gfbr);
+            tracing::warn!(dnn = %req.dnn, "no UP path for DNN: {e}");
+            return Err(problem(StatusCode::BAD_GATEWAY, "DNN_DENIED", "no user-plane path for the DNN"));
+        }
+    };
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
-    let seq = smf.next_seq();
+    let seq = path.anchor.next_seq();
     // The SMF owns UE address allocation; the address(es) ride into the UPF's downlink
     // PDR so it can route N6 traffic back to this session (design/131). An IPv4 address
     // is allocated when the selected type includes IPv4; an IPv6 /64 + interface
@@ -709,7 +827,7 @@ async fn create_sm_context(
         smf.usage_threshold_bytes,
     );
     // Release the GFBR reservation if the N4 establishment doesn't complete.
-    let resp = match smf.transact(&est_req, seq).await {
+    let resp = match path.anchor.transact(&est_req, seq).await {
         Some(r) => r,
         None => {
             smf.release_gfbr(reserved_gfbr);
@@ -736,8 +854,8 @@ async fn create_sm_context(
     // session's second half on it and splice the two together. The anchor is
     // established first precisely so its N3 ingress can be the I-UPF's uplink egress.
     let mut chain = None;
-    if let Some(iupf) = &smf.iupf {
-        match establish_chain(&smf, iupf, &est, ue_addr, &req.dnn).await {
+    if path.intermediate.is_some() {
+        match establish_chain(&smf, &path, &est, ue_addr, &req.dnn).await {
             Ok((leg, an_teid, an_addr)) => {
                 chain = Some(leg);
                 // The RAN must tunnel to the I-UPF, not the anchor.
@@ -748,9 +866,9 @@ async fn create_sm_context(
                 // Don't leave a half-built chain behind: tear the anchor session down
                 // and fail the establishment.
                 tracing::warn!("chained N4 setup failed, rolling back the anchor: {e}");
-                let seq = smf.next_seq();
+                let seq = path.anchor.next_seq();
                 let del = pfcp::session_deletion_request(est.up_seid, seq);
-                let _ = smf.transact(&del, seq).await;
+                let _ = path.anchor.transact(&del, seq).await;
                 smf.release_gfbr(reserved_gfbr);
                 return Err(problem(
                     StatusCode::BAD_GATEWAY,
@@ -802,6 +920,7 @@ async fn create_sm_context(
             n3_teid: est.n3_teid,
             n3_addr: est.n3_addr,
             chain,
+            path,
             ue_ip,
             pdu_type: selected_type,
             ue_ipv6,
@@ -874,14 +993,16 @@ async fn create_sm_context(
 /// anchor's in everything handed to the RAN.
 async fn establish_chain(
     smf: &SmfState,
-    iupf: &N4Peer,
+    path: &SessionPath,
     anchor: &pfcp::EstablishedSession,
     ue: pfcp::UeAddr,
     dnn: &str,
 ) -> anyhow::Result<(ChainedLeg, u32, Ipv4Addr)> {
+    let iupf =
+        path.intermediate.as_ref().ok_or_else(|| anyhow::anyhow!("chain without an intermediate"))?;
     // The breakout anchor, if any, goes up first: the classifier's branch FAR points at
     // its N3 ingress and — like the default anchor — that is set at establishment.
-    let breakout = match &smf.breakout {
+    let breakout = match &path.breakout {
         Some((psa2, prefix)) => {
             let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
             let seq = psa2.next_seq();
@@ -940,10 +1061,10 @@ async fn establish_chain(
     // Both anchors send downlink back to the *same* I-UPF ingress — it is the node that
     // holds the gNB tunnel, so one return path serves however many anchors the uplink
     // fans out to. That symmetry is why a breakout needs no second downlink ingress.
-    point_downlink_at(&smf.anchor, anchor.up_seid, dl_ingress, dnn)
+    point_downlink_at(&path.anchor, anchor.up_seid, dl_ingress, dnn)
         .await
         .map_err(|e| anyhow::anyhow!("anchor UPF: {e}"))?;
-    if let (Some((psa2, _)), Some((est2, _))) = (&smf.breakout, &breakout) {
+    if let (Some((psa2, _)), Some((est2, _))) = (&path.breakout, &breakout) {
         point_downlink_at(psa2, est2.up_seid, dl_ingress, dnn)
             .await
             .map_err(|e| anyhow::anyhow!("breakout anchor: {e}"))?;
@@ -1265,10 +1386,10 @@ async fn update_sm_context(
     if !valid_gnb_target(gnb_teid, gnb_addr) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let (up_seid, dnn, old_gnb, chain) = {
+    let (up_seid, dnn, old_gnb, chain, path) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
-            Some(c) => (c.up_seid, c.dnn.clone(), c.gnb, c.chain),
+            Some(c) => (c.up_seid, c.dnn.clone(), c.gnb, c.chain, c.path.clone()),
             None => return StatusCode::NOT_FOUND.into_response(),
         }
     };
@@ -1286,9 +1407,9 @@ async fn update_sm_context(
     // re-open the anchor's downlink toward it, so anything the anchor buffered during an
     // AN release flushes onto a path that is already complete.
     if let Some(leg) = chain {
-        let iupf = match &smf.iupf {
+        let iupf = match &path.intermediate {
             Some(p) => p,
-            // A context can only carry a leg if an I-UPF was configured; a restart with
+            // A context can only carry a leg if an I-UPF was on its path; a restart with
             // the chaining config removed would strand it.
             None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
@@ -1307,7 +1428,7 @@ async fn update_sm_context(
         Some(leg) => leg.dl_ingress,
         None => (gnb_teid, gnb_addr),
     };
-    let seq = smf.next_seq();
+    let seq = path.anchor.next_seq();
     let mod_req = pfcp::session_modification_request(
         up_seid,
         seq,
@@ -1319,7 +1440,7 @@ async fn update_sm_context(
         // anchor's N9 path is unchanged across the handover.
         send_end_marker && chain.is_none(),
     );
-    let resp = match smf.transact(&mod_req, seq).await {
+    let resp = match path.anchor.transact(&mod_req, seq).await {
         Some(r) => r,
         None => return StatusCode::BAD_GATEWAY.into_response(),
     };
@@ -1329,7 +1450,7 @@ async fn update_sm_context(
     // The breakout anchor's downlink was parked alongside the default one on AN release,
     // so it needs re-opening onto the same shared N9 ingress (design/134 Phase 2).
     if let Some(leg) = chain
-        && let (Some(seid), Some((psa2, _))) = (leg.breakout_seid, &smf.breakout)
+        && let (Some(seid), Some((psa2, _))) = (leg.breakout_seid, &path.breakout)
         && let Err(e) = point_downlink_at(psa2, seid, leg.dl_ingress, &dnn).await
     {
         tracing::warn!(%sm_ref, "breakout anchor downlink not restored: {e}");
@@ -1353,16 +1474,16 @@ async fn update_sm_context(
 /// Session Modification that DROPs downlink at the UPF and clears the stored gNB
 /// target. The session and its uplink path persist for a later Service Request.
 async fn deactivate_up(smf: &Arc<SmfState>, sm_ref: &str) -> StatusCode {
-    let (up_seid, chain) = {
+    let (up_seid, chain, path) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(sm_ref) {
-            Some(c) => (c.up_seid, c.chain),
+            Some(c) => (c.up_seid, c.chain, c.path.clone()),
             None => return StatusCode::NOT_FOUND,
         }
     };
-    let seq = smf.next_seq();
+    let seq = path.anchor.next_seq();
     let req = pfcp::session_deactivate_request(up_seid, seq, FAR_ID);
-    let resp = match smf.transact(&req, seq).await {
+    let resp = match path.anchor.transact(&req, seq).await {
         Some(r) => r,
         None => return StatusCode::BAD_GATEWAY,
     };
@@ -1373,7 +1494,7 @@ async fn deactivate_up(smf: &Arc<SmfState>, sm_ref: &str) -> StatusCode {
     // still pointed at the released gNB tunnel. It drops rather than buffers: only the
     // default anchor carries the URRs that turn a buffered packet into a paging request,
     // so downlink arriving for an idle UE *on the breakout DN* is lost (design/134 §4).
-    if let (Some(leg), Some((psa2, _))) = (chain, &smf.breakout)
+    if let (Some(leg), Some((psa2, _))) = (chain, &path.breakout)
         && let Some(seid) = leg.breakout_seid
     {
         let seq = psa2.next_seq();
@@ -1419,13 +1540,18 @@ async fn indirect_forwarding(
     Json(req): Json<IndirectForwardingReq>,
 ) -> axum::response::Response {
     if req.release {
-        // Tear the forwarding session down (idempotent: no tunnel → 204).
-        let fwd_seid = smf.contexts.lock().unwrap().get_mut(&sm_ref).and_then(|c| c.indirect_fwd.take());
-        let Some(fwd_seid) = fwd_seid else {
+        // Tear the forwarding session down (idempotent: no tunnel → 204). The forwarding
+        // session lives on the session's anchor, so it is deleted there.
+        let taken = {
+            let mut ctxs = smf.contexts.lock().unwrap();
+            ctxs.get_mut(&sm_ref)
+                .and_then(|c| c.indirect_fwd.take().map(|seid| (seid, c.path.anchor.clone())))
+        };
+        let Some((fwd_seid, anchor)) = taken else {
             return StatusCode::NO_CONTENT.into_response();
         };
-        let seq = smf.next_seq();
-        match smf.transact(&pfcp::session_deletion_request(fwd_seid, seq), seq).await {
+        let seq = anchor.next_seq();
+        match anchor.transact(&pfcp::session_deletion_request(fwd_seid, seq), seq).await {
             Some(r) if pfcp::response_accepted(&r) => {
                 tracing::info!(%sm_ref, "released the indirect forwarding tunnel");
                 return StatusCode::NO_CONTENT.into_response();
@@ -1440,11 +1566,13 @@ async fn indirect_forwarding(
     let Ok(target_teid) = u32::from_str_radix(teid_hex.trim_start_matches("0x"), 16) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if smf.contexts.lock().unwrap().get(&sm_ref).is_none() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
+    // The forwarding session is established on the session's own anchor.
+    let anchor = match smf.contexts.lock().unwrap().get(&sm_ref) {
+        Some(c) => c.path.anchor.clone(),
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
-    let seq = smf.next_seq();
+    let seq = anchor.next_seq();
     let est = pfcp::session_establishment_request_indirect_forwarding(
         cp_seid,
         seq,
@@ -1452,7 +1580,7 @@ async fn indirect_forwarding(
         target_teid,
         target_addr,
     );
-    let resp = match smf.transact(&est, seq).await {
+    let resp = match anchor.transact(&est, seq).await {
         Some(r) => r,
         None => return StatusCode::BAD_GATEWAY.into_response(),
     };
@@ -1484,12 +1612,13 @@ async fn release_sm_context(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<StatusCode, SbiProblem> {
-    let (up_seid, chain, supi, psi, sm_policy, reserved_gfbr, charging, policy) = {
+    let (up_seid, chain, path, supi, psi, sm_policy, reserved_gfbr, charging, policy) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
             Some(c) => (
                 c.up_seid,
                 c.chain,
+                c.path.clone(),
                 c.supi.clone(),
                 c.pdu_session_id,
                 c.sm_policy.clone(),
@@ -1506,11 +1635,11 @@ async fn release_sm_context(
             }
         }
     };
-    let seq = smf.next_seq();
+    let seq = path.anchor.next_seq();
     let del = pfcp::session_deletion_request(up_seid, seq);
     // Keep the context if the UPF is unreachable (the AMF may retry); a non-accepted
     // answer means the UPF already lost the session — drop our side anyway.
-    let resp = smf.transact(&del, seq).await.ok_or_else(|| {
+    let resp = path.anchor.transact(&del, seq).await.ok_or_else(|| {
         problem(StatusCode::BAD_GATEWAY, "UPF_NOT_RESPONDING", "no PFCP deletion response")
     })?;
     if !pfcp::response_accepted(&resp) {
@@ -1518,14 +1647,14 @@ async fn release_sm_context(
     }
     // Tear the other legs down too. The default anchor carries the URRs, so its deletion
     // response above is the one that bears the usage — the others' are discarded.
-    if let (Some(leg), Some(iupf)) = (chain, &smf.iupf) {
+    if let (Some(leg), Some(iupf)) = (chain, &path.intermediate) {
         let seq = iupf.next_seq();
         let del = pfcp::session_deletion_request(leg.up_seid, seq);
         match iupf.transact(&del, seq).await {
             Some(r) if pfcp::response_accepted(&r) => {}
             _ => tracing::warn!(%sm_ref, iupf_seid = leg.up_seid, "intermediate UPF did not accept the N4 deletion"),
         }
-        if let (Some(seid), Some((psa2, _))) = (leg.breakout_seid, &smf.breakout) {
+        if let (Some(seid), Some((psa2, _))) = (leg.breakout_seid, &path.breakout) {
             let seq = psa2.next_seq();
             let del = pfcp::session_deletion_request(seid, seq);
             match psa2.transact(&del, seq).await {
@@ -1609,16 +1738,17 @@ pub async fn handle_usage_reports(smf: Arc<SmfState>) {
         // The report addresses the session by OUR (CP) F-SEID.
         let ctx = {
             let ctxs = smf.contexts.lock().unwrap();
-            ctxs.values()
-                .find(|c| c.cp_seid == cp_seid)
-                .map(|c| (c.up_seid, c.supi.clone(), c.charging.clone(), c.policy.clone()))
+            ctxs.values().find(|c| c.cp_seid == cp_seid).map(|c| {
+                (c.up_seid, c.supi.clone(), c.charging.clone(), c.policy.clone(), c.path.anchor.clone())
+            })
         };
-        let Some((up_seid, supi, charging, policy)) = ctx else {
+        let Some((up_seid, supi, charging, policy, anchor)) = ctx else {
             tracing::warn!(cp_seid, "usage report for an unknown session — dropped");
             continue;
         };
-        // Ack toward the UPF (the usage stands measured either way).
-        if let Err(e) = smf.anchor.sock.send(&pfcp::session_report_response(up_seid, seq)).await {
+        // Ack on the session's own anchor socket (only anchors carry URRs, so that is the
+        // association the report arrived on). The usage stands measured either way.
+        if let Err(e) = anchor.sock.send(&pfcp::session_report_response(up_seid, seq)).await {
             tracing::warn!("session report ack send error: {e}");
         }
         tracing::info!(
@@ -1650,13 +1780,15 @@ pub async fn handle_usage_reports(smf: Arc<SmfState>) {
 async fn handle_dl_data_report(smf: &Arc<SmfState>, cp_seid: u64, seq: u32) {
     let ctx = {
         let ctxs = smf.contexts.lock().unwrap();
-        ctxs.values().find(|c| c.cp_seid == cp_seid).map(|c| (c.up_seid, c.supi.clone()))
+        ctxs.values()
+            .find(|c| c.cp_seid == cp_seid)
+            .map(|c| (c.up_seid, c.supi.clone(), c.path.anchor.clone()))
     };
-    let Some((up_seid, supi)) = ctx else {
+    let Some((up_seid, supi, anchor)) = ctx else {
         tracing::warn!(cp_seid, "downlink data report for an unknown session — dropped");
         return;
     };
-    if let Err(e) = smf.anchor.sock.send(&pfcp::session_report_response(up_seid, seq)).await {
+    if let Err(e) = anchor.sock.send(&pfcp::session_report_response(up_seid, seq)).await {
         tracing::warn!("downlink data report ack send error: {e}");
     }
     tracing::info!(up_seid, "downlink data for a CM-IDLE UE — requesting paging at the AMF");
@@ -1690,12 +1822,17 @@ async fn refresh_sm_policy(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<axum::response::Response, SbiProblem> {
-    let (sm_policy, up_seid, old_policy, supi, psi) = {
+    let (sm_policy, up_seid, old_policy, supi, psi, anchor) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
-            Some(c) => {
-                (c.sm_policy.clone(), c.up_seid, c.policy.clone(), c.supi.clone(), c.pdu_session_id)
-            }
+            Some(c) => (
+                c.sm_policy.clone(),
+                c.up_seid,
+                c.policy.clone(),
+                c.supi.clone(),
+                c.pdu_session_id,
+                c.path.anchor.clone(),
+            ),
             None => {
                 return Err(problem(
                     StatusCode::NOT_FOUND,
@@ -1727,9 +1864,9 @@ async fn refresh_sm_policy(
     let new_ambr = ambr_bps(&decision);
     if new_ambr != old_ambr {
         if let Some(ambr) = new_ambr {
-            let seq = smf.next_seq();
+            let seq = anchor.next_seq();
             let req = pfcp::session_qer_update_request(up_seid, seq, ambr);
-            match smf.transact(&req, seq).await {
+            match anchor.transact(&req, seq).await {
                 Some(resp) if pfcp::response_accepted(&resp) => tracing::info!(
                     %sm_ref, up_seid, "N4 QER re-rated: session AMBR now {}/{} bps",
                     ambr.uplink_bps, ambr.downlink_bps
@@ -1744,9 +1881,9 @@ async fn refresh_sm_policy(
     let new_flows = flow_qers(&decision);
     let (create, update, remove) = diff_flows(&old_flows, &new_flows);
     if !create.is_empty() || !update.is_empty() || !remove.is_empty() {
-        let seq = smf.next_seq();
+        let seq = anchor.next_seq();
         let req = pfcp::session_flow_modification_request(up_seid, seq, &create, &update, &remove);
-        match smf.transact(&req, seq).await {
+        match anchor.transact(&req, seq).await {
             Some(resp) if pfcp::response_accepted(&resp) => tracing::info!(
                 %sm_ref, up_seid, added = create.len(), updated = update.len(), removed = remove.len(),
                 "N4 per-flow QERs updated"
@@ -2045,7 +2182,35 @@ mod tests {
     /// sst=1/sd=010203 with a 1/2 Gbps session AMBR.
     /// Returns (nrf_base, udr_base).
     async fn spin_subscription_backend(supi: &str, plmn: &str) -> (String, String) {
+        spin_subscription_backend_dnns(supi, plmn, &["internet"]).await
+    }
+
+    /// Like [`spin_subscription_backend`] but provisioning several DNNs on the one slice
+    /// (each with the same demo QoS) — for the per-DNN UP-path selection test (design/134
+    /// Phase 3b), where a subscriber reaches more than one data network.
+    async fn spin_subscription_backend_dnns(
+        supi: &str,
+        plmn: &str,
+        dnns: &[&str],
+    ) -> (String, String) {
         use subscriber_db::{DataSet, ProvisionedDataStore, SubscriberStore};
+
+        let dnn_infos: Vec<_> = dnns.iter().map(|d| serde_json::json!({ "dnn": d })).collect();
+        let mut dnn_configs = serde_json::Map::new();
+        for d in dnns {
+            dnn_configs.insert(
+                d.to_string(),
+                serde_json::json!({
+                    "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+                    "5gQosProfile": { "5qi": 9, "arp": { "priorityLevel": 8 } },
+                    "qosFlows": [{
+                        "qfi": 2, "fiveQi": 1, "arpPriority": 5, "preEmptCap": true,
+                        "gbr": { "gfbrDl": "100 Mbps", "gfbrUl": "100 Mbps",
+                                 "mfbrDl": "200 Mbps", "mfbrUl": "200 Mbps" }
+                    }]
+                }),
+            );
+        }
 
         let store = Arc::new(subscriber_db::InMemoryStore::new());
         store
@@ -2055,7 +2220,7 @@ mod tests {
                 plmn,
                 &serde_json::json!({
                     "subscribedSnssaiInfos": {
-                        "1-010203": { "dnnInfos": [ { "dnn": "internet" } ] }
+                        "1-010203": { "dnnInfos": dnn_infos }
                     }
                 }),
             )
@@ -2067,17 +2232,7 @@ mod tests {
                 plmn,
                 &serde_json::json!([{
                     "singleNssai": { "sst": 1, "sd": "010203" },
-                    "dnnConfigurations": {
-                        "internet": {
-                            "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
-                            "5gQosProfile": { "5qi": 9, "arp": { "priorityLevel": 8 } },
-                            "qosFlows": [{
-                                "qfi": 2, "fiveQi": 1, "arpPriority": 5, "preEmptCap": true,
-                                "gbr": { "gfbrDl": "100 Mbps", "gfbrUl": "100 Mbps",
-                                         "mfbrDl": "200 Mbps", "mfbrUl": "200 Mbps" }
-                            }]
-                        }
-                    }
+                    "dnnConfigurations": dnn_configs
                 }]),
             )
             .unwrap();
@@ -2359,6 +2514,69 @@ mod tests {
         assert_eq!(status.as_u16(), 204, "release succeeded");
         assert_eq!(anchor.lock().unwrap().session_count(), 0, "anchor N4 session deleted");
         assert_eq!(iupf.lock().unwrap().session_count(), 0, "intermediate N4 session deleted");
+    }
+
+    /// design/134 Phase 3b: a config-file topology names **two anchors, one per DNN**, and
+    /// the SMF selects the path from the DNN — so a session on "internet" lands on one UPF
+    /// and a session on "ims" on the other, from a single graph the operator wrote. This is
+    /// the capability the env-var user plane can't express: it has one anchor for every DNN.
+    #[tokio::test]
+    async fn topology_routes_each_dnn_to_its_own_anchor() {
+        let (internet_ip, ims_ip) = (Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 4));
+        let (internet, internet_n4) = spin_upf(internet_ip).await;
+        let (ims, ims_n4) = spin_upf(ims_ip).await;
+
+        let (nrf_base, _udr) =
+            spin_subscription_backend_dnns("imsi-999700000000001", "99970", &["internet", "ims"])
+                .await;
+
+        // gNB hangs both anchors directly; each serves exactly one DNN.
+        let topo = crate::topology::Topology::parse(&format!(
+            r#"{{
+                "upNodes": {{
+                    "gNB":      {{ "type": "AN" }},
+                    "internet": {{ "type": "UPF", "n4": "{internet_n4}", "dnns": ["internet"] }},
+                    "ims":      {{ "type": "UPF", "n4": "{ims_n4}", "dnns": ["ims"] }}
+                }},
+                "links": [
+                    {{ "a": "gNB", "b": "internet" }},
+                    {{ "a": "gNB", "b": "ims" }}
+                ]
+            }}"#
+        ))
+        .unwrap();
+
+        let smf = Arc::new(
+            SmfState::connect_with_topology(topo, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+                .await
+                .unwrap(),
+        );
+        smf.associate().await.unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+        for (dnn, psi) in [("internet", 5u8), ("ims", 6u8)] {
+            let status = client
+                .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+                .json(&serde_json::json!({
+                    "supi": "imsi-999700000000001", "pduSessionId": psi, "dnn": dnn,
+                    "servingNetwork": { "mcc": "999", "mnc": "70" },
+                    "sNssai": { "sst": 1, "sd": "010203" }
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert!(status.is_success(), "create on DNN {dnn} failed: {status}");
+        }
+
+        // Each DNN's session landed on its own anchor — the graph, not a global default,
+        // picked the UPF.
+        assert_eq!(internet.lock().unwrap().session_count(), 1, "the internet DNN's anchor");
+        assert_eq!(ims.lock().unwrap().session_count(), 1, "the ims DNN's anchor");
     }
 
     /// The **uplink classifier** (design/134 Phase 2): one PDU session, one UE address,
