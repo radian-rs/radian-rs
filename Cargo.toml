@@ -23,6 +23,7 @@ members = [
     "nf/nf-udr",
     "nf/nf-pcf",
     "nf/nf-chf",
+    "nf/nf-nssf",
     "ran/gnb",
     "tools/radian-pki",
     "bdd",

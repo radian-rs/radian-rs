@@ -9,7 +9,7 @@
 
 - radian-rs is **depth-first on one golden path**. The register → auth → PDU session → ping arc is deep and CI-covered end-to-end (both the free-ran-ue `@sim` tier and radian's own `@scripted` gNB/UE tier): full 5G-AKA with SQN resync + algorithm negotiation, the complete CM-IDLE arc (AN release → paging → DL buffering → Service Request resume → buffer flush → T3513 retx), **full N2 handover + Xn path-switch with NH/NCC and direct/indirect data forwarding**, multi-PDU-session per-flow QoS/GBR, session-AMBR policing, CHF charging, PCF AM+SM policy, and a **native Rust gNB** (RRC/PDCP/SDAP/F1AP with a CU/DU F1 split — [128](128-gnb-ocudu-feasibility.md)).
 - free5gc is **breadth-first**. 14 NFs including **NSSF, NEF, N3IWF, TNGF, CHF, webconsole**; **ULCL + multi-UPF/I-UPF** user-plane topology; network slicing; **IPv6** PDU-session signalling (datapath stubbed — [131](131-ipv6-pdu-sessions.md) §2); **EAP-AKA'** + **SUCI ECIES profiles A/B**; NRPPa/positioning and MBS transport; multi-AMF with NAS reroute.
-- **The gap is breadth, not core-path depth.** radian-rs matches or exceeds free5gc on the single-UE single-session control+user plane, and *leads* on SBI security (mTLS mesh + CRL + PKI, ES256/JWKS OAuth), encryption-at-rest, a userspace UPF (no out-of-tree `gtp5g` kernel module), and owning a RAN stack free5gc doesn't have. radian-rs *trails* on (a) whole NFs (NSSF/NEF/N3IWF/TNGF), (b) user-plane topology (ULCL/multi-UPF/N9), and (c) auth/cipher breadth (EAP-AKA', SUCI ECIES, SNOW3G/ZUC). *(The IPv6 gap listed here originally is **closed** — [131](131-ipv6-pdu-sessions.md) shipped the full stack and radian-rs now leads free5gc on it.)*
+- **The gap is breadth, not core-path depth.** radian-rs matches or exceeds free5gc on the single-UE single-session control+user plane, and *leads* on SBI security (mTLS mesh + CRL + PKI, ES256/JWKS OAuth), encryption-at-rest, a userspace UPF (no out-of-tree `gtp5g` kernel module), and owning a RAN stack free5gc doesn't have. radian-rs *trails* on (a) whole NFs (NEF/N3IWF/TNGF — NSSF is now closed, [133](133-nssf-slicing.md)), (b) user-plane topology (ULCL/multi-UPF/N9), and (c) auth/cipher breadth (EAP-AKA', SUCI ECIES, SNOW3G/ZUC). *(The IPv6 gap listed here originally is **closed** — [131](131-ipv6-pdu-sessions.md) shipped the full stack and radian-rs now leads free5gc on it.)*
 - **Verdict: radian-rs is a credible depth-complete single-path 5GC + gNB; free5gc's edge is horizontal coverage. Close the gaps in the order P1 (protocol robustness + IPv6) → P2 (slicing + multi-UPF/ULCL + NEF) → P3 (non-3GPP access + auth/cipher breadth) → P4 (ecosystem).**
 
 Size legend: **S** ≈ days · **M** ≈ 1–2 weeks · **L** ≈ several weeks · **XL** ≈ multi-slice / months.
@@ -37,7 +37,7 @@ free5gc is not an arbitrary baseline — it is the implementation radian-rs alre
 | **NRF** | `NFs/nrf` | `nf-nrf` | near-parity — §2.6 |
 | **PCF** | `NFs/pcf` | `nf-pcf` | shared — §2.7 |
 | **CHF** | `NFs/chf` | `nf-chf` | shared — §2.8 (free5gc adds Diameter Ro/Gy + CDR files) |
-| **NSSF** | `NFs/nssf` | — | **Major, missing** — §3.1 |
+| **NSSF** | `NFs/nssf` | `nf-nssf` ([133](133-nssf-slicing.md)) | **CLOSED** — §3.1 |
 | **NEF** | `NFs/nef` | — | **Major, missing** — §3.2 |
 | **N3IWF** | `NFs/n3iwf` | — | **Major, missing** — §3.3 |
 | **TNGF** | `NFs/tngf` | — | **Major, missing** — §3.4 |
@@ -142,7 +142,7 @@ Both implement **Nchf_ConvergedCharging** (create/update/release) with CDR accum
 
 ## 3. Whole-NF gaps (breadth)
 
-### 3.1 NSSF — network slice selection · **Major** · **L**
+### 3.1 NSSF — network slice selection · ~~**Major**~~ **CLOSED** ([133](133-nssf-slicing.md))
 free5gc: `Nnssf_NSSelection` (slice selection for registration + PDU session) and `Nnssf_NSSAIAvailability` (per-TA slice availability). radian-rs does slice checks **locally in the AMF** (allowed-NSSAI intersection, designs 32/33/102) — there is no `Nnssf`, no NSI selection, no AMF re-selection on slice-not-served. Needed for any multi-slice topology.
 
 ### 3.2 NEF — northbound exposure · **Major** · **L**
@@ -203,7 +203,7 @@ Ordered by value-per-effort, respecting dependencies. Each is a candidate design
 2. ~~**IPv6 / IPv4v6 PDU sessions** (§2.2/2.3/4)~~ — **DONE**, shipped in [131](131-ipv6-pdu-sessions.md) (PRs #115/#116/#117/#118): type negotiation + #50/#51 downgrades, /64+IID allocation, the v6 datapath, SLAAC via Router Advertisements, PCO IPv6-DNS, and IPv4v6 dual-stack. Because free5gc stubs its v6 datapath (§2 of 131), radian-rs now **leads** here.
 
 **P2 — breadth that unlocks whole scenario classes:**
-3. **NSSF + AMF slice re-selection** (§3.1). *L*. New `nf-nssf` + `Nnssf`; wires into existing AMF slice logic.
+3. ~~**NSSF + AMF slice re-selection** (§3.1)~~ — **DONE** (NSSF), shipped in [133](133-nssf-slicing.md): `nf-nssf` + `Nnssf_NSSelection`/`NSSAIAvailability`, with **per-TA slice availability** as the capability AMF-local logic couldn't provide. *AMF re-selection stays open* — it needs multi-AMF (a separate gap).
 4. **ULCL + multi-UPF / N9** (§2.2/2.3/4). *XL*. UP-topology graph in SMF + N9 in UPF datapath — the largest core refactor; realistically its own multi-slice effort. Requires ≥2 UPFs first.
 5. **NEF + AF traffic influence** (§3.2). *L*. New `nf-nef` + UDR influence data (§2.5) + PCF PolicyAuthorization (§2.7); most valuable once ULCL exists (steers it).
 

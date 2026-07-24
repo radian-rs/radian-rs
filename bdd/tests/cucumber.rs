@@ -262,6 +262,10 @@ async fn start_core(world: &mut World) {
     world.procs.push(spawn_core(&tag, false, &[("RADIAN_PCF_NRF", nrf)], "pcf").await);
     // CHF serves Nchf_ConvergedCharging; the SMF opens a charging session per PDU session.
     world.procs.push(spawn_core(&tag, false, &[("RADIAN_CHF_NRF", nrf)], "chf").await);
+    // NSSF serves Nnssf_NSSelection; the AMF discovers it at registration for per-TA
+    // slice availability (design/133). Started before the AMF so the first
+    // registration already finds it.
+    world.procs.push(spawn_core(&tag, false, &[("RADIAN_NSSF_NRF", nrf)], "nssf").await);
     // UPF needs CAP_NET_ADMIN for its N6 TUN → run under sudo; advertise the host N3 address.
     // The UPF binds a distinct loopback alias (127.0.0.2) for N3/N4 + advertises it
     // as its N3 F-TEID address, so a scripted gNB can run real GTP-U on 127.0.0.1:2152
@@ -1161,6 +1165,22 @@ fn parse_slices(spec: &str) -> Vec<(u8, Option<[u8; 3]>)> {
             None => (s.parse().unwrap(), None),
         })
         .collect()
+}
+
+/// Register from a specific tracking area *and* request slices — the NSSF's per-TA
+/// availability decision depends on both (design/133).
+#[when(regex = r#"^the scripted UE sends its registration request from TAC "([0-9a-fA-F]{6})" requesting slices "([^"]+)"$"#)]
+async fn scripted_ue_registers_from_tac_requesting(world: &mut World, tac: String, spec: String) {
+    let tacs = parse_tacs(&tac);
+    let (gnb, ue) = (world.gnb.as_ref().expect("gNB connected"), world.ue.as_ref().expect("UE"));
+    let msg = ngap::initial_ue_message_with_nas_at(
+        SCRIPTED_RAN_UE_ID,
+        ue.registration_request_requesting(&parse_slices(&spec)),
+        "999",
+        "70",
+        &tacs[0],
+    );
+    gnb.send(&msg).await.expect("send InitialUEMessage");
 }
 
 #[when(regex = r#"^the scripted UE sends its registration request requesting slices "([^"]+)"$"#)]
