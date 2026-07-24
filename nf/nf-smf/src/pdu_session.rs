@@ -444,10 +444,26 @@ impl SmfState {
                     [i, a] => (a.as_str(), Some(i.as_str())),
                     _ => anyhow::bail!("UP path for DNN {dnn:?} has more than one intermediate"),
                 };
+                // A breakout route steers a prefix to a second anchor. The classifier that
+                // does the steering is the DNN's intermediate UPF, so a route on a DNN with
+                // no intermediate is a config error rather than a silently dropped rule.
+                let breakout = match topo.breakout_for_dnn(dnn) {
+                    Some(route) => {
+                        anyhow::ensure!(
+                            intermediate.is_some(),
+                            "DNN {dnn:?} has a breakout route but no intermediate UPF to classify at"
+                        );
+                        let prefix: pfcp::IpPrefix = route.prefix.parse().map_err(|_| {
+                            anyhow::anyhow!("breakout prefix {:?} is not a CIDR", route.prefix)
+                        })?;
+                        Some((peer(&route.via)?, prefix))
+                    }
+                    None => None,
+                };
                 Ok(SessionPath {
                     anchor: peer(anchor)?,
                     intermediate: intermediate.map(peer).transpose()?,
-                    breakout: None,
+                    breakout,
                 })
             }
         }
@@ -2577,6 +2593,77 @@ mod tests {
         // picked the UPF.
         assert_eq!(internet.lock().unwrap().session_count(), 1, "the internet DNN's anchor");
         assert_eq!(ims.lock().unwrap().session_count(), 1, "the ims DNN's anchor");
+    }
+
+    /// design/134 Phase 3c: the uplink classifier, now expressed in the topology config's
+    /// `routes` rather than the `RADIAN_SMF_PSA2_N4`/`PREFIX` env vars. One session on the
+    /// chained DNN fans out across the default anchor and the breakout anchor named by the
+    /// route — the same two-anchor splice as Phase 2, driven entirely by config.
+    #[tokio::test]
+    async fn topology_breakout_route_splits_a_session_across_two_anchors() {
+        let (anchor_ip, iupf_ip, edge_ip) = (
+            Ipv4Addr::new(127, 0, 0, 2),
+            Ipv4Addr::new(127, 0, 0, 3),
+            Ipv4Addr::new(127, 0, 0, 4),
+        );
+        let (anchor, anchor_n4) = spin_upf(anchor_ip).await;
+        let (iupf, iupf_n4) = spin_upf(iupf_ip).await;
+        let (edge, edge_n4) = spin_upf(edge_ip).await;
+
+        let (nrf_base, _udr) =
+            spin_subscription_backend("imsi-999700000000001", "99970").await;
+
+        // gNB → iupf → anchor for the default path; a route steers 10.99.0.0/16 to `edge`.
+        let topo = crate::topology::Topology::parse(&format!(
+            r#"{{
+                "upNodes": {{
+                    "gNB":    {{ "type": "AN" }},
+                    "iupf":   {{ "type": "UPF", "n4": "{iupf_n4}" }},
+                    "anchor": {{ "type": "UPF", "n4": "{anchor_n4}", "dnns": ["internet"] }},
+                    "edge":   {{ "type": "UPF", "n4": "{edge_n4}" }}
+                }},
+                "links": [
+                    {{ "a": "gNB", "b": "iupf" }},
+                    {{ "a": "iupf", "b": "anchor" }},
+                    {{ "a": "iupf", "b": "edge" }}
+                ],
+                "routes": [
+                    {{ "dnn": "internet", "prefix": "10.99.0.0/16", "via": "edge" }}
+                ]
+            }}"#
+        ))
+        .unwrap();
+
+        let smf = Arc::new(
+            SmfState::connect_with_topology(topo, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+                .await
+                .unwrap(),
+        );
+        smf.associate().await.unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+        let status = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_success(), "create failed: {status}");
+
+        // One PDU session spliced across all three: the anchor, the classifier, and the
+        // config-named breakout anchor.
+        assert_eq!(anchor.lock().unwrap().session_count(), 1, "the default anchor");
+        assert_eq!(iupf.lock().unwrap().session_count(), 1, "the classifier");
+        assert_eq!(edge.lock().unwrap().session_count(), 1, "the breakout anchor from the route");
     }
 
     /// The **uplink classifier** (design/134 Phase 2): one PDU session, one UE address,
