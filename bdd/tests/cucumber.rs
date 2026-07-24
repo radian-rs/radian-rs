@@ -27,6 +27,10 @@ const N4_PORT: u16 = 8805;
 /// loopback alias so its N3 (GTP-U :2152) doesn't collide with the scripted gNB's
 /// N3 (:2152 on 127.0.0.1) — the two speak GTP-U to each other across 127.0.0.1↔.2.
 const UPF_N3_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+/// A **second** UPF's loopback alias — the intermediate UPF (I-UPF) in a chained
+/// deployment (design/134): it binds 127.0.0.3 for N3/N4, so it coexists with the anchor
+/// (127.0.0.2) and the scripted gNB (127.0.0.1) on GTP-U :2152 with no namespace setup.
+const IUPF_N3_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
 const GNB_N3_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 const GNB_TEID: u32 = 0x1001; // datapath feature: the downlink F-TEID we install and expect
 const UDR_KEK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
@@ -243,6 +247,19 @@ async fn setup_ran_ue(world: &mut World) {
 
 #[when("I start the radian core")]
 async fn start_core(world: &mut World) {
+    start_core_inner(world, false).await;
+}
+
+/// design/134 Phase 3: start the core with an **intermediate UPF** (I-UPF) chained in
+/// front of the anchor, so every PDU session runs gNB → I-UPF → N9 → anchor → N6. A
+/// second `nf-upf` binds [`IUPF_N3_IP`] and the SMF is pointed at it via
+/// `RADIAN_SMF_IUPF_N4`; the signalling is otherwise identical.
+#[when("I start the radian core with an intermediate UPF")]
+async fn start_core_chained(world: &mut World) {
+    start_core_inner(world, true).await;
+}
+
+async fn start_core_inner(world: &mut World, chained: bool) {
     let nrf = "http://127.0.0.1:8000";
     let db = format!("/tmp/{}_udr.redb", world.feature_tag);
     let _ = std::fs::remove_file(&db);
@@ -284,10 +301,43 @@ async fn start_core(world: &mut World) {
     );
     assert!(wait_until(6, || netns::host_iface_exists("n6upf0")).await, "UPF N6 TUN did not come up");
 
+    // A chained deployment (design/134) puts an **intermediate UPF** in front of the
+    // anchor. It relays N3↔N9 only and needs no N6 TUN, so run it non-root: `N6Tun::open`
+    // then degrades and it serves N3/N4 alone (§D3). Its log is keyed "iupf" so it
+    // doesn't clobber the anchor's `/tmp/<tag>_upf.log`, and — having no TUN to wait on —
+    // its readiness is the N4/N3 banner rather than an interface.
+    if chained {
+        world.procs.push(
+            spawn_core_as(
+                &tag,
+                false,
+                &[
+                    ("RADIAN_UPF_BIND", &IUPF_N3_IP.to_string()),
+                    ("RADIAN_UPF_N3_ADDR", &IUPF_N3_IP.to_string()),
+                ],
+                "upf",
+                "iupf",
+            )
+            .await,
+        );
+        let iupf_log = nf_log(&tag, "iupf");
+        let up = wait_until(6, || {
+            let iupf_log = iupf_log.clone();
+            async move { netns::log_contains(&iupf_log, "UPF up: N4 (PFCP) + N3 (GTP-U)") }
+        })
+        .await;
+        assert!(up, "the intermediate UPF did not come up (see {})", iupf_log.display());
+    }
+
     let smf_n4 = format!("{UPF_N3_IP}:{N4_PORT}");
-    world.procs.push(
-        spawn_core(&tag, false, &[("RADIAN_SMF_UPF_N4", &smf_n4), ("RADIAN_SMF_NRF", nrf)], "smf").await,
-    );
+    let iupf_n4 = format!("{IUPF_N3_IP}:{N4_PORT}");
+    let mut smf_env = vec![("RADIAN_SMF_UPF_N4", smf_n4.as_str()), ("RADIAN_SMF_NRF", nrf)];
+    if chained {
+        // Every session then chains gNB → I-UPF → N9 → anchor; the SMF hands the gNB the
+        // I-UPF's N3 F-TEID, so the datapath steps drive the whole chain unchanged.
+        smf_env.push(("RADIAN_SMF_IUPF_N4", iupf_n4.as_str()));
+    }
+    world.procs.push(spawn_core(&tag, false, &smf_env, "smf").await);
     // Shrink T3513 so the paging-retransmission scenario runs in a few seconds. It
     // stays comfortably longer than a scripted resume takes, so scenarios whose UE
     // resumes (the buffer-flush arc) still stop paging before the first retransmit.
@@ -305,11 +355,24 @@ async fn start_core(world: &mut World) {
 /// Spawn one radian NF in the host namespace (under sudo when `root`), tracking it;
 /// its stdout+stderr are captured to `/tmp/<tag>_<nf>.log` for log-assertion steps.
 async fn spawn_core(tag: &str, root: bool, env: &[(&str, &str)], name: &str) -> tokio::process::Child {
-    let bin = radian_bin(name);
-    assert!(bin.exists(), "nf-{name} not found at {} — run `cargo build`", bin.display());
-    netns::spawn_host_env_logged(root, env, &bin.to_string_lossy(), &[], &nf_log(tag, name))
+    spawn_core_as(tag, root, env, name, name).await
+}
+
+/// Like [`spawn_core`] but with a distinct **log** name, so a second instance of the same
+/// binary (e.g. an intermediate UPF alongside the anchor, design/134) captures to its own
+/// `/tmp/<tag>_<log_name>.log` instead of clobbering the first's.
+async fn spawn_core_as(
+    tag: &str,
+    root: bool,
+    env: &[(&str, &str)],
+    bin_name: &str,
+    log_name: &str,
+) -> tokio::process::Child {
+    let bin = radian_bin(bin_name);
+    assert!(bin.exists(), "nf-{bin_name} not found at {} — run `cargo build`", bin.display());
+    netns::spawn_host_env_logged(root, env, &bin.to_string_lossy(), &[], &nf_log(tag, log_name))
         .await
-        .unwrap_or_else(|e| panic!("spawn nf-{name}: {e}"))
+        .unwrap_or_else(|e| panic!("spawn nf-{bin_name}: {e}"))
 }
 
 /// Path of the captured log for one core NF under this feature's tag.
