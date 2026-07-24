@@ -48,6 +48,16 @@ const BIND_ENV: &str = "RADIAN_UPF_BIND";
 // N6 (data network) TUN configuration. The UPF's own address sits inside the UE IP pool
 // (10.45.0.0/16, allocated by the SMF — see nf-smf) so the kernel routes UE return traffic
 // to this interface; .1 is the UPF's N6 gateway, UEs get .2 and up.
+//
+// These are the single-UPF defaults; each is overridable by env so a *second* anchor can
+// run alongside the first with its own TUN, address and DN (design/134 Phase 3d — a UPF
+// hosting a breakout DN needs a distinct `n6upf1`/subnet). The v6 gateway is opt-out
+// (`RADIAN_UPF_N6_ADDR6=none`) so a v4-only breakout anchor doesn't collide with the
+// default anchor on the shared `2001:db8::/32` v6 route.
+const N6_TUN_ENV: &str = "RADIAN_UPF_N6_TUN";
+const N6_ADDR_ENV: &str = "RADIAN_UPF_N6_ADDR";
+const N6_MASK_ENV: &str = "RADIAN_UPF_N6_MASK";
+const N6_ADDR6_ENV: &str = "RADIAN_UPF_N6_ADDR6";
 const N6_TUN_NAME: &str = "n6upf0";
 const N6_UPF_ADDR: Ipv4Addr = Ipv4Addr::new(10, 45, 0, 1);
 const N6_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 0, 0);
@@ -56,6 +66,11 @@ const N6_MTU: u16 = 1400; // headroom under 1500 for the N3 GTP-U/UDP/IP outer h
 /// (design/131) so the kernel routes UE return traffic to this TUN.
 const N6_UPF_ADDR6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
 const N6_PREFIX_LEN6: u8 = 32;
+
+/// Read an env var of type `T` (parsed), falling back to `default`.
+fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 
 type Upf = Arc<Mutex<pfcp::UpfState>>;
 
@@ -84,16 +99,22 @@ async fn main() -> anyhow::Result<()> {
     );
     info!(%bind, %node_ip, n4_port = pfcp::N4_PORT, n3_port = gtpu::GTPU_PORT, "UPF up: N4 (PFCP) + N3 (GTP-U)");
 
+    // N6 config: env-overridable so a second anchor can host its own DN (design/134).
+    let n6_tun = std::env::var(N6_TUN_ENV).unwrap_or_else(|_| N6_TUN_NAME.to_string());
+    let n6_addr = env_or(N6_ADDR_ENV, N6_UPF_ADDR);
+    let n6_mask = env_or(N6_MASK_ENV, N6_NETMASK);
+    // The v6 gateway is opt-out: `RADIAN_UPF_N6_ADDR6=none` disables v6 (a v4-only
+    // breakout anchor), else the env value or the default 2001:db8::1.
+    let n6_addr6 = match std::env::var(N6_ADDR6_ENV).as_deref() {
+        Ok("none") => None,
+        Ok(v) => v.parse().ok().map(|a| (a, N6_PREFIX_LEN6)),
+        Err(_) => Some((N6_UPF_ADDR6, N6_PREFIX_LEN6)),
+    };
+
     // N6 is the privileged edge: opening a TUN needs CAP_NET_ADMIN. Degrade gracefully.
-    let tun = match N6Tun::open(
-        N6_TUN_NAME,
-        N6_UPF_ADDR,
-        N6_NETMASK,
-        N6_MTU,
-        Some((N6_UPF_ADDR6, N6_PREFIX_LEN6)),
-    ) {
+    let tun = match N6Tun::open(&n6_tun, n6_addr, n6_mask, N6_MTU, n6_addr6) {
         Ok(t) => {
-            info!(tun = t.name(), addr = %N6_UPF_ADDR, addr6 = %N6_UPF_ADDR6, "N6 up: TUN open — user-plane forwarding live");
+            info!(tun = t.name(), addr = %n6_addr, addr6 = ?n6_addr6.map(|(a, _)| a), "N6 up: TUN open — user-plane forwarding live");
             Some(Arc::new(t))
         }
         Err(e) => {

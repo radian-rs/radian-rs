@@ -31,6 +31,16 @@ const UPF_N3_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 /// deployment (design/134): it binds 127.0.0.3 for N3/N4, so it coexists with the anchor
 /// (127.0.0.2) and the scripted gNB (127.0.0.1) on GTP-U :2152 with no namespace setup.
 const IUPF_N3_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
+/// A **third** UPF's loopback alias — the breakout anchor (PSA2) of a ULCL split
+/// (design/134 Phase 3d). It terminates its own DN on [`BREAKOUT_TUN`]/[`BREAKOUT_N6_ADDR`]
+/// and the classifier steers [`BREAKOUT_PREFIX`] to it.
+const PSA2_N3_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 4);
+const BREAKOUT_TUN: &str = "n6upf1";
+const BREAKOUT_N6_ADDR: &str = "10.99.0.1";
+const BREAKOUT_PREFIX: &str = "10.99.0.0/16";
+/// A private routing table for the breakout anchor's UE-pool return route (kept off the
+/// main table, which the default anchor owns).
+const BREAKOUT_TABLE: &str = "199";
 const GNB_N3_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 const GNB_TEID: u32 = 0x1001; // datapath feature: the downlink F-TEID we install and expect
 const UDR_KEK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
@@ -146,6 +156,8 @@ async fn clean_environment(world: &mut World) {
         let _ = netns::delete_netns(&ns).await;
     }
     let _ = netns::delete_veth(&world.host_veth()).await;
+    // Sweep the breakout anchor's source route (design/134 Phase 3d) — harmless if absent.
+    netns::del_source_route(BREAKOUT_N6_ADDR, BREAKOUT_TABLE).await;
 }
 
 #[then("the test environment should be clean")]
@@ -255,6 +267,10 @@ enum UpMode {
     /// The same chain, but described by a JSON UP-topology config the SMF loads via
     /// `RADIAN_SMF_TOPOLOGY` and routes per DNN (Phase 3b).
     ChainedTopology,
+    /// A ULCL split (Phase 3d): the classifier plus a **third** UPF, the breakout anchor,
+    /// terminating its own DN. The topology config steers [`BREAKOUT_PREFIX`] to it, so one
+    /// PDU session reaches two data networks with real packets.
+    Breakout,
 }
 
 impl UpMode {
@@ -284,6 +300,14 @@ async fn start_core_chained(world: &mut World) {
 #[when("I start the radian core from a UP topology config")]
 async fn start_core_from_topology(world: &mut World) {
     start_core_inner(world, UpMode::ChainedTopology).await;
+}
+
+/// design/134 Phase 3d: start the core with an **uplink-classifier breakout** — a third
+/// UPF terminating its own DN, with the topology config steering a prefix to it. One PDU
+/// session then reaches two data networks, proven with real packets to each gateway.
+#[when("I start the radian core with an uplink-classifier breakout")]
+async fn start_core_breakout(world: &mut World) {
+    start_core_inner(world, UpMode::Breakout).await;
 }
 
 async fn start_core_inner(world: &mut World, mode: UpMode) {
@@ -356,6 +380,38 @@ async fn start_core_inner(world: &mut World, mode: UpMode) {
         assert!(up, "the intermediate UPF did not come up (see {})", iupf_log.display());
     }
 
+    // Phase 3d: a third UPF — the **breakout anchor** — terminating its OWN DN. It needs a
+    // real N6 TUN, so run it root, with distinct N6 config (`n6upf1` / [`BREAKOUT_N6_ADDR`],
+    // v6 off) so it doesn't collide with the default anchor's `n6upf0`. A source route then
+    // lets it return the UE's traffic on its own TUN: the two anchors share the one UE
+    // address, so on a single host they must be kept off each other's return route.
+    if mode == UpMode::Breakout {
+        let psa2 = PSA2_N3_IP.to_string();
+        world.procs.push(
+            spawn_core_as(
+                &tag,
+                true,
+                &[
+                    ("RADIAN_UPF_BIND", &psa2),
+                    ("RADIAN_UPF_N3_ADDR", &psa2),
+                    ("RADIAN_UPF_N6_TUN", BREAKOUT_TUN),
+                    ("RADIAN_UPF_N6_ADDR", BREAKOUT_N6_ADDR),
+                    ("RADIAN_UPF_N6_ADDR6", "none"),
+                ],
+                "upf",
+                "psa2",
+            )
+            .await,
+        );
+        assert!(
+            wait_until(6, || netns::host_iface_exists(BREAKOUT_TUN)).await,
+            "the breakout anchor's N6 TUN ({BREAKOUT_TUN}) did not come up"
+        );
+        netns::add_source_route(BREAKOUT_N6_ADDR, BREAKOUT_TABLE, "10.45.0.0/16", BREAKOUT_TUN)
+            .await
+            .expect("install the breakout anchor's UE-pool return route");
+    }
+
     let smf_n4 = format!("{UPF_N3_IP}:{N4_PORT}");
     let iupf_n4 = format!("{IUPF_N3_IP}:{N4_PORT}");
     // A JSON topology file, written only in `ChainedTopology` mode — describes the same
@@ -381,6 +437,30 @@ async fn start_core_inner(world: &mut World, mode: UpMode) {
   "links": [
     {{ "a": "gNB",  "b": "iupf" }},
     {{ "a": "iupf", "b": "anchor" }}
+  ]
+}}"#
+            );
+            std::fs::write(&topology_path, topology).expect("write UP topology config");
+            smf_env.push(("RADIAN_SMF_TOPOLOGY", topology_path.as_str()));
+        }
+        UpMode::Breakout => {
+            // Same chain, plus a breakout anchor `edge` and a route steering the breakout
+            // prefix to it — one PDU session, two data networks.
+            let topology = format!(
+                r#"{{
+  "upNodes": {{
+    "gNB":    {{ "type": "AN" }},
+    "iupf":   {{ "type": "UPF", "n4": "{IUPF_N3_IP}:{N4_PORT}" }},
+    "anchor": {{ "type": "UPF", "n4": "{UPF_N3_IP}:{N4_PORT}", "dnns": ["internet"] }},
+    "edge":   {{ "type": "UPF", "n4": "{PSA2_N3_IP}:{N4_PORT}" }}
+  }},
+  "links": [
+    {{ "a": "gNB",  "b": "iupf" }},
+    {{ "a": "iupf", "b": "anchor" }},
+    {{ "a": "iupf", "b": "edge" }}
+  ],
+  "routes": [
+    {{ "dnn": "internet", "prefix": "{BREAKOUT_PREFIX}", "via": "edge" }}
   ]
 }}"#
             );
@@ -1416,6 +1496,9 @@ async fn scripted_core_running(_world: &mut World) {
 #[when("I stop the radian core")]
 async fn stop_core_only(_world: &mut World) {
     netns::kill_host_procs("target/debug/nf-").await.expect("kill radian core");
+    // Killing the UPFs removes their TUNs (and any route bound to them); the breakout
+    // anchor's `ip rule` is device-independent, so clear it explicitly (Phase 3d).
+    netns::del_source_route(BREAKOUT_N6_ADDR, BREAKOUT_TABLE).await;
 }
 
 // ── feature: gnb_standalone (@gnb, design/128 Phase 0) ─────────────────────────────────
