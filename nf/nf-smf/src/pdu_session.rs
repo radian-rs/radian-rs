@@ -550,6 +550,12 @@ impl SmfState {
         }
     }
 
+    /// Whether the topology declares a static breakout route for `dnn` — that breakout is
+    /// config-owned, so AF-influenced policy must not reconcile it away (design/135 Phase 2).
+    fn dnn_has_config_route(&self, dnn: &str) -> bool {
+        matches!(&self.routing, Routing::Graph(topo) if topo.breakout_for_dnn(dnn).is_some())
+    }
+
     /// PFCP Association Setup toward every UPF in the topology — required before any
     /// session.
     pub async fn associate(&self) -> anyhow::Result<()> {
@@ -2038,7 +2044,7 @@ async fn refresh_sm_policy(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<axum::response::Response, SbiProblem> {
-    let (sm_policy, up_seid, old_policy, supi, psi, anchor) = {
+    let (sm_policy, up_seid, old_policy, supi, psi, anchor, chain, path, dnn, ue_ip, ue_ipv6) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
             Some(c) => (
@@ -2048,6 +2054,11 @@ async fn refresh_sm_policy(
                 c.supi.clone(),
                 c.pdu_session_id,
                 c.path.anchor.clone(),
+                c.chain,
+                c.path.clone(),
+                c.dnn.clone(),
+                c.ue_ip,
+                c.ue_ipv6,
             ),
             None => {
                 return Err(problem(
@@ -2124,6 +2135,33 @@ async fn refresh_sm_policy(
             c.reserved_gfbr = new_gfbr;
         }
         c.policy = decision.clone();
+    }
+    // design/135 Phase 2: reconcile an **AF-influenced breakout** with the refreshed
+    // decision. A traffic-control decision naming a route (prefix → DNAI) means the SMF
+    // should have a live ULCL breakout; its absence means it should not. Only for a
+    // chained session whose breakout is *not* config-driven (a static topology route owns
+    // its own breakout — policy must not disturb it).
+    let config_route = smf.dnn_has_config_route(&dnn);
+    if let (Some(leg), Some(iupf)) = (chain, path.intermediate.as_deref()) {
+        let desired = decision.influence_route();
+        let active = leg.breakout_seid.is_some();
+        match (desired, active, config_route) {
+            (Some((prefix, dnai)), false, false) => {
+                match smf.node_for_dnai(&dnai) {
+                    Some(via) => {
+                        let ue = pfcp::UeAddr { v4: ue_ip, v6: ue_ipv6.map(|(p, _)| p) };
+                        let r = insert_breakout(&smf, &sm_ref, &leg, iupf, ue, &dnn, &prefix, &via).await;
+                        tracing::info!(%sm_ref, %prefix, %dnai, status = ?r.status(), "AF-influenced breakout inserted from SM policy");
+                    }
+                    None => tracing::warn!(%sm_ref, %dnai, "AF influence names a DNAI with no UP node"),
+                }
+            }
+            (None, true, false) => {
+                let r = remove_breakout(&smf, &sm_ref, &leg, iupf, &path).await;
+                tracing::info!(%sm_ref, status = ?r.status(), "AF-influenced breakout withdrawn from SM policy");
+            }
+            _ => {} // already in the desired state, or a config-route session
+        }
     }
     // Signal the change to the RAN/UE via the serving AMF (Namf_Communication →
     // N2 PDU Session Resource Modify + N1 PDU Session Modification Command).
@@ -3070,6 +3108,107 @@ mod tests {
             .status();
         assert_eq!(del.as_u16(), 204, "AF subscription deleted");
         assert_eq!(edge.lock().unwrap().session_count(), 0, "the breakout is gone");
+        assert!(iupf.lock().unwrap().branches_for_teid(ran_teid).is_empty(), "the branch is gone");
+        assert_eq!(anchor.lock().unwrap().session_count(), 1, "the default anchor is untouched");
+    }
+
+    /// design/135 Phase 2a: AF influence carried **through the SM policy**. A traffic-control
+    /// decision (route a prefix to a DNAI) appearing in the PCF's decision makes the SMF
+    /// splice a live breakout on a policy refresh; its withdrawal tears it down — so AF
+    /// influence composes with QoS in one decision, rather than the Phase-1 NEF→SMF shortcut.
+    #[tokio::test]
+    async fn sm_policy_traffic_control_drives_a_breakout_on_refresh() {
+        let (anchor_ip, iupf_ip, edge_ip) = (
+            Ipv4Addr::new(127, 0, 0, 2),
+            Ipv4Addr::new(127, 0, 0, 3),
+            Ipv4Addr::new(127, 0, 0, 4),
+        );
+        let (anchor, anchor_n4) = spin_upf(anchor_ip).await;
+        let (iupf, iupf_n4) = spin_upf(iupf_ip).await;
+        let (edge, edge_n4) = spin_upf(edge_ip).await;
+
+        let (nrf_base, udr_base) =
+            spin_subscription_backend("imsi-999700000000001", "99970").await;
+        // Baseline SM policy-data (no influence), backing a UDR-sourced PCF.
+        let udr = sbi_core::nudr::UdrClient::new(udr_base.clone());
+        let base_policy = serde_json::json!({ "default": {
+            "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" } } },
+            "pccRules": { "pcc-1": { "refQosData": "qos-1" } },
+            "qosDecs": { "qos-1": { "qfi": 1, "fiveQi": 9 } }
+        } });
+        udr.put_sm_policy_data("imsi-999700000000001", &base_policy).await.unwrap();
+        let _pcf = spin_pcf(&nrf_base, Some(&udr_base)).await;
+        let _amf = spin_mock_amf(&nrf_base).await;
+
+        // `edge` exposes DNAI "mec"; no static route — the breakout is policy-driven.
+        let topo = crate::topology::Topology::parse(&format!(
+            r#"{{
+                "upNodes": {{
+                    "gNB":    {{ "type": "AN" }},
+                    "iupf":   {{ "type": "UPF", "n4": "{iupf_n4}" }},
+                    "anchor": {{ "type": "UPF", "n4": "{anchor_n4}", "dnns": ["internet"] }},
+                    "edge":   {{ "type": "UPF", "n4": "{edge_n4}", "dnai": "mec" }}
+                }},
+                "links": [
+                    {{ "a": "gNB", "b": "iupf" }},
+                    {{ "a": "iupf", "b": "anchor" }},
+                    {{ "a": "iupf", "b": "edge" }}
+                ]
+            }}"#
+        ))
+        .unwrap();
+        let smf = Arc::new(
+            SmfState::connect_with_topology(topo, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+                .await
+                .unwrap(),
+        );
+        smf.associate().await.unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+        let created: SmContextCreatedData = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ran_teid = u32::from_str_radix(&created.up_n3_teid, 16).unwrap();
+        let sm_ref = created.sm_context_ref;
+        assert_eq!(edge.lock().unwrap().session_count(), 0, "no influence yet");
+
+        // AF influence lands in the policy: steer 10.99.0.0/16 to DNAI "mec".
+        let influenced = serde_json::json!({ "default": {
+            "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" } } },
+            "pccRules": { "pcc-1": { "refQosData": "qos-1" } },
+            "qosDecs": { "qos-1": { "qfi": 1, "fiveQi": 9 } },
+            "traffContDecs": { "tc-af": { "routeToLocs": [{ "dnai": "mec" }], "trafficPrefix": "10.99.0.0/16" } }
+        } });
+        udr.put_sm_policy_data("imsi-999700000000001", &influenced).await.unwrap();
+        let refresh = |sm_ref: &str| {
+            client.post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/refresh-policy")).send()
+        };
+        assert!(refresh(&sm_ref).await.unwrap().status().is_success(), "refresh (influence added)");
+        assert_eq!(edge.lock().unwrap().session_count(), 1, "the influenced breakout is spliced in");
+        assert_eq!(
+            iupf.lock().unwrap().branches_for_teid(ran_teid).len(),
+            1,
+            "the classifier steers the influenced prefix"
+        );
+
+        // Withdraw the influence: the policy loses the traffic-control decision.
+        udr.put_sm_policy_data("imsi-999700000000001", &base_policy).await.unwrap();
+        assert!(refresh(&sm_ref).await.unwrap().status().is_success(), "refresh (influence withdrawn)");
+        assert_eq!(edge.lock().unwrap().session_count(), 0, "the breakout is torn down");
         assert!(iupf.lock().unwrap().branches_for_teid(ran_teid).is_empty(), "the branch is gone");
         assert_eq!(anchor.lock().unwrap().session_count(), 1, "the default anchor is untouched");
     }
