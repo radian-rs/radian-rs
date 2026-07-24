@@ -13,6 +13,10 @@ use pdu_session::SmfState;
 
 const UPF_N4_ENV: &str = "RADIAN_SMF_UPF_N4";
 const DEFAULT_UPF_N4: &str = "127.0.0.1:8805";
+/// N4 address of an **intermediate UPF** (I-UPF). When set, every PDU session is
+/// chained gNB → I-UPF → N9 → anchor → N6 (design/134); the anchor stays
+/// `RADIAN_SMF_UPF_N4`. Absent ⇒ single-UPF operation.
+const IUPF_N4_ENV: &str = "RADIAN_SMF_IUPF_N4";
 const NRF_ENV: &str = "RADIAN_SMF_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 /// GFBR admission-control budget (Mbps, each direction). Absent ⇒ unlimited.
@@ -36,12 +40,14 @@ async fn main() -> anyhow::Result<()> {
     let upf_n4: SocketAddr = std::env::var(UPF_N4_ENV)
         .unwrap_or_else(|_| DEFAULT_UPF_N4.to_string())
         .parse()?;
+    let iupf_n4: Option<SocketAddr> =
+        std::env::var(IUPF_N4_ENV).ok().map(|v| v.parse()).transpose()?;
     let smf_ip = Ipv4Addr::new(127, 0, 0, 1); // TODO: real N4 source address / config
     let nrf_base =
         sbi_core::sbi_base(std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string()));
 
     // The NRF base is also how the SMF finds the UDM for Nudm_SDM subscription checks.
-    let mut smf = SmfState::connect(upf_n4, smf_ip, nrf_base.clone()).await?;
+    let mut smf = SmfState::connect(upf_n4, iupf_n4, smf_ip, nrf_base.clone()).await?;
     // Optional GFBR admission-control budget (else unlimited).
     if let Some(mbps) = std::env::var(GFBR_BUDGET_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
         let bps = mbps.saturating_mul(1_000_000);
@@ -56,7 +62,14 @@ async fn main() -> anyhow::Result<()> {
     }
     let smf = Arc::new(smf);
     smf.associate().await?;
-    tracing::info!(%upf_n4, "PFCP association established with UPF");
+    match iupf_n4 {
+        Some(iupf) => tracing::info!(
+            anchor = %upf_n4,
+            intermediate = %iupf,
+            "PFCP associations established; sessions run chained over N9 (design/134)"
+        ),
+        None => tracing::info!(%upf_n4, "PFCP association established with UPF"),
+    }
     // Consume UPF-initiated usage reports: ack + relay to the CHF (Nchf update).
     tokio::spawn(pdu_session::handle_usage_reports(smf.clone()));
 
