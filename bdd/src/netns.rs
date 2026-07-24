@@ -219,6 +219,19 @@ pub async fn add_source_route(src: &str, table: &str, dest: &str, dev: &str) -> 
     sudo(&["ip", "route", "add", dest, "dev", dev, "table", table], "add source route").await
 }
 
+/// POST a JSON `body` to `url` (via curl); returns whether the response was 2xx. Used to
+/// drive the SMF's OAM ULCL-insertion endpoint from a scenario (design/134 Phase 3e).
+pub async fn http_post(url: &str, body: &str) -> bool {
+    let out = Command::new("curl")
+        .args([
+            "-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST", "-H",
+            "Content-Type: application/json", "-d", body, url,
+        ])
+        .output()
+        .await;
+    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).starts_with('2'))
+}
+
 /// Remove a source route installed by [`add_source_route`] (best-effort — safe to call
 /// when nothing is installed, so it doubles as a defensive sweep).
 pub async fn del_source_route(src: &str, table: &str) {
