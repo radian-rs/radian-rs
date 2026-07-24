@@ -79,13 +79,13 @@ radian-rs is at or beyond free5gc on the mainline mobility + idle arcs; the AMF 
 | PCC/QoS/session/charging rule sourcing from PCF | ✅ | ✅ | — |
 | GFBR admission, URR usage → CHF | ✅ | ✅ | — |
 | DNN + S-NSSAI authorization (reject #27/#31/#70) | ✅ | ✅ | — |
-| **ULCL / branching point / uplink classifier** | ✅ (`ulcl_procedure.go`, `bp_manager.go`) | ❌ | **Major** — §6 |
-| **Multi-UPF / I-UPF + PSA chains / UP topology graph** | ✅ (`user_plane_information.go`, `upNodes/links`) | ❌ | **Major** — §6 |
+| **ULCL / branching point / uplink classifier** | ✅ (`ulcl_procedure.go`, `bp_manager.go`) | ✅ **CLOSED** — destination-prefix SDF filters steer one session to a second anchor, or break out locally ([134](134-ulcl-multi-upf.md) Phase 2) | **Closed** (dynamic insertion = Phase 3) |
+| **Multi-UPF / I-UPF + PSA chains / UP topology graph** | ✅ (`user_plane_information.go`, `upNodes/links`) | ✅ chains + a second anchor via per-association `N4Peer`s ([134](134-ulcl-multi-upf.md)); topology still env-configured, not a graph | **Minor** — config only (Phase 3) |
 | **IPv6 / IPv4v6 PDU session types** | ⚠ signalling only (`pco.go`, `gsm_build.go`) — negotiation + PCO-DNS but **no prefix/IID alloc, no SLAAC/RA** ([131](131-ipv6-pdu-sessions.md) §2) | ✅ **CLOSED** — negotiation, /64+IID, v6 datapath, SLAAC/RA, PCO-DNS, dual-stack ([131](131-ipv6-pdu-sessions.md)) | **▲ radian ahead** (free5gc's v6 datapath is stubbed) |
 | Ethernet PDU session type | ✅ | ❌ | **Minor** |
 | UE-IP pool | IPv4 only (the v6 pool is absent) | IPv4 + an IPv6 /64-per-session pool ([131](131-ipv6-pdu-sessions.md)) | **▲ radian ahead** |
 
-The SMF's user plane is **single-UPF, single-N4-association, IPv4-only**. free5gc's ULCL + multi-UPF UP-topology graph (steered by `config/uerouting.yaml`) is the single largest core-network capability gap.
+The SMF's user plane *was* **single-UPF, single-N4-association, IPv4-only** — the single largest core-network capability gap at survey time. [134](134-ulcl-multi-upf.md) has since closed the mechanism (N9 chaining, multi-peer N4, an uplink classifier); what free5gc still has and radian-rs does not is the **declarative UP-topology graph** (`upNodes`/`links`, steered by `config/uerouting.yaml`) and mid-session ULCL insertion.
 
 ### 2.3 UPF
 
@@ -96,8 +96,8 @@ The SMF's user plane is **single-UPF, single-N4-association, IPv4-only**. free5g
 | Session-AMBR policing, per-flow GBR, URR volume | ✅ | ✅ | — |
 | CM-IDLE DL buffering + Downlink Data Report + flush | ✅ (netlink buffer) | ✅ (bounded in-process) | — |
 | GTP-U End Marker, F-TEID CHOOSE, NetworkInstance=DNN | ✅ | ✅ | — |
-| **N9 interface (UPF↔UPF chaining)** | ✅ | ❌ | **Major** — pairs with ULCL/multi-UPF |
-| **IPv6 flow matching / SDF filters** | ⚠ v6 parser exists (`flowdesc.go`) but the gtp5g binding emits IPv4 attrs only — effectively v4 | ✅ v6 UE-IP PDI + /64 routing ([131](131-ipv6-pdu-sessions.md)); per-flow SDF still v4 | **Minor** (v6 SDF filters remain) |
+| **N9 interface (UPF↔UPF chaining)** | ✅ | ✅ **CLOSED** — uplink over N9 to the next UPF and downlink back through the classifier's own N9 ingress ([134](134-ulcl-multi-upf.md)) | — |
+| **IPv6 flow matching / SDF filters** | ⚠ v6 parser exists (`flowdesc.go`) but the gtp5g binding emits IPv4 attrs only — effectively v4 | ✅ v6 UE-IP PDI + /64 routing ([131](131-ipv6-pdu-sessions.md)); SDF classification now reads both families ([134](134-ulcl-multi-upf.md) Phase 2) | **▲ radian ahead** |
 | NAT for N6 | ✅ (config) | ❌ | **Minor** |
 
 ### 2.4 AUSF / UDM (authentication)
@@ -161,7 +161,7 @@ free5gc: React frontend + Go backend writing subscriber provisioning (SUPI/keys/
 
 | Capability | free5gc | radian-rs | Sev · Size |
 |---|---|---|---|
-| **ULCL + multi-UPF / I-UPF / N9 chaining** | ✅ | ❌ | Major · **XL** |
+| ~~**ULCL + multi-UPF / I-UPF / N9 chaining**~~ **mostly CLOSED** | ✅ | ✅ N9 + chains + uplink classifier ([134](134-ulcl-multi-upf.md)); UP-topology config outstanding | Minor · **L** (Phase 3) |
 | ~~**IPv6 / IPv4v6 PDU sessions** (control + datapath)~~ **CLOSED** | ⚠ signalling only, datapath stubbed ([131](131-ipv6-pdu-sessions.md) §2) | ✅ full stack ([131](131-ipv6-pdu-sessions.md)) | **▲ radian ahead** |
 | **Network slicing** (NSSF + slice re-selection) | ✅ | partial (AMF-local) | Major · **L** |
 | **Non-3GPP access** (N3IWF + TNGF) | ✅ | ❌ | Major · **XL** |
@@ -204,7 +204,7 @@ Ordered by value-per-effort, respecting dependencies. Each is a candidate design
 
 **P2 — breadth that unlocks whole scenario classes:**
 3. ~~**NSSF + AMF slice re-selection** (§3.1)~~ — **DONE** (NSSF), shipped in [133](133-nssf-slicing.md): `nf-nssf` + `Nnssf_NSSelection`/`NSSAIAvailability`, with **per-TA slice availability** as the capability AMF-local logic couldn't provide. *AMF re-selection stays open* — it needs multi-AMF (a separate gap).
-4. **ULCL + multi-UPF / N9** (§2.2/2.3/4). *XL*. UP-topology graph in SMF + N9 in UPF datapath — the largest core refactor; realistically its own multi-slice effort. Requires ≥2 UPFs first.
+4. **ULCL + multi-UPF / N9** (§2.2/2.3/4). *XL*. **Substantially DONE** in [134](134-ulcl-multi-upf.md) (PRs #121/#122/…): N9 in the UPF datapath, multi-peer N4 in the SMF, and an uplink classifier that splits one PDU session across two anchors by destination prefix (with local breakout falling out for free). The survey also found and repaired a latent bug — the UPF never read establishment-time `CreateFar`, which had left [84](84-indirect-data-forwarding.md)'s forwarding path silently inert. *Remaining:* config-driven UP topology and mid-session ULCL insertion/removal (Phase 3).
 5. **NEF + AF traffic influence** (§3.2). *L*. New `nf-nef` + UDR influence data (§2.5) + PCF PolicyAuthorization (§2.7); most valuable once ULCL exists (steers it).
 
 **P3 — access + auth breadth:**

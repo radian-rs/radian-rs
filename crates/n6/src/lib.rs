@@ -111,8 +111,10 @@ pub fn uplink<'a>(state: &mut UpfState, teid: u32, inner: &'a [u8], now_nanos: u
         return Uplink::RateLimited;
     }
     // An anchor sends it out to the data network; an intermediate UPF forwards it on to
-    // the next UPF over N9 (design/134).
-    match state.uplink_egress_for_teid(teid) {
+    // the next UPF over N9 (design/134). On an **uplink classifier** the choice is made
+    // per packet — a branch rule can send this one to a different anchor while the rest
+    // of the session takes the default egress (design/134 Phase 2).
+    match state.uplink_egress_for(teid, inner) {
         Some(pfcp::Egress::ToPeer { teid, addr }) => {
             Uplink::Forward { teid, peer: addr, pkt: inner }
         }
@@ -364,7 +366,7 @@ mod tests {
         let mut state = UpfState::new();
         pfcp::handle_n4(
             &pfcp::session_establishment_request_via_peer(
-                0xCAFE, 1, UPF_IP, UE_IP, "internet", 0x9001, peer,
+                0xCAFE, 1, UPF_IP, UE_IP, "internet", 0x9001, peer, &[],
             ),
             UPF_IP,
             &mut state,
@@ -383,6 +385,89 @@ mod tests {
         assert!(matches!(uplink(&mut state, 1, &spoofed, 0), Uplink::Spoofed { .. }));
     }
 
+    /// The **uplink classifier** (design/134 Phase 2): one session, two anchors. Traffic
+    /// for the branch prefix is steered to a second PSA while everything else keeps
+    /// taking the session's default N9 egress — the egress is a per-packet decision.
+    #[test]
+    fn uplink_classifier_steers_matching_destinations_to_a_second_anchor() {
+        let (psa1, psa2) = (Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::new(127, 0, 0, 3));
+        let edge = pfcp::FlowFilter::to_prefix(pfcp::IpPrefix::new(Ipv4Addr::new(10, 99, 0, 0), 16));
+        let mut state = UpfState::new();
+        pfcp::handle_n4(
+            &pfcp::session_establishment_request_via_peer(
+                0xCAFE,
+                1,
+                UPF_IP,
+                UE_IP,
+                "internet",
+                0x9001,
+                psa1,
+                &[(edge, pfcp::Egress::ToPeer { teid: 0x9002, addr: psa2 })],
+            ),
+            UPF_IP,
+            &mut state,
+            0,
+        )
+        .expect("establish uplink classifier");
+
+        let branched = ipv4_packet(UE_IP, Ipv4Addr::new(10, 99, 1, 1), b"edge");
+        assert_eq!(
+            uplink(&mut state, 1, &branched, 0),
+            Uplink::Forward { teid: 0x9002, peer: psa2, pkt: &branched[..] },
+            "a destination in the branch prefix goes to the second anchor"
+        );
+        let default = ipv4_packet(UE_IP, Ipv4Addr::new(8, 8, 8, 8), b"internet");
+        assert_eq!(
+            uplink(&mut state, 1, &default, 0),
+            Uplink::Forward { teid: 0x9001, peer: psa1, pkt: &default[..] },
+            "everything else still takes the session's default egress"
+        );
+        // The classifier does not weaken the edge checks it sits behind.
+        let spoofed = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(10, 99, 1, 1), b"x");
+        assert!(
+            matches!(uplink(&mut state, 1, &spoofed, 0), Uplink::Spoofed { .. }),
+            "a spoofed source is dropped even when it matches a branch"
+        );
+    }
+
+    /// A ULCL can also **break out locally**: the branch's egress is this node's own N6
+    /// rather than another UPF, so matched traffic never enters the tunnel to the anchor.
+    #[test]
+    fn uplink_classifier_can_break_out_to_local_n6() {
+        let psa = Ipv4Addr::new(127, 0, 0, 2);
+        let edge = pfcp::FlowFilter::to_prefix(pfcp::IpPrefix::new(Ipv4Addr::new(10, 99, 0, 0), 16));
+        let mut state = UpfState::new();
+        pfcp::handle_n4(
+            &pfcp::session_establishment_request_via_peer(
+                0xCAFE,
+                1,
+                UPF_IP,
+                UE_IP,
+                "internet",
+                0x9001,
+                psa,
+                &[(edge, pfcp::Egress::ToN6)],
+            ),
+            UPF_IP,
+            &mut state,
+            0,
+        )
+        .expect("establish uplink classifier");
+
+        let local = ipv4_packet(UE_IP, Ipv4Addr::new(10, 99, 1, 1), b"local");
+        assert_eq!(
+            uplink(&mut state, 1, &local, 0),
+            Uplink::ToN6(&local[..]),
+            "the branch breaks out to this node's data network"
+        );
+        let remote = ipv4_packet(UE_IP, Ipv4Addr::new(8, 8, 8, 8), b"remote");
+        assert_eq!(
+            uplink(&mut state, 1, &remote, 0),
+            Uplink::Forward { teid: 0x9001, peer: psa, pkt: &remote[..] },
+            "the rest still tunnels to the anchor"
+        );
+    }
+
     /// The chain's **return path** (design/134): a G-PDU arriving on the intermediate
     /// UPF's downlink N9 ingress — traffic coming back from the anchor — is forwarded on
     /// to the gNB rather than treated as uplink. Direction is decided by *which ingress*
@@ -393,7 +478,7 @@ mod tests {
         let mut state = UpfState::new();
         let resp = pfcp::handle_n4(
             &pfcp::session_establishment_request_via_peer(
-                0xCAFE, 1, UPF_IP, UE_IP, "internet", 0x9001, peer,
+                0xCAFE, 1, UPF_IP, UE_IP, "internet", 0x9001, peer, &[],
             ),
             UPF_IP,
             &mut state,
@@ -625,7 +710,7 @@ mod tests {
         let ambr = pfcp::SessionAmbr { uplink_bps: 1_000_000_000, downlink_bps: 1_000_000_000 };
         let flow = pfcp::FlowQer {
             qfi: 2,
-            filter: pfcp::FlowFilter { protocol: 17, port_low: 5000, port_high: 5010 },
+            filter: pfcp::FlowFilter::transport(17, 5000, 5010),
             mfbr_dl_bps: 80_000,
             mfbr_ul_bps: 80_000,
         };

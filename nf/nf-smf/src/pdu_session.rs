@@ -54,6 +54,10 @@ struct ChainedLeg {
     /// downlink runs anchor → I-UPF. Re-installed on every re-activation, since an AN
     /// release parks the anchor's downlink in BUFF.
     dl_ingress: (u32, Ipv4Addr),
+    /// The **breakout anchor**'s N4 session, when the I-UPF is classifying a prefix off
+    /// to a second PSA (design/134 Phase 2). It shares `dl_ingress` with the default
+    /// anchor — one return path serves both.
+    breakout_seid: Option<u64>,
 }
 
 /// Per-PDU-session SMF state.
@@ -213,6 +217,40 @@ impl N4Peer {
     }
 }
 
+/// The user-plane topology this SMF drives (design/134). Assembled from environment
+/// variables today; Phase 3 replaces that with a real `upNodes`/`links` config.
+#[derive(Debug, Clone, Copy)]
+pub struct UserPlane {
+    /// The **anchor** (PSA) every session terminates on by default.
+    pub anchor: SocketAddr,
+    /// An **intermediate** UPF in front of the anchor: every session is then chained
+    /// gNB → I-UPF → N9 → anchor → N6.
+    pub intermediate: Option<SocketAddr>,
+    /// A **second anchor** and the destination prefix steered to it — the uplink
+    /// classifier (Phase 2). Requires `intermediate`: the ULCL is the node the RAN
+    /// tunnels to, so it is the only one that sees uplink before it has been committed
+    /// to an anchor. Ignored without one.
+    pub breakout: Option<(SocketAddr, pfcp::IpPrefix)>,
+}
+
+impl UserPlane {
+    /// One anchor; the gNB tunnels straight to it.
+    pub fn single(anchor: SocketAddr) -> Self {
+        Self { anchor, intermediate: None, breakout: None }
+    }
+
+    /// An intermediate UPF chained in front of the anchor over N9.
+    pub fn chained(anchor: SocketAddr, intermediate: SocketAddr) -> Self {
+        Self { anchor, intermediate: Some(intermediate), breakout: None }
+    }
+
+    /// Steer `prefix` to a second anchor, making the intermediate UPF a ULCL.
+    pub fn with_breakout(mut self, psa2: SocketAddr, prefix: pfcp::IpPrefix) -> Self {
+        self.breakout = Some((psa2, prefix));
+        self
+    }
+}
+
 /// SMF runtime: PFCP client(s) toward the user plane plus the SM-context table.
 pub struct SmfState {
     smf_ip: Ipv4Addr,
@@ -224,6 +262,9 @@ pub struct SmfState {
     /// An optional **intermediate** UPF (I-UPF). When present every session is chained
     /// gNB → I-UPF → N9 → anchor → N6 (design/134).
     iupf: Option<Arc<N4Peer>>,
+    /// A second anchor plus the destination prefix the I-UPF steers to it — the uplink
+    /// classifier (design/134 Phase 2). `None` ⇒ every session takes one anchor.
+    breakout: Option<(Arc<N4Peer>, pfcp::IpPrefix)>,
     /// UPF-initiated Session Report Requests, consumed by
     /// [`handle_usage_reports`].
     reports_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
@@ -247,30 +288,38 @@ pub struct SmfState {
 }
 
 impl SmfState {
-    /// Bind an N4 client socket toward the anchor UPF, and — when `iupf_n4` is given —
-    /// a second toward an **intermediate UPF** in front of it, so every session is
-    /// chained gNB → I-UPF → N9 → anchor → N6 (design/134). `None` ⇒ single-UPF
-    /// operation, where the anchor is also the node the gNB tunnels to.
+    /// Bind an N4 client socket to each node of `up` — the anchor, plus an intermediate
+    /// UPF and/or a second anchor when the topology has them (design/134).
     ///
     /// Each peer gets its own socket, sequence space and pending map; only the anchor
     /// carries URRs, so only its reader forwards Session Reports.
     pub async fn connect(
-        upf_n4: SocketAddr,
-        iupf_n4: Option<SocketAddr>,
+        up: UserPlane,
         smf_ip: Ipv4Addr,
         nrf_base: impl Into<String>,
     ) -> std::io::Result<Self> {
         let (reports_tx, reports_rx) = tokio::sync::mpsc::unbounded_channel();
-        let anchor = N4Peer::connect(upf_n4, Some(reports_tx)).await?;
-        let iupf = match iupf_n4 {
+        let anchor = N4Peer::connect(up.anchor, Some(reports_tx)).await?;
+        let iupf = match up.intermediate {
             Some(addr) => Some(N4Peer::connect(addr, None).await?),
             None => None,
+        };
+        // A breakout anchor is only reachable *through* the classifier, so it is
+        // meaningless without an intermediate UPF to host it.
+        let breakout = match (&iupf, up.breakout) {
+            (Some(_), Some((addr, prefix))) => Some((N4Peer::connect(addr, None).await?, prefix)),
+            (None, Some(_)) => {
+                tracing::warn!("a breakout anchor needs an intermediate UPF — ignoring it");
+                None
+            }
+            _ => None,
         };
         Ok(Self {
             smf_ip,
             nrf_base: nrf_base.into(),
             anchor,
             iupf,
+            breakout,
             reports_rx: tokio::sync::Mutex::new(reports_rx),
             cp_seid: AtomicU64::new(1),
             next_ref: AtomicU64::new(1),
@@ -360,12 +409,15 @@ impl SmfState {
         self.anchor.transact(req, expect_seq).await
     }
 
-    /// PFCP Association Setup toward every UPF in the chain — required before any
+    /// PFCP Association Setup toward every UPF in the topology — required before any
     /// session.
     pub async fn associate(&self) -> anyhow::Result<()> {
         self.anchor.associate(self.smf_ip).await?;
         if let Some(iupf) = &self.iupf {
             iupf.associate(self.smf_ip).await?;
+        }
+        if let Some((psa2, _)) = &self.breakout {
+            psa2.associate(self.smf_ip).await?;
         }
         Ok(())
     }
@@ -814,6 +866,10 @@ async fn create_sm_context(
 ///   follow-up Session Modification. That is the same operation as pointing it at a
 ///   gNB: a UPF's downlink egress is just a GTP-U `(TEID, address)`.
 ///
+/// With a breakout configured the I-UPF also becomes an **uplink classifier**: a second
+/// anchor is established first and a branch rule steers its prefix there, so one PDU
+/// session — one UE address — reaches two data networks (Phase 2).
+///
 /// Returns the leg plus the I-UPF's **gNB-facing** N3 F-TEID, which replaces the
 /// anchor's in everything handed to the RAN.
 async fn establish_chain(
@@ -823,6 +879,42 @@ async fn establish_chain(
     ue: pfcp::UeAddr,
     dnn: &str,
 ) -> anyhow::Result<(ChainedLeg, u32, Ipv4Addr)> {
+    // The breakout anchor, if any, goes up first: the classifier's branch FAR points at
+    // its N3 ingress and — like the default anchor — that is set at establishment.
+    let breakout = match &smf.breakout {
+        Some((psa2, prefix)) => {
+            let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
+            let seq = psa2.next_seq();
+            let req = pfcp::session_establishment_request(
+                cp_seid,
+                seq,
+                smf.smf_ip,
+                ue,
+                dnn,
+                None, // policed once, on the default anchor
+                &[],
+                None, // and metered there too — this leg carries no URRs
+            );
+            let resp = psa2
+                .transact(&req, seq)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("no PFCP response from the breakout anchor"))?;
+            let est = pfcp::parse_session_establishment_response(&resp)
+                .ok_or_else(|| anyhow::anyhow!("breakout anchor rejected the N4 establishment"))?;
+            Some((est, *prefix))
+        }
+        None => None,
+    };
+    let branches: Vec<_> = breakout
+        .iter()
+        .map(|(est, prefix)| {
+            (
+                pfcp::FlowFilter::to_prefix(*prefix),
+                pfcp::Egress::ToPeer { teid: est.n3_teid, addr: est.n3_addr },
+            )
+        })
+        .collect();
+
     let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
     let seq = iupf.next_seq();
     let est_req = pfcp::session_establishment_request_via_peer(
@@ -833,6 +925,7 @@ async fn establish_chain(
         dnn,
         anchor.n3_teid,
         anchor.n3_addr,
+        &branches,
     );
     let resp = iupf
         .transact(&est_req, seq)
@@ -844,34 +937,52 @@ async fn establish_chain(
         .dl_ingress
         .ok_or_else(|| anyhow::anyhow!("intermediate UPF allocated no N9 downlink ingress"))?;
 
-    let seq = smf.anchor.next_seq();
-    let mod_req = pfcp::session_modification_request(
-        anchor.up_seid,
-        seq,
-        FAR_ID,
-        dl_ingress.0,
-        dl_ingress.1,
-        dnn,
-        false,
-    );
-    let resp = smf
-        .anchor
-        .transact(&mod_req, seq)
+    // Both anchors send downlink back to the *same* I-UPF ingress — it is the node that
+    // holds the gNB tunnel, so one return path serves however many anchors the uplink
+    // fans out to. That symmetry is why a breakout needs no second downlink ingress.
+    point_downlink_at(&smf.anchor, anchor.up_seid, dl_ingress, dnn)
         .await
-        .ok_or_else(|| anyhow::anyhow!("no PFCP response from the anchor UPF"))?;
-    anyhow::ensure!(
-        pfcp::response_accepted(&resp),
-        "the anchor UPF refused the N9 downlink target"
-    );
+        .map_err(|e| anyhow::anyhow!("anchor UPF: {e}"))?;
+    if let (Some((psa2, _)), Some((est2, _))) = (&smf.breakout, &breakout) {
+        point_downlink_at(psa2, est2.up_seid, dl_ingress, dnn)
+            .await
+            .map_err(|e| anyhow::anyhow!("breakout anchor: {e}"))?;
+    }
     tracing::info!(
         anchor_seid = anchor.up_seid,
         iupf_seid = est.up_seid,
+        breakout_seid = ?breakout.as_ref().map(|(e, _)| e.up_seid),
+        breakout_prefix = ?breakout.as_ref().map(|(_, p)| p.to_string()),
         n9_uplink_teid = anchor.n3_teid,
         n9_downlink_teid = dl_ingress.0,
         ran_teid = est.n3_teid,
         "chained the session through an intermediate UPF"
     );
-    Ok((ChainedLeg { up_seid: est.up_seid, dl_ingress }, est.n3_teid, est.n3_addr))
+    Ok((
+        ChainedLeg {
+            up_seid: est.up_seid,
+            dl_ingress,
+            breakout_seid: breakout.map(|(e, _)| e.up_seid),
+        },
+        est.n3_teid,
+        est.n3_addr,
+    ))
+}
+
+/// Point one UPF session's downlink FAR at a GTP-U `(TEID, address)` — a gNB tunnel or,
+/// on an anchor sitting behind a chain, the intermediate UPF's N9 ingress. The two are
+/// the same PFCP operation.
+async fn point_downlink_at(
+    peer: &N4Peer,
+    up_seid: u64,
+    target: (u32, Ipv4Addr),
+    dnn: &str,
+) -> Result<(), &'static str> {
+    let seq = peer.next_seq();
+    let req =
+        pfcp::session_modification_request(up_seid, seq, FAR_ID, target.0, target.1, dnn, false);
+    let resp = peer.transact(&req, seq).await.ok_or("no PFCP response")?;
+    if pfcp::response_accepted(&resp) { Ok(()) } else { Err("refused the downlink target") }
 }
 
 /// Whether one smf-select `subscribedSnssaiInfos` entry's `dnnInfos` contains `dnn`.
@@ -1215,6 +1326,15 @@ async fn update_sm_context(
     if !pfcp::response_accepted(&resp) {
         return StatusCode::BAD_GATEWAY.into_response();
     }
+    // The breakout anchor's downlink was parked alongside the default one on AN release,
+    // so it needs re-opening onto the same shared N9 ingress (design/134 Phase 2).
+    if let Some(leg) = chain
+        && let (Some(seid), Some((psa2, _))) = (leg.breakout_seid, &smf.breakout)
+        && let Err(e) = point_downlink_at(psa2, seid, leg.dl_ingress, &dnn).await
+    {
+        tracing::warn!(%sm_ref, "breakout anchor downlink not restored: {e}");
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
 
     if let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref) {
         c.gnb = Some((gnb_teid, gnb_addr));
@@ -1233,10 +1353,10 @@ async fn update_sm_context(
 /// Session Modification that DROPs downlink at the UPF and clears the stored gNB
 /// target. The session and its uplink path persist for a later Service Request.
 async fn deactivate_up(smf: &Arc<SmfState>, sm_ref: &str) -> StatusCode {
-    let up_seid = {
+    let (up_seid, chain) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(sm_ref) {
-            Some(c) => c.up_seid,
+            Some(c) => (c.up_seid, c.chain),
             None => return StatusCode::NOT_FOUND,
         }
     };
@@ -1248,6 +1368,20 @@ async fn deactivate_up(smf: &Arc<SmfState>, sm_ref: &str) -> StatusCode {
     };
     if !pfcp::response_accepted(&resp) {
         return StatusCode::BAD_GATEWAY;
+    }
+    // Park the breakout anchor's downlink too, or it would keep forwarding to an I-UPF
+    // still pointed at the released gNB tunnel. It drops rather than buffers: only the
+    // default anchor carries the URRs that turn a buffered packet into a paging request,
+    // so downlink arriving for an idle UE *on the breakout DN* is lost (design/134 §4).
+    if let (Some(leg), Some((psa2, _))) = (chain, &smf.breakout)
+        && let Some(seid) = leg.breakout_seid
+    {
+        let seq = psa2.next_seq();
+        let req = pfcp::session_deactivate_request(seid, seq, FAR_ID);
+        match psa2.transact(&req, seq).await {
+            Some(r) if pfcp::response_accepted(&r) => {}
+            _ => tracing::warn!(%sm_ref, "breakout anchor did not accept the deactivation"),
+        }
     }
     if let Some(c) = smf.contexts.lock().unwrap().get_mut(sm_ref) {
         c.gnb = None;
@@ -1382,14 +1516,22 @@ async fn release_sm_context(
     if !pfcp::response_accepted(&resp) {
         tracing::warn!(%sm_ref, up_seid, "UPF did not accept the N4 deletion (already gone?)");
     }
-    // Tear the intermediate leg down too. The anchor carries the URRs, so its deletion
-    // response above is the one that bears the usage — the I-UPF's is discarded.
+    // Tear the other legs down too. The default anchor carries the URRs, so its deletion
+    // response above is the one that bears the usage — the others' are discarded.
     if let (Some(leg), Some(iupf)) = (chain, &smf.iupf) {
         let seq = iupf.next_seq();
         let del = pfcp::session_deletion_request(leg.up_seid, seq);
         match iupf.transact(&del, seq).await {
             Some(r) if pfcp::response_accepted(&r) => {}
             _ => tracing::warn!(%sm_ref, iupf_seid = leg.up_seid, "intermediate UPF did not accept the N4 deletion"),
+        }
+        if let (Some(seid), Some((psa2, _))) = (leg.breakout_seid, &smf.breakout) {
+            let seq = psa2.next_seq();
+            let del = pfcp::session_deletion_request(seid, seq);
+            match psa2.transact(&del, seq).await {
+                Some(r) if pfcp::response_accepted(&r) => {}
+                _ => tracing::warn!(%sm_ref, breakout_seid = seid, "breakout anchor did not accept the N4 deletion"),
+            }
         }
     }
     // Final usage reports: the session URR plus each per-flow URR. Logged, and —
@@ -1701,11 +1843,11 @@ fn flow_qers(decision: &sbi_core::npcf::SmPolicyDecision) -> Vec<pfcp::FlowQer> 
             let filter = f.filter.as_ref()?;
             Some(pfcp::FlowQer {
                 qfi: f.qfi,
-                filter: pfcp::FlowFilter {
-                    protocol: filter.protocol,
-                    port_low: filter.port_low,
-                    port_high: filter.port_high,
-                },
+                filter: pfcp::FlowFilter::transport(
+                    filter.protocol,
+                    filter.port_low,
+                    filter.port_high,
+                ),
                 mfbr_dl_bps: sbi_core::npcf::bitrate_to_bps(&gbr.mfbr_dl)?,
                 mfbr_ul_bps: sbi_core::npcf::bitrate_to_bps(&gbr.mfbr_ul)?,
             })
@@ -2080,8 +2222,6 @@ mod tests {
 
     /// Full Nsmf → N4 spine: an in-process UPF, the SMF as PFCP client + SBI server,
     /// driven over HTTP — with the subscription checked against a real UDR/UDM chain.
-    /// CreateSMContext authorizes the DNN and establishes the session (UPF allocates
-    /// the uplink TEID); UpdateSMContext installs the gNB downlink target on the UPF.
     /// Multi-UPF chaining (design/134): with an intermediate UPF configured, one
     /// CreateSMContext builds **two** N4 sessions and splices them, so the user plane
     /// runs gNB → I-UPF → N9 → anchor → N6. Both UPFs are real `UpfState`s over real
@@ -2094,7 +2234,7 @@ mod tests {
 
         let (nrf_base, _udr_base) = spin_subscription_backend("imsi-999700000000001", "99970").await;
         let smf = Arc::new(
-            SmfState::connect(anchor_n4, Some(iupf_n4), anchor_ip, nrf_base).await.unwrap(),
+            SmfState::connect(UserPlane::chained(anchor_n4, iupf_n4), anchor_ip, nrf_base).await.unwrap(),
         );
         smf.associate().await.unwrap();
         let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2221,6 +2361,149 @@ mod tests {
         assert_eq!(iupf.lock().unwrap().session_count(), 0, "intermediate N4 session deleted");
     }
 
+    /// The **uplink classifier** (design/134 Phase 2): one PDU session, one UE address,
+    /// **two anchors**. The I-UPF forwards most uplink to the default anchor but steers
+    /// the breakout prefix to a second PSA — and both anchors return downlink through the
+    /// same I-UPF ingress. Three real `UpfState`s over real PFCP (.1 anchor,
+    /// .2 classifier, .3 breakout anchor).
+    #[tokio::test]
+    async fn uplink_classifier_splits_one_session_across_two_anchors() {
+        let (anchor_ip, iupf_ip, psa2_ip) = (
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(127, 0, 0, 2),
+            Ipv4Addr::new(127, 0, 0, 3),
+        );
+        let (anchor, anchor_n4) = spin_upf(anchor_ip).await;
+        let (iupf, iupf_n4) = spin_upf(iupf_ip).await;
+        let (psa2, psa2_n4) = spin_upf(psa2_ip).await;
+        let edge = pfcp::IpPrefix::new(Ipv4Addr::new(10, 99, 0, 0), 16);
+
+        let (nrf_base, _udr_base) = spin_subscription_backend("imsi-999700000000001", "99970").await;
+        let smf = Arc::new(
+            SmfState::connect(
+                UserPlane::chained(anchor_n4, iupf_n4).with_breakout(psa2_n4, edge),
+                anchor_ip,
+                nrf_base,
+            )
+            .await
+            .unwrap(),
+        );
+        smf.associate().await.unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+        let created: SmContextCreatedData = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(psa2.lock().unwrap().session_count(), 1, "the breakout anchor has a session");
+
+        // Uplink fans out: the branch prefix goes to the second anchor, everything else
+        // keeps the default N9 egress. Both decisions come from the *same* ingress TEID —
+        // the classifier picks per packet.
+        let ran_teid = u32::from_str_radix(&created.up_n3_teid, 16).unwrap();
+        let branches = iupf.lock().unwrap().branches_for_teid(ran_teid);
+        assert_eq!(branches.len(), 1, "one branch rule installed on the classifier");
+        assert_eq!(branches[0].0, pfcp::FlowFilter::to_prefix(edge), "steering on the prefix");
+        assert_eq!(
+            branches[0].1,
+            pfcp::Egress::ToPeer { teid: 1, addr: psa2_ip },
+            "the branch egress is the breakout anchor's N3 ingress"
+        );
+        assert_eq!(
+            iupf.lock().unwrap().uplink_egress_for_teid(ran_teid),
+            Some(pfcp::Egress::ToPeer { teid: 1, addr: anchor_ip }),
+            "the default egress is still the original anchor"
+        );
+        // Both anchors terminate on N6 — neither forwards onward.
+        for (name, upf) in [("default", &anchor), ("breakout", &psa2)] {
+            assert_eq!(
+                upf.lock().unwrap().uplink_egress_for_teid(1),
+                Some(pfcp::Egress::ToN6),
+                "the {name} anchor terminates the session on N6"
+            );
+        }
+
+        // Downlink converges: both anchors send back to the *same* I-UPF ingress, since
+        // it is the node holding the gNB tunnel.
+        let ue_ip = created.ue_ipv4_addr.expect("UE IPv4");
+        let n9_dl = anchor.lock().unwrap().route_downlink(ue_ip).expect("anchor downlink");
+        assert_eq!(n9_dl.1, iupf_ip);
+        assert_eq!(
+            psa2.lock().unwrap().route_downlink(ue_ip),
+            Some(n9_dl),
+            "the breakout anchor returns downlink through the same classifier ingress"
+        );
+
+        // Activation points the classifier at the gNB — one return path for both anchors.
+        let status = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
+            .json(&serde_json::json!({"gnbN3Teid":"00005678","gnbN3Addr":"10.0.0.9"}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_success(), "UpdateSMContext succeeded");
+        assert_eq!(
+            iupf.lock().unwrap().downlink_via_n9_ingress(n9_dl.0),
+            Some((0x5678, Ipv4Addr::new(10, 0, 0, 9))),
+            "downlink from either anchor reaches the gNB through the classifier"
+        );
+
+        // AN release parks *both* anchors, so neither keeps feeding a released tunnel.
+        let status = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
+            .json(&serde_json::json!({"upCnxState":"DEACTIVATED"}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_success(), "AN release succeeded");
+        assert_eq!(anchor.lock().unwrap().route_downlink(ue_ip), None, "default anchor parked");
+        assert_eq!(psa2.lock().unwrap().route_downlink(ue_ip), None, "breakout anchor parked");
+
+        // …and re-activation restores both.
+        let status = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
+            .json(&serde_json::json!({"gnbN3Teid":"0000abcd","gnbN3Addr":"10.0.0.11"}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_success(), "re-activation succeeded");
+        assert_eq!(anchor.lock().unwrap().route_downlink(ue_ip), Some(n9_dl));
+        assert_eq!(psa2.lock().unwrap().route_downlink(ue_ip), Some(n9_dl));
+
+        // Release tears down all three legs.
+        let status = client
+            .post(format!(
+                "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
+                created.sm_context_ref
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 204, "release succeeded");
+        for (name, upf) in [("anchor", &anchor), ("classifier", &iupf), ("breakout", &psa2)] {
+            assert_eq!(upf.lock().unwrap().session_count(), 0, "{name} N4 session deleted");
+        }
+    }
+
+    /// CreateSMContext authorizes the DNN and establishes the session (UPF allocates
+    /// the uplink TEID); UpdateSMContext installs the gNB downlink target on the UPF.
     #[tokio::test]
     async fn pdu_session_create_then_update_drives_n4() {
         let upf_ip = Ipv4Addr::new(127, 0, 0, 1);
@@ -2250,7 +2533,7 @@ mod tests {
 
         // SMF: connect, associate, serve Nsmf.
         let smf =
-            Arc::new(SmfState::connect(upf_addr, None, Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap());
+            Arc::new(SmfState::connect(UserPlane::single(upf_addr), Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap());
         smf.associate().await.unwrap();
         let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let smf_addr = smf_listener.local_addr().unwrap();
@@ -2414,7 +2697,7 @@ mod tests {
         let pcf = spin_pcf(&nrf_base, None).await;
 
         let smf = Arc::new(
-            SmfState::connect(upf_addr, None, Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap(),
+            SmfState::connect(UserPlane::single(upf_addr), Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap(),
         );
         smf.associate().await.unwrap();
         let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2503,7 +2786,7 @@ mod tests {
         let _pcf = spin_pcf(&nrf_base, None).await;
         // Budget = exactly one demo GBR flow.
         let smf = Arc::new(
-            SmfState::connect(upf_addr, None, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+            SmfState::connect(UserPlane::single(upf_addr), Ipv4Addr::new(127, 0, 0, 1), nrf_base)
                 .await
                 .unwrap()
                 .with_gfbr_budget(100_000_000, 100_000_000),
@@ -2589,7 +2872,7 @@ mod tests {
 
         // SMF with a 1000-byte usage threshold + the usage-report handler running.
         let smf = Arc::new(
-            SmfState::connect(upf_addr, None, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+            SmfState::connect(UserPlane::single(upf_addr), Ipv4Addr::new(127, 0, 0, 1), nrf_base)
                 .await
                 .unwrap()
                 .with_usage_threshold(1000),
@@ -2752,7 +3035,7 @@ mod tests {
         let amf_modifies = spin_mock_amf(&nrf_base).await;
 
         let smf = Arc::new(
-            SmfState::connect(upf_addr, None, Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap(),
+            SmfState::connect(UserPlane::single(upf_addr), Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap(),
         );
         smf.associate().await.unwrap();
         let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2930,7 +3213,7 @@ mod tests {
 
         let (nrf_base, _udr_base) = spin_subscription_backend("imsi-999700000000001", "99970").await;
         let smf =
-            Arc::new(SmfState::connect(upf_addr, None, Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap());
+            Arc::new(SmfState::connect(UserPlane::single(upf_addr), Ipv4Addr::new(127, 0, 0, 1), nrf_base).await.unwrap());
         smf.associate().await.unwrap();
         let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let smf_addr = smf_listener.local_addr().unwrap();

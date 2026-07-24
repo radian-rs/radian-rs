@@ -8,7 +8,7 @@
 //! modification/deletion come in later slices.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::SystemTime;
 
 pub use rs_pfcp;
@@ -74,6 +74,9 @@ const AMBR_QER_ID: u32 = 1;
 /// The uplink FAR's id — forwards to the core (N6), or over N9 to the next UPF when
 /// the SMF gave it an Outer Header Creation (design/134).
 const UPLINK_FAR_ID: u32 = 1;
+/// The downlink FAR's id — the one a Session Modification re-points at the gNB tunnel
+/// (or, on an anchor behind a chain, at the intermediate UPF's N9 ingress).
+const DOWNLINK_FAR_ID: u32 = 2;
 /// The downlink PDR's id. On an anchor it matches the UE address; on an intermediate
 /// UPF it instead carries an F-TEID, because downlink arrives back from the anchor over
 /// N9 (design/134).
@@ -82,52 +85,150 @@ const DOWNLINK_PDR_ID: u16 = 2;
 /// session-AMBR QER), and its classifier PDR id is `PER_FLOW_PDR_BASE + index`.
 const PER_FLOW_QER_BASE: u32 = 1000;
 const PER_FLOW_PDR_BASE: u16 = 100;
+/// A **ULCL branch**'s classifier PDR id is `ULCL_PDR_BASE + index` and its FAR id
+/// `ULCL_FAR_BASE + index` (design/134 Phase 2). The PDR band clears the per-flow one
+/// (`100..=355`, QFI being a `u8`); the FAR band clears the uplink (1) and downlink (2)
+/// FARs. A branch PDR outranks the per-flow QoS classifiers on precedence, since
+/// choosing an egress has to happen before the packet is policed on its way there.
+const ULCL_PDR_BASE: u16 = 400;
+const ULCL_FAR_BASE: u32 = 3;
+const ULCL_PRECEDENCE: u32 = 40;
 /// The session-level volume URR id (usage measurement + final report at deletion).
 const SESSION_URR_ID: u32 = 1;
 /// A GBR flow's per-flow volume URR id is `PER_FLOW_URR_BASE + qfi` — its usage is
 /// measured separately (per-rating-group charging) and reported at deletion.
 pub const PER_FLOW_URR_BASE: u32 = 2000;
 
-/// A compact packet classifier for a QoS flow: transport protocol + a port range,
-/// matched against **either** endpoint — a greenfield stand-in for a full TS 29.244
-/// SDF filter (a production UPF parses IPFilterRule syntax). Carried in the PDR's
-/// SDF filter field as a self-described `flow_description`.
+/// An IP prefix — an SDF filter's destination match (`dst=10.99.0.0/16`). Holds both
+/// families so a ULCL can steer IPv6 traffic too (design/131 shipped v6 sessions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpPrefix {
+    pub addr: IpAddr,
+    pub len: u8,
+}
+
+impl IpPrefix {
+    pub fn new(addr: impl Into<IpAddr>, len: u8) -> Self {
+        Self { addr: addr.into(), len }
+    }
+
+    /// Whether `ip` falls in this prefix. A mismatched family never matches.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        fn masked(bytes: &[u8], len: u8) -> Vec<u8> {
+            let len = usize::from(len).min(bytes.len() * 8);
+            let (full, rem) = (len / 8, len % 8);
+            let mut out = bytes[..full].to_vec();
+            if rem > 0 {
+                out.push(bytes[full] & (0xffu8 << (8 - rem)));
+            }
+            out
+        }
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                masked(&net.octets(), self.len) == masked(&ip.octets(), self.len)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                masked(&net.octets(), self.len) == masked(&ip.octets(), self.len)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for IpPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.len)
+    }
+}
+
+impl std::str::FromStr for IpPrefix {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        let (addr, len) = s.split_once('/').ok_or(())?;
+        Ok(Self { addr: addr.parse().map_err(|_| ())?, len: len.parse().map_err(|_| ())? })
+    }
+}
+
+/// The classification inputs one packet offers an SDF filter.
+#[derive(Debug, Clone, Copy)]
+struct PacketKey {
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dst: IpAddr,
+}
+
+/// A compact packet classifier — a greenfield stand-in for a full TS 29.244 SDF filter
+/// (a production UPF parses IPFilterRule syntax). Carried in the PDR's SDF filter field
+/// as a self-described `flow_description`. Every component is optional and an absent one
+/// matches anything, so one type serves both users: a **QoS** classifier picks a flow by
+/// protocol + ports, while a **ULCL branch** picks an egress by destination prefix
+/// (design/134 Phase 2). Nothing stops a rule from combining them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowFilter {
-    pub protocol: u8,
-    pub port_low: u16,
-    pub port_high: u16,
+    /// Transport protocol; `None` matches any.
+    pub protocol: Option<u8>,
+    /// An inclusive port range matched against **either** endpoint; `None` matches any.
+    pub ports: Option<(u16, u16)>,
+    /// Prefix the packet's **destination** must fall in; `None` matches any. Unlike
+    /// `ports` this is directional — steering by where traffic is going is exactly what
+    /// an uplink classifier does.
+    pub dst: Option<IpPrefix>,
 }
 
 impl FlowFilter {
-    /// Whether a packet with transport `(protocol, src_port, dst_port)` matches.
-    fn matches(&self, protocol: u8, src_port: u16, dst_port: u16) -> bool {
-        protocol == self.protocol
-            && ((self.port_low..=self.port_high).contains(&src_port)
-                || (self.port_low..=self.port_high).contains(&dst_port))
+    /// A QoS classifier: a transport protocol and a port range on either endpoint.
+    pub fn transport(protocol: u8, port_low: u16, port_high: u16) -> Self {
+        Self { protocol: Some(protocol), ports: Some((port_low, port_high)), dst: None }
     }
 
-    /// Encode as the PDR SDF filter's flow-description string.
+    /// A ULCL branch classifier: everything destined into `prefix`.
+    pub fn to_prefix(prefix: IpPrefix) -> Self {
+        Self { protocol: None, ports: None, dst: Some(prefix) }
+    }
+
+    /// Whether a packet matches. An all-`None` filter matches everything.
+    fn matches(&self, key: &PacketKey) -> bool {
+        self.protocol.is_none_or(|p| p == key.protocol)
+            && self.ports.is_none_or(|(lo, hi)| {
+                (lo..=hi).contains(&key.src_port) || (lo..=hi).contains(&key.dst_port)
+            })
+            && self.dst.is_none_or(|d| d.contains(key.dst))
+    }
+
+    /// Encode as the PDR SDF filter's flow-description string. Absent components are
+    /// omitted, so a filter written before `dst` existed round-trips unchanged.
     fn to_flow_description(self) -> String {
-        format!("proto={};ports={}-{}", self.protocol, self.port_low, self.port_high)
+        let mut parts = Vec::new();
+        if let Some(p) = self.protocol {
+            parts.push(format!("proto={p}"));
+        }
+        if let Some((lo, hi)) = self.ports {
+            parts.push(format!("ports={lo}-{hi}"));
+        }
+        if let Some(d) = self.dst {
+            parts.push(format!("dst={d}"));
+        }
+        parts.join(";")
     }
 
-    /// Parse a flow-description written by [`to_flow_description`].
+    /// Parse a flow-description written by [`to_flow_description`]. `None` only if a
+    /// present component is malformed — an empty description is the match-all filter.
     fn from_flow_description(s: &str) -> Option<Self> {
-        let (mut protocol, mut ports) = (None, None);
-        for part in s.split(';') {
+        let mut f = FlowFilter { protocol: None, ports: None, dst: None };
+        for part in s.split(';').filter(|p| !p.is_empty()) {
             let (k, v) = part.split_once('=')?;
             match k {
-                "proto" => protocol = v.parse().ok(),
+                "proto" => f.protocol = Some(v.parse().ok()?),
                 "ports" => {
                     let (lo, hi) = v.split_once('-')?;
-                    ports = Some((lo.parse().ok()?, hi.parse().ok()?));
+                    f.ports = Some((lo.parse().ok()?, hi.parse().ok()?));
                 }
+                "dst" => f.dst = Some(v.parse().ok()?),
                 _ => {}
             }
         }
-        let (port_low, port_high) = ports?;
-        Some(FlowFilter { protocol: protocol?, port_low, port_high })
+        Some(f)
     }
 }
 
@@ -152,24 +253,41 @@ struct FlowEnforcer {
     dl_bytes: u64,
 }
 
-/// Extract `(protocol, src_port, dst_port)` from a bare IPv4 packet for flow
-/// classification. Ports are 0 for protocols that don't carry them. `None` if the
-/// packet is not IPv4 or is truncated.
-fn transport_key(pkt: &[u8]) -> Option<(u8, u16, u16)> {
-    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
-        return None;
-    }
-    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
-    let protocol = pkt[9];
+/// Extract the classification inputs from a bare IP packet: protocol, ports and
+/// destination address. Ports are 0 for protocols that don't carry them. `None` if the
+/// packet is neither IPv4 nor IPv6, or is truncated.
+///
+/// IPv6 extension headers are not walked — a packet carrying them classifies as its
+/// first next-header with ports 0, which is the same conservative treatment IPv4 gives
+/// an unrecognised protocol.
+fn packet_key(pkt: &[u8]) -> Option<PacketKey> {
     // TCP (6), UDP (17), SCTP (132) carry ports in the first 4 L4-header bytes.
-    let (src_port, dst_port) = match protocol {
-        6 | 17 | 132 if pkt.len() >= ihl + 4 => (
-            u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]),
-            u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]),
-        ),
-        _ => (0, 0),
-    };
-    Some((protocol, src_port, dst_port))
+    fn ports(pkt: &[u8], protocol: u8, off: usize) -> (u16, u16) {
+        match protocol {
+            6 | 17 | 132 if pkt.len() >= off + 4 => (
+                u16::from_be_bytes([pkt[off], pkt[off + 1]]),
+                u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]),
+            ),
+            _ => (0, 0),
+        }
+    }
+    match pkt.first().map(|b| b >> 4) {
+        Some(4) if pkt.len() >= 20 => {
+            let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+            let protocol = pkt[9];
+            let (src_port, dst_port) = ports(pkt, protocol, ihl);
+            let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+            Some(PacketKey { protocol, src_port, dst_port, dst: dst.into() })
+        }
+        Some(6) if pkt.len() >= 40 => {
+            let protocol = pkt[6]; // next header
+            let (src_port, dst_port) = ports(pkt, protocol, 40);
+            let mut dst = [0u8; 16];
+            dst.copy_from_slice(&pkt[24..40]);
+            Some(PacketKey { protocol, src_port, dst_port, dst: Ipv6Addr::from(dst).into() })
+        }
+        _ => None,
+    }
 }
 
 /// The Create QER + classifier Create PDR (SDF filter) + volume Create URR IEs for
@@ -209,6 +327,81 @@ fn flow_create_ies(f: &FlowQer) -> (Ie, Ie, Ie) {
         .build()
         .expect("build per-flow Create PDR");
     (qer.to_ie(), pdr.to_ie(), urr.to_ie())
+}
+
+/// Build the FAR forwarding parameters for one egress: plain N6 (this node delivers the
+/// traffic to the data network) or a GTP-U tunnel toward another UPF over N9.
+fn egress_forwarding_parameters(
+    egress: Egress,
+    dnn: &str,
+) -> rs_pfcp::ie::forwarding_parameters::ForwardingParameters {
+    let params = rs_pfcp::ie::forwarding_parameters::ForwardingParameters::new(
+        DestinationInterface::new(Interface::Core),
+    )
+    .with_network_instance(NetworkInstance::new(dnn));
+    match egress {
+        Egress::ToN6 => params,
+        Egress::ToPeer { teid, addr } => {
+            params.with_outer_header_creation(OuterHeaderCreation::gtpu_ipv4(teid, addr))
+        }
+    }
+}
+
+/// The classifier Create PDR + Create FAR IEs for one **ULCL branch** (design/134
+/// Phase 2): a PDR whose SDF filter selects traffic by destination, bound to a FAR of
+/// its own so the matched subset leaves by a different egress than the session default.
+/// `index` distinguishes the branches of one session and fixes both ids, so a later
+/// modification can address a branch.
+fn branch_create_ies(index: usize, filter: &FlowFilter, egress: Egress, dnn: &str) -> (Ie, Ie) {
+    let far_id = FarId::new(ULCL_FAR_BASE + index as u32);
+    let pdi = PdiBuilder::uplink_access()
+        .sdf_filter(SdfFilter::new(&filter.to_flow_description()))
+        .build()
+        .expect("build branch PDI");
+    let pdr = CreatePdrBuilder::new(PdrId::new(ULCL_PDR_BASE + index as u16))
+        .precedence(Precedence::new(ULCL_PRECEDENCE))
+        .pdi(pdi)
+        .far_id(far_id)
+        .build()
+        .expect("build branch Create PDR");
+    let far = CreateFar::builder(far_id)
+        .apply_action(ApplyAction::FORW)
+        .forwarding_parameters(egress_forwarding_parameters(egress, dnn))
+        .build()
+        .expect("build branch Create FAR");
+    (pdr.to_ie(), far.to_ie())
+}
+
+/// Parse the **ULCL branch** rules a message provisions: each classifier PDR in the
+/// branch id band, paired with the egress of the FAR it points at. Ordered by PDR id so
+/// the UPF evaluates them the way the SMF numbered them.
+fn parse_branches(msg: &dyn rs_pfcp::message::Message) -> Vec<(FlowFilter, Egress)> {
+    let far_egress: HashMap<u32, Egress> = msg
+        .ies(IeType::CreateFar)
+        .filter_map(|ie| CreateFar::unmarshal(&ie.payload).ok())
+        .map(|far| {
+            let egress = far
+                .forwarding_parameters
+                .and_then(|fp| fp.outer_header_creation)
+                .and_then(|ohc| {
+                    Some(Egress::ToPeer { teid: u32::from(ohc.teid?), addr: ohc.ipv4_address? })
+                })
+                .unwrap_or(Egress::ToN6);
+            (far.far_id.value, egress)
+        })
+        .collect();
+    let mut pdrs: Vec<CreatePdr> = msg
+        .ies(IeType::CreatePdr)
+        .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
+        .filter(|pdr| pdr.pdr_id.value >= ULCL_PDR_BASE)
+        .collect();
+    pdrs.sort_by_key(|pdr| pdr.pdr_id.value);
+    pdrs.into_iter()
+        .filter_map(|pdr| {
+            let filter = FlowFilter::from_flow_description(&pdr.pdi.sdf_filter?.flow_description)?;
+            Some((filter, *far_egress.get(&pdr.far_id?.value)?))
+        })
+        .collect()
 }
 
 /// Parse the per-flow QERs a message provisions: each classifier PDR (SDF filter)
@@ -349,8 +542,14 @@ struct Session {
     downlink: Option<(u32, Ipv4Addr)>,
     /// Where this session's uplink goes after decapsulation — out to N6 (an anchor) or
     /// on to the next UPF over N9 (an intermediate UPF, design/134). Seeded from the
-    /// uplink FAR's Outer Header Creation at establishment.
+    /// uplink FAR's Outer Header Creation at establishment. This is the **default**: a
+    /// packet matching a `branch` leaves by that branch's egress instead.
     uplink: Egress,
+    /// **Uplink classifier** rules (TS 23.501 §5.6.4, design/134 Phase 2), consulted in
+    /// order; the first match wins. Each pairs an SDF filter with its own egress, so a
+    /// subset of the session's uplink can break out to a different anchor while the rest
+    /// takes `uplink`. Empty ⇒ this node does not branch.
+    branches: Vec<(FlowFilter, Egress)>,
     /// An intermediate UPF's **downlink N9 ingress** TEID: the anchor sends downlink
     /// back here under it, and this node forwards it on to `downlink` (the gNB). `None`
     /// on an anchor, whose downlink arrives from N6 and is routed by UE address.
@@ -399,8 +598,8 @@ impl Session {
     /// true total. A crossed session-URR volume threshold flags a report.
     fn admit(&mut self, uplink: bool, now_nanos: u64, pkt: &[u8]) -> bool {
         let bytes = pkt.len();
-        let flow_idx = transport_key(pkt)
-            .and_then(|(p, s, d)| self.flow_qers.iter().position(|f| f.filter.matches(p, s, d)));
+        let flow_idx = packet_key(pkt)
+            .and_then(|key| self.flow_qers.iter().position(|f| f.filter.matches(&key)));
         let bucket: Option<&mut TokenBucket> = match flow_idx {
             Some(i) if uplink => Some(&mut self.flow_qers[i].ul_bucket),
             Some(i) => Some(&mut self.flow_qers[i].dl_bucket),
@@ -507,11 +706,36 @@ impl UpfState {
 
     /// The gNB downlink target `(TEID, IP)` for a session, once a Session Modification
     /// has installed it. The GTP-U datapath uses it to encapsulate downlink packets.
-    /// Where the session owning this uplink N3/N9 TEID sends its traffic once
-    /// decapsulated — N6 for an anchor, an N9 peer for an intermediate UPF
-    /// (design/134). `None` if the TEID is unknown.
+    /// The **default** egress of the session owning this uplink N3/N9 TEID — N6 for an
+    /// anchor, an N9 peer for an intermediate UPF (design/134). `None` if the TEID is
+    /// unknown. Ignores branch rules; the datapath wants [`uplink_egress_for`].
+    ///
+    /// [`uplink_egress_for`]: UpfState::uplink_egress_for
     pub fn uplink_egress_for_teid(&self, teid: u32) -> Option<Egress> {
         self.sessions.values().find(|s| s.n3_teid == teid).map(|s| s.uplink)
+    }
+
+    /// Where this uplink packet goes once decapsulated. An **uplink classifier** node
+    /// consults its branch rules first, so egress is a *per-packet* decision rather than
+    /// a per-session one — that is the whole point of a ULCL (design/134 Phase 2). Falls
+    /// back to the session's default egress when nothing matches. `None` if the TEID is
+    /// unknown.
+    pub fn uplink_egress_for(&self, teid: u32, pkt: &[u8]) -> Option<Egress> {
+        let s = self.sessions.values().find(|s| s.n3_teid == teid)?;
+        let branched = packet_key(pkt).and_then(|key| {
+            s.branches.iter().find(|(filter, _)| filter.matches(&key)).map(|(_, e)| *e)
+        });
+        Some(branched.unwrap_or(s.uplink))
+    }
+
+    /// The branch rules installed on the session owning this uplink TEID — the SMF's
+    /// view of what this node steers away from its default egress.
+    pub fn branches_for_teid(&self, teid: u32) -> Vec<(FlowFilter, Egress)> {
+        self.sessions
+            .values()
+            .find(|s| s.n3_teid == teid)
+            .map(|s| s.branches.clone())
+            .unwrap_or_default()
     }
 
     /// If `teid` is an intermediate UPF's **downlink N9 ingress**, the gNB target to
@@ -604,6 +828,7 @@ impl UpfState {
         usage_threshold: Option<u64>,
         now_nanos: u64,
         uplink: Egress,
+        branches: Vec<(FlowFilter, Egress)>,
         wants_dl_ingress: bool,
     ) -> (u64, u32, Option<u32>) {
         let up_seid = self.next_seid;
@@ -639,6 +864,7 @@ impl UpfState {
                 ue_ipv6: ue.v6,
                 downlink: None,
                 uplink,
+                branches,
                 ambr,
                 ul_bucket,
                 dl_bucket,
@@ -1043,6 +1269,7 @@ pub fn session_establishment_request_via_peer(
     dnn: &str,
     peer_teid: u32,
     peer_addr: Ipv4Addr,
+    branches: &[(FlowFilter, Egress)],
 ) -> Vec<u8> {
     let ue: UeAddr = ue.into();
     // Uplink: the gNB sends here on a UPF-allocated N3 F-TEID; forward over N9 to the
@@ -1089,11 +1316,22 @@ pub fn session_establishment_request_via_peer(
         .build()
         .expect("build downlink Create FAR");
 
+    // Uplink-classifier branches: each is a higher-precedence classifier PDR bound to a
+    // FAR of its own, so traffic it matches leaves by a different egress than the N9
+    // default above — this node is then a ULCL (design/134 Phase 2).
+    let mut pdrs = vec![ul_pdr.to_ie(), dl_pdr.to_ie()];
+    let mut fars = vec![ul_far.to_ie(), dl_far.to_ie()];
+    for (i, (filter, egress)) in branches.iter().enumerate() {
+        let (pdr, far) = branch_create_ies(i, filter, *egress, dnn);
+        pdrs.push(pdr);
+        fars.push(far);
+    }
+
     SessionEstablishmentRequestBuilder::new(0u64, seq)
         .node_id(smf_ip)
         .fseid(cp_seid, smf_ip)
-        .create_pdrs(vec![ul_pdr.to_ie(), dl_pdr.to_ie()])
-        .create_fars(vec![ul_far.to_ie(), dl_far.to_ie()])
+        .create_pdrs(pdrs)
+        .create_fars(fars)
         .build()
         .expect("build intermediate-UPF Session Establishment Request")
         .marshal()
@@ -1350,6 +1588,9 @@ pub fn handle_n4(
                 .ies(IeType::CreatePdr)
                 .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
                 .any(|pdr| pdr.pdr_id.value == DOWNLINK_PDR_ID && pdr.pdi.f_teid.is_some());
+            // Uplink-classifier rules: a subset of uplink steered to its own egress
+            // (design/134 Phase 2). Empty on a node that doesn't branch.
+            let branches = parse_branches(msg.as_ref());
             let (up_seid, teid, dl_ingress_teid) = state.establish(
                 cp_fseid.seid.into(),
                 ue,
@@ -1358,6 +1599,7 @@ pub fn handle_n4(
                 usage_threshold,
                 now_nanos,
                 uplink,
+                branches,
                 wants_dl_ingress,
             );
             let mut builder = SessionEstablishmentResponseBuilder::new(
@@ -1388,11 +1630,18 @@ pub fn handle_n4(
                 .and_then(|ie| PfcpsmReqFlags::unmarshal(&ie.payload).ok())
                 .is_some_and(|f| f.contains(PfcpsmReqFlags::SNDEM));
             // A downlink Update FAR either installs the gNB tunnel (Outer Header
-            // Creation → activate) or DROPs downlink (AN release → deactivate).
+            // Creation → activate) or DROPs downlink (AN release → deactivate). Selected
+            // by **FAR id**: a message may carry updates for several FARs, and applying
+            // whichever came first would silently retarget the downlink from an uplink
+            // or branch update (design/134 §4). Updating those mid-session is a Phase 3
+            // concern (dynamic ULCL insertion) — for now they are ignored, not misread.
             if let Some(uf) = msg
                 .ies(IeType::UpdateFar)
                 .filter_map(|ie| UpdateFar::unmarshal(&ie.payload).ok())
-                .find(|uf| uf.update_forwarding_parameters.is_some() || uf.apply_action.is_some())
+                .find(|uf| {
+                    uf.far_id.value == DOWNLINK_FAR_ID
+                        && (uf.update_forwarding_parameters.is_some() || uf.apply_action.is_some())
+                })
             {
                 let ohc = uf
                     .update_forwarding_parameters
@@ -1779,7 +2028,7 @@ mod tests {
         let mut iupf = UpfState::new();
         handle_n4(
             &session_establishment_request_via_peer(
-                0xCAFE, 1, node_ip, UE_IP, "internet", 0x9001, peer,
+                0xCAFE, 1, node_ip, UE_IP, "internet", 0x9001, peer, &[],
             ),
             node_ip,
             &mut iupf,
@@ -1832,7 +2081,7 @@ mod tests {
         // SMF installs the gNB's downlink F-TEID via Session Modification.
         let gnb_ip = Ipv4Addr::new(10, 0, 0, 9);
         let resp = handle_n4(
-            &session_modification_request(up_seid, 2, 1, 0x5678, gnb_ip, "internet", false),
+            &session_modification_request(up_seid, 2, DOWNLINK_FAR_ID, 0x5678, gnb_ip, "internet", false),
             node_ip,
             &mut state,
             0,
@@ -1855,7 +2104,7 @@ mod tests {
         assert_eq!(state.route_downlink(Ipv4Addr::new(10, 45, 0, 3)), None, "unknown UE IP: no route");
 
         // AN release: a deactivate modification DROPs downlink and clears the route.
-        handle_n4(&session_deactivate_request(up_seid, 3, 1), node_ip, &mut state, 0)
+        handle_n4(&session_deactivate_request(up_seid, 3, DOWNLINK_FAR_ID), node_ip, &mut state, 0)
             .expect("deactivate response");
         assert_eq!(state.downlink_for(up_seid), None, "downlink target cleared on deactivation");
         assert_eq!(state.route_downlink(UE_IP), None, "no N6 route while the UE is idle");
@@ -1863,7 +2112,7 @@ mod tests {
         // The session and its uplink TEID survive — a Service Request can re-activate.
         assert_eq!(state.session_count(), 1, "session retained across deactivation");
         let resp = handle_n4(
-            &session_modification_request(up_seid, 4, 1, 0x9ABC, gnb_ip, "internet", false),
+            &session_modification_request(up_seid, 4, DOWNLINK_FAR_ID, 0x9ABC, gnb_ip, "internet", false),
             node_ip,
             &mut state,
             0,
@@ -1984,18 +2233,18 @@ mod tests {
         let gnb_b = Ipv4Addr::new(10, 0, 9, 2);
 
         // First downlink install (no old path) — even with SNDEM, nothing to flush.
-        handle_n4(&session_modification_request(up_seid, 2, 1, 0x5678, gnb_a, "internet", true), node_ip, &mut state, 0)
+        handle_n4(&session_modification_request(up_seid, 2, DOWNLINK_FAR_ID, 0x5678, gnb_a, "internet", true), node_ip, &mut state, 0)
             .expect("first install");
         assert!(state.take_end_markers().is_empty(), "no End Marker on the first downlink install");
 
         // A re-point WITHOUT SNDEM — no End Marker.
-        handle_n4(&session_modification_request(up_seid, 3, 1, 0x9abc, gnb_b, "internet", false), node_ip, &mut state, 0)
+        handle_n4(&session_modification_request(up_seid, 3, DOWNLINK_FAR_ID, 0x9abc, gnb_b, "internet", false), node_ip, &mut state, 0)
             .expect("re-point without SNDEM");
         assert!(state.take_end_markers().is_empty(), "no End Marker when SNDEM is unset");
 
         // A genuine path switch (SNDEM + a different gNB) — an End Marker for the OLD
         // (gNB B) tunnel; consumed once.
-        handle_n4(&session_modification_request(up_seid, 4, 1, 0x1234, gnb_a, "internet", true), node_ip, &mut state, 0)
+        handle_n4(&session_modification_request(up_seid, 4, DOWNLINK_FAR_ID, 0x1234, gnb_a, "internet", true), node_ip, &mut state, 0)
             .expect("path switch");
         assert_eq!(
             state.take_end_markers(),
@@ -2031,22 +2280,124 @@ mod tests {
         assert_eq!(state.ambr_for(up_seid), Some(new), "Update QER re-rated the session AMBR");
     }
 
+    /// A classification key for a packet to `dst` with the given transport tuple.
+    fn key(protocol: u8, src_port: u16, dst_port: u16, dst: impl Into<IpAddr>) -> PacketKey {
+        PacketKey { protocol, src_port, dst_port, dst: dst.into() }
+    }
+
     #[test]
     fn flow_filter_matches_and_roundtrips() {
-        let f = FlowFilter { protocol: 17, port_low: 5000, port_high: 5010 };
-        assert!(f.matches(17, 40000, 5005), "UDP with dst port in range");
-        assert!(f.matches(17, 5001, 40000), "UDP with src port in range");
-        assert!(!f.matches(6, 5005, 5005), "wrong protocol");
-        assert!(!f.matches(17, 80, 443), "ports out of range");
+        let anywhere = Ipv4Addr::new(8, 8, 8, 8);
+        let f = FlowFilter::transport(17, 5000, 5010);
+        assert!(f.matches(&key(17, 40000, 5005, anywhere)), "UDP with dst port in range");
+        assert!(f.matches(&key(17, 5001, 40000, anywhere)), "UDP with src port in range");
+        assert!(!f.matches(&key(6, 5005, 5005, anywhere)), "wrong protocol");
+        assert!(!f.matches(&key(17, 80, 443, anywhere)), "ports out of range");
         // The flow-description carried in the PDR SDF filter round-trips.
         assert_eq!(FlowFilter::from_flow_description(&f.to_flow_description()), Some(f));
     }
 
+    /// The ULCL classifier: a destination-prefix filter steers by *where traffic is
+    /// going*, independent of the transport tuple a QoS filter looks at.
+    #[test]
+    fn destination_prefix_filter_matches_and_roundtrips() {
+        let anywhere = Ipv4Addr::new(8, 8, 8, 8);
+        let edge = FlowFilter::to_prefix(IpPrefix::new(Ipv4Addr::new(10, 99, 0, 0), 16));
+        assert!(edge.matches(&key(6, 1234, 80, Ipv4Addr::new(10, 99, 5, 7))), "in the prefix");
+        assert!(!edge.matches(&key(6, 1234, 80, Ipv4Addr::new(10, 98, 5, 7))), "outside it");
+        assert!(
+            !edge.matches(&key(6, 1234, 80, "2001:db8::1".parse::<Ipv6Addr>().unwrap())),
+            "a v6 destination never matches a v4 prefix"
+        );
+        assert_eq!(FlowFilter::from_flow_description(&edge.to_flow_description()), Some(edge));
+
+        // A prefix that isn't byte-aligned, and the v6 family.
+        let odd = IpPrefix::new(Ipv4Addr::new(10, 0, 128, 0), 17);
+        assert!(odd.contains(Ipv4Addr::new(10, 0, 200, 1).into()));
+        assert!(!odd.contains(Ipv4Addr::new(10, 0, 100, 1).into()));
+        let v6 = FlowFilter::to_prefix(IpPrefix::new("2001:db8:a::".parse::<Ipv6Addr>().unwrap(), 48));
+        assert!(v6.matches(&key(58, 0, 0, "2001:db8:a:1::9".parse::<Ipv6Addr>().unwrap())));
+        assert!(!v6.matches(&key(58, 0, 0, "2001:db8:b::9".parse::<Ipv6Addr>().unwrap())));
+        assert_eq!(FlowFilter::from_flow_description(&v6.to_flow_description()), Some(v6));
+
+        // Components compose, and a filter with none of them matches everything.
+        let combined = FlowFilter {
+            protocol: Some(6),
+            ports: Some((80, 80)),
+            dst: Some(IpPrefix::new(Ipv4Addr::new(10, 99, 0, 0), 16)),
+        };
+        assert!(combined.matches(&key(6, 40000, 80, Ipv4Addr::new(10, 99, 1, 1))));
+        assert!(!combined.matches(&key(6, 40000, 443, Ipv4Addr::new(10, 99, 1, 1))), "wrong port");
+        assert!(!combined.matches(&key(6, 40000, 80, Ipv4Addr::new(1, 1, 1, 1))), "wrong prefix");
+        assert_eq!(
+            FlowFilter::from_flow_description(&combined.to_flow_description()),
+            Some(combined)
+        );
+        let any = FlowFilter { protocol: None, ports: None, dst: None };
+        assert!(any.matches(&key(17, 1, 2, anywhere)), "an empty filter matches everything");
+        assert_eq!(FlowFilter::from_flow_description(""), Some(any));
+    }
+
+    /// A Session Modification is applied to the FAR it names. Before design/134 Phase 2
+    /// the UPF took whichever Update FAR came first, so an update aimed at the uplink or
+    /// a branch FAR would have silently retargeted the downlink.
+    #[test]
+    fn session_modification_applies_to_the_named_far() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        handle_n4(
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("establish");
+
+        // An update for the *uplink* FAR must not install a downlink target.
+        let gnb = Ipv4Addr::new(10, 0, 0, 9);
+        let wrong = session_modification_request(1, 2, UPLINK_FAR_ID, 0x5678, gnb, "internet", false);
+        assert!(response_accepted(&handle_n4(&wrong, node_ip, &mut state, 0).expect("accepted")));
+        assert_eq!(state.downlink_for(1), None, "an uplink-FAR update leaves the downlink alone");
+
+        // The same message against the downlink FAR does install it.
+        let right =
+            session_modification_request(1, 3, DOWNLINK_FAR_ID, 0x5678, gnb, "internet", false);
+        assert!(response_accepted(&handle_n4(&right, node_ip, &mut state, 0).expect("accepted")));
+        assert_eq!(state.downlink_for(1), Some((0x5678, gnb)));
+    }
+
+    /// The classifier reads the destination out of both IP families.
+    #[test]
+    fn packet_key_reads_both_families() {
+        let v4 = udp_packet(1111, 2222, 40);
+        let k = packet_key(&v4).expect("v4 key");
+        assert_eq!((k.protocol, k.src_port, k.dst_port), (17, 1111, 2222));
+        assert_eq!(k.dst, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
+
+        let mut v6 = vec![0u8; 48];
+        v6[0] = 0x60; // IPv6
+        v6[6] = 17; // next header = UDP
+        v6[24..40].copy_from_slice(&"2001:db8:a::9".parse::<Ipv6Addr>().unwrap().octets());
+        v6[40..42].copy_from_slice(&3333u16.to_be_bytes());
+        v6[42..44].copy_from_slice(&4444u16.to_be_bytes());
+        let k = packet_key(&v6).expect("v6 key");
+        assert_eq!((k.protocol, k.src_port, k.dst_port), (17, 3333, 4444));
+        assert_eq!(k.dst, IpAddr::V6("2001:db8:a::9".parse().unwrap()));
+
+        assert!(packet_key(&[0u8; 8]).is_none(), "truncated / non-IP");
+    }
+
     /// A UDP packet from `src_port` to `dst_port`, padded to `total_len` bytes.
     fn udp_packet(src_port: u16, dst_port: u16, total_len: usize) -> Vec<u8> {
+        udp_packet_to(Ipv4Addr::new(203, 0, 113, 5), src_port, dst_port, total_len)
+    }
+
+    /// As [`udp_packet`] but addressed to `dst` — for classifying on destination.
+    fn udp_packet_to(dst: Ipv4Addr, src_port: u16, dst_port: u16, total_len: usize) -> Vec<u8> {
         let mut p = vec![0u8; total_len.max(28)];
         p[0] = 0x45; // IPv4, IHL 5
         p[9] = 17; // UDP
+        p[16..20].copy_from_slice(&dst.octets());
         p[20..22].copy_from_slice(&src_port.to_be_bytes());
         p[22..24].copy_from_slice(&dst_port.to_be_bytes());
         p
@@ -2060,7 +2411,7 @@ mod tests {
         let ambr = SessionAmbr { uplink_bps: 1_000_000_000, downlink_bps: 2_000_000_000 };
         let flow = FlowQer {
             qfi: 2,
-            filter: FlowFilter { protocol: 17, port_low: 5000, port_high: 5010 },
+            filter: FlowFilter::transport(17, 5000, 5010),
             mfbr_dl_bps: 80_000,
             mfbr_ul_bps: 80_000,
         };
@@ -2121,7 +2472,7 @@ mod tests {
         // Establish with one GBR flow (QFI 2, UDP 5000–5010, 80 kbps).
         let f2 = FlowQer {
             qfi: 2,
-            filter: FlowFilter { protocol: 17, port_low: 5000, port_high: 5010 },
+            filter: FlowFilter::transport(17, 5000, 5010),
             mfbr_dl_bps: 80_000,
             mfbr_ul_bps: 80_000,
         };
@@ -2137,7 +2488,7 @@ mod tests {
         // Mid-session: add QFI 3 and re-rate QFI 2 up to 800 kbps.
         let f3 = FlowQer {
             qfi: 3,
-            filter: FlowFilter { protocol: 17, port_low: 6000, port_high: 6010 },
+            filter: FlowFilter::transport(17, 6000, 6010),
             mfbr_dl_bps: 160_000,
             mfbr_ul_bps: 160_000,
         };
@@ -2214,11 +2565,11 @@ mod tests {
             .expect("establish");
         let up_seid = 1u64;
         let gnb = Ipv4Addr::new(10, 0, 0, 9);
-        handle_n4(&session_modification_request(up_seid, 2, 1, 0x5678, gnb, "internet", false), node_ip, &mut state, 0)
+        handle_n4(&session_modification_request(up_seid, 2, DOWNLINK_FAR_ID, 0x5678, gnb, "internet", false), node_ip, &mut state, 0)
             .expect("activate downlink");
 
         // AN release → the session buffers downlink (not drops).
-        handle_n4(&session_deactivate_request(up_seid, 3, 1), node_ip, &mut state, 0).expect("deactivate");
+        handle_n4(&session_deactivate_request(up_seid, 3, DOWNLINK_FAR_ID), node_ip, &mut state, 0).expect("deactivate");
         assert!(state.is_buffering(UE_IP), "session buffering while CM-IDLE");
         assert_eq!(state.route_downlink(UE_IP), None, "no tunnel while idle");
 
@@ -2233,7 +2584,7 @@ mod tests {
 
         // Service Request resume: re-installing the downlink flushes the buffer to
         // the new gNB tunnel.
-        handle_n4(&session_modification_request(up_seid, 4, 1, 0x9ABC, gnb, "internet", false), node_ip, &mut state, 0)
+        handle_n4(&session_modification_request(up_seid, 4, DOWNLINK_FAR_ID, 0x9ABC, gnb, "internet", false), node_ip, &mut state, 0)
             .expect("re-activate");
         assert!(!state.is_buffering(UE_IP), "no longer buffering after resume");
         let flushed = state.take_flush();
@@ -2261,7 +2612,7 @@ mod tests {
         // One GBR flow (QFI 2, UDP 5000–5010) with an MFBR far above the traffic.
         let f2 = FlowQer {
             qfi: 2,
-            filter: FlowFilter { protocol: 17, port_low: 5000, port_high: 5010 },
+            filter: FlowFilter::transport(17, 5000, 5010),
             mfbr_dl_bps: 100_000_000,
             mfbr_ul_bps: 100_000_000,
         };
