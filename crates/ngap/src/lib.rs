@@ -307,8 +307,11 @@ pub fn tac_from_initial_ue(msg: &InitialUEMessage) -> Option<[u8; 3]> {
 /// Build an `NGSetupRequest` (TS 38.413 §9.2.6.1) advertising the tracking areas
 /// the gNB serves — for tests and a gNB simulator. Mandatory IEs: Global RAN Node
 /// ID, Supported TA List, Default Paging DRX.
-pub fn ng_setup_request(gnb_id: u32, mcc: &str, mnc: &str, tacs: &[[u8; 3]]) -> NGAP_PDU {
-    let ta_list = SupportedTAList(
+/// The **Supported TA List** a RAN node advertises: one item per tracking area, each
+/// broadcasting the PLMN and the slice it supports. Shared by NG Setup and RAN
+/// Configuration Update (design/132).
+fn supported_ta_list(tacs: &[[u8; 3]], mcc: &str, mnc: &str) -> SupportedTAList {
+    SupportedTAList(
         tacs.iter()
             .map(|tac| SupportedTAItem {
                 tac: TAC(tac.to_vec()),
@@ -323,13 +326,251 @@ pub fn ng_setup_request(gnb_id: u32, mcc: &str, mnc: &str, tacs: &[[u8; 3]]) -> 
                 ie_extensions: None,
             })
             .collect(),
-    );
+    )
+}
+
+pub fn ng_setup_request(gnb_id: u32, mcc: &str, mnc: &str, tacs: &[[u8; 3]]) -> NGAP_PDU {
+    let ta_list = supported_ta_list(tacs, mcc, mnc);
     let node_id = GlobalRANNodeID::GlobalGNB_ID(helpers::global_gnb_id(plmn(mcc, mnc), gnb_id));
     build_ngap!(InitiatingMessage, NGSetup,
         REJECT, NGSetupRequest,
         REJECT GlobalRANNodeID(node_id),
         REJECT SupportedTAList(ta_list),
         IGNORE DefaultPagingDRX(PagingDRX(PagingDRX::V128)),
+    )
+}
+
+// ── Interface management (TS 38.413 §8.7, design/132) ────────────────────────────────
+
+/// What an **NG Reset** asks the peer to release (TS 38.413 §9.2.6.11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResetScope {
+    /// Release every UE context on this NG interface association.
+    All,
+    /// Release only these `(AMF-UE-NGAP-ID, RAN-UE-NGAP-ID)` associations — either id
+    /// may be absent in an item.
+    Part(Vec<(Option<u64>, Option<u32>)>),
+}
+
+/// Build the `UE-associatedLogicalNG-connectionList` for the given UE associations.
+/// The IE is `SIZE(1..65536)`, so callers must not pass an empty slice.
+fn ue_association_list(ues: &[(u64, u32)]) -> UE_associatedLogicalNG_connectionList {
+    UE_associatedLogicalNG_connectionList(
+        ues.iter()
+            .map(|(amf_ue_id, ran_ue_id)| UE_associatedLogicalNG_connectionItem {
+                amf_ue_ngap_id: Some(AMF_UE_NGAP_ID(*amf_ue_id)),
+                ran_ue_ngap_id: Some(RAN_UE_NGAP_ID(*ran_ue_id)),
+                ie_extensions: None,
+            })
+            .collect(),
+    )
+}
+
+/// gNB → AMF: **NG Reset** resetting the whole interface — what a gNB sends after a
+/// restart. The AMF releases every UE context on the association, then acknowledges.
+pub fn ng_reset_all(cause_radio: u8) -> NGAP_PDU {
+    build_ngap!(InitiatingMessage, NGReset,
+        REJECT, NGReset,
+        IGNORE Cause(Cause::RadioNetwork(CauseRadioNetwork(cause_radio))),
+        REJECT ResetType(ResetType::NG_Interface(ResetAll(ResetAll::RESET_ALL))),
+    )
+}
+
+/// gNB → AMF: **NG Reset** for a subset of UE associations (must be non-empty).
+pub fn ng_reset_partial(cause_radio: u8, ues: &[(u64, u32)]) -> NGAP_PDU {
+    build_ngap!(InitiatingMessage, NGReset,
+        REJECT, NGReset,
+        IGNORE Cause(Cause::RadioNetwork(CauseRadioNetwork(cause_radio))),
+        REJECT ResetType(ResetType::PartOfNG_Interface(ue_association_list(ues))),
+    )
+}
+
+/// The scope an **NG Reset** requests. `None` for other PDUs.
+pub fn parse_ng_reset(pdu: &NGAP_PDU) -> Option<ResetScope> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_NGReset(req) = value else {
+        return None;
+    };
+    req.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        NGResetProtocolIEs_EntryValue::Id_ResetType(ResetType::NG_Interface(_)) => {
+            Some(ResetScope::All)
+        }
+        NGResetProtocolIEs_EntryValue::Id_ResetType(ResetType::PartOfNG_Interface(list)) => {
+            Some(ResetScope::Part(
+                list.0
+                    .iter()
+                    .map(|i| {
+                        (i.amf_ue_ngap_id.as_ref().map(|x| x.0), i.ran_ue_ngap_id.as_ref().map(|x| x.0))
+                    })
+                    .collect(),
+            ))
+        }
+        _ => None,
+    })
+}
+
+/// AMF → gNB: **NG Reset Acknowledge**. `released` lists the UE associations actually
+/// released; pass an empty slice for a full reset — the list IE is `SIZE(1..)`, so an
+/// empty one would fail to encode and is therefore **omitted** instead.
+pub fn ng_reset_acknowledge(released: &[(u64, u32)]) -> NGAP_PDU {
+    if released.is_empty() {
+        return build_ngap!(SuccessfulOutcome, NGReset, REJECT, NGResetAcknowledge,);
+    }
+    build_ngap!(SuccessfulOutcome, NGReset,
+        REJECT, NGResetAcknowledge,
+        IGNORE UE_associatedLogicalNG_connectionList(ue_association_list(released)),
+    )
+}
+
+/// The UE associations an **NG Reset Acknowledge** reports as released (gNB side).
+pub fn parse_ng_reset_acknowledge(pdu: &NGAP_PDU) -> Option<Vec<(Option<u64>, Option<u32>)>> {
+    let NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome { value, .. }) = pdu else {
+        return None;
+    };
+    let SuccessfulOutcomeValue::Id_NGReset(ack) = value else {
+        return None;
+    };
+    let released = ack
+        .protocol_i_es
+        .0
+        .iter()
+        .find_map(|ie| match &ie.value {
+            NGResetAcknowledgeProtocolIEs_EntryValue::Id_UE_associatedLogicalNG_connectionList(l) => {
+                Some(l.0.iter().map(|i| {
+                    (i.amf_ue_ngap_id.as_ref().map(|x| x.0), i.ran_ue_ngap_id.as_ref().map(|x| x.0))
+                }).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+    Some(released)
+}
+
+/// gNB → AMF: **RAN Configuration Update** — the gNB changed its name and/or the
+/// tracking areas it serves, without re-running NG Setup (TS 38.413 §8.7.2).
+pub fn ran_configuration_update(name: &str, tacs: &[[u8; 3]], mcc: &str, mnc: &str) -> NGAP_PDU {
+    build_ngap!(InitiatingMessage, RANConfigurationUpdate,
+        REJECT, RANConfigurationUpdate,
+        IGNORE RANNodeName(name.to_string()),
+        REJECT SupportedTAList(supported_ta_list(tacs, mcc, mnc)),
+    )
+}
+
+/// A **RAN Configuration Update**'s new `(RAN node name, supported TACs)` — every IE is
+/// optional, so `None` in a field means "unchanged". `None` overall for other PDUs.
+#[allow(clippy::type_complexity)]
+pub fn parse_ran_configuration_update(
+    pdu: &NGAP_PDU,
+) -> Option<(Option<String>, Option<Vec<[u8; 3]>>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_RANConfigurationUpdate(req) = value else {
+        return None;
+    };
+    let (mut name, mut tacs) = (None, None);
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            RANConfigurationUpdateProtocolIEs_EntryValue::Id_RANNodeName(n) => {
+                name = Some(n.0.clone())
+            }
+            RANConfigurationUpdateProtocolIEs_EntryValue::Id_SupportedTAList(l) => {
+                tacs = Some(
+                    l.0.iter()
+                        .filter_map(|item| <[u8; 3]>::try_from(item.tac.0.as_slice()).ok())
+                        .collect(),
+                )
+            }
+            _ => {}
+        }
+    }
+    Some((name, tacs))
+}
+
+/// AMF → gNB: **RAN Configuration Update Acknowledge** (no mandatory IEs).
+pub fn ran_configuration_update_acknowledge() -> NGAP_PDU {
+    build_ngap!(SuccessfulOutcome, RANConfigurationUpdate, REJECT, RANConfigurationUpdateAcknowledge,)
+}
+
+/// **Error Indication** (TS 38.413 §8.7.5) — report a protocol error, optionally naming
+/// the UE association it concerns. Sent by either side.
+pub fn error_indication(amf_ue_id: Option<u64>, ran_ue_id: Option<u32>, cause_radio: u8) -> NGAP_PDU {
+    let mut ies = Vec::new();
+    if let Some(id) = amf_ue_id {
+        ies.push(build_ngap_ie!(ErrorIndication, IGNORE AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(id))));
+    }
+    if let Some(id) = ran_ue_id {
+        ies.push(build_ngap_ie!(ErrorIndication, IGNORE RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(id))));
+    }
+    ies.push(build_ngap_ie!(ErrorIndication, IGNORE Cause(Cause::RadioNetwork(CauseRadioNetwork(cause_radio)))));
+    NGAP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(ID_ERROR_INDICATION),
+        criticality: Criticality(Criticality::IGNORE),
+        value: InitiatingMessageValue::Id_ErrorIndication(ErrorIndication {
+            protocol_i_es: ErrorIndicationProtocolIEs(ies),
+        }),
+    })
+}
+
+/// The `(AMF-UE-NGAP-ID, RAN-UE-NGAP-ID)` an **Error Indication** names, if any.
+pub fn parse_error_indication(pdu: &NGAP_PDU) -> Option<(Option<u64>, Option<u32>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_ErrorIndication(msg) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut ran_ue_id) = (None, None);
+    for ie in &msg.protocol_i_es.0 {
+        match &ie.value {
+            ErrorIndicationProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(id) => amf_ue_id = Some(id.0),
+            ErrorIndicationProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(id) => ran_ue_id = Some(id.0),
+            _ => {}
+        }
+    }
+    Some((amf_ue_id, ran_ue_id))
+}
+
+/// AMF → gNB: **Overload Start** — ask the RAN to shed load with `action` (an
+/// [`OverloadAction`] value, e.g. `REJECT_NON_EMERGENCY_MO_DT`). TS 38.413 §8.7.6.
+pub fn overload_start(action: u8) -> NGAP_PDU {
+    build_ngap!(InitiatingMessage, OverloadStart,
+        IGNORE, OverloadStart,
+        IGNORE AMFOverloadResponse(OverloadResponse::OverloadAction(OverloadAction(action))),
+    )
+}
+
+/// AMF → gNB: **Overload Stop** — the overload condition cleared. Carries no IEs.
+pub fn overload_stop() -> NGAP_PDU {
+    build_ngap!(InitiatingMessage, OverloadStop, IGNORE, OverloadStop,)
+}
+
+/// gNB side: the [`OverloadAction`] an **Overload Start** requests. `None` for others.
+pub fn overload_action(pdu: &NGAP_PDU) -> Option<u8> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_OverloadStart(msg) = value else {
+        return None;
+    };
+    msg.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+        OverloadStartProtocolIEs_EntryValue::Id_AMFOverloadResponse(
+            OverloadResponse::OverloadAction(a),
+        ) => Some(a.0),
+        _ => None,
+    })
+}
+
+/// gNB side: whether this PDU is an **Overload Stop**.
+pub fn is_overload_stop(pdu: &NGAP_PDU) -> bool {
+    matches!(
+        pdu,
+        NGAP_PDU::InitiatingMessage(InitiatingMessage {
+            value: InitiatingMessageValue::Id_OverloadStop(_),
+            ..
+        })
     )
 }
 
@@ -3078,5 +3319,65 @@ mod gnb_side_tests {
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
         assert_eq!(initial_context_setup_request_qfis(&back), vec![(1, 3)]);
         assert!(pdu_session_setup_request_qfis(&back).is_empty(), "wrong PDU type");
+    }
+
+    /// The interface-management family (TS 38.413 §8.7, design/132) survives an APER
+    /// round trip and parses back: NG Reset (full + partial) + Acknowledge, RAN
+    /// Configuration Update + Acknowledge, Error Indication, Overload Start/Stop.
+    #[test]
+    fn interface_management_round_trips() {
+        fn rt(pdu: NGAP_PDU) -> NGAP_PDU {
+            NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode")
+        }
+        let unspec = CauseRadioNetwork::UNSPECIFIED;
+
+        // NG Reset: the whole interface (a restarted gNB).
+        assert_eq!(parse_ng_reset(&rt(ng_reset_all(unspec))), Some(ResetScope::All));
+        // NG Reset: only the listed UE associations.
+        assert_eq!(
+            parse_ng_reset(&rt(ng_reset_partial(unspec, &[(7, 3), (9, 4)]))),
+            Some(ResetScope::Part(vec![(Some(7), Some(3)), (Some(9), Some(4))]))
+        );
+
+        // Acknowledge: a full reset omits the list IE (it is SIZE(1..)); a partial one
+        // reports exactly what it released.
+        assert_eq!(parse_ng_reset_acknowledge(&rt(ng_reset_acknowledge(&[]))), Some(vec![]));
+        assert_eq!(
+            parse_ng_reset_acknowledge(&rt(ng_reset_acknowledge(&[(7, 3)]))),
+            Some(vec![(Some(7), Some(3))])
+        );
+
+        // RAN Configuration Update: a new name + supported TACs, then the Acknowledge.
+        assert_eq!(
+            parse_ran_configuration_update(&rt(ran_configuration_update(
+                "gnb-2",
+                &[[0, 0, 2], [0, 0, 3]],
+                "999",
+                "70"
+            ))),
+            Some((Some("gnb-2".to_string()), Some(vec![[0, 0, 2], [0, 0, 3]])))
+        );
+        assert!(
+            matches!(rt(ran_configuration_update_acknowledge()), NGAP_PDU::SuccessfulOutcome(_)),
+            "the acknowledge is a SuccessfulOutcome"
+        );
+
+        // Error Indication, with and without the UE association.
+        assert_eq!(
+            parse_error_indication(&rt(error_indication(Some(5), Some(6), unspec))),
+            Some((Some(5), Some(6)))
+        );
+        assert_eq!(
+            parse_error_indication(&rt(error_indication(None, None, unspec))),
+            Some((None, None)),
+            "a non-UE-associated Error Indication still parses"
+        );
+
+        // Overload Start carries the requested action; Overload Stop carries no IEs.
+        let start = rt(overload_start(OverloadAction::REJECT_NON_EMERGENCY_MO_DT));
+        assert_eq!(overload_action(&start), Some(OverloadAction::REJECT_NON_EMERGENCY_MO_DT));
+        assert!(!is_overload_stop(&start));
+        assert!(is_overload_stop(&rt(overload_stop())));
+        assert_eq!(overload_action(&rt(overload_stop())), None, "stop carries no action");
     }
 }

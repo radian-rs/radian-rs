@@ -983,6 +983,83 @@ async fn ue_slaac_and_reaches_gw(world: &mut World, gw: String) {
     assert!(ok, "the UE did not SLAAC from a Router Advertisement and reach the gateway");
 }
 
+// ── N2 interface management (TS 38.413 §8.7, design/132) ────────────────────────────
+
+#[when("the gNB resets the whole NG interface")]
+async fn gnb_resets_ng_interface(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::ng_reset_all(ngap::CauseRadioNetwork::UNSPECIFIED))
+        .await
+        .expect("send NGReset");
+}
+
+#[then("the AMF acknowledges the NG reset")]
+async fn amf_acks_ng_reset(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let pdu = gnb.recv().await.expect("the NG Reset Acknowledge");
+    assert!(
+        ngap::parse_ng_reset_acknowledge(&pdu).is_some(),
+        "expected an NGResetAcknowledge, got {}",
+        pdu.procedure_name()
+    );
+}
+
+#[when(regex = r#"^the gNB updates its configuration to serve TAC "([^"]+)"$"#)]
+async fn gnb_updates_configuration(world: &mut World, tac: String) {
+    let tacs = parse_tacs(&tac);
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::ran_configuration_update("radian-gnb-reconfigured", &tacs, "999", "70"))
+        .await
+        .expect("send RANConfigurationUpdate");
+}
+
+#[then("the AMF acknowledges the configuration update")]
+async fn amf_acks_configuration_update(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let pdu = gnb.recv().await.expect("the RAN Configuration Update Acknowledge");
+    assert!(
+        matches!(pdu, ngap::NGAP_PDU::SuccessfulOutcome(_)),
+        "expected a SuccessfulOutcome, got {}",
+        pdu.procedure_name()
+    );
+}
+
+#[when("the gNB sends an Error Indication")]
+async fn gnb_sends_error_indication(world: &mut World) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::error_indication(None, None, ngap::CauseRadioNetwork::UNSPECIFIED))
+        .await
+        .expect("send ErrorIndication");
+}
+
+#[when(regex = r#"^the operator (signals|clears) AMF overload$"#)]
+async fn operator_overload(_world: &mut World, verb: String) {
+    let action = if verb == "signals" { "start" } else { "stop" };
+    let resp = sbi_core::sbi_client()
+        .post("http://127.0.0.1:8001/oam/v1/overload")
+        .header("content-type", "application/json")
+        .body(format!(r#"{{"action":"{action}"}}"#))
+        .send()
+        .await
+        .expect("POST the AMF's OAM overload endpoint");
+    assert!(resp.status().is_success(), "OAM overload returned {}", resp.status());
+}
+
+#[then(regex = r#"^the gNB receives an Overload (Start|Stop)$"#)]
+async fn gnb_receives_overload(world: &mut World, which: String) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let pdu = gnb.recv().await.expect("the overload message");
+    if which == "Start" {
+        assert!(
+            ngap::overload_action(&pdu).is_some(),
+            "expected an OverloadStart carrying an action, got {}",
+            pdu.procedure_name()
+        );
+    } else {
+        assert!(ngap::is_overload_stop(&pdu), "expected an OverloadStop, got {}", pdu.procedure_name());
+    }
+}
+
 /// Parse a comma-separated TAC list like `"000001,000002"` into 3-byte TACs.
 fn parse_tacs(spec: &str) -> Vec<[u8; 3]> {
     spec.split(',').filter(|s| !s.is_empty()).map(parse_tac).collect()

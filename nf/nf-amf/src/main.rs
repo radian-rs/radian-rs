@@ -1095,7 +1095,29 @@ fn namf_callback_router() -> axum::Router {
         }
     }
 
+    /// OAM: signal **Overload Start / Stop** to every connected gNB (TS 38.413
+    /// §8.7.6/7, design/132). Body `{"action":"start"|"stop"}`. The AMF has no load
+    /// metric of its own, so overload is operator-driven — this is the trigger.
+    async fn overload(
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::http::StatusCode {
+        let (sent, label) = match body.get("action").and_then(|v| v.as_str()) {
+            Some("start") => (
+                broadcast_to_gnbs(
+                    || ngap::overload_start(ngap::OverloadAction::REJECT_NON_EMERGENCY_MO_DT),
+                    "OverloadStart",
+                ),
+                "OverloadStart",
+            ),
+            Some("stop") => (broadcast_to_gnbs(ngap::overload_stop, "OverloadStop"), "OverloadStop"),
+            _ => return axum::http::StatusCode::BAD_REQUEST,
+        };
+        info!("OAM: {label} broadcast to {sent} gNB(s)");
+        axum::http::StatusCode::NO_CONTENT
+    }
+
     axum::Router::new()
+        .route("/oam/v1/overload", axum::routing::post(overload))
         .route("/namf-callback/v1/{supi}/dereg-notify", axum::routing::post(dereg_notify))
         .route("/namf-callback/v1/{supi}/sdm-notify", axum::routing::post(sdm_notify))
         .route(
@@ -1668,6 +1690,39 @@ async fn handle_ngap(
                     send_or_log(conn, &ack, label).await;
                 }
             }
+            // ── Interface management (TS 38.413 §8.7, design/132) ──────────────────
+            InitiatingMessageValue::Id_NGReset(_) => {
+                if let Some(ack) = on_ng_reset(ues, amf_smf, &pdu).await {
+                    send_or_log(conn, &ack, "NGResetAcknowledge").await;
+                }
+            }
+            InitiatingMessageValue::Id_RANConfigurationUpdate(_) => {
+                // The gNB changed its name and/or served tracking areas without
+                // re-running NG Setup: update the link state that paging scoping and
+                // handover target resolution read, then acknowledge. Absent IEs mean
+                // "unchanged" (every IE is optional, TS 38.413 §9.2.6.5).
+                if let Some((name, tacs)) = ngap::parse_ran_configuration_update(&pdu) {
+                    if let Some(tacs) = tacs.clone()
+                        && let Some(link) =
+                            GNB_LINKS.lock().unwrap().iter_mut().find(|l| l.tx.same_channel(dereg_tx))
+                    {
+                        link.tacs = tacs;
+                    }
+                    info!("gNB configuration update: name {name:?}, TACs {tacs:02x?}");
+                }
+                let ack = ngap::ran_configuration_update_acknowledge();
+                send_or_log(conn, &ack, "RANConfigurationUpdateAcknowledge").await;
+            }
+            InitiatingMessageValue::Id_ErrorIndication(_) => {
+                // Logged, not acted on: a spurious Error Indication must not tear down
+                // a working session (design/132 D3).
+                match ngap::parse_error_indication(&pdu) {
+                    Some((amf_ue_id, ran_ue_id)) => warn!(
+                        "gNB Error Indication (AMF-UE-NGAP-ID {amf_ue_id:?}, RAN-UE-NGAP-ID {ran_ue_id:?})"
+                    ),
+                    None => warn!("gNB Error Indication (unparseable)"),
+                }
+            }
             _ => info!("unhandled initiating message: {}", pdu.procedure_name()),
         },
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
@@ -1732,9 +1787,27 @@ async fn on_ue_context_release_request(
     pdu: &NGAP_PDU,
 ) -> Option<NGAP_PDU> {
     let (amf_ue_id, ran_ue_id) = ngap::parse_ue_context_release_request(pdu)?;
-    let sessions: Vec<(u8, (String, String))> = ues
+    if !release_ue_context(ues, amf_smf, amf_ue_id).await {
+        return None;
+    }
+    Some(ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::NORMAL_RELEASE))
+}
+
+/// Release one UE's RAN context with AN-release semantics: deactivate each PDU session's
+/// user plane at the SMF, drop the N2 association, and retain the 5GMM context by its
+/// 5G-TMSI so a Service Request can resume it. Returns whether a context was found.
+/// Shared by the gNB's `UEContextReleaseRequest` and by **NG Reset** (design/132).
+async fn release_ue_context(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    amf_ue_id: u64,
+) -> bool {
+    let Some(sessions) = ues
         .get(&amf_ue_id)
-        .map(|c| c.sm_refs.iter().map(|(psi, v)| (*psi, v.clone())).collect())?;
+        .map(|c| c.sm_refs.iter().map(|(psi, v)| (*psi, v.clone())).collect::<Vec<_>>())
+    else {
+        return false;
+    };
 
     // Deactivate the user plane for each session (best-effort — the RAN context is
     // released regardless; a failed SMF call just leaves that session's UPF route
@@ -1764,7 +1837,58 @@ async fn on_ue_context_release_request(
             None => warn!("UE {amf_ue_id}: released with no 5G-GUTI — context dropped, no resume"),
         }
     }
-    Some(ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::NORMAL_RELEASE))
+    true
+}
+
+/// Handle a gNB-initiated **NG Reset** (TS 38.413 §8.7.4, design/132): release the
+/// affected UE contexts, then acknowledge. A **full** reset (the gNB restarted) drops
+/// every context this AMF holds; a **partial** reset drops only the named associations.
+/// The acknowledge reports the partial list, and omits the IE for a full reset (it is
+/// `SIZE(1..)`, so an empty list would not encode).
+async fn on_ng_reset(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_smf: &pdu_session::AmfSmf,
+    pdu: &NGAP_PDU,
+) -> Option<NGAP_PDU> {
+    let scope = ngap::parse_ng_reset(pdu)?;
+    let targets: Vec<(u64, u32)> = match &scope {
+        ngap::ResetScope::All => ues.iter().map(|(id, c)| (*id, c.ran_ue_id)).collect(),
+        ngap::ResetScope::Part(list) => list
+            .iter()
+            .filter_map(|(amf_ue_id, ran)| {
+                let amf_ue_id = (*amf_ue_id)?;
+                let ctx = ues.get(&amf_ue_id)?;
+                Some((amf_ue_id, ran.unwrap_or(ctx.ran_ue_id)))
+            })
+            .collect(),
+    };
+    for (amf_ue_id, _) in &targets {
+        release_ue_context(ues, amf_smf, *amf_ue_id).await;
+    }
+    let full = matches!(scope, ngap::ResetScope::All);
+    info!(
+        "NG Reset ({}): released {} UE context(s)",
+        if full { "whole interface" } else { "partial" },
+        targets.len()
+    );
+    Some(ngap::ng_reset_acknowledge(if full { &[] } else { &targets }))
+}
+
+/// Broadcast a pre-built NGAP PDU to every connected gNB (design/132) — the AMF-initiated
+/// Overload Start/Stop. Closed associations are swept as we go, like [`page_gnbs`].
+fn broadcast_to_gnbs(build: impl Fn() -> NGAP_PDU, label: &'static str) -> usize {
+    let mut sent = 0;
+    let mut links = GNB_LINKS.lock().unwrap();
+    // `NGAP_PDU` is not `Clone`, so build a fresh one per association (the same shape
+    // the N2-handover cross-association path uses).
+    links.retain(|l| match l.tx.send(UeCmd::Forward { pdu: Box::new(build()), label }) {
+        Ok(()) => {
+            sent += 1;
+            true
+        }
+        Err(_) => false,
+    });
+    sent
 }
 
 /// Implicit-deregistration sweep (TS 24.501 §5.3.7): evict retained CM-IDLE

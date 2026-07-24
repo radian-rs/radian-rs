@@ -220,6 +220,40 @@ Feature: Scripted gNB/UE — full 5G-AKA registration against the live core
     And the UE reads an "IPV6" PDU address
     And the accept returns the IPv6 DNS server "2001:4860:4860::8888"
 
+  # design/132: N2 interface management (TS 38.413 §8.7). A restarted gNB resets the
+  # whole NG interface; the AMF releases the UE contexts it held before acknowledging.
+  Scenario: A gNB restart resets the NG interface
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the scripted UE sends its registration request from TAC "000001"
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with RES*
+    Then the AMF selects NEA2/NIA2 in a security mode command
+    When the scripted UE completes the security mode procedure
+    Then the AMF sets up the initial context carrying the registration accept
+    When the gNB confirms the context and the UE completes the registration
+    Then the AMF nudges the registered UE with a configuration update
+    When the gNB resets the whole NG interface
+    Then the AMF acknowledges the NG reset
+    And the "amf" log should contain "NG Reset (whole interface)"
+
+  Scenario: A gNB updates its configuration without re-running NG Setup
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the gNB updates its configuration to serve TAC "000009"
+    Then the AMF acknowledges the configuration update
+    And the "amf" log should contain "gNB configuration update"
+
+  Scenario: Error Indication is logged and the AMF signals overload
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the gNB sends an Error Indication
+    Then the "amf" log should contain "gNB Error Indication"
+    When the operator signals AMF overload
+    Then the gNB receives an Overload Start
+    When the operator clears AMF overload
+    Then the gNB receives an Overload Stop
+
   Scenario: Teardown topology
     Given the scripted core is running
     When I stop the radian core
