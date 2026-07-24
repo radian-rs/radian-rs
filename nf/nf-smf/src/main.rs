@@ -9,7 +9,7 @@ mod pdu_session;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use pdu_session::SmfState;
+use pdu_session::{SmfState, UserPlane};
 
 const UPF_N4_ENV: &str = "RADIAN_SMF_UPF_N4";
 const DEFAULT_UPF_N4: &str = "127.0.0.1:8805";
@@ -17,6 +17,11 @@ const DEFAULT_UPF_N4: &str = "127.0.0.1:8805";
 /// chained gNB → I-UPF → N9 → anchor → N6 (design/134); the anchor stays
 /// `RADIAN_SMF_UPF_N4`. Absent ⇒ single-UPF operation.
 const IUPF_N4_ENV: &str = "RADIAN_SMF_IUPF_N4";
+/// N4 address of a **second anchor**, plus the destination prefix steered to it — the
+/// uplink classifier (design/134 Phase 2). Both are required together, and both need
+/// `RADIAN_SMF_IUPF_N4`: the classifier runs on the intermediate UPF.
+const PSA2_N4_ENV: &str = "RADIAN_SMF_PSA2_N4";
+const ULCL_PREFIX_ENV: &str = "RADIAN_SMF_ULCL_PREFIX";
 const NRF_ENV: &str = "RADIAN_SMF_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 /// GFBR admission-control budget (Mbps, each direction). Absent ⇒ unlimited.
@@ -42,12 +47,27 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
     let iupf_n4: Option<SocketAddr> =
         std::env::var(IUPF_N4_ENV).ok().map(|v| v.parse()).transpose()?;
+    let mut user_plane = match iupf_n4 {
+        Some(iupf) => UserPlane::chained(upf_n4, iupf),
+        None => UserPlane::single(upf_n4),
+    };
+    // A second anchor + the prefix classified to it (both or neither).
+    match (std::env::var(PSA2_N4_ENV).ok(), std::env::var(ULCL_PREFIX_ENV).ok()) {
+        (Some(psa2), Some(prefix)) => {
+            let prefix: pfcp::IpPrefix = prefix
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{ULCL_PREFIX_ENV} is not an IP prefix"))?;
+            user_plane = user_plane.with_breakout(psa2.parse()?, prefix);
+        }
+        (None, None) => {}
+        _ => anyhow::bail!("{PSA2_N4_ENV} and {ULCL_PREFIX_ENV} must be set together"),
+    }
     let smf_ip = Ipv4Addr::new(127, 0, 0, 1); // TODO: real N4 source address / config
     let nrf_base =
         sbi_core::sbi_base(std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string()));
 
     // The NRF base is also how the SMF finds the UDM for Nudm_SDM subscription checks.
-    let mut smf = SmfState::connect(upf_n4, iupf_n4, smf_ip, nrf_base.clone()).await?;
+    let mut smf = SmfState::connect(user_plane, smf_ip, nrf_base.clone()).await?;
     // Optional GFBR admission-control budget (else unlimited).
     if let Some(mbps) = std::env::var(GFBR_BUDGET_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
         let bps = mbps.saturating_mul(1_000_000);
@@ -62,13 +82,20 @@ async fn main() -> anyhow::Result<()> {
     }
     let smf = Arc::new(smf);
     smf.associate().await?;
-    match iupf_n4 {
-        Some(iupf) => tracing::info!(
+    match (user_plane.intermediate, user_plane.breakout) {
+        (Some(iupf), Some((psa2, prefix))) => tracing::info!(
+            anchor = %upf_n4,
+            classifier = %iupf,
+            breakout_anchor = %psa2,
+            breakout_prefix = %prefix,
+            "PFCP associations established; the intermediate UPF classifies uplink to two anchors (design/134)"
+        ),
+        (Some(iupf), None) => tracing::info!(
             anchor = %upf_n4,
             intermediate = %iupf,
             "PFCP associations established; sessions run chained over N9 (design/134)"
         ),
-        None => tracing::info!(%upf_n4, "PFCP association established with UPF"),
+        _ => tracing::info!(%upf_n4, "PFCP association established with UPF"),
     }
     // Consume UPF-initiated usage reports: ack + relay to the CHF (Nchf update).
     tokio::spawn(pdu_session::handle_usage_reports(smf.clone()));
