@@ -1268,6 +1268,7 @@ pub fn pdu_session_establishment_accept(
     ambr: SessionAmbr,
     flows: &[QosFlowDesc],
     cause: Option<u8>,
+    dns_ipv6: Option<std::net::Ipv6Addr>,
 ) -> Vec<u8> {
     let mut m = Vec::with_capacity(48);
     // 5GSM header: EPD, PDU session id, PTI, message type (0xC2 = Establishment Accept).
@@ -1333,12 +1334,61 @@ pub fn pdu_session_establishment_accept(
         m.extend_from_slice(&(desc.len() as u16).to_be_bytes());
         m.extend_from_slice(&desc);
     }
+    // Extended PCO (IEI 0x7B, TLV-E) — returned when the UE requested DNS via PCO: the
+    // configuration-protocol octet (0x80) + a **DNS Server IPv6 Address** container
+    // (id 0x0003, the 16-byte server address). TS 24.501 §9.11.4.6 (design/131 Phase D).
+    if let Some(dns) = dns_ipv6 {
+        let mut pco = vec![0x80u8]; // ext bit set, configuration protocol = 0
+        pco.extend_from_slice(&[0x00, 0x03, 16]); // container id 0x0003, length 16
+        pco.extend_from_slice(&dns.octets());
+        m.push(0x7b);
+        m.extend_from_slice(&(pco.len() as u16).to_be_bytes());
+        m.extend_from_slice(&pco);
+    }
     // DNN (IEI 0x25): RFC 1035 label form — a length-prefixed label per dot-separated part.
     m.push(0x25);
     let dnn_buf: Vec<u8> = rfc1035_labels(dnn);
     m.push(dnn_buf.len() as u8);
     m.extend_from_slice(&dnn_buf);
     m
+}
+
+/// Like [`pdu_session_establishment_request_typed`] but also requesting DNS server
+/// addresses via an ePCO (a **DNS Server IPv6 Address Request** container, id 0x0003) —
+/// UE side / tests (design/131 Phase D). The type IE precedes the ePCO so
+/// [`requested_pdu_session_type`] still finds it.
+pub fn pdu_session_establishment_request_with_dns(
+    pdu_session_id: u8,
+    pti: u8,
+    ty: PduSessionType,
+) -> Vec<u8> {
+    let mut m = pdu_session_establishment_request_typed(pdu_session_id, pti, ty);
+    // Extended PCO (IEI 0x7B, TLV-E): config-protocol octet + an empty DNS Server IPv6
+    // Address Request container (id 0x0003, length 0).
+    let pco = [0x80u8, 0x00, 0x03, 0x00];
+    m.push(0x7b);
+    m.extend_from_slice(&(pco.len() as u16).to_be_bytes());
+    m.extend_from_slice(&pco);
+    m
+}
+
+/// Whether a PDU Session Establishment Request container's ePCO requests a **DNS Server
+/// IPv6 Address** (container id 0x0003) — the AMF uses it to decide whether to return
+/// DNS in the accept (design/131 Phase D). Scans for the container id, which is
+/// unambiguous for the ePCOs this stack builds.
+pub fn pco_requests_ipv6_dns(container: &[u8]) -> bool {
+    // The ePCO IE (0x7B) carries container ids; a DNS-IPv6 request is `00 03` with a
+    // zero length.
+    container.windows(3).any(|w| w == [0x00, 0x03, 0x00])
+}
+
+/// The IPv6 DNS server address from an Establishment Accept's ePCO (container id
+/// 0x0003, 16-byte address) — UE side / tests. `None` if the accept returned none.
+pub fn dns_ipv6_from_establishment_accept(container: &[u8]) -> Option<std::net::Ipv6Addr> {
+    container.windows(19).find_map(|w| {
+        (w[0] == 0x00 && w[1] == 0x03 && w[2] == 16)
+            .then(|| std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&w[3..19]).unwrap()))
+    })
 }
 
 /// Build a 5GSM **PDU Session Modification Command** (TS 24.501 §8.3.5) as the raw
@@ -1764,6 +1814,7 @@ mod tests {
             ambr,
             &[],
             None,
+            None,
         );
         // A 5GSM Establishment Accept: header, the UE's IPv4 in the PDU address, and the DNN.
         assert_eq!(&accept[..4], &[0x2e, 5, 1, 0xc2]);
@@ -1852,6 +1903,7 @@ mod tests {
             ambr,
             &[default],
             None,
+            None,
         );
         assert!(accept.windows(3).any(|w| w == [0x79, 0x00, 0x06]), "0x79 IE header (len 6)");
         assert!(accept.ends_with(&[0x25, 0x09, 0x08, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't']), "DNN still last");
@@ -1865,6 +1917,7 @@ mod tests {
             Some([1, 2, 3]),
             ambr,
             &[],
+            None,
             None,
         );
         assert!(!bare.windows(1).any(|w| w == [0x79]), "no QoS flow descriptions IE when empty");
@@ -2098,6 +2151,7 @@ mod tests {
             ambr,
             &[],
             None,
+            None,
         );
         assert_eq!(
             ue_ipv4_from_establishment_accept(&accept),
@@ -2124,6 +2178,7 @@ mod tests {
             ambr,
             &[],
             None,
+            None,
         );
         assert_eq!(v6[4] & 0x0f, 2, "selected PDU session type = IPv6");
         assert!(v6.windows(3).any(|w| w == [0x29, 9, 0x02]), "IPv6 PDU Address IE (len 9, type 2)");
@@ -2141,6 +2196,7 @@ mod tests {
             None,
             ambr,
             &[],
+            None,
             None,
         );
         assert_eq!(v46[4] & 0x0f, 3, "selected PDU session type = IPv4v6");
@@ -2163,6 +2219,7 @@ mod tests {
             ambr,
             &[],
             Some(sm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED),
+            None,
         );
         assert_eq!(down[4] & 0x0f, 1, "downgraded to IPv4");
         assert_eq!(accept_5gsm_cause(&down), Some(50), "5GSM cause #50 present");
@@ -2177,6 +2234,36 @@ mod tests {
             let req = pdu_session_establishment_request_typed(5, 1, ty);
             assert_eq!(requested_pdu_session_type(&req), Some(ty), "round-trip {ty:?}");
         }
+    }
+
+    /// The ePCO DNS round-trip (design/131 Phase D): a request signals a DNS-IPv6
+    /// request (without disturbing the type IE), and the accept returns the server.
+    #[test]
+    fn pco_ipv6_dns_request_and_response() {
+        let req = pdu_session_establishment_request_with_dns(5, 1, PduSessionType::Ipv6);
+        assert!(pco_requests_ipv6_dns(&req), "the request asks for an IPv6 DNS server");
+        assert_eq!(requested_pdu_session_type(&req), Some(PduSessionType::Ipv6), "type IE still found");
+        assert!(
+            !pco_requests_ipv6_dns(&pdu_session_establishment_request_typed(5, 1, PduSessionType::Ipv6)),
+            "a bare typed request does not ask for DNS"
+        );
+
+        let dns: std::net::Ipv6Addr = "2001:4860:4860::8888".parse().unwrap();
+        let ambr = session_ambr_from_bitrates("1 Gbps", "2 Gbps").unwrap();
+        let iid = [0, 0, 0, 0, 0, 0, 0, 1];
+        let accept = pdu_session_establishment_accept(
+            5, 1, &PduAddress::Ipv6 { iid }, "internet", 1, None, ambr, &[], None, Some(dns),
+        );
+        assert_eq!(dns_ipv6_from_establishment_accept(&accept), Some(dns), "DNS server readable");
+        assert!(
+            accept.ends_with(&[0x25, 0x09, 0x08, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't']),
+            "the DNN is still the last IE (the ePCO precedes it)"
+        );
+        let no_dns = pdu_session_establishment_accept(
+            5, 1, &PduAddress::Ipv6 { iid }, "internet", 1, None, ambr, &[], None, None,
+        );
+        assert_eq!(dns_ipv6_from_establishment_accept(&no_dns), None, "no DNS ⇒ none readable");
+        assert!(!no_dns.contains(&0x7b), "no ePCO IE when no DNS");
     }
 
     /// A PDU Session Establishment Reject's cause and T3396 read back out of its

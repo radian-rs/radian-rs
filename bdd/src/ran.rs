@@ -557,6 +557,28 @@ impl ScriptedUe {
         self.protected_uplink(&inner)
     }
 
+    /// Like [`pdu_session_request_typed`] but also requesting DNS server addresses via
+    /// PCO (design/131 Phase D) — the network returns the IPv6 DNS in the accept's ePCO.
+    pub fn pdu_session_request_typed_with_dns(
+        &mut self,
+        psi: u8,
+        ty: nas::PduSessionType,
+    ) -> Result<Vec<u8>> {
+        let container = nas::pdu_session_establishment_request_with_dns(psi, 1, ty);
+        let transport = nas::ul_nas_transport_sm(psi, container, None, None);
+        let inner = nas::decode_nas_5gs_message(&transport).context("encode UL NAS Transport")?;
+        self.protected_uplink(&inner)
+    }
+
+    /// The IPv6 DNS server from a relayed accept's ePCO (design/131 Phase D), if the
+    /// network returned one.
+    pub fn read_pdu_session_dns_ipv6(&mut self, dl_nas: &[u8]) -> Result<Option<std::net::Ipv6Addr>> {
+        let msg = self.read_downlink(dl_nas)?;
+        let (_psi, container) =
+            nas::sm_container_from_dl_nas_transport(&msg).context("no SM container in the DL NAS")?;
+        Ok(nas::dns_ipv6_from_establishment_accept(&container))
+    }
+
     /// Read a relayed **PDU Session Establishment Accept**, returning `(psi, PDU
     /// address, optional 5GSM cause)` — handles IPv4, IPv6 (interface identifier),
     /// and IPv4v6, plus the session-type downgrade cause (design/131).

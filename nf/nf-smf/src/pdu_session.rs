@@ -383,6 +383,10 @@ struct SmContextCreatedData {
     /// IPv6-only) — the AMF carries it in the N1 accept.
     #[serde(skip_serializing_if = "Option::is_none")]
     cause5gsm: Option<u8>,
+    /// The IPv6 DNS server for this DNN, returned to the UE in the accept's ePCO when
+    /// it requested DNS via PCO (design/131 Phase D).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_ipv6: Option<String>,
     /// The subscribed slice serving this DNN (from the UDR sm-data) — the AMF puts it
     /// in the N1 accept.
     s_nssai: Snssai,
@@ -408,6 +412,9 @@ struct SessionSubscription {
     allow_v4: bool,
     allow_v6: bool,
     default_type: nas::PduSessionType,
+    /// The DNN's IPv6 DNS server (sm-data `dnnConfigurations[dnn].dns.ipv6`), returned
+    /// to the UE in the accept's ePCO when it requests DNS (design/131 Phase D).
+    dns_ipv6: Option<std::net::Ipv6Addr>,
 }
 
 #[derive(Deserialize)]
@@ -680,6 +687,7 @@ async fn create_sm_context(
             up_n3_teid: format!("{:08x}", est.n3_teid),
             up_n3_addr: est.n3_addr,
             selected_pdu_session_type: selected_type.as_str().to_string(),
+            dns_ipv6: sub.dns_ipv6.map(|a| a.to_string()),
             ue_ipv4_addr: ue_ip,
             ue_ipv6_prefix: ue_ipv6.map(|(p, _)| format!("{p}/64")),
             ue_ipv6_iid: ue_ipv6.map(|(_, iid)| hex::encode(iid)),
@@ -866,7 +874,12 @@ async fn fetch_session_subscription(
         );
     }
     let (allow_v4, allow_v6, default_type) = parse_pdu_session_types(dnn_config);
-    Ok(SessionSubscription { snssai, ambr, qos_flows, allow_v4, allow_v6, default_type })
+    // The DNN's IPv6 DNS server, if provisioned (returned in the accept's ePCO).
+    let dns_ipv6 = dnn_config
+        .pointer("/dns/ipv6")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<std::net::Ipv6Addr>().ok());
+    Ok(SessionSubscription { snssai, ambr, qos_flows, allow_v4, allow_v6, default_type, dns_ipv6 })
 }
 
 /// Discover the base URL of the first registered NF of `nf_type` via the NRF.
@@ -939,6 +952,7 @@ async fn update_sm_context(
                     ue_ipv6_prefix: c.ue_ipv6.map(|(p, _)| format!("{p}/64")),
                     ue_ipv6_iid: c.ue_ipv6.map(|(_, iid)| hex::encode(iid)),
                     cause5gsm: None,
+                    dns_ipv6: None, // DNS is only returned in the initial accept
                     s_nssai: c.snssai.clone(),
                     session_ambr: c.policy.session_ambr().cloned(),
                     qos_flows: c.policy.qos_flows(),

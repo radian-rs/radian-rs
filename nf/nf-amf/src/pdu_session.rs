@@ -25,6 +25,9 @@ pub struct SmContextCreated {
     pub pdu_type: ngap::PduSessionType,
     /// A 5GSM cause set on a session-type downgrade (#50/#51), for the N1 accept.
     pub cause: Option<u8>,
+    /// The IPv6 DNS server for this DNN (from the SMF), returned in the accept's ePCO
+    /// when the UE requested DNS via PCO (design/131 Phase D).
+    pub dns_ipv6: Option<std::net::Ipv6Addr>,
     /// The subscribed slice (from the SMF's UDR sm-data lookup): SST + optional SD bytes.
     pub snssai_sst: u8,
     pub snssai_sd: Option<[u8; 3]>,
@@ -80,6 +83,7 @@ fn parse_sm_context_created(
         nas::PduSessionType::Ipv4v6 => ngap::PduSessionType::Ipv4v6,
     };
     let cause = body.get("cause5gsm").and_then(|v| v.as_u64()).and_then(|v| u8::try_from(v).ok());
+    let dns_ipv6 = body.get("dnsIpv6").and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
 
     // Subscribed session parameters for the N1 accept. Tolerate their absence
     // (defaults match the pre-subscription behaviour) so an older SMF still works.
@@ -111,6 +115,7 @@ fn parse_sm_context_created(
         pdu_address,
         pdu_type,
         cause,
+        dns_ipv6,
         snssai_sst,
         snssai_sd,
         ambr,
