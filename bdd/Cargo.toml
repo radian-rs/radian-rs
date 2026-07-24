@@ -15,6 +15,8 @@ gtpu.workspace = true
 # The scripted gNB/UE (design/116 Tier B) speaks real NGAP/NAS to the live AMF.
 ngap.workspace = true
 nas.workspace = true
+# The AMF's OAM surface (overload trigger, design/132) is driven over SBI.
+sbi-core.workspace = true
 aka.workspace = true
 # The standalone gNB (design/128 Phase 0): the `@gnb` tier drives it over the Uu.
 radian-gnb.workspace = true

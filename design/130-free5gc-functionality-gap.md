@@ -9,7 +9,7 @@
 
 - radian-rs is **depth-first on one golden path**. The register → auth → PDU session → ping arc is deep and CI-covered end-to-end (both the free-ran-ue `@sim` tier and radian's own `@scripted` gNB/UE tier): full 5G-AKA with SQN resync + algorithm negotiation, the complete CM-IDLE arc (AN release → paging → DL buffering → Service Request resume → buffer flush → T3513 retx), **full N2 handover + Xn path-switch with NH/NCC and direct/indirect data forwarding**, multi-PDU-session per-flow QoS/GBR, session-AMBR policing, CHF charging, PCF AM+SM policy, and a **native Rust gNB** (RRC/PDCP/SDAP/F1AP with a CU/DU F1 split — [128](128-gnb-ocudu-feasibility.md)).
 - free5gc is **breadth-first**. 14 NFs including **NSSF, NEF, N3IWF, TNGF, CHF, webconsole**; **ULCL + multi-UPF/I-UPF** user-plane topology; network slicing; **IPv6** PDU-session signalling (datapath stubbed — [131](131-ipv6-pdu-sessions.md) §2); **EAP-AKA'** + **SUCI ECIES profiles A/B**; NRPPa/positioning and MBS transport; multi-AMF with NAS reroute.
-- **The gap is breadth, not core-path depth.** radian-rs matches or exceeds free5gc on the single-UE single-session control+user plane, and *leads* on SBI security (mTLS mesh + CRL + PKI, ES256/JWKS OAuth), encryption-at-rest, a userspace UPF (no out-of-tree `gtp5g` kernel module), and owning a RAN stack free5gc doesn't have. radian-rs *trails* on (a) whole NFs (NSSF/NEF/N3IWF/TNGF), (b) user-plane topology (ULCL/multi-UPF/N9), (c) IPv6, and (d) auth/cipher breadth (EAP-AKA', SUCI ECIES, SNOW3G/ZUC).
+- **The gap is breadth, not core-path depth.** radian-rs matches or exceeds free5gc on the single-UE single-session control+user plane, and *leads* on SBI security (mTLS mesh + CRL + PKI, ES256/JWKS OAuth), encryption-at-rest, a userspace UPF (no out-of-tree `gtp5g` kernel module), and owning a RAN stack free5gc doesn't have. radian-rs *trails* on (a) whole NFs (NSSF/NEF/N3IWF/TNGF), (b) user-plane topology (ULCL/multi-UPF/N9), and (c) auth/cipher breadth (EAP-AKA', SUCI ECIES, SNOW3G/ZUC). *(The IPv6 gap listed here originally is **closed** — [131](131-ipv6-pdu-sessions.md) shipped the full stack and radian-rs now leads free5gc on it.)*
 - **Verdict: radian-rs is a credible depth-complete single-path 5GC + gNB; free5gc's edge is horizontal coverage. Close the gaps in the order P1 (protocol robustness + IPv6) → P2 (slicing + multi-UPF/ULCL + NEF) → P3 (non-3GPP access + auth/cipher breadth) → P4 (ecosystem).**
 
 Size legend: **S** ≈ days · **M** ≈ 1–2 weeks · **L** ≈ several weeks · **XL** ≈ multi-slice / months.
@@ -61,8 +61,8 @@ Neither stack ships **SCP, SEPP, BSF, LMF, NWDAF, or SMSF** — so those are sha
 | **N2 handover** (Required/Request/Command/Notify/Cancel + fwd) | ✅ | ✅ | — |
 | **Xn Path Switch** (+NH/NCC rotation) | ✅ | ✅ | — |
 | **EAP-AKA'** authentication | ✅ | ❌ | **Moderate** — §6 |
-| **NGReset / Overload Start·Stop / ErrorIndication** | ✅ | ❌ | **Minor→Moderate** — robustness/compliance |
-| **RAN Configuration Update** (+Ack/Failure) | ✅ | ❌ | **Minor** |
+| **NGReset / Overload Start·Stop / ErrorIndication** | ✅ | ✅ **CLOSED** ([132](132-n2-interface-management.md)) | — |
+| **RAN Configuration Update** (+Ack) | ✅ | ✅ **CLOSED** ([132](132-n2-interface-management.md)) | — |
 | **Multi-AMF + NAS Reroute** (`RerouteNASRequest`, `config/multiAMF`) | ✅ | ❌ | **Moderate** — no AMF-set / re-route |
 | **NRPPa** transport (positioning) | ✅ (plumbed) | ❌ | **Minor** (no LMF either side) |
 | **MBS** (`Namf_MBS_*`, multicast/broadcast) | ✅ (plumbed) | ❌ | **Minor** |
@@ -81,9 +81,9 @@ radian-rs is at or beyond free5gc on the mainline mobility + idle arcs; the AMF 
 | DNN + S-NSSAI authorization (reject #27/#31/#70) | ✅ | ✅ | — |
 | **ULCL / branching point / uplink classifier** | ✅ (`ulcl_procedure.go`, `bp_manager.go`) | ❌ | **Major** — §6 |
 | **Multi-UPF / I-UPF + PSA chains / UP topology graph** | ✅ (`user_plane_information.go`, `upNodes/links`) | ❌ | **Major** — §6 |
-| **IPv6 / IPv4v6 PDU session types** | ⚠ signalling only (`pco.go`, `gsm_build.go`) — negotiation + PCO-DNS but **no prefix/IID alloc, no SLAAC/RA** ([131](131-ipv6-pdu-sessions.md) §2) | ❌ (IPv4 only) | **Major** — [131](131-ipv6-pdu-sessions.md) |
+| **IPv6 / IPv4v6 PDU session types** | ⚠ signalling only (`pco.go`, `gsm_build.go`) — negotiation + PCO-DNS but **no prefix/IID alloc, no SLAAC/RA** ([131](131-ipv6-pdu-sessions.md) §2) | ✅ **CLOSED** — negotiation, /64+IID, v6 datapath, SLAAC/RA, PCO-DNS, dual-stack ([131](131-ipv6-pdu-sessions.md)) | **▲ radian ahead** (free5gc's v6 datapath is stubbed) |
 | Ethernet PDU session type | ✅ | ❌ | **Minor** |
-| UE-IP pool | IPv4+IPv6 | IPv4 only | folds into IPv6 gap |
+| UE-IP pool | IPv4 only (the v6 pool is absent) | IPv4 + an IPv6 /64-per-session pool ([131](131-ipv6-pdu-sessions.md)) | **▲ radian ahead** |
 
 The SMF's user plane is **single-UPF, single-N4-association, IPv4-only**. free5gc's ULCL + multi-UPF UP-topology graph (steered by `config/uerouting.yaml`) is the single largest core-network capability gap.
 
@@ -97,7 +97,7 @@ The SMF's user plane is **single-UPF, single-N4-association, IPv4-only**. free5g
 | CM-IDLE DL buffering + Downlink Data Report + flush | ✅ (netlink buffer) | ✅ (bounded in-process) | — |
 | GTP-U End Marker, F-TEID CHOOSE, NetworkInstance=DNN | ✅ | ✅ | — |
 | **N9 interface (UPF↔UPF chaining)** | ✅ | ❌ | **Major** — pairs with ULCL/multi-UPF |
-| **IPv6 flow matching / SDF filters** | ⚠ v6 parser exists (`flowdesc.go`) but the gtp5g binding emits IPv4 attrs only — effectively v4 | ❌ (IPv4) | **Major** — pairs with IPv6 gap |
+| **IPv6 flow matching / SDF filters** | ⚠ v6 parser exists (`flowdesc.go`) but the gtp5g binding emits IPv4 attrs only — effectively v4 | ✅ v6 UE-IP PDI + /64 routing ([131](131-ipv6-pdu-sessions.md)); per-flow SDF still v4 | **Minor** (v6 SDF filters remain) |
 | NAT for N6 | ✅ (config) | ❌ | **Minor** |
 
 ### 2.4 AUSF / UDM (authentication)
@@ -162,7 +162,7 @@ free5gc: React frontend + Go backend writing subscriber provisioning (SUPI/keys/
 | Capability | free5gc | radian-rs | Sev · Size |
 |---|---|---|---|
 | **ULCL + multi-UPF / I-UPF / N9 chaining** | ✅ | ❌ | Major · **XL** |
-| **IPv6 / IPv4v6 PDU sessions** (control + datapath) | ⚠ signalling only, datapath stubbed ([131](131-ipv6-pdu-sessions.md) §2) | ❌ IPv4 only | Major · **L** |
+| ~~**IPv6 / IPv4v6 PDU sessions** (control + datapath)~~ **CLOSED** | ⚠ signalling only, datapath stubbed ([131](131-ipv6-pdu-sessions.md) §2) | ✅ full stack ([131](131-ipv6-pdu-sessions.md)) | **▲ radian ahead** |
 | **Network slicing** (NSSF + slice re-selection) | ✅ | partial (AMF-local) | Major · **L** |
 | **Non-3GPP access** (N3IWF + TNGF) | ✅ | ❌ | Major · **XL** |
 | **EAP-AKA'** | ✅ | ❌ | Moderate · **M** |
@@ -170,7 +170,7 @@ free5gc: React frontend + Go backend writing subscriber provisioning (SUPI/keys/
 | **SNOW3G / ZUC** (NEA1/3, NIA1/3) | ✅ | ❌ NEA2/NIA2 only | Moderate · **M** |
 | **AF traffic influence** (NEF→UDR/PCF→ULCL) | ✅ | ❌ | Moderate · **L** (needs NEF+ULCL) |
 | **Multi-AMF + NAS reroute** | ✅ | ❌ | Moderate · **M** |
-| **N2 reset / overload / error-indication / RAN-config-update** | ✅ | ❌ | Minor→Moderate · **S–M** |
+| ~~**N2 reset / overload / error-indication / RAN-config-update**~~ **CLOSED** | ✅ | ✅ ([132](132-n2-interface-management.md)) | — |
 | **NRPPa / positioning**, **MBS** transport | ✅ plumbed | ❌ | Minor · **M** |
 
 ## 5. RAN-side — where the comparison inverts (▲ radian ahead)
@@ -190,6 +190,7 @@ This is coverage free5gc simply doesn't have — but it is measured against a *d
 | **Native gNB stack** (RRC/PDCP/SDAP/F1AP + F1 split) | ✅ | test emulator only |
 | **Deep timer / idle-mode state machine** (T3512/13/22/55/3346/3396, buffer-flush, T3513 retx) | ✅ | partial |
 | **CI-runnable scripted gNB/UE e2e tier** (no external simulator) | ✅ | Go E2E needs full RAN/UE emulator + namespaces |
+| **IPv6 / IPv4v6 PDU sessions** — working datapath, SLAAC/RA, PCO-DNS, dual-stack ([131](131-ipv6-pdu-sessions.md)) | ✅ full stack | signalling scaffold only: no prefix/IID alloc, no SLAAC/RA, v4-only datapath |
 
 These are genuine radian-rs advantages — the gap is not one-directional. A greenfield core that leads on security posture and ships its own RAN is a different value proposition than free5gc's horizontal NF coverage.
 
@@ -198,8 +199,8 @@ These are genuine radian-rs advantages — the gap is not one-directional. A gre
 Ordered by value-per-effort, respecting dependencies. Each is a candidate design-doc slice (`131+`).
 
 **P1 — protocol robustness + IPv6 (core-parity, high value):**
-1. **N2 interface management** — NGReset/Overload/ErrorIndication/RAN-Config-Update (§2.1). *S–M*. Compliance + interop hardening; no new NF.
-2. **IPv6 / IPv4v6 PDU sessions** (§2.2/2.3/4) — **scoped in [131](131-ipv6-pdu-sessions.md)**. *L*. Touches `nas` (PDU type/PCO/IID), `nf-smf` (/64+IID alloc + negotiation), `crates/n6` (v6 TUN), `pfcp`/UPF (v6 PDI + **ICMPv6 RA/SLAAC**). Independent of new NFs; broad scenario unlock. Since free5gc stubs the v6 datapath (§2 of 131), a correct build puts radian-rs **ahead** here.
+1. ~~**N2 interface management** — NGReset/Overload/ErrorIndication/RAN-Config-Update (§2.1)~~ — **DONE**, shipped in [132](132-n2-interface-management.md): all four procedures, with the AMF releasing UE contexts on NG Reset and an OAM route driving Overload.
+2. ~~**IPv6 / IPv4v6 PDU sessions** (§2.2/2.3/4)~~ — **DONE**, shipped in [131](131-ipv6-pdu-sessions.md) (PRs #115/#116/#117/#118): type negotiation + #50/#51 downgrades, /64+IID allocation, the v6 datapath, SLAAC via Router Advertisements, PCO IPv6-DNS, and IPv4v6 dual-stack. Because free5gc stubs its v6 datapath (§2 of 131), radian-rs now **leads** here.
 
 **P2 — breadth that unlocks whole scenario classes:**
 3. **NSSF + AMF slice re-selection** (§3.1). *L*. New `nf-nssf` + `Nnssf`; wires into existing AMF slice logic.

@@ -277,6 +277,7 @@ dependencies = [
  "pfcp",
  "radian-gnb",
  "rrc",
+ "sbi-core",
  "sctp-rs",
  "sdap",
  "tokio",
