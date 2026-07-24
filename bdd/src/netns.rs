@@ -208,6 +208,33 @@ pub async fn add_route(ns: &str, dest: &str, spec: &[&str]) -> Result<()> {
     sudo(&args, "add route").await
 }
 
+/// Install a **source-routed** return path on the host: traffic *from* `src` looks up
+/// `table`, where `dest` routes out `dev`. This lets a second UPF's N6 TUN own the UE-pool
+/// return route without colliding with the first anchor's on the main table — the two
+/// anchors of a ULCL breakout share the UE address but must return via different TUNs
+/// (design/134 Phase 3d). Idempotent: any stale rule/table is cleared first.
+pub async fn add_source_route(src: &str, table: &str, dest: &str, dev: &str) -> Result<()> {
+    del_source_route(src, table).await;
+    sudo(&["ip", "rule", "add", "from", src, "lookup", table], "add ip rule").await?;
+    sudo(&["ip", "route", "add", dest, "dev", dev, "table", table], "add source route").await
+}
+
+/// Remove a source route installed by [`add_source_route`] (best-effort — safe to call
+/// when nothing is installed, so it doubles as a defensive sweep).
+pub async fn del_source_route(src: &str, table: &str) {
+    for args in [
+        vec!["ip", "rule", "del", "from", src, "lookup", table],
+        vec!["ip", "route", "flush", "table", table],
+    ] {
+        let _ = Command::new("sudo")
+            .args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+}
+
 /// Whether interface `iface` exists inside namespace `ns`.
 pub async fn iface_exists(ns: &str, iface: &str) -> bool {
     Command::new("sudo")
