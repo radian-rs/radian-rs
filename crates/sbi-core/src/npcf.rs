@@ -187,9 +187,33 @@ pub struct PccRule {
     pub ref_chg_data: Option<String>,
 }
 
+/// A route target — an abstract edge named by its DNAI (TS 23.501 §5.6.7). The SMF
+/// resolves the DNAI to a UP node via its topology (design/135).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteToLocation {
+    pub dnai: String,
+}
+
+/// `TrafficControlData` (TS 29.512 §5.6.2.10) — a traffic-steering decision an AF
+/// influence adds to the SM policy: route the matched traffic to a DNAI (design/135).
+/// The standard derives *which* traffic from a linked PCC rule's `flowInfo`; radian's
+/// per-flow filter is port-based (no destination), so the steered destination prefix
+/// rides here as `trafficPrefix` — the CIDR the classifier matches (a known simplification,
+/// like the IPFilterRule one in design/135 §D4).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TrafficControlData {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_to_locs: Vec<RouteToLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_prefix: Option<String>,
+}
+
 /// `SmPolicyDecision` (TS 29.512 §5.6.2.5), trimmed to the **session rules** (session
 /// AMBR), the **PCC rules** (the authorized flows) with the **QoS** and **charging**
-/// decisions they reference — all keyed maps.
+/// decisions they reference, and the **traffic-control** decisions (AF-influenced route
+/// to a DNAI) — all keyed maps.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SmPolicyDecision {
@@ -211,6 +235,11 @@ pub struct SmPolicyDecision {
     /// Update (present = install/modify, `null` = remove, absent = keep).
     #[serde(rename = "chgDecs", default, skip_serializing_if = "HashMap::is_empty")]
     pub charging_descs: HashMap<String, ChargingData>,
+    /// Traffic-control decisions keyed by tc id (TS 29.512 `traffContDecs`) — an
+    /// AF-influenced route to a DNAI. The SMF turns one into a live ULCL breakout on a
+    /// policy refresh (design/135 Phase 2).
+    #[serde(rename = "traffContDecs", default, skip_serializing_if = "HashMap::is_empty")]
+    pub traffic_control_data: HashMap<String, TrafficControlData>,
 }
 
 impl SmPolicyDecision {
@@ -304,6 +333,16 @@ impl SmPolicyDecision {
             .find_map(|r| r.ref_chg_data.as_ref())?;
         Some(self.charging_descs.get(chg_id)?.rating_group)
     }
+
+    /// The AF-influenced route this decision carries, if any: the `(traffic prefix, DNAI)`
+    /// of the first traffic-control decision that names both — what the SMF steers to a
+    /// breakout (design/135 Phase 2). `None` ⇒ no influence in effect.
+    pub fn influence_route(&self) -> Option<(String, String)> {
+        self.traffic_control_data.values().find_map(|tc| {
+            let dnai = tc.route_to_locs.first()?.dnai.clone();
+            Some((tc.traffic_prefix.clone()?, dnai))
+        })
+    }
 }
 
 /// A **partial** SM policy decision — the Npcf_SMPolicyControl Update response is a
@@ -322,6 +361,8 @@ pub struct SmPolicyUpdate {
     pub qos_descs: HashMap<String, Option<QosData>>,
     #[serde(rename = "chgDecs", default, skip_serializing_if = "HashMap::is_empty")]
     pub charging_descs: HashMap<String, Option<ChargingData>>,
+    #[serde(rename = "traffContDecs", default, skip_serializing_if = "HashMap::is_empty")]
+    pub traffic_control_data: HashMap<String, Option<TrafficControlData>>,
 }
 
 impl SmPolicyDecision {
@@ -334,11 +375,19 @@ impl SmPolicyDecision {
         let pcc_rules = diff_keyed(&self.pcc_rules, &next.pcc_rules);
         let qos_descs = diff_keyed(&self.qos_descs, &next.qos_descs);
         let charging_descs = diff_keyed(&self.charging_descs, &next.charging_descs);
+        let traffic_control_data = diff_keyed(&self.traffic_control_data, &next.traffic_control_data);
         (!session_rules.is_empty()
             || !pcc_rules.is_empty()
             || !qos_descs.is_empty()
-            || !charging_descs.is_empty())
-        .then_some(SmPolicyUpdate { session_rules, pcc_rules, qos_descs, charging_descs })
+            || !charging_descs.is_empty()
+            || !traffic_control_data.is_empty())
+        .then_some(SmPolicyUpdate {
+            session_rules,
+            pcc_rules,
+            qos_descs,
+            charging_descs,
+            traffic_control_data,
+        })
     }
 
     /// Merge a partial Update onto this decision: for each id in each keyed map's delta,
@@ -348,6 +397,7 @@ impl SmPolicyDecision {
         apply_keyed(&mut self.pcc_rules, &update.pcc_rules);
         apply_keyed(&mut self.qos_descs, &update.qos_descs);
         apply_keyed(&mut self.charging_descs, &update.charging_descs);
+        apply_keyed(&mut self.traffic_control_data, &update.traffic_control_data);
     }
 }
 
@@ -1071,5 +1121,44 @@ mod tests {
         let mut merged = prev.clone();
         merged.apply(&delta);
         assert_eq!(merged.session_ambr(), None, "no rule → no effective AMBR");
+    }
+
+    #[test]
+    fn traffic_control_influence_route_diffs_and_applies() {
+        // No influence yet.
+        let prev = SmPolicyDecision::default();
+        assert_eq!(prev.influence_route(), None);
+
+        // An AF influence adds a traffic-control decision: steer 10.99.0.0/16 to DNAI "mec".
+        let next = SmPolicyDecision {
+            traffic_control_data: HashMap::from([(
+                "tc-af1".to_string(),
+                TrafficControlData {
+                    route_to_locs: vec![RouteToLocation { dnai: "mec".into() }],
+                    traffic_prefix: Some("10.99.0.0/16".into()),
+                },
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(next.influence_route(), Some(("10.99.0.0/16".into(), "mec".into())));
+
+        // The delta carries it under traffContDecs; apply reconstructs next.
+        let delta = prev.diff(&next).expect("influence added");
+        assert!(delta.traffic_control_data.get("tc-af1").unwrap().is_some());
+        let wire = serde_json::to_value(&delta).unwrap();
+        assert_eq!(
+            wire.pointer("/traffContDecs/tc-af1/routeToLocs/0/dnai").and_then(|v| v.as_str()),
+            Some("mec")
+        );
+        let mut merged = prev.clone();
+        merged.apply(&delta);
+        assert_eq!(merged, next);
+
+        // Withdrawing the influence → the tc decision maps to null; no route remains.
+        let delta = next.diff(&prev).expect("influence withdrawn");
+        assert_eq!(*delta.traffic_control_data.get("tc-af1").unwrap(), None);
+        let mut merged = next.clone();
+        merged.apply(&delta);
+        assert_eq!(merged.influence_route(), None);
     }
 }
