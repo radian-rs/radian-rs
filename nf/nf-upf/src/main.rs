@@ -280,6 +280,20 @@ async fn serve_n3(socket: Arc<tokio::net::UdpSocket>, state: Upf, tun: Option<Ar
                         },
                         None => info!(teid, bytes = inner.len(), "N3 uplink decapped (N6 disabled)"),
                     },
+                    // This UPF is an intermediate node in a chain (design/134):
+                    // re-encapsulate and forward on — uplink to the next UPF over N9, or
+                    // downlink coming back from the anchor on to the gNB over N3. Both
+                    // ride this same socket (N9 is GTP-U like N3); the peer's F-TEID
+                    // says which tunnel.
+                    n6::Uplink::Forward { teid: peer_teid, peer, pkt } => {
+                        let dst = SocketAddrV4::new(peer, gtpu::GTPU_PORT);
+                        match socket.send_to(&gtpu::encap(peer_teid, pkt), dst).await {
+                            Ok(_) => {
+                                info!(teid, peer_teid, %peer, bytes = pkt.len(), "chained UPF: G-PDU re-encapsulated and forwarded")
+                            }
+                            Err(e) => warn!(teid, %peer, "chained forward send error: {e}"),
+                        }
+                    }
                     n6::Uplink::UnknownTeid => warn!(teid, "N3 G-PDU for unknown TEID — dropped"),
                     n6::Uplink::Spoofed { claimed, assigned } => {
                         warn!(teid, %claimed, %assigned, "N3 uplink source spoofing — dropped")

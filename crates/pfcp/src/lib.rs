@@ -71,6 +71,13 @@ pub const N4_PORT: u16 = 8805;
 
 /// The QER id the session-AMBR QER carries (one session-level QER per session).
 const AMBR_QER_ID: u32 = 1;
+/// The uplink FAR's id — forwards to the core (N6), or over N9 to the next UPF when
+/// the SMF gave it an Outer Header Creation (design/134).
+const UPLINK_FAR_ID: u32 = 1;
+/// The downlink PDR's id. On an anchor it matches the UE address; on an intermediate
+/// UPF it instead carries an F-TEID, because downlink arrives back from the anchor over
+/// N9 (design/134).
+const DOWNLINK_PDR_ID: u16 = 2;
 /// A GBR flow's per-flow QER id is `PER_FLOW_QER_BASE + qfi` (distinct from the
 /// session-AMBR QER), and its classifier PDR id is `PER_FLOW_PDR_BASE + index`.
 const PER_FLOW_QER_BASE: u32 = 1000;
@@ -250,6 +257,20 @@ impl From<Ipv4Addr> for UeAddr {
     }
 }
 
+/// Where a session's **uplink** traffic goes once decapsulated (design/134).
+///
+/// A PDU Session Anchor sends it out to the data network; an **intermediate UPF** (an
+/// I-UPF / uplink classifier) forwards it on to the next UPF over **N9**, which is
+/// GTP-U like N3 and rides the same socket — the peer's F-TEID distinguishes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Egress {
+    /// Out to the data network over N6 — the anchor's behaviour.
+    #[default]
+    ToN6,
+    /// On to another UPF over N9, addressed by that peer's F-TEID.
+    ToPeer { teid: u32, addr: Ipv4Addr },
+}
+
 /// Whether IPv6 address `addr` falls within the /64 `prefix` (top 64 bits match).
 fn ipv6_in_prefix64(addr: Ipv6Addr, prefix: Ipv6Addr) -> bool {
     let (a, p) = (addr.octets(), prefix.octets());
@@ -326,6 +347,14 @@ struct Session {
     /// falls in it route to this session; `None` for an IPv4-only session.
     ue_ipv6: Option<Ipv6Addr>,
     downlink: Option<(u32, Ipv4Addr)>,
+    /// Where this session's uplink goes after decapsulation — out to N6 (an anchor) or
+    /// on to the next UPF over N9 (an intermediate UPF, design/134). Seeded from the
+    /// uplink FAR's Outer Header Creation at establishment.
+    uplink: Egress,
+    /// An intermediate UPF's **downlink N9 ingress** TEID: the anchor sends downlink
+    /// back here under it, and this node forwards it on to `downlink` (the gNB). `None`
+    /// on an anchor, whose downlink arrives from N6 and is routed by UE address.
+    dl_ingress_teid: Option<u32>,
     /// Session AMBR (from a Create/Update QER), when provisioned.
     ambr: Option<SessionAmbr>,
     /// Per-direction AMBR policers. `None` ⇒ that direction is unlimited.
@@ -478,6 +507,23 @@ impl UpfState {
 
     /// The gNB downlink target `(TEID, IP)` for a session, once a Session Modification
     /// has installed it. The GTP-U datapath uses it to encapsulate downlink packets.
+    /// Where the session owning this uplink N3/N9 TEID sends its traffic once
+    /// decapsulated — N6 for an anchor, an N9 peer for an intermediate UPF
+    /// (design/134). `None` if the TEID is unknown.
+    pub fn uplink_egress_for_teid(&self, teid: u32) -> Option<Egress> {
+        self.sessions.values().find(|s| s.n3_teid == teid).map(|s| s.uplink)
+    }
+
+    /// If `teid` is an intermediate UPF's **downlink N9 ingress**, the gNB target to
+    /// forward that traffic on to (design/134). `None` for an uplink or unknown TEID —
+    /// which is what distinguishes the two directions on a chained node.
+    pub fn downlink_via_n9_ingress(&self, teid: u32) -> Option<(u32, Ipv4Addr)> {
+        self.sessions
+            .values()
+            .find(|s| s.dl_ingress_teid == Some(teid))
+            .and_then(|s| s.downlink)
+    }
+
     pub fn downlink_for(&self, up_seid: u64) -> Option<(u32, Ipv4Addr)> {
         self.sessions.get(&up_seid).and_then(|s| s.downlink)
     }
@@ -557,11 +603,20 @@ impl UpfState {
         flows: &[FlowQer],
         usage_threshold: Option<u64>,
         now_nanos: u64,
-    ) -> (u64, u32) {
+        uplink: Egress,
+        wants_dl_ingress: bool,
+    ) -> (u64, u32, Option<u32>) {
         let up_seid = self.next_seid;
         let teid = self.next_teid;
         self.next_seid += 1;
         self.next_teid += 1;
+        // An intermediate UPF also needs an ingress TEID for downlink arriving back from
+        // the anchor over N9 (design/134).
+        let dl_ingress_teid = wants_dl_ingress.then(|| {
+            let t = self.next_teid;
+            self.next_teid += 1;
+            t
+        });
         let ul_bucket = ambr.map(|a| TokenBucket::new(a.uplink_bps, now_nanos));
         let dl_bucket = ambr.map(|a| TokenBucket::new(a.downlink_bps, now_nanos));
         let flow_qers = flows
@@ -583,6 +638,7 @@ impl UpfState {
                 ue_ip: ue.v4,
                 ue_ipv6: ue.v6,
                 downlink: None,
+                uplink,
                 ambr,
                 ul_bucket,
                 dl_bucket,
@@ -596,9 +652,10 @@ impl UpfState {
                 buffering: false,
                 dl_buffer: std::collections::VecDeque::new(),
                 dl_data_report_due: false,
+                dl_ingress_teid,
             },
         );
-        (up_seid, teid)
+        (up_seid, teid, dl_ingress_teid)
     }
 
     /// Take one pending threshold-triggered usage report, if any session crossed its
@@ -973,6 +1030,75 @@ pub fn session_establishment_request(
     builder.build().expect("build Session Establishment Request").marshal()
 }
 
+/// SMF: build a Session Establishment Request for an **intermediate UPF** — an I-UPF /
+/// uplink classifier (design/134). Same shape as [`session_establishment_request`],
+/// except the uplink FAR carries an **Outer Header Creation** toward the next UPF's N9
+/// F-TEID, so decapsulated uplink leaves over N9 rather than out to N6. The downlink
+/// PDR is pointed at the gNB by a later Session Modification, exactly as for an anchor.
+pub fn session_establishment_request_via_peer(
+    cp_seid: u64,
+    seq: u32,
+    smf_ip: Ipv4Addr,
+    ue: impl Into<UeAddr>,
+    dnn: &str,
+    peer_teid: u32,
+    peer_addr: Ipv4Addr,
+) -> Vec<u8> {
+    let ue: UeAddr = ue.into();
+    // Uplink: the gNB sends here on a UPF-allocated N3 F-TEID; forward over N9 to the
+    // next UPF via Outer Header Creation. The UE address rides on the *uplink* PDI here
+    // (an anchor carries it on the downlink one) so the chain's first hop — the node
+    // closest to the RAN — can still anti-spoof.
+    let ul_pdi = PdiBuilder::uplink_access()
+        .f_teid(upf_chooses_fteid())
+        .ue_ip_address(UeIpAddress::new(ue.v4, ue.v6))
+        .build()
+        .expect("build uplink PDI");
+    let ul_pdr = CreatePdrBuilder::new(PdrId::new(1))
+        .precedence(Precedence::new(100))
+        .pdi(ul_pdi)
+        .far_id(FarId::new(UPLINK_FAR_ID))
+        .build()
+        .expect("build uplink Create PDR");
+    let ul_params = rs_pfcp::ie::forwarding_parameters::ForwardingParameters::new(
+        rs_pfcp::ie::destination_interface::DestinationInterface::new(Interface::Core),
+    )
+    .with_outer_header_creation(OuterHeaderCreation::gtpu_ipv4(peer_teid, peer_addr));
+    let ul_far = CreateFar::builder(FarId::new(UPLINK_FAR_ID))
+        .apply_action(ApplyAction::FORW)
+        .forwarding_parameters(ul_params)
+        .build()
+        .expect("build uplink Create FAR");
+
+    // Downlink: unlike an anchor (which matches the UE address on traffic from N6), an
+    // intermediate UPF receives downlink back from the anchor over **N9** — so its
+    // downlink PDR takes a CHOOSE F-TEID and the UPF reports the ingress it allocated.
+    // Its FAR gains Outer Header Creation toward the gNB on the Session Modification.
+    let dl_pdi = PdiBuilder::downlink_core()
+        .f_teid(upf_chooses_fteid())
+        .build()
+        .expect("build downlink PDI");
+    let dl_pdr = CreatePdrBuilder::new(PdrId::new(DOWNLINK_PDR_ID))
+        .precedence(Precedence::new(200))
+        .pdi(dl_pdi)
+        .far_id(FarId::new(2))
+        .build()
+        .expect("build downlink Create PDR");
+    let dl_far = CreateFar::builder(FarId::new(2))
+        .forward_to_network(Interface::Access, NetworkInstance::new(dnn))
+        .build()
+        .expect("build downlink Create FAR");
+
+    SessionEstablishmentRequestBuilder::new(0u64, seq)
+        .node_id(smf_ip)
+        .fseid(cp_seid, smf_ip)
+        .create_pdrs(vec![ul_pdr.to_ie(), dl_pdr.to_ie()])
+        .create_fars(vec![ul_far.to_ie(), dl_far.to_ie()])
+        .build()
+        .expect("build intermediate-UPF Session Establishment Request")
+        .marshal()
+}
+
 /// SMF: build a PFCP Session Establishment Request for an **indirect data
 /// forwarding** tunnel (TS 23.502 §4.9.1.3.3). One PDR matches packets arriving on
 /// a UPF-allocated Access-facing F-TEID (the ingress the source gNB forwards to);
@@ -1202,22 +1328,54 @@ pub fn handle_n4(
                 .find(|u| u.urr_id.id == SESSION_URR_ID)
                 .and_then(|u| u.volume_threshold)
                 .and_then(|t| t.total_volume);
-            let (up_seid, teid) =
-                state.establish(cp_fseid.seid.into(), ue, ambr, &flows, usage_threshold, now_nanos);
-            let created_pdr = CreatedPdr::new(PdrId::new(1), Fteid::ipv4(teid, node_ip)).to_ie();
-            Some(
-                SessionEstablishmentResponseBuilder::new(
-                    cp_fseid.seid,
-                    seq,
-                    CauseValue::RequestAccepted,
-                )
-                .node_id(node_ip)
-                .fseid(up_seid, node_ip) // UP F-SEID
-                .created_pdr(created_pdr)
-                .build()
-                .ok()?
-                .marshal(),
+            // The uplink FAR's Outer Header Creation: when the SMF pointed this
+            // session's uplink at another UPF, the traffic leaves over **N9** instead of
+            // N6 (design/134 — an I-UPF / uplink classifier). Absent ⇒ this node is the
+            // anchor. Until now establishment-time FARs were never read at all, so
+            // indirect data forwarding (design/84) built a FAR this UPF ignored.
+            let uplink = msg
+                .ies(IeType::CreateFar)
+                .filter_map(|ie| CreateFar::unmarshal(&ie.payload).ok())
+                .find(|far| far.far_id.value == UPLINK_FAR_ID)
+                .and_then(|far| far.forwarding_parameters)
+                .and_then(|fp| fp.outer_header_creation)
+                .and_then(|ohc| {
+                    Some(Egress::ToPeer { teid: u32::from(ohc.teid?), addr: ohc.ipv4_address? })
+                })
+                .unwrap_or(Egress::ToN6);
+            // An intermediate UPF asks for a **downlink** ingress F-TEID too: its
+            // downlink PDR (id 2) carries an F-TEID rather than matching a UE address,
+            // because downlink arrives back from the anchor over N9 (design/134).
+            let wants_dl_ingress = msg
+                .ies(IeType::CreatePdr)
+                .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
+                .any(|pdr| pdr.pdr_id.value == DOWNLINK_PDR_ID && pdr.pdi.f_teid.is_some());
+            let (up_seid, teid, dl_ingress_teid) = state.establish(
+                cp_fseid.seid.into(),
+                ue,
+                ambr,
+                &flows,
+                usage_threshold,
+                now_nanos,
+                uplink,
+                wants_dl_ingress,
+            );
+            let mut builder = SessionEstablishmentResponseBuilder::new(
+                cp_fseid.seid,
+                seq,
+                CauseValue::RequestAccepted,
             )
+            .node_id(node_ip)
+            .fseid(up_seid, node_ip) // UP F-SEID
+            .created_pdr(CreatedPdr::new(PdrId::new(1), Fteid::ipv4(teid, node_ip)).to_ie());
+            // An intermediate UPF also reports the downlink N9 ingress F-TEID it
+            // allocated — the SMF hands it to the anchor as its downlink target.
+            if let Some(dl) = dl_ingress_teid {
+                builder = builder.created_pdr(
+                    CreatedPdr::new(PdrId::new(DOWNLINK_PDR_ID), Fteid::ipv4(dl, node_ip)).to_ie(),
+                );
+            }
+            Some(builder.build().ok()?.marshal())
         }
         MsgType::SessionModificationRequest => {
             // Addressed by UP-SEID (the header SEID the UPF handed out at establishment).
@@ -1429,6 +1587,11 @@ pub struct EstablishedSession {
     /// The UPF-allocated N3 F-TEID (carried to the gNB in the N2 SM info).
     pub n3_teid: u32,
     pub n3_addr: Ipv4Addr,
+    /// The UPF-allocated **downlink N9 ingress** F-TEID, when the session asked for one
+    /// (an intermediate UPF — design/134). The SMF gives it to the anchor as that
+    /// session's downlink Outer Header Creation target, so downlink flows
+    /// anchor → I-UPF → gNB.
+    pub dl_ingress: Option<(u32, Ipv4Addr)>,
 }
 
 /// SMF: parse a Session Establishment Response — the UP F-SEID and the UPF-allocated
@@ -1444,15 +1607,27 @@ pub fn parse_session_establishment_response(data: &[u8]) -> Option<EstablishedSe
             .and_then(|ie| Fseid::unmarshal(&ie.payload).ok())?
             .seid,
     );
-    let f_teid = msg
+    // A chained (intermediate) UPF reports two Created PDRs: id 1 is the uplink ingress
+    // the gNB sends to, id 2 the downlink N9 ingress the anchor sends back to.
+    let created: Vec<CreatedPdr> = msg
         .ies(IeType::CreatedPdr)
-        .next()
-        .and_then(|ie| CreatedPdr::unmarshal(&ie.payload).ok())?
-        .f_teid;
+        .filter_map(|ie| CreatedPdr::unmarshal(&ie.payload).ok())
+        .collect();
+    let f_teid = created
+        .iter()
+        .find(|p| p.pdr_id.value == 1)
+        .or_else(|| created.first())?
+        .f_teid
+        .clone();
+    let dl_ingress = created
+        .iter()
+        .find(|p| p.pdr_id.value == DOWNLINK_PDR_ID)
+        .and_then(|p| Some((u32::from(p.f_teid.teid), p.f_teid.ipv4_address?)));
     Some(EstablishedSession {
         up_seid,
         n3_teid: u32::from(f_teid.teid),
         n3_addr: f_teid.ipv4_address?,
+        dl_ingress,
     })
 }
 
@@ -1578,6 +1753,47 @@ mod tests {
             Some((prefix, 0x5678, gnb_ip)),
             "an RS on the uplink TEID resolves to the /64 + gNB target"
         );
+    }
+
+    /// An **intermediate UPF** (design/134): the establishment's uplink FAR carries an
+    /// Outer Header Creation, so the session's uplink leaves over N9 toward that peer
+    /// rather than out to N6. Establishment-time FARs were previously never parsed at
+    /// all — which also left indirect data forwarding (design/84) silently inert.
+    #[test]
+    fn establishment_far_sets_an_n9_uplink_egress() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let peer = Ipv4Addr::new(127, 0, 0, 2);
+
+        // An anchor: no Outer Header Creation on the uplink FAR → out to N6.
+        let mut anchor = UpfState::new();
+        handle_n4(
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None),
+            node_ip,
+            &mut anchor,
+            0,
+        )
+        .expect("establish anchor");
+        assert_eq!(anchor.uplink_egress_for_teid(1), Some(Egress::ToN6), "an anchor egresses to N6");
+
+        // An intermediate UPF: the uplink FAR points at the next UPF's N9 F-TEID.
+        let mut iupf = UpfState::new();
+        handle_n4(
+            &session_establishment_request_via_peer(
+                0xCAFE, 1, node_ip, UE_IP, "internet", 0x9001, peer,
+            ),
+            node_ip,
+            &mut iupf,
+            0,
+        )
+        .expect("establish intermediate UPF");
+        assert_eq!(
+            iupf.uplink_egress_for_teid(1),
+            Some(Egress::ToPeer { teid: 0x9001, addr: peer }),
+            "the uplink FAR's Outer Header Creation seeded the N9 egress"
+        );
+        // It still allocates an N3 F-TEID for the gNB and learns the UE address.
+        assert_eq!(iupf.ue_ip_for_teid(1), Some(UE_IP));
+        assert_eq!(iupf.uplink_egress_for_teid(99), None, "unknown TEID");
     }
 
     #[test]
