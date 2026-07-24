@@ -119,6 +119,11 @@ struct SmContext {
     /// GFBR `(downlink, uplink)` bits/sec this session reserved (GFBR admission) —
     /// released at teardown, adjusted on a mid-session policy change.
     reserved_gfbr: (u64, u64),
+    /// Whether the session's live breakout was installed by the **SM policy** (an AF
+    /// influence, design/135 Phase 2). Only such a breakout is reconciled away when the
+    /// influence disappears — a breakout inserted directly (OAM / a NEF without a PCF) is
+    /// not in the policy, so a refresh must not tear it down.
+    policy_breakout: bool,
     /// The Nchf charging data session `(chf_base, charging_ref)`, when a CHF was
     /// discovered at establishment — updated with each relayed usage report,
     /// released with the final usage at teardown. `None` ⇒ no charging.
@@ -318,6 +323,10 @@ pub struct SmfState {
     /// so the UPF reports mid-session usage (VOLTH) — the charging trigger.
     /// `None` ⇒ usage is only reported at session deletion.
     usage_threshold_bytes: Option<u64>,
+    /// How other NFs reach this SMF's SBI surface — baked into the SM policy
+    /// `notificationUri` so a PCF-initiated re-authorization (an AF influence landing,
+    /// design/135 Phase 2b) finds its way back to the right SM context.
+    callback_base: String,
 }
 
 impl SmfState {
@@ -412,7 +421,14 @@ impl SmfState {
             gfbr_budget_bps: (u64::MAX, u64::MAX),
             reserved_gfbr_bps: Mutex::new((0, 0)),
             usage_threshold_bytes: None,
+            callback_base: DEFAULT_CALLBACK_BASE.to_string(),
         }
+    }
+
+    /// Set the base URL other NFs use to reach this SMF (the SM policy `notificationUri`).
+    pub fn with_callback_base(mut self, base: impl Into<String>) -> Self {
+        self.callback_base = base.into();
+        self
     }
 
     /// Resolve the [`SessionPath`] a session on `dnn` runs — the peers its whole lifetime
@@ -720,6 +736,14 @@ pub fn router(state: Arc<SmfState>) -> Router {
             "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/refresh-policy",
             post(refresh_sm_policy),
         )
+        // The PCF's policy-update notification target (the `notificationUri` this SMF
+        // registered at policy create): a PCF-initiated re-authorization, e.g. after an AF
+        // influence landed (design/135 Phase 2b). Same work as a refresh — re-pull the
+        // decision and reconcile — so it shares the handler.
+        .route(
+            "/nsmf-callback/v1/sm-policies/{sm_ref}/update",
+            post(refresh_sm_policy),
+        )
         .route(
             "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/indirect-forwarding",
             post(indirect_forwarding),
@@ -788,12 +812,20 @@ async fn create_sm_context(
     // PCF is registered it is authoritative (TS 23.503 §6.1.3.5); otherwise fall
     // back to the sm-data policy fetched above. Done before the N4 establishment so
     // the authorized flows are known when the context is built.
+    // The SM-context reference is allocated up front so it can ride in the policy
+    // `notificationUri`: a PCF-initiated re-authorization (an AF influence landing) then
+    // addresses this exact context without the PCF knowing anything about SMF internals.
+    let sm_ref = smf.next_ref.fetch_add(1, Ordering::Relaxed).to_string();
     let policy_ctx = sbi_core::npcf::SmPolicyContextData {
         supi: req.supi.clone(),
         pdu_session_id: req.pdu_session_id,
         dnn: req.dnn.clone(),
         snssai_sst: Some(sub.snssai.sst),
         snssai_sd: sub.snssai.sd.clone(),
+        notification_uri: Some(format!(
+            "{}/nsmf-callback/v1/sm-policies/{sm_ref}/update",
+            smf.callback_base
+        )),
     };
     let (decision, sm_policy) = match fetch_sm_policy(&smf.nrf_base, &policy_ctx).await {
         Some((pcf_base, created)) => {
@@ -953,7 +985,6 @@ async fn create_sm_context(
         }
     };
 
-    let sm_ref = smf.next_ref.fetch_add(1, Ordering::Relaxed).to_string();
     smf.contexts.lock().unwrap().insert(
         sm_ref.clone(),
         SmContext {
@@ -975,6 +1006,7 @@ async fn create_sm_context(
             sm_policy,
             policy: decision.clone(),
             reserved_gfbr,
+            policy_breakout: false,
             charging,
         },
     );
@@ -1653,6 +1685,10 @@ async fn indirect_forwarding(
 /// the SMF inserts and removes exactly this one branch (design/134 Phase 3e).
 const MID_SESSION_BREAKOUT_INDEX: usize = 0;
 
+/// Default base other NFs use to reach this SMF's SBI (overridable — see
+/// [`SmfState::with_callback_base`]).
+const DEFAULT_CALLBACK_BASE: &str = "http://127.0.0.1:8002";
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BreakoutReq {
@@ -2044,7 +2080,8 @@ async fn refresh_sm_policy(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<axum::response::Response, SbiProblem> {
-    let (sm_policy, up_seid, old_policy, supi, psi, anchor, chain, path, dnn, ue_ip, ue_ipv6) = {
+    #[allow(clippy::type_complexity)]
+    let (sm_policy, up_seid, old_policy, supi, psi, anchor, chain, path, dnn, ue_ip, ue_ipv6, policy_breakout) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
             Some(c) => (
@@ -2059,6 +2096,7 @@ async fn refresh_sm_policy(
                 c.dnn.clone(),
                 c.ue_ip,
                 c.ue_ipv6,
+                c.policy_breakout,
             ),
             None => {
                 return Err(problem(
@@ -2142,25 +2180,40 @@ async fn refresh_sm_policy(
     // chained session whose breakout is *not* config-driven (a static topology route owns
     // its own breakout — policy must not disturb it).
     let config_route = smf.dnn_has_config_route(&dnn);
-    if let (Some(leg), Some(iupf)) = (chain, path.intermediate.as_deref()) {
+    if let (Some(leg), Some(iupf)) = (chain, path.intermediate.as_deref())
+        && !config_route
+    {
         let desired = decision.influence_route();
         let active = leg.breakout_seid.is_some();
-        match (desired, active, config_route) {
-            (Some((prefix, dnai)), false, false) => {
-                match smf.node_for_dnai(&dnai) {
-                    Some(via) => {
-                        let ue = pfcp::UeAddr { v4: ue_ip, v6: ue_ipv6.map(|(p, _)| p) };
-                        let r = insert_breakout(&smf, &sm_ref, &leg, iupf, ue, &dnn, &prefix, &via).await;
-                        tracing::info!(%sm_ref, %prefix, %dnai, status = ?r.status(), "AF-influenced breakout inserted from SM policy");
+        match (desired, active) {
+            (Some((prefix, dnai)), false) => match smf.node_for_dnai(&dnai) {
+                Some(via) => {
+                    let ue = pfcp::UeAddr { v4: ue_ip, v6: ue_ipv6.map(|(p, _)| p) };
+                    let r = insert_breakout(&smf, &sm_ref, &leg, iupf, ue, &dnn, &prefix, &via).await;
+                    // Remember that *policy* owns this breakout, so a later refresh that
+                    // sees no influence may withdraw it.
+                    if r.status().is_success()
+                        && let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref)
+                    {
+                        c.policy_breakout = true;
                     }
-                    None => tracing::warn!(%sm_ref, %dnai, "AF influence names a DNAI with no UP node"),
+                    tracing::info!(%sm_ref, %prefix, %dnai, status = ?r.status(), "AF-influenced breakout inserted from SM policy");
                 }
-            }
-            (None, true, false) => {
+                None => tracing::warn!(%sm_ref, %dnai, "AF influence names a DNAI with no UP node"),
+            },
+            // Withdraw only a breakout policy installed: one inserted directly (OAM, or a
+            // NEF with no PCF) is not expressed in the policy, so its absence there means
+            // nothing about it.
+            (None, true) if policy_breakout => {
                 let r = remove_breakout(&smf, &sm_ref, &leg, iupf, &path).await;
+                if r.status().is_success()
+                    && let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref)
+                {
+                    c.policy_breakout = false;
+                }
                 tracing::info!(%sm_ref, status = ?r.status(), "AF-influenced breakout withdrawn from SM policy");
             }
-            _ => {} // already in the desired state, or a config-route session
+            _ => {} // already in the desired state, or a directly-installed breakout
         }
     }
     // Signal the change to the RAN/UE via the serving AMF (Namf_Communication →
@@ -3209,6 +3262,245 @@ mod tests {
         udr.put_sm_policy_data("imsi-999700000000001", &base_policy).await.unwrap();
         assert!(refresh(&sm_ref).await.unwrap().status().is_success(), "refresh (influence withdrawn)");
         assert_eq!(edge.lock().unwrap().session_count(), 0, "the breakout is torn down");
+        assert!(iupf.lock().unwrap().branches_for_teid(ran_teid).is_empty(), "the branch is gone");
+        assert_eq!(anchor.lock().unwrap().session_count(), 1, "the default anchor is untouched");
+    }
+
+    /// design/135 Phase 2b: a breakout installed **directly** (OAM, or a NEF with no PCF)
+    /// is not expressed in the SM policy, so a policy refresh that sees no influence must
+    /// leave it alone — only a policy-installed breakout is reconciled away.
+    #[tokio::test]
+    async fn a_directly_installed_breakout_survives_a_policy_refresh() {
+        let (anchor_ip, iupf_ip, edge_ip) = (
+            Ipv4Addr::new(127, 0, 0, 2),
+            Ipv4Addr::new(127, 0, 0, 3),
+            Ipv4Addr::new(127, 0, 0, 4),
+        );
+        let (_anchor, anchor_n4) = spin_upf(anchor_ip).await;
+        let (iupf, iupf_n4) = spin_upf(iupf_ip).await;
+        let (edge, edge_n4) = spin_upf(edge_ip).await;
+
+        let (nrf_base, udr_base) =
+            spin_subscription_backend("imsi-999700000000001", "99970").await;
+        // A PCF whose policy carries **no** influence — so a refresh sees no route.
+        let udr = sbi_core::nudr::UdrClient::new(udr_base.clone());
+        udr.put_sm_policy_data(
+            "imsi-999700000000001",
+            &serde_json::json!({ "default": {
+                "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" } } },
+                "pccRules": { "pcc-1": { "refQosData": "qos-1" } },
+                "qosDecs": { "qos-1": { "qfi": 1, "fiveQi": 9 } }
+            } }),
+        )
+        .await
+        .unwrap();
+        let _pcf = spin_pcf(&nrf_base, Some(&udr_base)).await;
+        let _amf = spin_mock_amf(&nrf_base).await;
+
+        let topo = crate::topology::Topology::parse(&format!(
+            r#"{{
+                "upNodes": {{
+                    "gNB":    {{ "type": "AN" }},
+                    "iupf":   {{ "type": "UPF", "n4": "{iupf_n4}" }},
+                    "anchor": {{ "type": "UPF", "n4": "{anchor_n4}", "dnns": ["internet"] }},
+                    "edge":   {{ "type": "UPF", "n4": "{edge_n4}", "dnai": "mec" }}
+                }},
+                "links": [
+                    {{ "a": "gNB", "b": "iupf" }},
+                    {{ "a": "iupf", "b": "anchor" }},
+                    {{ "a": "iupf", "b": "edge" }}
+                ]
+            }}"#
+        ))
+        .unwrap();
+        let smf = Arc::new(
+            SmfState::connect_with_topology(topo, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+                .await
+                .unwrap(),
+        );
+        smf.associate().await.unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+        let created: SmContextCreatedData = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ran_teid = u32::from_str_radix(&created.up_n3_teid, 16).unwrap();
+
+        // Install a breakout the *direct* way (the OAM trigger — not via policy).
+        let insert = client
+            .post(format!("{base}/oam/v1/breakout"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5,
+                "prefix": "10.99.0.0/16", "via": "edge"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(insert.is_success(), "direct breakout inserted");
+        assert_eq!(edge.lock().unwrap().session_count(), 1);
+
+        // A policy refresh (no influence in the policy) must NOT tear it down.
+        let refreshed = client
+            .post(format!(
+                "{base}/nsmf-pdusession/v1/sm-contexts/{}/refresh-policy",
+                created.sm_context_ref
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(refreshed.is_success(), "policy refreshed");
+        assert_eq!(
+            edge.lock().unwrap().session_count(),
+            1,
+            "a directly-installed breakout survives a policy refresh"
+        );
+        assert_eq!(
+            iupf.lock().unwrap().branches_for_teid(ran_teid).len(),
+            1,
+            "its classifier branch is still installed"
+        );
+    }
+
+    /// design/135 Phase 2b: the **full production chain** — AF → NEF → PCF → SMF. The AF
+    /// posts a traffic-influence subscription; the NEF authorizes it at the PCF
+    /// (Npcf_PolicyAuthorization); the PCF folds the route into the session's SM policy and
+    /// notifies the SMF on the `notificationUri` it registered; the SMF re-authorizes,
+    /// finds the route in the decision, and splices the breakout. Deleting the AF
+    /// subscription unwinds the same chain.
+    #[tokio::test]
+    async fn af_influence_through_the_pcf_drives_a_breakout() {
+        let (anchor_ip, iupf_ip, edge_ip) = (
+            Ipv4Addr::new(127, 0, 0, 2),
+            Ipv4Addr::new(127, 0, 0, 3),
+            Ipv4Addr::new(127, 0, 0, 4),
+        );
+        let (anchor, anchor_n4) = spin_upf(anchor_ip).await;
+        let (iupf, iupf_n4) = spin_upf(iupf_ip).await;
+        let (edge, edge_n4) = spin_upf(edge_ip).await;
+
+        let (nrf_base, udr_base) =
+            spin_subscription_backend("imsi-999700000000001", "99970").await;
+        let udr = sbi_core::nudr::UdrClient::new(udr_base.clone());
+        udr.put_sm_policy_data(
+            "imsi-999700000000001",
+            &serde_json::json!({ "default": {
+                "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" } } },
+                "pccRules": { "pcc-1": { "refQosData": "qos-1" } },
+                "qosDecs": { "qos-1": { "qfi": 1, "fiveQi": 9 } }
+            } }),
+        )
+        .await
+        .unwrap();
+        // A real PCF (UDR-backed) — the SMF discovers it, and the NEF authorizes through it.
+        let pcf_state = spin_pcf(&nrf_base, Some(&udr_base)).await;
+        let _amf = spin_mock_amf(&nrf_base).await;
+        let pcf_base = discover_endpoint(&nrf_base, "PCF").await.expect("PCF discoverable");
+
+        let topo = crate::topology::Topology::parse(&format!(
+            r#"{{
+                "upNodes": {{
+                    "gNB":    {{ "type": "AN" }},
+                    "iupf":   {{ "type": "UPF", "n4": "{iupf_n4}" }},
+                    "anchor": {{ "type": "UPF", "n4": "{anchor_n4}", "dnns": ["internet"] }},
+                    "edge":   {{ "type": "UPF", "n4": "{edge_n4}", "dnai": "mec" }}
+                }},
+                "links": [
+                    {{ "a": "gNB", "b": "iupf" }},
+                    {{ "a": "iupf", "b": "anchor" }},
+                    {{ "a": "iupf", "b": "edge" }}
+                ]
+            }}"#
+        ))
+        .unwrap();
+
+        // Bind the SMF's listener first so its callback base — the policy notificationUri
+        // the PCF calls back on — is its real address.
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        let smf = Arc::new(
+            SmfState::connect_with_topology(topo, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+                .await
+                .unwrap()
+                .with_callback_base(format!("http://{smf_addr}")),
+        );
+        smf.associate().await.unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        // A NEF that authorizes influences through the PCF (Phase 2b), not the SMF direct.
+        let nef = sbi_core::nnef::NefState::with_smf_base(format!("http://{smf_addr}"))
+            .with_pcf_base(pcf_base);
+        let nef_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nef_addr = nef_l.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(nef_l, sbi_core::nnef::router(nef)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+        let created: SmContextCreatedData = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ran_teid = u32::from_str_radix(&created.up_n3_teid, 16).unwrap();
+        assert_eq!(pcf_state.association_count(), 1, "the SMF created an SM policy association");
+        assert_eq!(edge.lock().unwrap().session_count(), 0, "no influence yet");
+
+        // The AF asks the NEF to steer 10.99.0.0/16 to the "mec" edge.
+        let sub = client
+            .post(format!("http://{nef_addr}/3gpp-traffic-influence/v1/app1/subscriptions"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "dnn": "internet",
+                "prefix": "10.99.0.0/16",
+                "trafficRoutes": [{ "dnai": "mec" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sub.status().as_u16(), 201, "AF subscription created");
+        let self_link = sub.headers().get("location").unwrap().to_str().unwrap().to_string();
+
+        // AF → NEF → PCF → (notify) → SMF → N4: the breakout is live, driven entirely by
+        // the policy — no direct NEF→SMF call was made.
+        assert_eq!(edge.lock().unwrap().session_count(), 1, "the influenced breakout is spliced in");
+        assert_eq!(
+            iupf.lock().unwrap().branches_for_teid(ran_teid).len(),
+            1,
+            "the classifier steers the AF-influenced prefix"
+        );
+
+        // Deleting the AF subscription deletes the PCF app-session, which re-authorizes
+        // the SMF with no route → the breakout is withdrawn.
+        let del = client
+            .delete(format!("http://{nef_addr}{self_link}"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(del.as_u16(), 204, "AF subscription deleted");
+        assert_eq!(edge.lock().unwrap().session_count(), 0, "the breakout is withdrawn");
         assert!(iupf.lock().unwrap().branches_for_teid(ran_teid).is_empty(), "the branch is gone");
         assert_eq!(anchor.lock().unwrap().session_count(), 1, "the default anchor is untouched");
     }

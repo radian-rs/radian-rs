@@ -71,19 +71,28 @@ struct SubCreated {
     self_link: String,
 }
 
-/// What a live subscription steers, remembered so a delete can reverse it.
+/// What a live subscription steers, remembered so a delete can reverse it — and *how* it
+/// was applied, since that decides how it is withdrawn.
 struct Subscription {
     supi: String,
     dnn: Option<String>,
+    /// The PCF app-session backing this subscription, when the request went through the
+    /// PCF (design/135 Phase 2b). `None` ⇒ it was applied straight at the SMF (Phase 1).
+    app_session: Option<String>,
 }
 
-/// NEF runtime: how to reach the SMF, plus the live subscriptions.
+/// NEF runtime: how to reach the PCF/SMF, plus the live subscriptions.
 #[derive(Clone)]
 pub struct NefState {
-    /// NRF base for discovering the SMF; `None` when an explicit SMF base is set.
+    /// NRF base for discovering the PCF/SMF; `None` when explicit bases are set.
     nrf_base: Option<String>,
     /// An explicit SMF base URL, overriding discovery (an env escape hatch / tests).
     smf_base: Option<String>,
+    /// An explicit PCF base URL. When a PCF is reachable — set here or discovered — an AF
+    /// influence is authorized **through it** (design/135 Phase 2b), so the route lands in
+    /// the SM policy and composes with QoS. Without a PCF the NEF falls back to driving
+    /// the SMF directly (Phase 1).
+    pcf_base: Option<String>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -93,21 +102,32 @@ struct Inner {
 }
 
 impl NefState {
-    /// Discover the SMF via the NRF at `nrf_base`.
+    /// Discover the PCF/SMF via the NRF at `nrf_base`.
     pub fn new(nrf_base: impl Into<String>) -> Self {
-        Self::build(Some(nrf_base.into()), None)
+        Self::build(Some(nrf_base.into()), None, None)
     }
 
     /// Reach the SMF at an explicit base URL, bypassing NRF discovery (deployments without
-    /// an NRF, or tests).
+    /// an NRF, or tests). No PCF ⇒ the Phase-1 direct path.
     pub fn with_smf_base(smf_base: impl Into<String>) -> Self {
-        Self::build(None, Some(smf_base.into()))
+        Self::build(None, Some(smf_base.into()), None)
     }
 
-    fn build(nrf_base: Option<String>, smf_base: Option<String>) -> Self {
+    /// Authorize influences through an explicit PCF (design/135 Phase 2b).
+    pub fn with_pcf_base(mut self, pcf_base: impl Into<String>) -> Self {
+        self.pcf_base = Some(pcf_base.into());
+        self
+    }
+
+    fn build(
+        nrf_base: Option<String>,
+        smf_base: Option<String>,
+        pcf_base: Option<String>,
+    ) -> Self {
         Self {
             nrf_base,
             smf_base,
+            pcf_base,
             inner: Arc::new(Mutex::new(Inner {
                 next_id: AtomicU64::new(1),
                 subs: HashMap::new(),
@@ -117,12 +137,22 @@ impl NefState {
 
     /// The SMF base URL — the explicit override, else NRF discovery.
     async fn smf_base(&self) -> Option<String> {
-        if let Some(base) = &self.smf_base {
+        self.peer_base(self.smf_base.as_ref(), "SMF").await
+    }
+
+    /// The PCF base URL — the explicit override, else NRF discovery. `None` ⇒ no PCF is
+    /// deployed, so influences are applied straight at the SMF.
+    async fn pcf_base(&self) -> Option<String> {
+        self.peer_base(self.pcf_base.as_ref(), "PCF").await
+    }
+
+    async fn peer_base(&self, explicit: Option<&String>, nf_type: &str) -> Option<String> {
+        if let Some(base) = explicit {
             return Some(base.clone());
         }
         let nrf = self.nrf_base.as_ref()?;
         crate::nnrf::NrfClient::new(nrf.clone())
-            .discover("SMF", "NEF")
+            .discover(nf_type, "NEF")
             .await
             .ok()?
             .into_iter()
@@ -130,11 +160,11 @@ impl NefState {
             .service_base()
     }
 
-    fn record(&self, supi: String, dnn: Option<String>) -> String {
+    fn record(&self, supi: String, dnn: Option<String>, app_session: Option<String>) -> String {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
         let sub_id = format!("sub-{id}");
-        inner.subs.insert(sub_id.clone(), Subscription { supi, dnn });
+        inner.subs.insert(sub_id.clone(), Subscription { supi, dnn, app_session });
         sub_id
     }
 
@@ -202,19 +232,24 @@ async fn create_subscription(
     let Some(dnai) = sub.traffic_routes.first().map(|r| r.dnai.clone()) else {
         return (StatusCode::BAD_REQUEST, "no trafficRoutes[].dnai").into_response();
     };
-    let Some(smf) = nef.smf_base().await else {
-        return (StatusCode::BAD_GATEWAY, "no SMF discovered").into_response();
+    // With a PCF deployed, authorize the influence **through it** (Npcf_PolicyAuthorization):
+    // the route then lands in the session's SM policy and composes with QoS, and the PCF
+    // notifies the SMF to re-authorize (design/135 Phase 2b). Without one, drive the SMF's
+    // breakout trigger directly (Phase 1). Either way the NEF passes the DNAI through —
+    // the SMF resolves it to a UP node via its topology (§D2).
+    let applied = match nef.pcf_base().await {
+        Some(pcf) => authorize_at_pcf(&pcf, &supi, sub.dnn.as_deref(), &prefix, &dnai).await,
+        None => match nef.smf_base().await {
+            Some(smf) => steer_at_smf(&smf, &supi, sub.dnn.as_deref(), &prefix, &dnai).await,
+            None => Err("no PCF or SMF discovered".to_string()),
+        },
     };
-
-    // Drive the SMF's breakout trigger. The NEF passes the DNAI through — the SMF resolves
-    // it to a UP node via its topology (design/135 D2).
-    let body = serde_json::json!({ "supi": supi, "dnn": sub.dnn, "prefix": prefix, "dnai": dnai });
-    match crate::sbi_client().post(format!("{smf}/oam/v1/breakout")).json(&body).send().await {
-        Ok(r) if r.status().is_success() => {
-            let sub_id = nef.record(supi, sub.dnn.clone());
-            let self_link =
-                format!("/3gpp-traffic-influence/v1/{af_id}/subscriptions/{sub_id}");
-            tracing::info!(%af_id, %sub_id, %prefix, %dnai, "AF traffic influence: breakout inserted");
+    match applied {
+        Ok(app_session) => {
+            let via_pcf = app_session.is_some();
+            let sub_id = nef.record(supi, sub.dnn.clone(), app_session);
+            let self_link = format!("/3gpp-traffic-influence/v1/{af_id}/subscriptions/{sub_id}");
+            tracing::info!(%af_id, %sub_id, %prefix, %dnai, via_pcf, "AF traffic influence authorized");
             (
                 StatusCode::CREATED,
                 [(header::LOCATION, self_link.clone())],
@@ -222,9 +257,57 @@ async fn create_subscription(
             )
                 .into_response()
         }
-        Ok(r) => (StatusCode::BAD_GATEWAY, format!("SMF refused the breakout: {}", r.status()))
-            .into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("SMF unreachable: {e}")).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+/// Authorize the influence at the PCF as an application session; returns its id.
+async fn authorize_at_pcf(
+    pcf: &str,
+    supi: &str,
+    dnn: Option<&str>,
+    prefix: &str,
+    dnai: &str,
+) -> Result<Option<String>, String> {
+    let body = serde_json::json!({ "ascReqData": {
+        "supi": supi,
+        "dnn": dnn,
+        "afRoutReq": { "routeToLocs": [{ "dnai": dnai }] },
+        "trafficPrefix": prefix,
+    }});
+    let resp = crate::sbi_client()
+        .post(format!("{pcf}/npcf-policyauthorization/v1/app-sessions"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("PCF unreachable: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("PCF refused the influence: {}", resp.status()));
+    }
+    // The app-session id is the last segment of the Location header.
+    let id = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|loc| loc.rsplit('/').next())
+        .unwrap_or_default()
+        .to_string();
+    Ok(Some(id))
+}
+
+/// Drive the SMF's breakout trigger directly (no PCF deployed).
+async fn steer_at_smf(
+    smf: &str,
+    supi: &str,
+    dnn: Option<&str>,
+    prefix: &str,
+    dnai: &str,
+) -> Result<Option<String>, String> {
+    let body = serde_json::json!({ "supi": supi, "dnn": dnn, "prefix": prefix, "dnai": dnai });
+    match crate::sbi_client().post(format!("{smf}/oam/v1/breakout")).json(&body).send().await {
+        Ok(r) if r.status().is_success() => Ok(None),
+        Ok(r) => Err(format!("SMF refused the breakout: {}", r.status())),
+        Err(e) => Err(format!("SMF unreachable: {e}")),
     }
 }
 
@@ -236,12 +319,23 @@ async fn delete_subscription(
     let Some(sub) = nef.take(&sub_id) else {
         return StatusCode::NO_CONTENT.into_response();
     };
-    let Some(smf) = nef.smf_base().await else {
-        return (StatusCode::BAD_GATEWAY, "no SMF discovered").into_response();
-    };
-    let body = serde_json::json!({ "supi": sub.supi, "dnn": sub.dnn, "remove": true });
-    let _ = crate::sbi_client().post(format!("{smf}/oam/v1/breakout")).json(&body).send().await;
-    tracing::info!(%sub_id, "AF traffic influence: breakout removed");
+    // Withdraw the way it was authorized: delete the PCF app-session (the PCF drops the
+    // route from the policy and re-authorizes the SMF), else remove at the SMF directly.
+    match (&sub.app_session, nef.pcf_base().await) {
+        (Some(app_session), Some(pcf)) => {
+            let url = format!("{pcf}/npcf-policyauthorization/v1/app-sessions/{app_session}");
+            let _ = crate::sbi_client().delete(url).send().await;
+        }
+        _ => {
+            let Some(smf) = nef.smf_base().await else {
+                return (StatusCode::BAD_GATEWAY, "no SMF discovered").into_response();
+            };
+            let body = serde_json::json!({ "supi": sub.supi, "dnn": sub.dnn, "remove": true });
+            let _ =
+                crate::sbi_client().post(format!("{smf}/oam/v1/breakout")).json(&body).send().await;
+        }
+    }
+    tracing::info!(%sub_id, via_pcf = sub.app_session.is_some(), "AF traffic influence withdrawn");
     StatusCode::NO_CONTENT.into_response()
 }
 

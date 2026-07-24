@@ -27,6 +27,11 @@ const ULCL_PREFIX_ENV: &str = "RADIAN_SMF_ULCL_PREFIX";
 /// scalar `RADIAN_SMF_{UPF,IUPF,PSA2}_N4` vars: the SMF loads a named-node `upNodes`/`links`
 /// graph and selects a path **per DNN**. Absent ⇒ the fixed env-var user plane above.
 const TOPOLOGY_ENV: &str = "RADIAN_SMF_TOPOLOGY";
+/// Address other NFs use to reach this SMF's SBI — baked into the SM policy
+/// `notificationUri` so a PCF-initiated re-authorization (an AF influence landing,
+/// design/135 Phase 2b) reaches the right SM context.
+const ADVERTISE_ENV: &str = "RADIAN_SMF_ADVERTISE_ADDR";
+const DEFAULT_ADVERTISE_ADDR: &str = "127.0.0.1";
 const NRF_ENV: &str = "RADIAN_SMF_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 /// GFBR admission-control budget (Mbps, each direction). Absent ⇒ unlimited.
@@ -102,6 +107,13 @@ async fn main() -> anyhow::Result<()> {
             SmfState::connect(user_plane, smf_ip, nrf_base.clone()).await?
         }
     };
+    // How the PCF reaches us for a policy-update notification (design/135 Phase 2b).
+    let advertise =
+        std::env::var(ADVERTISE_ENV).unwrap_or_else(|_| DEFAULT_ADVERTISE_ADDR.to_string());
+    smf = smf.with_callback_base(format!(
+        "{}://{advertise}:{SBI_PORT}",
+        sbi_core::sbi_scheme()
+    ));
     // Optional GFBR admission-control budget (else unlimited).
     if let Some(mbps) = std::env::var(GFBR_BUDGET_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
         let bps = mbps.saturating_mul(1_000_000);

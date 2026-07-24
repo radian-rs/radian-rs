@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -135,6 +136,12 @@ pub struct SmPolicyContextData {
     pub snssai_sst: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snssai_sd: Option<String>,
+    /// Where the PCF sends a policy **update notification** (TS 29.512 `notificationUri`)
+    /// when it re-authorizes this session out of band — e.g. after an AF influence lands
+    /// (design/135 Phase 2b). The URI is opaque to the PCF: the SMF encodes its own
+    /// SM-context reference in it, which is how a PCF-initiated notify finds the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_uri: Option<String>,
 }
 
 /// A **session rule** (TS 29.512 §5.6.2.7), trimmed to the authorized session AMBR —
@@ -208,6 +215,50 @@ pub struct TrafficControlData {
     pub route_to_locs: Vec<RouteToLocation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_prefix: Option<String>,
+}
+
+/// The AF's routing requirement (TS 29.514 `AfRoutingRequirement`) — where the AF wants
+/// its traffic routed, as DNAIs.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AfRoutingRequirement {
+    #[serde(default)]
+    pub route_to_locs: Vec<RouteToLocation>,
+}
+
+/// `AppSessionContextReqData` (TS 29.514 §5.6.2.2), trimmed: which UE + DN the AF is
+/// influencing, and where to route it. The steered destination prefix rides here for the
+/// same reason it rides on [`TrafficControlData`] — radian's per-flow filter is port-based.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSessionContextReqData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supi: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub af_rout_req: Option<AfRoutingRequirement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_prefix: Option<String>,
+}
+
+/// `AppSessionContext` (TS 29.514) — an AF application session, the resource
+/// `Npcf_PolicyAuthorization` creates. Carries the AF's routing requirement, which the PCF
+/// folds into the affected session's SM policy decision (design/135 Phase 2b).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSessionContext {
+    #[serde(rename = "ascReqData")]
+    pub asc_req_data: AppSessionContextReqData,
+}
+
+/// One stored AF influence: which UE/DN it targets and the route it asks for.
+#[derive(Debug, Clone)]
+struct AfInfluence {
+    supi: String,
+    dnn: String,
+    prefix: String,
+    dnai: String,
 }
 
 /// `SmPolicyDecision` (TS 29.512 §5.6.2.5), trimmed to the **session rules** (session
@@ -538,6 +589,9 @@ pub struct PcfState {
     /// SM policy id → (creating context, current decision), for update/delete/audit.
     associations: Arc<Mutex<HashMap<String, (SmPolicyContextData, SmPolicyDecision)>>>,
     next_id: Arc<std::sync::atomic::AtomicU64>,
+    /// AF influences from `Npcf_PolicyAuthorization`, keyed by app-session id — folded
+    /// into the SM policy decision of the session they target (design/135 Phase 2b).
+    influences: Arc<Mutex<HashMap<String, AfInfluence>>>,
 }
 
 impl PcfState {
@@ -547,6 +601,7 @@ impl PcfState {
             udr: None,
             associations: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            influences: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -565,6 +620,14 @@ impl PcfState {
     /// policy-data when provisioned, else the local config. Re-read on every
     /// call, so an Update reflects a mid-session UDR policy change.
     async fn decide_for(&self, ctx: &SmPolicyContextData) -> SmPolicyDecision {
+        let mut decision = self.base_decision_for(ctx).await;
+        self.apply_influences(ctx, &mut decision);
+        decision
+    }
+
+    /// The subscriber's policy before AF influence — UDR policy-data when provisioned,
+    /// else the local config.
+    async fn base_decision_for(&self, ctx: &SmPolicyContextData) -> SmPolicyDecision {
         if let Some(udr) = &self.udr {
             match udr.get_sm_policy_data(&ctx.supi).await {
                 Ok(Some(doc)) => match serde_json::from_value::<PolicyConfig>(doc) {
@@ -585,15 +648,110 @@ impl PcfState {
         }
         self.config.decide(&ctx.dnn)
     }
+
+    /// Fold every AF influence targeting this session (`supi` + `dnn`) into the decision as
+    /// a **traffic-control decision** — how `Npcf_PolicyAuthorization` reaches the SMF
+    /// (design/135 Phase 2b): the AF's route becomes part of the authorized SM policy, so
+    /// it composes with QoS instead of arriving on a side channel.
+    fn apply_influences(&self, ctx: &SmPolicyContextData, decision: &mut SmPolicyDecision) {
+        for (id, inf) in self.influences.lock().unwrap().iter() {
+            if inf.supi == ctx.supi && inf.dnn == ctx.dnn {
+                decision.traffic_control_data.insert(
+                    format!("af-{id}"),
+                    TrafficControlData {
+                        route_to_locs: vec![RouteToLocation { dnai: inf.dnai.clone() }],
+                        traffic_prefix: Some(inf.prefix.clone()),
+                    },
+                );
+            }
+        }
+    }
+
+    /// The policy-update notification URI of the association serving `(supi, dnn)`, if the
+    /// SMF registered one — where a PCF-initiated re-authorization is announced.
+    fn notify_uri_for(&self, supi: &str, dnn: &str) -> Option<String> {
+        self.associations
+            .lock()
+            .unwrap()
+            .values()
+            .find(|(ctx, _)| ctx.supi == supi && ctx.dnn == dnn)
+            .and_then(|(ctx, _)| ctx.notification_uri.clone())
+    }
 }
 
-/// Build the PCF router (Npcf_SMPolicyControl).
+/// Tell the SMF to re-authorize the affected session, so it pulls the decision the AF
+/// influence just changed. Awaited (rather than fire-and-forget) so the AF's response
+/// means the influence has actually been applied — a deliberate simplification of the
+/// asynchronous 3GPP notification.
+async fn notify_smf(uri: Option<String>) {
+    let Some(uri) = uri else {
+        tracing::debug!("AF influence: no SM policy association to notify");
+        return;
+    };
+    match crate::sbi_client().post(&uri).json(&serde_json::json!({})).send().await {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!(%uri, "notified the SMF of an AF-influenced policy change")
+        }
+        Ok(r) => tracing::warn!(%uri, status = %r.status(), "SM policy notify rejected"),
+        Err(e) => tracing::warn!(%uri, "SM policy notify failed: {e}"),
+    }
+}
+
+/// Build the PCF router (Npcf_SMPolicyControl + Npcf_PolicyAuthorization).
 pub fn router(state: PcfState) -> Router {
     Router::new()
         .route("/npcf-smpolicycontrol/v1/sm-policies", post(create_sm_policy))
         .route("/npcf-smpolicycontrol/v1/sm-policies/{policy_id}/update", post(update_sm_policy))
         .route("/npcf-smpolicycontrol/v1/sm-policies/{policy_id}/delete", post(delete_sm_policy))
+        // Npcf_PolicyAuthorization (TS 29.514) — the AF (via the NEF) asks for its traffic
+        // to be routed to a DNAI; the PCF folds it into the SM policy and notifies the SMF.
+        .route("/npcf-policyauthorization/v1/app-sessions", post(create_app_session))
+        .route(
+            "/npcf-policyauthorization/v1/app-sessions/{app_session_id}",
+            axum::routing::delete(delete_app_session),
+        )
         .with_state(state)
+}
+
+/// `Npcf_PolicyAuthorization_Create` — record the AF's routing requirement and re-authorize
+/// the affected session (the SMF then pulls a decision carrying the route).
+async fn create_app_session(
+    State(pcf): State<PcfState>,
+    Json(asc): Json<AppSessionContext>,
+) -> axum::response::Response {
+    let req = asc.asc_req_data;
+    let dnai = req.af_rout_req.and_then(|r| r.route_to_locs.first().map(|l| l.dnai.clone()));
+    let (Some(supi), Some(dnn), Some(prefix), Some(dnai)) =
+        (req.supi, req.dnn, req.traffic_prefix, dnai)
+    else {
+        return (StatusCode::BAD_REQUEST, "need supi, dnn, trafficPrefix and a routeToLocs dnai")
+            .into_response();
+    };
+    let id = pcf.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string();
+    pcf.influences.lock().unwrap().insert(
+        id.clone(),
+        AfInfluence { supi: supi.clone(), dnn: dnn.clone(), prefix: prefix.clone(), dnai: dnai.clone() },
+    );
+    tracing::info!(supi = %supi, %dnn, %prefix, %dnai, "AF influence authorized (app-session {id})");
+    // Re-authorize the session: the SMF pulls the decision, which now carries the route.
+    notify_smf(pcf.notify_uri_for(&supi, &dnn)).await;
+    let location = format!("/npcf-policyauthorization/v1/app-sessions/{id}");
+    (StatusCode::CREATED, [(axum::http::header::LOCATION, location)]).into_response()
+}
+
+/// `Npcf_PolicyAuthorization_Delete` — withdraw the AF's routing requirement and
+/// re-authorize, so the SMF tears the influenced route back down.
+async fn delete_app_session(
+    State(pcf): State<PcfState>,
+    Path(app_session_id): Path<String>,
+) -> StatusCode {
+    let removed = pcf.influences.lock().unwrap().remove(&app_session_id);
+    let Some(inf) = removed else {
+        return StatusCode::NO_CONTENT; // idempotent
+    };
+    tracing::info!(supi = %inf.supi, dnn = %inf.dnn, "AF influence withdrawn (app-session {app_session_id})");
+    notify_smf(pcf.notify_uri_for(&inf.supi, &inf.dnn)).await;
+    StatusCode::NO_CONTENT
 }
 
 /// `Npcf_SMPolicyControl_Create` — create the association and return the policy
@@ -752,6 +910,7 @@ mod tests {
             dnn: "internet".into(),
             snssai_sst: Some(1),
             snssai_sd: Some("010203".into()),
+            notification_uri: None,
         };
         let created = pcf.create_sm_policy(&ctx).await.expect("policy created");
         assert!(!created.policy_id.is_empty(), "an SM policy id was assigned");
@@ -833,6 +992,7 @@ mod tests {
             dnn: "internet".into(),
             snssai_sst: Some(1),
             snssai_sd: None,
+            notification_uri: None,
         };
         // The UDR policy-data — not the local demo (1/2 Gbps) — drove the decision.
         let created = pcf.create_sm_policy(&ctx).await.unwrap();
