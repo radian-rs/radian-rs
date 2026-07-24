@@ -45,6 +45,7 @@ use rs_pfcp::ie::network_instance::NetworkInstance;
 use rs_pfcp::ie::pfcpsm_req_flags::PfcpsmReqFlags;
 use rs_pfcp::ie::outer_header_creation::OuterHeaderCreation;
 use rs_pfcp::ie::qer_id::QerId;
+use rs_pfcp::ie::remove_far::RemoveFar;
 use rs_pfcp::ie::remove_pdr::RemovePdr;
 use rs_pfcp::ie::remove_qer::RemoveQer;
 use rs_pfcp::ie::sdf_filter::SdfFilter;
@@ -373,9 +374,10 @@ fn branch_create_ies(index: usize, filter: &FlowFilter, egress: Egress, dnn: &st
 }
 
 /// Parse the **ULCL branch** rules a message provisions: each classifier PDR in the
-/// branch id band, paired with the egress of the FAR it points at. Ordered by PDR id so
-/// the UPF evaluates them the way the SMF numbered them.
-fn parse_branches(msg: &dyn rs_pfcp::message::Message) -> Vec<(FlowFilter, Egress)> {
+/// branch id band, tagged with its PDR id (so a later modification can remove it by id)
+/// and paired with the egress of the FAR it points at. Ordered by PDR id so the UPF
+/// evaluates them the way the SMF numbered them.
+fn parse_branches(msg: &dyn rs_pfcp::message::Message) -> Vec<(u16, FlowFilter, Egress)> {
     let far_egress: HashMap<u32, Egress> = msg
         .ies(IeType::CreateFar)
         .filter_map(|ie| CreateFar::unmarshal(&ie.payload).ok())
@@ -398,8 +400,9 @@ fn parse_branches(msg: &dyn rs_pfcp::message::Message) -> Vec<(FlowFilter, Egres
     pdrs.sort_by_key(|pdr| pdr.pdr_id.value);
     pdrs.into_iter()
         .filter_map(|pdr| {
+            let id = pdr.pdr_id.value;
             let filter = FlowFilter::from_flow_description(&pdr.pdi.sdf_filter?.flow_description)?;
-            Some((filter, *far_egress.get(&pdr.far_id?.value)?))
+            Some((id, filter, *far_egress.get(&pdr.far_id?.value)?))
         })
         .collect()
 }
@@ -546,10 +549,11 @@ struct Session {
     /// packet matching a `branch` leaves by that branch's egress instead.
     uplink: Egress,
     /// **Uplink classifier** rules (TS 23.501 §5.6.4, design/134 Phase 2), consulted in
-    /// order; the first match wins. Each pairs an SDF filter with its own egress, so a
-    /// subset of the session's uplink can break out to a different anchor while the rest
-    /// takes `uplink`. Empty ⇒ this node does not branch.
-    branches: Vec<(FlowFilter, Egress)>,
+    /// order; the first match wins. Each is `(PDR id, SDF filter, egress)` — the id lets a
+    /// mid-session modification remove a specific branch (Phase 3e). A subset of the
+    /// session's uplink can break out to a different anchor while the rest takes `uplink`.
+    /// Empty ⇒ this node does not branch.
+    branches: Vec<(u16, FlowFilter, Egress)>,
     /// An intermediate UPF's **downlink N9 ingress** TEID: the anchor sends downlink
     /// back here under it, and this node forwards it on to `downlink` (the gNB). `None`
     /// on an anchor, whose downlink arrives from N6 and is routed by UE address.
@@ -723,7 +727,7 @@ impl UpfState {
     pub fn uplink_egress_for(&self, teid: u32, pkt: &[u8]) -> Option<Egress> {
         let s = self.sessions.values().find(|s| s.n3_teid == teid)?;
         let branched = packet_key(pkt).and_then(|key| {
-            s.branches.iter().find(|(filter, _)| filter.matches(&key)).map(|(_, e)| *e)
+            s.branches.iter().find(|(_, filter, _)| filter.matches(&key)).map(|(_, _, e)| *e)
         });
         Some(branched.unwrap_or(s.uplink))
     }
@@ -734,7 +738,7 @@ impl UpfState {
         self.sessions
             .values()
             .find(|s| s.n3_teid == teid)
-            .map(|s| s.branches.clone())
+            .map(|s| s.branches.iter().map(|(_, f, e)| (*f, *e)).collect())
             .unwrap_or_default()
     }
 
@@ -828,7 +832,7 @@ impl UpfState {
         usage_threshold: Option<u64>,
         now_nanos: u64,
         uplink: Egress,
-        branches: Vec<(FlowFilter, Egress)>,
+        branches: Vec<(u16, FlowFilter, Egress)>,
         wants_dl_ingress: bool,
     ) -> (u64, u32, Option<u32>) {
         let up_seid = self.next_seid;
@@ -1069,6 +1073,24 @@ impl UpfState {
     fn remove_flow(&mut self, up_seid: u64, qfi: u8) {
         if let Some(s) = self.sessions.get_mut(&up_seid) {
             s.flow_qers.retain(|e| e.qfi != qfi);
+        }
+    }
+
+    /// Install a **uplink-classifier branch** on a live session (a mid-session Create
+    /// PDR+FAR — design/134 Phase 3e). Keyed by PDR `id`, so re-adding the same id
+    /// replaces it rather than duplicating; the branch list stays ordered by id.
+    fn add_branch(&mut self, up_seid: u64, id: u16, filter: FlowFilter, egress: Egress) {
+        if let Some(s) = self.sessions.get_mut(&up_seid) {
+            s.branches.retain(|(existing, ..)| *existing != id);
+            s.branches.push((id, filter, egress));
+            s.branches.sort_by_key(|(id, ..)| *id);
+        }
+    }
+
+    /// Remove a branch by its PDR `id` (a mid-session Remove PDR). No-op if absent.
+    fn remove_branch(&mut self, up_seid: u64, id: u16) {
+        if let Some(s) = self.sessions.get_mut(&up_seid) {
+            s.branches.retain(|(existing, ..)| *existing != id);
         }
     }
 
@@ -1441,6 +1463,39 @@ pub fn session_flow_modification_request(
     builder.build().marshal()
 }
 
+/// SMF: build a Session Modification that **inserts an uplink-classifier branch** on a
+/// live session (design/134 Phase 3e) — a Create PDR + Create FAR in the branch id band,
+/// steering `filter` to `egress`. `index` fixes both ids (`ULCL_PDR_BASE`/`ULCL_FAR_BASE`
+/// `+ index`) so [`session_modification_remove_branch`] can later address it. This is the
+/// mid-session counterpart to the establishment-time branches Phase 2 provisions.
+pub fn session_modification_add_branch(
+    up_seid: u64,
+    seq: u32,
+    index: usize,
+    filter: FlowFilter,
+    egress: Egress,
+    dnn: &str,
+) -> Vec<u8> {
+    let (pdr, far) = branch_create_ies(index, &filter, egress, dnn);
+    SessionModificationRequestBuilder::new(up_seid, seq)
+        .create_pdrs(vec![pdr])
+        .create_fars(vec![far])
+        .build()
+        .marshal()
+}
+
+/// SMF: build a Session Modification that **removes** the branch at `index` — a Remove PDR
+/// + Remove FAR in the branch id band (design/134 Phase 3e).
+pub fn session_modification_remove_branch(up_seid: u64, seq: u32, index: usize) -> Vec<u8> {
+    let pdr = RemovePdr::new(PdrId::new(ULCL_PDR_BASE + index as u16)).to_ie();
+    let far = RemoveFar::new(FarId::new(ULCL_FAR_BASE + index as u32)).to_ie();
+    SessionModificationRequestBuilder::new(up_seid, seq)
+        .remove_pdrs(vec![pdr])
+        .remove_fars(vec![far])
+        .build()
+        .marshal()
+}
+
 /// SMF: build a PFCP Session Modification Request that **deactivates** the downlink
 /// user-plane connection (TS 23.502 §4.2.6 AN release) — an Update FAR set to
 /// **BUFF**er downlink (and notify the CP on first arrival, `NOCP`), clearing its
@@ -1691,6 +1746,21 @@ pub fn handle_n4(
                     let qfi = uq.qer_id.value.saturating_sub(PER_FLOW_QER_BASE) as u8;
                     state.update_flow_rate(up_seid, qfi, mbr.downlink, mbr.uplink, now_nanos);
                 }
+            }
+            // Mid-session uplink-classifier changes (design/134 Phase 3e): a Create PDR+FAR
+            // in the branch id band inserts a branch on a live session; a Remove PDR there
+            // takes one away. This is what makes a modification against a branch meaningful
+            // — establishment-time branches (Phase 2) are provisioned once and never
+            // touched. Remove RUNS FIRST so re-provisioning a branch id lands cleanly.
+            for rp in msg
+                .ies(IeType::RemovePdr)
+                .filter_map(|ie| RemovePdr::unmarshal(&ie.payload).ok())
+                .filter(|rp| rp.pdr_id.value >= ULCL_PDR_BASE)
+            {
+                state.remove_branch(up_seid, rp.pdr_id.value);
+            }
+            for (id, filter, egress) in parse_branches(msg.as_ref()) {
+                state.add_branch(up_seid, id, filter, egress);
             }
             Some(
                 SessionModificationResponseBuilder::new(up_seid, seq)
@@ -2364,6 +2434,45 @@ mod tests {
             session_modification_request(1, 3, DOWNLINK_FAR_ID, 0x5678, gnb, "internet", false);
         assert!(response_accepted(&handle_n4(&right, node_ip, &mut state, 0).expect("accepted")));
         assert_eq!(state.downlink_for(1), Some((0x5678, gnb)));
+    }
+
+    /// design/134 Phase 3e: an uplink-classifier branch inserted and removed **mid-session**
+    /// via Session Modification — the dynamic counterpart to Phase 2's establishment-time
+    /// branches, and the reason a modification against a branch FAR now means something.
+    #[test]
+    fn branch_inserted_and_removed_mid_session() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        // A plain anchor session: default uplink egress is N6, no branches.
+        let est = handle_n4(
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("establish");
+        let teid = parse_session_establishment_response(&est).expect("established").n3_teid;
+
+        let to_edge = udp_packet_to(Ipv4Addr::new(10, 99, 5, 7), 1234, 80, 40);
+        let elsewhere = udp_packet_to(Ipv4Addr::new(203, 0, 113, 5), 1234, 80, 40);
+        assert_eq!(state.uplink_egress_for(teid, &to_edge), Some(Egress::ToN6), "no branch yet");
+
+        // Insert a branch steering 10.99.0.0/16 to a second anchor.
+        let peer = Egress::ToPeer { teid: 0x777, addr: Ipv4Addr::new(127, 0, 0, 4) };
+        let filter = FlowFilter::to_prefix(IpPrefix::new(Ipv4Addr::new(10, 99, 0, 0), 16));
+        let add = session_modification_add_branch(1, 2, 0, filter, peer, "internet");
+        assert!(response_accepted(&handle_n4(&add, node_ip, &mut state, 0).expect("accepted")));
+        assert_eq!(state.uplink_egress_for(teid, &to_edge), Some(peer), "the branch steers the prefix");
+        assert_eq!(
+            state.uplink_egress_for(teid, &elsewhere),
+            Some(Egress::ToN6),
+            "traffic off the prefix still takes the default egress"
+        );
+
+        // Remove it: the prefix falls back to the default egress.
+        let remove = session_modification_remove_branch(1, 3, 0);
+        assert!(response_accepted(&handle_n4(&remove, node_ip, &mut state, 0).expect("accepted")));
+        assert_eq!(state.uplink_egress_for(teid, &to_edge), Some(Egress::ToN6), "branch removed");
     }
 
     /// The classifier reads the destination out of both IP families.

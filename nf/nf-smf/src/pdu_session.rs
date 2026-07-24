@@ -534,6 +534,12 @@ impl SmfState {
         (prefix, iid)
     }
 
+    /// A connected UP peer by node name — used to reach a breakout anchor named by an OAM
+    /// ULCL-insertion request (design/134 Phase 3e).
+    fn peer_by_name(&self, name: &str) -> Option<Arc<N4Peer>> {
+        self.peers.get(name).cloned()
+    }
+
     /// PFCP Association Setup toward every UPF in the topology — required before any
     /// session.
     pub async fn associate(&self) -> anyhow::Result<()> {
@@ -702,6 +708,10 @@ pub fn router(state: Arc<SmfState>) -> Router {
             "/nsmf-pdusession/v1/sm-contexts/{sm_ref}/indirect-forwarding",
             post(indirect_forwarding),
         )
+        // OAM: insert/remove an uplink-classifier breakout on a live session (design/134
+        // Phase 3e). A stand-in trigger — in production this is driven by NEF/AF traffic
+        // influence (design/130 P2-5) — but the mechanism it exercises is the same.
+        .route("/oam/v1/breakout", post(oam_breakout))
         .with_state(state)
 }
 
@@ -1620,6 +1630,164 @@ async fn indirect_forwarding(
         }),
     )
         .into_response()
+}
+
+/// The PDR/FAR index a mid-session breakout occupies on the classifier. A live session
+/// chained without a breakout carries no establishment-time branches, so index 0 is free;
+/// the SMF inserts and removes exactly this one branch (design/134 Phase 3e).
+const MID_SESSION_BREAKOUT_INDEX: usize = 0;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BreakoutReq {
+    supi: String,
+    pdu_session_id: u8,
+    /// The destination prefix to steer (CIDR). Required on insert, ignored on remove.
+    #[serde(default)]
+    prefix: Option<String>,
+    /// The breakout anchor's UP-node name. Required on insert, ignored on remove.
+    #[serde(default)]
+    via: Option<String>,
+    /// Remove the breakout instead of inserting one.
+    #[serde(default)]
+    remove: bool,
+}
+
+/// OAM: insert or remove an **uplink-classifier breakout** on a live PDU session
+/// (design/134 Phase 3e) — the dynamic counterpart to the establishment-time breakout of
+/// Phase 2/3c. The session must be **chained** (its classifier is the intermediate UPF,
+/// the only node that sees uplink before it is committed to an anchor). This OAM trigger
+/// stands in for NEF/AF traffic influence; the N4 mechanism it drives is identical.
+async fn oam_breakout(
+    State(smf): State<Arc<SmfState>>,
+    Json(req): Json<BreakoutReq>,
+) -> axum::response::Response {
+    // Find the session by (SUPI, PDU-session id) and snapshot what the N4 work needs.
+    let found = {
+        let ctxs = smf.contexts.lock().unwrap();
+        ctxs.iter()
+            .find(|(_, c)| c.supi == req.supi && c.pdu_session_id == req.pdu_session_id)
+            .map(|(r, c)| {
+                (r.clone(), c.chain, c.dnn.clone(), c.path.clone(), c.ue_ip, c.ue_ipv6)
+            })
+    };
+    let Some((sm_ref, chain, dnn, path, ue_ip, ue_ipv6)) = found else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // A breakout needs a classifier, which is the session's intermediate UPF.
+    let (Some(leg), Some(iupf)) = (chain, path.intermediate.clone()) else {
+        return (StatusCode::CONFLICT, "session is not chained; no classifier to branch at")
+            .into_response();
+    };
+
+    if req.remove {
+        remove_breakout(&smf, &sm_ref, &leg, &iupf, &path).await
+    } else {
+        let (Some(prefix), Some(via)) = (req.prefix, req.via) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        let ue = pfcp::UeAddr { v4: ue_ip, v6: ue_ipv6.map(|(p, _)| p) };
+        insert_breakout(&smf, &sm_ref, &leg, &iupf, ue, &dnn, &prefix, &via).await
+    }
+}
+
+/// Splice a breakout anchor into a live chained session: establish its N4 session, point
+/// its downlink back at the classifier's shared N9 ingress, then add a branch on the
+/// classifier steering `prefix` to it — the mid-session build of Phase 2's two-anchor split.
+#[allow(clippy::too_many_arguments)]
+async fn insert_breakout(
+    smf: &Arc<SmfState>,
+    sm_ref: &str,
+    leg: &ChainedLeg,
+    iupf: &N4Peer,
+    ue: pfcp::UeAddr,
+    dnn: &str,
+    prefix: &str,
+    via: &str,
+) -> axum::response::Response {
+    if leg.breakout_seid.is_some() {
+        return (StatusCode::CONFLICT, "the session already has a breakout").into_response();
+    }
+    let Ok(prefix) = prefix.parse::<pfcp::IpPrefix>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(psa2) = smf.peer_by_name(via) else {
+        return (StatusCode::NOT_FOUND, "unknown breakout UP node").into_response();
+    };
+
+    // 1. Establish the breakout anchor's session (no URRs — only the default anchor meters).
+    let cp_seid = smf.cp_seid.fetch_add(1, Ordering::Relaxed);
+    let seq = psa2.next_seq();
+    let req = pfcp::session_establishment_request(cp_seid, seq, smf.smf_ip, ue, dnn, None, &[], None);
+    let est = match psa2.transact(&req, seq).await.and_then(|r| pfcp::parse_session_establishment_response(&r)) {
+        Some(e) => e,
+        None => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    // 2. Point its downlink at the classifier's N9 ingress — the shared return path.
+    if point_downlink_at(&psa2, est.up_seid, leg.dl_ingress, dnn).await.is_err() {
+        let seq = psa2.next_seq();
+        let _ = psa2.transact(&pfcp::session_deletion_request(est.up_seid, seq), seq).await;
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    // 3. Add the classifier branch steering the prefix to the breakout anchor.
+    let seq = iupf.next_seq();
+    let egress = pfcp::Egress::ToPeer { teid: est.n3_teid, addr: est.n3_addr };
+    let filter = pfcp::FlowFilter::to_prefix(prefix);
+    let add =
+        pfcp::session_modification_add_branch(leg.up_seid, seq, MID_SESSION_BREAKOUT_INDEX, filter, egress, dnn);
+    match iupf.transact(&add, seq).await {
+        Some(r) if pfcp::response_accepted(&r) => {}
+        _ => {
+            let seq = psa2.next_seq();
+            let _ = psa2.transact(&pfcp::session_deletion_request(est.up_seid, seq), seq).await;
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    }
+    // 4. Record the breakout on the context so re-activation / release address it.
+    if let Some(c) = smf.contexts.lock().unwrap().get_mut(sm_ref) {
+        if let Some(leg) = &mut c.chain {
+            leg.breakout_seid = Some(est.up_seid);
+        }
+        c.path.breakout = Some((psa2, prefix));
+    }
+    tracing::info!(%sm_ref, %prefix, breakout_seid = est.up_seid, "inserted a mid-session ULCL breakout");
+    StatusCode::OK.into_response()
+}
+
+/// Undo [`insert_breakout`]: remove the classifier branch and delete the breakout anchor's
+/// N4 session.
+async fn remove_breakout(
+    smf: &Arc<SmfState>,
+    sm_ref: &str,
+    leg: &ChainedLeg,
+    iupf: &N4Peer,
+    path: &SessionPath,
+) -> axum::response::Response {
+    let (Some(breakout_seid), Some((psa2, _))) = (leg.breakout_seid, &path.breakout) else {
+        return (StatusCode::CONFLICT, "the session has no breakout").into_response();
+    };
+    // 1. Remove the classifier branch — the prefix falls back to the default anchor.
+    let seq = iupf.next_seq();
+    let remove = pfcp::session_modification_remove_branch(leg.up_seid, seq, MID_SESSION_BREAKOUT_INDEX);
+    match iupf.transact(&remove, seq).await {
+        Some(r) if pfcp::response_accepted(&r) => {}
+        _ => return StatusCode::BAD_GATEWAY.into_response(),
+    }
+    // 2. Delete the breakout anchor's session.
+    let seq = psa2.next_seq();
+    match psa2.transact(&pfcp::session_deletion_request(breakout_seid, seq), seq).await {
+        Some(r) if pfcp::response_accepted(&r) => {}
+        _ => tracing::warn!(%sm_ref, breakout_seid, "breakout anchor did not accept the deletion"),
+    }
+    // 3. Clear the breakout from the context.
+    if let Some(c) = smf.contexts.lock().unwrap().get_mut(sm_ref) {
+        if let Some(leg) = &mut c.chain {
+            leg.breakout_seid = None;
+        }
+        c.path.breakout = None;
+    }
+    tracing::info!(%sm_ref, breakout_seid, "removed the mid-session ULCL breakout");
+    StatusCode::OK.into_response()
 }
 
 /// `Nsmf_PDUSession_ReleaseSMContext` (TS 29.502 §5.2.2.4): tear the N4 session
@@ -2664,6 +2832,111 @@ mod tests {
         assert_eq!(anchor.lock().unwrap().session_count(), 1, "the default anchor");
         assert_eq!(iupf.lock().unwrap().session_count(), 1, "the classifier");
         assert_eq!(edge.lock().unwrap().session_count(), 1, "the breakout anchor from the route");
+    }
+
+    /// design/134 Phase 3e: a breakout inserted and removed **mid-session** via the OAM
+    /// endpoint. A plain chained session (no route) gets a breakout spliced onto it live,
+    /// then torn back down — the dynamic counterpart to Phase 2/3c's establishment-time
+    /// breakout, exercising the Session Modification path Phase 2 leaves inert.
+    #[tokio::test]
+    async fn oam_inserts_and_removes_a_mid_session_breakout() {
+        let (anchor_ip, iupf_ip, edge_ip) = (
+            Ipv4Addr::new(127, 0, 0, 2),
+            Ipv4Addr::new(127, 0, 0, 3),
+            Ipv4Addr::new(127, 0, 0, 4),
+        );
+        let (anchor, anchor_n4) = spin_upf(anchor_ip).await;
+        let (iupf, iupf_n4) = spin_upf(iupf_ip).await;
+        let (edge, edge_n4) = spin_upf(edge_ip).await;
+
+        let (nrf_base, _udr) =
+            spin_subscription_backend("imsi-999700000000001", "99970").await;
+
+        // A chain to the anchor, with `edge` present but NO route — establishment is a
+        // plain chain and the breakout is added later, mid-session.
+        let topo = crate::topology::Topology::parse(&format!(
+            r#"{{
+                "upNodes": {{
+                    "gNB":    {{ "type": "AN" }},
+                    "iupf":   {{ "type": "UPF", "n4": "{iupf_n4}" }},
+                    "anchor": {{ "type": "UPF", "n4": "{anchor_n4}", "dnns": ["internet"] }},
+                    "edge":   {{ "type": "UPF", "n4": "{edge_n4}" }}
+                }},
+                "links": [
+                    {{ "a": "gNB", "b": "iupf" }},
+                    {{ "a": "iupf", "b": "anchor" }},
+                    {{ "a": "iupf", "b": "edge" }}
+                ]
+            }}"#
+        ))
+        .unwrap();
+
+        let smf = Arc::new(
+            SmfState::connect_with_topology(topo, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+                .await
+                .unwrap(),
+        );
+        smf.associate().await.unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+        let created: SmContextCreatedData = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ran_teid = u32::from_str_radix(&created.up_n3_teid, 16).unwrap();
+
+        // A plain chain: anchor + classifier have sessions, the breakout anchor none.
+        assert_eq!(edge.lock().unwrap().session_count(), 0, "no breakout yet");
+        assert!(iupf.lock().unwrap().branches_for_teid(ran_teid).is_empty(), "no branch yet");
+
+        // Insert the breakout via OAM.
+        let insert = client
+            .post(format!("{base}/oam/v1/breakout"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5,
+                "prefix": "10.99.0.0/16", "via": "edge"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(insert.is_success(), "insert failed: {insert}");
+        assert_eq!(edge.lock().unwrap().session_count(), 1, "the breakout anchor now has a session");
+        let branches = iupf.lock().unwrap().branches_for_teid(ran_teid);
+        assert_eq!(branches.len(), 1, "the classifier now steers one branch");
+        assert_eq!(
+            branches[0].1,
+            pfcp::Egress::ToPeer { teid: 1, addr: edge_ip },
+            "the branch steers to the breakout anchor"
+        );
+
+        // Remove it via OAM.
+        let remove = client
+            .post(format!("{base}/oam/v1/breakout"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "remove": true
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(remove.is_success(), "remove failed: {remove}");
+        assert_eq!(edge.lock().unwrap().session_count(), 0, "the breakout anchor's session is gone");
+        assert!(iupf.lock().unwrap().branches_for_teid(ran_teid).is_empty(), "the branch is gone");
+        assert_eq!(anchor.lock().unwrap().session_count(), 1, "the default anchor is untouched");
     }
 
     /// The **uplink classifier** (design/134 Phase 2): one PDU session, one UE address,

@@ -271,12 +271,20 @@ enum UpMode {
     /// terminating its own DN. The topology config steers [`BREAKOUT_PREFIX`] to it, so one
     /// PDU session reaches two data networks with real packets.
     Breakout,
+    /// The same three UPFs, but the topology carries **no route** — the breakout is added
+    /// mid-session over the OAM endpoint (Phase 3e) rather than at establishment.
+    BreakoutDeferred,
 }
 
 impl UpMode {
     /// Whether a second (intermediate) UPF is spawned.
     fn chained(self) -> bool {
         self != UpMode::Single
+    }
+
+    /// Whether a third UPF (the breakout anchor) is spawned with its own N6 TUN.
+    fn has_breakout_anchor(self) -> bool {
+        matches!(self, UpMode::Breakout | UpMode::BreakoutDeferred)
     }
 }
 
@@ -308,6 +316,13 @@ async fn start_core_from_topology(world: &mut World) {
 #[when("I start the radian core with an uplink-classifier breakout")]
 async fn start_core_breakout(world: &mut World) {
     start_core_inner(world, UpMode::Breakout).await;
+}
+
+/// design/134 Phase 3e: the breakout anchor is up but the topology has no route to it — the
+/// classifier only steers to it once a breakout is inserted mid-session over OAM.
+#[when("I start the radian core with a deferred breakout anchor")]
+async fn start_core_breakout_deferred(world: &mut World) {
+    start_core_inner(world, UpMode::BreakoutDeferred).await;
 }
 
 async fn start_core_inner(world: &mut World, mode: UpMode) {
@@ -385,7 +400,7 @@ async fn start_core_inner(world: &mut World, mode: UpMode) {
     // v6 off) so it doesn't collide with the default anchor's `n6upf0`. A source route then
     // lets it return the UE's traffic on its own TUN: the two anchors share the one UE
     // address, so on a single host they must be kept off each other's return route.
-    if mode == UpMode::Breakout {
+    if mode.has_breakout_anchor() {
         let psa2 = PSA2_N3_IP.to_string();
         world.procs.push(
             spawn_core_as(
@@ -443,9 +458,20 @@ async fn start_core_inner(world: &mut World, mode: UpMode) {
             std::fs::write(&topology_path, topology).expect("write UP topology config");
             smf_env.push(("RADIAN_SMF_TOPOLOGY", topology_path.as_str()));
         }
-        UpMode::Breakout => {
-            // Same chain, plus a breakout anchor `edge` and a route steering the breakout
-            // prefix to it — one PDU session, two data networks.
+        UpMode::Breakout | UpMode::BreakoutDeferred => {
+            // Same chain plus a breakout anchor `edge`. In `Breakout` a route steers the
+            // breakout prefix to it at establishment; in `BreakoutDeferred` the topology
+            // carries no route and the breakout is inserted mid-session over OAM (Phase 3e).
+            let routes = if mode == UpMode::Breakout {
+                format!(
+                    r#",
+  "routes": [
+    {{ "dnn": "internet", "prefix": "{BREAKOUT_PREFIX}", "via": "edge" }}
+  ]"#
+                )
+            } else {
+                String::new()
+            };
             let topology = format!(
                 r#"{{
   "upNodes": {{
@@ -458,10 +484,7 @@ async fn start_core_inner(world: &mut World, mode: UpMode) {
     {{ "a": "gNB",  "b": "iupf" }},
     {{ "a": "iupf", "b": "anchor" }},
     {{ "a": "iupf", "b": "edge" }}
-  ],
-  "routes": [
-    {{ "dnn": "internet", "prefix": "{BREAKOUT_PREFIX}", "via": "edge" }}
-  ]
+  ]{routes}
 }}"#
             );
             std::fs::write(&topology_path, topology).expect("write UP topology config");
@@ -1129,6 +1152,19 @@ async fn ue_reaches_dn_over_datapath(world: &mut World, gw: String) {
     .await
     .expect("run the datapath echo");
     assert!(ok, "no ICMP echo reply returned through the signalled N3/N6 datapath");
+}
+
+/// design/134 Phase 3e: insert an uplink-classifier breakout on the live session over the
+/// SMF's OAM endpoint (a stand-in for NEF/AF traffic influence). The classifier then steers
+/// `prefix` to the breakout anchor named by `via`, changing the datapath mid-session.
+#[when(regex = r#"^I insert a breakout for "([^"]+)" via "([^"]+)"$"#)]
+async fn insert_breakout_oam(world: &mut World, prefix: String, via: String) {
+    let psi = world.pdu_psi.expect("a PDU session was established");
+    let supi = world.ue.as_ref().expect("scripted UE").supi().to_string();
+    let body =
+        format!(r#"{{"supi":"{supi}","pduSessionId":{psi},"prefix":"{prefix}","via":"{via}"}}"#);
+    let ok = netns::http_post("http://127.0.0.1:8002/oam/v1/breakout", &body).await;
+    assert!(ok, "the SMF refused the OAM breakout insertion");
 }
 
 #[then(regex = r#"^the UE can reach the data network gateway "([^"]+)" over the IPv6 datapath$"#)]
