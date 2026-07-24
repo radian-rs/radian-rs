@@ -806,6 +806,37 @@ async fn accept_carries_cause(world: &mut World, cause: u8) {
     assert_eq!(got, cause, "5GSM downgrade cause");
 }
 
+#[when(regex = r#"^the scripted UE requests an? "(IPV4|IPV6|IPV4V6)" PDU session requesting DNS$"#)]
+async fn ue_requests_typed_pdu_session_dns(world: &mut World, ty: String) {
+    let psi = 1u8;
+    let request = world
+        .ue
+        .as_mut()
+        .expect("UE")
+        .pdu_session_request_typed_with_dns(psi, pdu_type_from_name(&ty))
+        .expect("build the typed request with a DNS request");
+    let amf_ue_id = world.amf_ue_id.expect("AMF-UE-NGAP-ID assigned");
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    gnb.send(&ngap::uplink_nas_transport(amf_ue_id, SCRIPTED_RAN_UE_ID, request))
+        .await
+        .expect("send UL NAS Transport (DNS-requesting PDU session request)");
+    world.pdu_psi = Some(psi);
+}
+
+#[then(regex = r#"^the accept returns the IPv6 DNS server "([^"]+)"$"#)]
+async fn accept_returns_dns(world: &mut World, dns: String) {
+    let expected: Ipv6Addr = dns.parse().expect("valid IPv6 DNS server");
+    let accept = world.pending_nas.as_ref().expect("the relayed accept NAS");
+    let got = world
+        .ue
+        .as_mut()
+        .expect("UE")
+        .read_pdu_session_dns_ipv6(accept)
+        .expect("read the accept")
+        .expect("the accept returned an IPv6 DNS server");
+    assert_eq!(got, expected, "IPv6 DNS server from PCO");
+}
+
 /// The marker payload of the injected downlink packet — checked when it flushes.
 const DL_MARKER: &[u8] = b"radian-downlink";
 

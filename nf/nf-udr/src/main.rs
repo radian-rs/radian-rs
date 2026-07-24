@@ -140,6 +140,8 @@ fn provision_demo(store: &RedbStore) -> anyhow::Result<()> {
                 // IPv4 default, but IPv6 (hence IPv4v6) is also allowed — the SMF
                 // negotiates the selected type against this set (design/131).
                 "pduSessionTypes": { "defaultSessionType": "IPV4", "allowedSessionTypes": ["IPV4", "IPV6"] },
+                // The IPv6 DNS server returned to the UE via PCO (design/131 Phase D).
+                "dns": { "ipv6": "2001:4860:4860::8888" },
                 "sessionAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
                 // Default QoS flow: non-GBR, 5QI 9. (ARP defaults to priority 8.)
                 "5gQosProfile": { "5qi": 9, "arp": { "priorityLevel": 8 } },

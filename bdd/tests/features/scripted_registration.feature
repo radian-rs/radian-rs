@@ -204,6 +204,22 @@ Feature: Scripted gNB/UE — full 5G-AKA registration against the live core
     And the UE reads an "IPV4" PDU address
     And the accept carries 5GSM cause 50
 
+  Scenario: An IPv6 session returns a DNS server via PCO (design/131 Phase D)
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the scripted UE sends its registration request from TAC "000001"
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with RES*
+    Then the AMF selects NEA2/NIA2 in a security mode command
+    When the scripted UE completes the security mode procedure
+    Then the AMF sets up the initial context carrying the registration accept
+    When the gNB confirms the context and the UE completes the registration
+    Then the AMF nudges the registered UE with a configuration update
+    When the scripted UE requests an "IPV6" PDU session requesting DNS
+    Then the AMF sets up the PDU session at the gNB
+    And the UE reads an "IPV6" PDU address
+    And the accept returns the IPv6 DNS server "2001:4860:4860::8888"
+
   Scenario: Teardown topology
     Given the scripted core is running
     When I stop the radian core

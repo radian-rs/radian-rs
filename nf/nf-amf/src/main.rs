@@ -3319,6 +3319,10 @@ async fn dispatch_uplink_nas(
                     } else {
                         created.ngap_flows.clone()
                     };
+                    // Return the IPv6 DNS server in the accept's ePCO only if the UE
+                    // requested it via PCO and the SMF provided one (design/131 Phase D).
+                    let dns_ipv6 =
+                        nas::pco_requests_ipv6_dns(&container).then_some(created.dns_ipv6).flatten();
                     let accept = nas::pdu_session_establishment_accept(
                         psi,
                         pti,
@@ -3329,6 +3333,7 @@ async fn dispatch_uplink_nas(
                         created.ambr,
                         &created.nas_flows,
                         created.cause,
+                        dns_ipv6,
                     );
                     let dl = nas::dl_nas_transport_sm(psi, accept);
                     let Some(ctx) = ues.get_mut(&amf_ue_id) else { return None };
