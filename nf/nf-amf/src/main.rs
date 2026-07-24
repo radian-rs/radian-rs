@@ -3732,6 +3732,18 @@ async fn on_security_mode_complete(
         Some(supi) => create_am_policy(nrf_base, supi, PLMN_MCC, PLMN_MNC).await,
         None => None,
     };
+    // Slice selection (design/133): the NSSF decides which requested slices the UE may
+    // use given the subscription **and its tracking area** — a subscribed slice that is
+    // not deployed in that TA is refused, which the local intersection cannot see.
+    // Read the inputs before the mutable borrow (the call awaits).
+    let (requested_nssai, ue_tac) = match ues.get(&amf_ue_id) {
+        Some(c) => (c.requested_nssai.clone(), c.tac),
+        None => return Vec::new(),
+    };
+    let nssf_decision = match &subscribed {
+        Some(subscribed) => select_slices(nrf_base, ue_tac, &requested_nssai, subscribed).await,
+        None => None,
+    };
 
     let Some(ctx) = ues.get_mut(&amf_ue_id) else {
         return Vec::new();
@@ -3771,10 +3783,13 @@ async fn on_security_mode_complete(
     // Request presents it; the retained-context store is keyed by it).
     ctx.guti_tmsi = Some(tmsi);
     // Fail-open when the subscription is unreachable: no NSSAI IEs, and slice
-    // admission falls back to the SMF's check.
-    let (allowed, rejected) = match &subscribed {
-        Some(subscribed) => compute_nssai(&ctx.requested_nssai, subscribed),
-        None => (Vec::new(), Vec::new()),
+    // admission falls back to the SMF's check. With a subscription, the NSSF's
+    // decision wins; without a reachable NSSF we degrade to the local intersection
+    // (design/133 D2) rather than dropping the registration.
+    let (allowed, rejected) = match (&subscribed, nssf_decision) {
+        (Some(_), Some(decision)) => decision,
+        (Some(subscribed), None) => compute_nssai(&ctx.requested_nssai, subscribed),
+        (None, _) => (Vec::new(), Vec::new()),
     };
 
     // Nothing the UE requested is subscribed → the registration cannot serve any
@@ -3948,6 +3963,34 @@ fn bitrate_to_bps(s: &str) -> Option<u64> {
 /// (Npcf_AMPolicyControl, TS 29.507). Returns `(pcf_base, assoc_id, policy)` — the
 /// PCF's AM policy (RFSP + UE-AMBR). `None` (best-effort) when no PCF is reachable
 /// or the call fails, so registration proceeds with the subscribed policy.
+/// Ask the NSSF which of the UE's requested slices it may be granted in tracking area
+/// `tac`, given `subscribed` (Nnssf_NSSelection, design/133). The NSSF's answer differs
+/// from the local [`compute_nssai`] intersection exactly when a subscribed slice is not
+/// deployed in that tracking area.
+///
+/// `None` when no NSSF is registered or the call fails — the caller then falls back to
+/// the local intersection, so an NSSF outage degrades slicing to the previous behaviour
+/// instead of dropping registrations (the fail-open contract).
+#[allow(clippy::type_complexity)]
+async fn select_slices(
+    nrf_base: &str,
+    tac: Option<[u8; 3]>,
+    requested: &[(u8, Option<[u8; 3]>)],
+    subscribed: &[(u8, Option<[u8; 3]>)],
+) -> Option<(Vec<(u8, Option<[u8; 3]>)>, Vec<(u8, Option<[u8; 3]>)>)> {
+    let nssf = discover_nf(nrf_base, "NSSF").await.ok()?;
+    match sbi_core::nnssf::NssfClient::new(nssf).ns_selection(tac, requested, subscribed).await {
+        Ok((allowed, rejected)) => {
+            info!("NSSF slice selection (TAC {tac:02x?}): allowed {allowed:?}, rejected {rejected:?}");
+            Some((allowed, rejected))
+        }
+        Err(e) => {
+            warn!("Nnssf_NSSelection failed (falling back to the local intersection): {e}");
+            None
+        }
+    }
+}
+
 async fn create_am_policy(
     nrf_base: &str,
     supi: &str,

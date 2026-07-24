@@ -48,6 +48,21 @@ Feature: Scripted gNB/UE — full 5G-AKA registration against the live core
     When the scripted UE completes the security mode procedure
     Then the AMF rejects the registration with 5GMM cause 62 and a back-off timer
 
+  # design/133: the capability an AMF-local intersection structurally cannot provide.
+  # Slice 1:010203 IS subscribed, but the NSSF publishes TAC 000007 as deploying no
+  # slice at all — so the UE is refused there. Before the NSSF this registration would
+  # have been ALLOWED (subscribed ⇒ allowed, regardless of tracking area).
+  Scenario: A subscribed slice that is not deployed in the UE's tracking area is refused
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the scripted UE sends its registration request from TAC "000007" requesting slices "1:010203"
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with RES*
+    Then the AMF selects NEA2/NIA2 in a security mode command
+    When the scripted UE completes the security mode procedure
+    Then the AMF rejects the registration with 5GMM cause 62 and a back-off timer
+    And the "nssf" log should contain "Nnssf_NSSelection"
+
   Scenario: A UE that fails authentication is rejected and released (D6)
     Given the scripted core is running
     When the scripted gNB connects and completes NG Setup

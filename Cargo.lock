@@ -1848,6 +1848,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nf-nssf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "common",
+ "sbi-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nf-pcf"
 version = "0.1.0"
 dependencies = [

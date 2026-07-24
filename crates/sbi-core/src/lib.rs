@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub mod nausf;
 pub mod nchf;
 pub mod nnrf;
+pub mod nnssf;
 pub mod npcf;
 pub mod npcf_am;
 pub mod policy;
