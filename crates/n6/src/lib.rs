@@ -53,8 +53,13 @@ fn in_prefix64(addr: Ipv6Addr, prefix: Ipv6Addr) -> bool {
 /// What to do with an uplink packet decapsulated from an N3 G-PDU.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Uplink<'a> {
-    /// Forward this inner packet out to N6 (the data network).
+    /// Forward this inner packet out to N6 (the data network) — this UPF is the anchor.
     ToN6(&'a [u8]),
+    /// Re-encapsulate and forward on to another node (GTP-U to `peer` under `teid`) —
+    /// this UPF is an intermediate node in a chain (design/134). It covers **both**
+    /// directions: uplink on to the next UPF over N9, and downlink coming back from the
+    /// anchor over N9 on to the gNB over N3. Mechanically identical, so one outcome.
+    Forward { teid: u32, peer: Ipv4Addr, pkt: &'a [u8] },
     /// The G-PDU's TEID matches no established session — drop.
     UnknownTeid,
     /// The inner packet's source is not the UE's assigned address — likely spoofing;
@@ -75,6 +80,13 @@ pub enum Uplink<'a> {
 /// forms its address there via SLAAC); anything else is forwarded as-is (the DN device
 /// drops what it can't route). A packet that passes is metered against the uplink AMBR.
 pub fn uplink<'a>(state: &mut UpfState, teid: u32, inner: &'a [u8], now_nanos: u64) -> Uplink<'a> {
+    // On an intermediate UPF, a TEID matching its downlink N9 ingress is traffic coming
+    // *back* from the anchor — forward it on to the gNB rather than treating it as
+    // uplink (design/134). Checked first: the direction is decided by which ingress the
+    // TEID belongs to, not by the packet.
+    if let Some((gnb_teid, gnb_ip)) = state.downlink_via_n9_ingress(teid) {
+        return Uplink::Forward { teid: gnb_teid, peer: gnb_ip, pkt: inner };
+    }
     if !state.knows_teid(teid) {
         return Uplink::UnknownTeid;
     }
@@ -98,7 +110,14 @@ pub fn uplink<'a>(state: &mut UpfState, teid: u32, inner: &'a [u8], now_nanos: u
     if !state.admit_uplink(teid, now_nanos, inner) {
         return Uplink::RateLimited;
     }
-    Uplink::ToN6(inner)
+    // An anchor sends it out to the data network; an intermediate UPF forwards it on to
+    // the next UPF over N9 (design/134).
+    match state.uplink_egress_for_teid(teid) {
+        Some(pfcp::Egress::ToPeer { teid, addr }) => {
+            Uplink::Forward { teid, peer: addr, pkt: inner }
+        }
+        _ => Uplink::ToN6(inner),
+    }
 }
 
 /// What to do with a downlink packet that arrived from N6 (the data network).
@@ -335,6 +354,82 @@ mod tests {
         let (mut state, teid) = established_upf();
         let inner = ipv4_packet(UE_IP, Ipv4Addr::new(8, 8, 8, 8), b"uplink");
         assert_eq!(uplink(&mut state, teid, &inner, 0), Uplink::ToN6(&inner[..]));
+    }
+
+    /// On an **intermediate UPF** the uplink is re-encapsulated toward the next UPF over
+    /// N9 rather than handed to N6 (design/134) — the chain's forwarding hop.
+    #[test]
+    fn uplink_on_an_intermediate_upf_forwards_over_n9() {
+        let peer = Ipv4Addr::new(127, 0, 0, 2);
+        let mut state = UpfState::new();
+        pfcp::handle_n4(
+            &pfcp::session_establishment_request_via_peer(
+                0xCAFE, 1, UPF_IP, UE_IP, "internet", 0x9001, peer,
+            ),
+            UPF_IP,
+            &mut state,
+            0,
+        )
+        .expect("establish intermediate UPF");
+
+        let pkt = ipv4_packet(UE_IP, Ipv4Addr::new(8, 8, 8, 8), b"uplink");
+        assert_eq!(
+            uplink(&mut state, 1, &pkt, 0),
+            Uplink::Forward { teid: 0x9001, peer, pkt: &pkt[..] },
+            "forwarded on to the next UPF, not out to N6"
+        );
+        // Anti-spoofing still applies on the chain's first hop.
+        let spoofed = ipv4_packet(Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(8, 8, 8, 8), b"x");
+        assert!(matches!(uplink(&mut state, 1, &spoofed, 0), Uplink::Spoofed { .. }));
+    }
+
+    /// The chain's **return path** (design/134): a G-PDU arriving on the intermediate
+    /// UPF's downlink N9 ingress — traffic coming back from the anchor — is forwarded on
+    /// to the gNB rather than treated as uplink. Direction is decided by *which ingress*
+    /// the TEID belongs to.
+    #[test]
+    fn downlink_from_the_anchor_is_forwarded_on_to_the_gnb() {
+        let peer = Ipv4Addr::new(127, 0, 0, 2);
+        let mut state = UpfState::new();
+        let resp = pfcp::handle_n4(
+            &pfcp::session_establishment_request_via_peer(
+                0xCAFE, 1, UPF_IP, UE_IP, "internet", 0x9001, peer,
+            ),
+            UPF_IP,
+            &mut state,
+            0,
+        )
+        .expect("establish intermediate UPF");
+        let est = pfcp::parse_session_establishment_response(&resp).expect("parse response");
+        let (dl_teid, _) =
+            est.dl_ingress.expect("the intermediate UPF allocated a downlink N9 ingress");
+        assert_ne!(dl_teid, est.n3_teid, "the two ingresses are distinct TEIDs");
+
+        // The SMF points its downlink FAR at the gNB, exactly as for an anchor.
+        pfcp::handle_n4(
+            &pfcp::session_modification_request(
+                est.up_seid, 2, 2, GNB_TEID, GNB_IP, "internet", false,
+            ),
+            UPF_IP,
+            &mut state,
+            0,
+        )
+        .expect("modify");
+
+        // Downlink arriving from the anchor goes on to the gNB.
+        let down = ipv4_packet(Ipv4Addr::new(8, 8, 8, 8), UE_IP, b"downlink");
+        assert_eq!(
+            uplink(&mut state, dl_teid, &down, 0),
+            Uplink::Forward { teid: GNB_TEID, peer: GNB_IP, pkt: &down[..] },
+            "the chain's return path reaches the gNB"
+        );
+        // ...and the uplink ingress still goes the other way, on to the anchor.
+        let up = ipv4_packet(UE_IP, Ipv4Addr::new(8, 8, 8, 8), b"uplink");
+        assert_eq!(
+            uplink(&mut state, est.n3_teid, &up, 0),
+            Uplink::Forward { teid: 0x9001, peer, pkt: &up[..] },
+            "uplink still goes on to the anchor"
+        );
     }
 
     #[test]

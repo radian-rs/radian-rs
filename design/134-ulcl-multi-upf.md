@@ -1,0 +1,71 @@
+# ULCL + multi-UPF / N9 — uplink classifier and UPF chaining
+
+> Research date: 2026-07-23. Branch `feat/134-ulcl-multi-upf`.
+> Executes design/130's **P2 ULCL/multi-UPF** item (§2.2/2.3/4) — the largest single gap in the analysis, and the one it flagged as *the pivot decision*.
+> 3GPP: TS 23.501 §5.6.4 (uplink classifier), §5.6.4.2 (branching point), TS 29.244 (PFCP: PDR precedence, FAR Outer Header Creation, N9).
+
+## TL;DR
+
+- **Target topology:** `gNB --N3--> I-UPF (ULCL) --N9--> PSA --N6--> DN`, where the ULCL classifies uplink traffic and can steer a subset to a *second* PSA (local breakout). One PDU session, one UE IP, two anchors.
+- radian-rs today is **single-UPF by construction**: the SMF holds one `connect()`ed N4 socket, a session has exactly one egress (`downlink`), and the uplink datapath's only outcome is `ToN6`. There is no N9 path in either direction.
+- The survey turned up a **latent correctness gap that is also the prerequisite**: `handle_n4` never reads `CreateFar`, so Outer Header Creation set at *establishment* is silently dropped. `session_establishment_request_indirect_forwarding` (design/84's handover forwarding) therefore builds a FAR radian's own UPF ignores — its forwarding half is unimplemented and untested.
+- Two findings make this far more tractable than design/130 feared: the UPF **already degrades gracefully when its TUN won't open**, so an I-UPF needs no N6 device and none of the N6 singleton constants change; and `127.0.0.0/8` is entirely local, so a second UPF process is env-vars-only — no alias setup.
+- **Decision: phase it. Land the datapath foundation (N9 egress + honouring Create FAR) first, unit-testable with no second process; then multi-peer N4 in the SMF and a real two-UPF chain; then the branching classifier; then topology config. This doc + Phase 1a land together; the rest are follow-on slices.**
+
+## 1. What blocks it today (measured)
+
+| # | Blocker | Where |
+|---|---|---|
+| 1 | `SmfState` owns **one** `connect()`ed N4 socket; `transact` sends on it unconditionally (9 call sites + 2 raw `sock.send`) | `nf-smf/src/pdu_session.rs` |
+| 2 | **`handle_n4` never reads `CreateFar`** — establishment-time Outer Header Creation is dropped on the floor | `crates/pfcp/src/lib.rs` |
+| 3 | `Session` has exactly one egress (`downlink`); `n6::uplink`'s only forwarding outcome is `ToN6` | `crates/pfcp`, `crates/n6` |
+| 4 | `FlowFilter` matches protocol + one port range — **no destination-IP match**, and ULCL steers *by destination* | `crates/pfcp/src/lib.rs` |
+| 5 | UPF N6 singletons (TUN name, v4/v6 gateway, netmask) are `const` | `nf-upf/src/main.rs` |
+
+## 2. Design decisions
+
+**D1 — Fix the Create FAR gap first, on its own merits.** The UPF must parse `CreateFar` → forwarding parameters → Outer Header Creation at establishment and seed the session's egress from it. This is a prerequisite for N9 *and* repairs indirect data forwarding, which has been silently non-functional. It is also the piece testable with zero new processes.
+
+**D2 — A session gets an explicit uplink egress.** `Session` gains `uplink: Egress`, where `Egress` is `ToN6` (today's behaviour, the PSA) or `ToPeer { teid, addr }` (an N9 tunnel, the I-UPF). `n6::uplink` returns `ToN9 { .. }` for the latter and `serve_n3` re-encapsulates on the *same* GTP-U socket — N9 is GTP-U/2152 like N3, distinguished by TEID. Downlink needs no new concept: `Downlink::ToN3 { gnb_ip, gpdu }` is already a generic *(peer, datagram)* pair, so a PSA sending downlink to the I-UPF works unchanged once its `downlink` holds the I-UPF's N9 F-TEID.
+
+**D3 — The I-UPF runs without an N6 device.** It only classifies N3→N9 and relays N9→N3. The UPF's existing "TUN unavailable ⇒ warn and keep serving N3/N4" degrade means this needs no change to the N6 constants, and the second instance is `RADIAN_UPF_BIND=127.0.0.3` + `RADIAN_UPF_N3_ADDR=127.0.0.3`. Only the PSA (the existing UPF) touches N6. *Rejected:* parameterising all the N6 constants up front — unnecessary for the first chain, and it can wait until a second **anchor** (Phase 2) actually needs its own DN.
+
+**D4 — Extend the flow description with a destination prefix.** `FlowFilter`'s `to_flow_description`/`from_flow_description` use a **self-invented** `proto=..;ports=..` format, not IPFilterRule — so there is no wire compatibility to preserve and adding `dst=10.60.0.0/16` is a purely local change to those two functions plus `matches`. `transport_key` must also stop discarding the addresses it already parses. (A real UPF parses IPFilterRule; that stays a known simplification.)
+
+**D5 — Multi-peer N4 is an `N4Peer` refactor, not a parameter.** Each association needs its own socket, sequence space and pending-transaction map (two UPFs' sequence numbers would otherwise collide in one map). `SmfState` becomes `{ peers: HashMap<UpfId, Arc<N4Peer>>, .. }` with `cp_seid`/IP pools staying SMF-scoped; `transact` takes the peer. This is the single largest mechanical change and is why it is its own phase.
+
+**D6 — An SM context can already hold two N4 sessions.** `SmContext.indirect_fwd: Option<u64>` is precedent — one context owning a second UP-SEID. The chain generalises that to a per-node list rather than inventing a new model.
+
+## 3. Phases
+
+**Phase 1a — N9 datapath foundation. Size M. LANDED.**
+UPF honours `CreateFar` Outer Header Creation at establishment; `Session` gains an explicit uplink `Egress`; `n6::uplink` gains `ToN9`; `serve_n3` re-encapsulates to the peer; a PFCP builder for an I-UPF-shaped session (uplink PDR with a CHOOSE N3 F-TEID → FAR with OHC toward a peer). **Exit:** unit tests drive a `UpfState` that forwards uplink to an N9 peer instead of N6, and indirect forwarding's FAR is honoured for the first time. No second process needed.
+  - **Landed:** `pfcp` — `Egress { ToN6, ToPeer { teid, addr } }`; `Session.uplink` seeded in `establish`; **`handle_n4` now parses `CreateFar` → forwarding parameters → Outer Header Creation on the uplink FAR** (`UPLINK_FAR_ID`), closing the gap that made establishment-time FARs inert; `uplink_egress_for_teid`; `session_establishment_request_via_peer` (the I-UPF shape: CHOOSE N3 ingress + uplink FAR with OHC toward the next UPF, downlink PDR unchanged so the gNB target still lands via Session Modification). `n6` — `Uplink::ToN9 { teid, peer, pkt }`, chosen after the spoof and AMBR checks so the chain's first hop keeps both. `nf-upf` — a `ToN9` arm re-encapsulating on the **same** GTP-U socket. **Tests:** pfcp 21 (an anchor egresses `ToN6`, an I-UPF egresses `ToPeer`, unknown TEID `None`), n6 15 (uplink forwards over N9; anti-spoofing still applies); workspace `--exclude bdd` 45 bins; **full `cargo test -p bdd` = 33 scenarios / 369 steps GREEN and unchanged** — existing anchor sessions still egress to N6, so the datapath tiers are untouched; clippy no net-new.
+
+**Phase 1b — multi-peer N4 + a real chain. Size L. Datapath half LANDED; SMF half open.**
+`N4Peer` refactor; SMF establishes PSA-then-I-UPF (the PSA's N9 F-TEID must exist before the I-UPF's FAR can point at it) and hands the gNB the *I-UPF's* N3 F-TEID; a second `nf-upf` process in BDD. **Exit:** a packet traverses gNB → I-UPF → N9 → PSA → N6 and the reply returns.
+
+  - **Landed — the chained-session datapath model (both directions).** The problem 1a didn't have to solve: an intermediate UPF needs **two** ingress TEIDs — uplink from the gNB, and downlink arriving *back* from the anchor over N9 — but `Session` had a single `n3_teid`. Now: `Session.dl_ingress_teid`; `establish` allocates a second TEID when asked; the establishment handler detects the request (downlink PDR carrying an F-TEID rather than a UE address) and **reports both Created PDRs**; `parse_session_establishment_response` returns `dl_ingress` keyed by PDR id (it previously took the first Created PDR blindly); `downlink_via_n9_ingress` resolves that TEID to the gNB target. `n6::uplink` checks the downlink ingress **first** — *direction is decided by which ingress the TEID belongs to, not by inspecting the packet* — so `Uplink::ToN9` became direction-neutral **`Uplink::Forward { teid, peer, pkt }`**, covering uplink→N9 and downlink→N3 with one outcome since they are mechanically identical (re-encapsulate to a peer).
+  - **Design correction found by a failing test:** moving the I-UPF's downlink PDI to an F-TEID removed the UE address it used to carry, silently disabling **anti-spoofing at the chain's first hop** — the node closest to the RAN, which is exactly where it belongs. Fixed by carrying the UE address on the I-UPF's *uplink* PDI instead (an anchor keeps it on the downlink one). PFCP allows both on a PDI; the spoof test caught it.
+  - **Tests:** pfcp 21, n6 16 — a chained session forwards uplink on to the anchor *and* forwards the anchor's downlink on to the gNB, with the two ingresses distinct and spoofing still rejected at the edge; workspace `--exclude bdd` 45 bins; **full bdd 33 scenarios / 369 steps GREEN and unchanged**; clippy no net-new.
+  - **Still open in 1b:** the `N4Peer` multi-peer refactor (per-peer socket/seq/pending — two UPFs' sequence numbers would collide in one map; 9 `transact` call sites + 2 raw sends), the SMF's PSA-then-I-UPF orchestration, a second `nf-upf` process in BDD, and the e2e chained packet. Everything the *UPF* needs is now in place; what remains is entirely control-plane.
+
+**Phase 2 — the branching classifier. Size L.**
+Destination-prefix SDF filters; a classifier PDR at precedence 50 pointing at a *second* FAR; `admit`/`classify` returns the chosen egress; a second PSA with its own N6. **Exit:** two destinations, two anchors, one PDU session.
+
+**Phase 3 — UP topology + dynamic insertion. Size L.**
+Config-driven `upNodes`/`links`, SMF-side path selection, ULCL inserted/removed mid-session.
+
+## 4. Risks & open questions
+
+- **The pivot question stands.** design/130 asked whether multi-UPF is worth it before a second-UPF deployment story exists. Phases 1a/1b answer it cheaply — 1a is unit-tested with no new process, and 1b's second UPF is env-vars-only. If the chain proves unmotivated, stopping after 1a still leaves a repaired indirect-forwarding path and an explicit egress model.
+- **Two `nf-upf` processes collide on the BDD log path** (`/tmp/{tag}_{nf}.log` is keyed on NF name) and on the readiness probe (`host_iface_exists("n6upf0")`). Both need an instance suffix; an I-UPF with no TUN also has no interface to wait on, so it needs a different readiness signal.
+- **MTU.** Double GTP-U encapsulation on the chain eats headroom the current `N6_MTU = 1400` was sized for; a chained session wants a lower UE MTU.
+- **`session_modification_request` ignores `far_id`** — the UPF takes the *first* Update FAR with forwarding params. A chain that updates the uplink and downlink FARs in one message would be mis-applied. Small, real, fix it in 1b.
+- **Outer Header Removal is not modelled** (radian decapsulates implicitly in `gtpu::parse`). Cosmetic until a real UPF interop.
+
+## 5. Sources
+
+- `nf-smf/src/pdu_session.rs` (`SmfState`, `connect`, `transact`, `SmContext`), `crates/pfcp/src/lib.rs` (`session_establishment_request`, `..._indirect_forwarding`, `session_modification_request`, `FlowFilter`/`transport_key`, `handle_n4`), `crates/n6/src/lib.rs` (`uplink`/`downlink`), `nf-upf/src/main.rs` (`serve_n3`, `serve_n6_downlink`, N6 consts), `bdd/tests/cucumber.rs` (`start_core`, the loopback-alias trick from [124](124-bdd-scripted-datapath.md)).
+- rs-pfcp 0.3.1: `PdiBuilder::builder(SourceInterface)` + `.f_teid()` (a Core-source PDI with an F-TEID — the PSA's N9 ingress), `OuterHeaderCreation::gtpu_ipv6`, `outer_header_removal` (unused).
+- TS 23.501 §5.6.4, TS 29.244. Gap origin: [130](130-free5gc-functionality-gap.md) §2.2/2.3/4. Related: [84](84-indirect-data-forwarding.md) (whose FAR this repairs).
