@@ -1010,6 +1010,10 @@ async fn create_sm_context(
             charging,
         },
     );
+    // An AF influence already in this session's policy — a group / any-UE influence the
+    // PCF read from the UDR — applies from the start: splice its breakout now, before the
+    // session ever carries traffic (design/135 Phase 3).
+    reconcile_influence_breakout(&smf, &sm_ref).await;
     // Record this SMF as the serving SMF for the session (Nudm_UECM). Best-effort,
     // off the establishment path — the session is up regardless.
     spawn_uecm_register(
@@ -2076,12 +2080,75 @@ async fn handle_dl_data_report(smf: &Arc<SmfState>, cp_seid: u64, seq: u32) {
 /// best-effort). Returns `200` + the (possibly changed) decision; `204` when the
 /// session used the sm-data fallback (no PCF association); `404` for an unknown
 /// context.
+///
+/// Bring the session's live ULCL breakout into line with the **AF influence** its SM
+/// policy carries (design/135). A traffic-control decision naming a route (prefix → DNAI)
+/// means the session should have a breakout; its absence means it should not. Run both at
+/// **establishment** (so a group / any-UE influence already in the policy applies to a new
+/// session, Phase 3) and on every **policy refresh** (so an influence arriving mid-session
+/// applies to a live one, Phase 2).
+///
+/// Two things are deliberately left alone: a session whose DNN owns a *static* topology
+/// route (that breakout is config-owned), and a breakout installed **directly** (OAM, or a
+/// NEF with no PCF) — such a breakout is not expressed in the policy, so its absence there
+/// says nothing about it. `policy_breakout` records which breakouts policy owns.
+async fn reconcile_influence_breakout(smf: &Arc<SmfState>, sm_ref: &str) {
+    let snapshot = {
+        let ctxs = smf.contexts.lock().unwrap();
+        ctxs.get(sm_ref).map(|c| {
+            (
+                c.chain,
+                c.path.clone(),
+                c.dnn.clone(),
+                c.ue_ip,
+                c.ue_ipv6,
+                c.policy_breakout,
+                c.policy.influence_route(),
+            )
+        })
+    };
+    let Some((chain, path, dnn, ue_ip, ue_ipv6, policy_breakout, desired)) = snapshot else {
+        return;
+    };
+    // A breakout needs a classifier — the session's intermediate UPF.
+    let (Some(leg), Some(iupf)) = (chain, path.intermediate.as_deref()) else { return };
+    if smf.dnn_has_config_route(&dnn) {
+        return;
+    }
+    match (desired, leg.breakout_seid.is_some()) {
+        (Some((prefix, dnai)), false) => match smf.node_for_dnai(&dnai) {
+            Some(via) => {
+                let ue = pfcp::UeAddr { v4: ue_ip, v6: ue_ipv6.map(|(p, _)| p) };
+                let r = insert_breakout(smf, sm_ref, &leg, iupf, ue, &dnn, &prefix, &via).await;
+                // Remember that *policy* owns this breakout, so a later refresh that sees
+                // no influence may withdraw it.
+                if r.status().is_success()
+                    && let Some(c) = smf.contexts.lock().unwrap().get_mut(sm_ref)
+                {
+                    c.policy_breakout = true;
+                }
+                tracing::info!(%sm_ref, %prefix, %dnai, status = ?r.status(), "AF-influenced breakout inserted from SM policy");
+            }
+            None => tracing::warn!(%sm_ref, %dnai, "AF influence names a DNAI with no UP node"),
+        },
+        (None, true) if policy_breakout => {
+            let r = remove_breakout(smf, sm_ref, &leg, iupf, &path).await;
+            if r.status().is_success()
+                && let Some(c) = smf.contexts.lock().unwrap().get_mut(sm_ref)
+            {
+                c.policy_breakout = false;
+            }
+            tracing::info!(%sm_ref, status = ?r.status(), "AF-influenced breakout withdrawn from SM policy");
+        }
+        _ => {} // already in the desired state, or a directly-installed breakout
+    }
+}
+
 async fn refresh_sm_policy(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<axum::response::Response, SbiProblem> {
-    #[allow(clippy::type_complexity)]
-    let (sm_policy, up_seid, old_policy, supi, psi, anchor, chain, path, dnn, ue_ip, ue_ipv6, policy_breakout) = {
+    let (sm_policy, up_seid, old_policy, supi, psi, anchor) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
             Some(c) => (
@@ -2091,12 +2158,6 @@ async fn refresh_sm_policy(
                 c.supi.clone(),
                 c.pdu_session_id,
                 c.path.anchor.clone(),
-                c.chain,
-                c.path.clone(),
-                c.dnn.clone(),
-                c.ue_ip,
-                c.ue_ipv6,
-                c.policy_breakout,
             ),
             None => {
                 return Err(problem(
@@ -2179,43 +2240,7 @@ async fn refresh_sm_policy(
     // should have a live ULCL breakout; its absence means it should not. Only for a
     // chained session whose breakout is *not* config-driven (a static topology route owns
     // its own breakout — policy must not disturb it).
-    let config_route = smf.dnn_has_config_route(&dnn);
-    if let (Some(leg), Some(iupf)) = (chain, path.intermediate.as_deref())
-        && !config_route
-    {
-        let desired = decision.influence_route();
-        let active = leg.breakout_seid.is_some();
-        match (desired, active) {
-            (Some((prefix, dnai)), false) => match smf.node_for_dnai(&dnai) {
-                Some(via) => {
-                    let ue = pfcp::UeAddr { v4: ue_ip, v6: ue_ipv6.map(|(p, _)| p) };
-                    let r = insert_breakout(&smf, &sm_ref, &leg, iupf, ue, &dnn, &prefix, &via).await;
-                    // Remember that *policy* owns this breakout, so a later refresh that
-                    // sees no influence may withdraw it.
-                    if r.status().is_success()
-                        && let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref)
-                    {
-                        c.policy_breakout = true;
-                    }
-                    tracing::info!(%sm_ref, %prefix, %dnai, status = ?r.status(), "AF-influenced breakout inserted from SM policy");
-                }
-                None => tracing::warn!(%sm_ref, %dnai, "AF influence names a DNAI with no UP node"),
-            },
-            // Withdraw only a breakout policy installed: one inserted directly (OAM, or a
-            // NEF with no PCF) is not expressed in the policy, so its absence there means
-            // nothing about it.
-            (None, true) if policy_breakout => {
-                let r = remove_breakout(&smf, &sm_ref, &leg, iupf, &path).await;
-                if r.status().is_success()
-                    && let Some(c) = smf.contexts.lock().unwrap().get_mut(&sm_ref)
-                {
-                    c.policy_breakout = false;
-                }
-                tracing::info!(%sm_ref, status = ?r.status(), "AF-influenced breakout withdrawn from SM policy");
-            }
-            _ => {} // already in the desired state, or a directly-installed breakout
-        }
-    }
+    reconcile_influence_breakout(&smf, &sm_ref).await;
     // Signal the change to the RAN/UE via the serving AMF (Namf_Communication →
     // N2 PDU Session Resource Modify + N1 PDU Session Modification Command).
     // Best-effort, off the response path — only when the QoS actually changed.
@@ -3503,6 +3528,134 @@ mod tests {
         assert_eq!(edge.lock().unwrap().session_count(), 0, "the breakout is withdrawn");
         assert!(iupf.lock().unwrap().branches_for_teid(ran_teid).is_empty(), "the branch is gone");
         assert_eq!(anchor.lock().unwrap().session_count(), 1, "the default anchor is untouched");
+    }
+
+    /// design/135 Phase 3: a **group / any-UE** influence. The AF's request names no single
+    /// session, so the NEF stores it in the UDR as application influence data; the PCF reads
+    /// it when it authorizes a policy, and the SMF applies it **at establishment** — so a
+    /// session created *after* the AF made its request is born with the breakout in place.
+    #[tokio::test]
+    async fn a_group_influence_applies_to_a_new_session_at_establishment() {
+        let (anchor_ip, iupf_ip, edge_ip) = (
+            Ipv4Addr::new(127, 0, 0, 2),
+            Ipv4Addr::new(127, 0, 0, 3),
+            Ipv4Addr::new(127, 0, 0, 4),
+        );
+        let (anchor, anchor_n4) = spin_upf(anchor_ip).await;
+        let (iupf, iupf_n4) = spin_upf(iupf_ip).await;
+        let (edge, edge_n4) = spin_upf(edge_ip).await;
+
+        let (nrf_base, udr_base) =
+            spin_subscription_backend("imsi-999700000000001", "99970").await;
+        let udr = sbi_core::nudr::UdrClient::new(udr_base.clone());
+        udr.put_sm_policy_data(
+            "imsi-999700000000001",
+            &serde_json::json!({ "default": {
+                "sessRules": { "rule-1": { "authSessAmbr": { "uplink": "200 Mbps", "downlink": "400 Mbps" } } },
+                "pccRules": { "pcc-1": { "refQosData": "qos-1" } },
+                "qosDecs": { "qos-1": { "qfi": 1, "fiveQi": 9 } }
+            } }),
+        )
+        .await
+        .unwrap();
+        let _pcf = spin_pcf(&nrf_base, Some(&udr_base)).await;
+        let _amf = spin_mock_amf(&nrf_base).await;
+        let pcf_base = discover_endpoint(&nrf_base, "PCF").await.expect("PCF discoverable");
+
+        let topo = crate::topology::Topology::parse(&format!(
+            r#"{{
+                "upNodes": {{
+                    "gNB":    {{ "type": "AN" }},
+                    "iupf":   {{ "type": "UPF", "n4": "{iupf_n4}" }},
+                    "anchor": {{ "type": "UPF", "n4": "{anchor_n4}", "dnns": ["internet"] }},
+                    "edge":   {{ "type": "UPF", "n4": "{edge_n4}", "dnai": "mec" }}
+                }},
+                "links": [
+                    {{ "a": "gNB", "b": "iupf" }},
+                    {{ "a": "iupf", "b": "anchor" }},
+                    {{ "a": "iupf", "b": "edge" }}
+                ]
+            }}"#
+        ))
+        .unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        let smf = Arc::new(
+            SmfState::connect_with_topology(topo, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+                .await
+                .unwrap()
+                .with_callback_base(format!("http://{smf_addr}")),
+        );
+        smf.associate().await.unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        let nef = sbi_core::nnef::NefState::with_smf_base(format!("http://{smf_addr}"))
+            .with_pcf_base(pcf_base)
+            .with_udr_base(udr_base.clone());
+        let nef_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nef_addr = nef_l.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(nef_l, sbi_core::nnef::router(nef)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        // The AF influences **any UE** on "internet" — BEFORE any session exists.
+        let sub = client
+            .post(format!("http://{nef_addr}/3gpp-traffic-influence/v1/app1/subscriptions"))
+            .json(&serde_json::json!({
+                "anyUeInd": true, "dnn": "internet",
+                "prefix": "10.99.0.0/16",
+                "trafficRoutes": [{ "dnai": "mec" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sub.status().as_u16(), 201, "group influence stored");
+        let self_link = sub.headers().get("location").unwrap().to_str().unwrap().to_string();
+        assert_eq!(
+            udr.list_influence_data().await.unwrap().len(),
+            1,
+            "the influence lives in the UDR, not on a session"
+        );
+
+        // Now a session is established — it must be born with the breakout.
+        let base = format!("http://{smf_addr}");
+        let created: SmContextCreatedData = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ran_teid = u32::from_str_radix(&created.up_n3_teid, 16).unwrap();
+        assert_eq!(
+            edge.lock().unwrap().session_count(),
+            1,
+            "the new session is established with the group influence's breakout"
+        );
+        assert_eq!(
+            iupf.lock().unwrap().branches_for_teid(ran_teid).len(),
+            1,
+            "its classifier already steers the influenced prefix"
+        );
+        assert_eq!(anchor.lock().unwrap().session_count(), 1, "and still has its default anchor");
+
+        // Withdrawing the AF subscription drops the UDR influence data.
+        let del = client
+            .delete(format!("http://{nef_addr}{self_link}"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(del.as_u16(), 204, "AF subscription deleted");
+        assert!(
+            udr.list_influence_data().await.unwrap().is_empty(),
+            "the influence is gone from the UDR, so later sessions are unaffected"
+        );
     }
 
     /// The **uplink classifier** (design/134 Phase 2): one PDU session, one UE address,

@@ -151,6 +151,14 @@ pub fn router_with_udm(store: Arc<dyn SubscriberStore>, udm_base: Option<String>
             "/nudr-dr/v2/policy-data/ues/{ue_id}/am-data",
             get(get_am_policy_data).put(put_am_policy_data),
         )
+        // Application influence data (TS 29.519 application-data) — an AF traffic
+        // influence for a *group of UEs / any UE*, keyed by influence id rather than by
+        // subscriber, and applied by the PCF to matching sessions (design/135 Phase 3).
+        .route("/nudr-dr/v2/application-data/influenceData", get(list_influence_data))
+        .route(
+            "/nudr-dr/v2/application-data/influenceData/{influence_id}",
+            axum::routing::put(put_influence_data).delete(delete_influence_data),
+        )
         .with_state(state);
     // SBI security (design/46): the UDR holds subscriber data + the withdrawal that
     // can trigger the AMF callback, so it is the first service protected. The
@@ -458,6 +466,39 @@ async fn put_sm_policy_data(
     put_doc(st.store, DataSet::Policy, ue_id, String::new(), doc).await
 }
 
+/// Application influence-data handlers (TS 29.519 application-data, design/135 Phase 3).
+/// Keyed by influence id, not by subscriber: one document can target a UE group or *any*
+/// UE, so the PCF scans them all and matches on DNN/slice.
+async fn put_influence_data(
+    State(st): State<NudrState>,
+    Path(influence_id): Path<String>,
+    Json(doc): Json<serde_json::Value>,
+) -> StatusCode {
+    match st.store.put_influence_data(&influence_id, &doc) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::warn!(%influence_id, "influence-data store failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn delete_influence_data(
+    State(st): State<NudrState>,
+    Path(influence_id): Path<String>,
+) -> StatusCode {
+    // Idempotent: deleting an absent influence is still "gone".
+    st.store.remove_influence_data(&influence_id);
+    StatusCode::NO_CONTENT
+}
+
+/// Every influence-data document, as `{influenceId: document}`.
+async fn list_influence_data(State(st): State<NudrState>) -> Json<serde_json::Value> {
+    let map: serde_json::Map<String, serde_json::Value> =
+        st.store.list_influence_data().into_iter().collect();
+    Json(serde_json::Value::Object(map))
+}
+
 /// AM policy-data handlers (TS 29.519 am-data) — keyed by ueId only, so these
 /// read/write `DataSet::AmPolicy` under an empty PLMN key.
 async fn get_am_policy_data(
@@ -623,6 +664,52 @@ impl UdrClient {
 
     fn policy_data_url(&self, supi: &str) -> String {
         format!("{}/nudr-dr/v2/policy-data/ues/{}/sm-data", self.base, supi)
+    }
+
+    /// Store an **application influence-data** document (TS 29.519 application-data) — an
+    /// AF traffic influence for a UE group / any UE (design/135 Phase 3). Written by the
+    /// NEF, read by the PCF.
+    pub async fn put_influence_data(
+        &self,
+        influence_id: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), SbiError> {
+        self.bearer(self.http.put(self.influence_url(influence_id)).json(doc))
+            .await
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Delete an influence-data document (idempotent).
+    pub async fn delete_influence_data(&self, influence_id: &str) -> Result<(), SbiError> {
+        self.bearer(self.http.delete(self.influence_url(influence_id)))
+            .await
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Every influence-data document as `(influenceId, document)`.
+    pub async fn list_influence_data(
+        &self,
+    ) -> Result<Vec<(String, serde_json::Value)>, SbiError> {
+        let url = format!("{}/nudr-dr/v2/application-data/influenceData", self.base);
+        let map: serde_json::Map<String, serde_json::Value> = self
+            .bearer(self.http.get(url))
+            .await
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(map.into_iter().collect())
+    }
+
+    fn influence_url(&self, influence_id: &str) -> String {
+        format!("{}/nudr-dr/v2/application-data/influenceData/{}", self.base, influence_id)
     }
 
     /// Fetch the subscriber's **AM** policy data (TS 29.519 `policy-data/ues/{ueId}/

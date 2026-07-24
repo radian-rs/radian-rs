@@ -20,6 +20,9 @@ const SMF_ENV: &str = "RADIAN_NEF_SMF";
 /// Authorize influences through this PCF instead of discovering one. Set to `none` to
 /// force the PCF-less path (drive the SMF directly, design/135 Phase 1).
 const PCF_ENV: &str = "RADIAN_NEF_PCF";
+/// Store group / any-UE influences at this UDR instead of discovering one (design/135
+/// Phase 3).
+const UDR_ENV: &str = "RADIAN_NEF_UDR";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,6 +64,13 @@ async fn main() -> anyhow::Result<()> {
             state = state.with_pcf_base(pcf);
         }
         Err(_) => {}
+    }
+    // A group / any-UE influence is stored as UDR application influence data, so every PCF
+    // applies it — including to sessions established later (design/135 Phase 3).
+    if let Ok(udr) = std::env::var(UDR_ENV) {
+        let udr = sbi_core::sbi_base(udr);
+        info!(%udr, "group influences stored as UDR influence data");
+        state = state.with_udr_base(udr);
     }
 
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;

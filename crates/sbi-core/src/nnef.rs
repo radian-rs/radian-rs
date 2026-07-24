@@ -46,6 +46,17 @@ pub struct TrafficInfluSub {
     /// description — the same value the SMF's classifier ultimately matches on.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Apply to **any** UE (TS 29.522 `anyUeInd`) — a group influence, stored in the UDR
+    /// rather than authorized per session (design/135 Phase 3).
+    #[serde(default)]
+    pub any_ue_ind: bool,
+    /// An external group identifier — the group form of the same thing. Membership is
+    /// carried by `supis` here; a real deployment resolves it at the UDM/UDR.
+    #[serde(default)]
+    pub external_group_id: Option<String>,
+    /// The SUPIs a group influence covers.
+    #[serde(default)]
+    pub supis: Vec<String>,
 }
 
 /// One IP flow filter: a set of IPFilterRule `flowDescriptions`.
@@ -71,14 +82,33 @@ struct SubCreated {
     self_link: String,
 }
 
+/// How a subscription was applied — which decides how a delete withdraws it.
+#[derive(Debug, Clone)]
+enum Applied {
+    /// Authorized at the PCF as an app-session (design/135 Phase 2b).
+    Pcf(String),
+    /// Applied straight at the SMF's breakout trigger — no PCF deployed (Phase 1).
+    Smf,
+    /// Stored in the UDR as group / any-UE influence data (Phase 3).
+    Udr(String),
+}
+
+impl Applied {
+    fn label(&self) -> &'static str {
+        match self {
+            Applied::Pcf(_) => "pcf",
+            Applied::Smf => "smf-direct",
+            Applied::Udr(_) => "udr-influence-data",
+        }
+    }
+}
+
 /// What a live subscription steers, remembered so a delete can reverse it — and *how* it
 /// was applied, since that decides how it is withdrawn.
 struct Subscription {
     supi: String,
     dnn: Option<String>,
-    /// The PCF app-session backing this subscription, when the request went through the
-    /// PCF (design/135 Phase 2b). `None` ⇒ it was applied straight at the SMF (Phase 1).
-    app_session: Option<String>,
+    applied: Applied,
 }
 
 /// NEF runtime: how to reach the PCF/SMF, plus the live subscriptions.
@@ -93,6 +123,10 @@ pub struct NefState {
     /// the SM policy and composes with QoS. Without a PCF the NEF falls back to driving
     /// the SMF directly (Phase 1).
     pcf_base: Option<String>,
+    /// An explicit UDR base URL. A **group / any-UE** influence is stored there as
+    /// application influence data (design/135 Phase 3) rather than authorized per session,
+    /// so every PCF picks it up — including for sessions established later.
+    udr_base: Option<String>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -119,6 +153,12 @@ impl NefState {
         self
     }
 
+    /// Store group / any-UE influences at an explicit UDR (design/135 Phase 3).
+    pub fn with_udr_base(mut self, udr_base: impl Into<String>) -> Self {
+        self.udr_base = Some(udr_base.into());
+        self
+    }
+
     fn build(
         nrf_base: Option<String>,
         smf_base: Option<String>,
@@ -128,6 +168,7 @@ impl NefState {
             nrf_base,
             smf_base,
             pcf_base,
+            udr_base: None,
             inner: Arc::new(Mutex::new(Inner {
                 next_id: AtomicU64::new(1),
                 subs: HashMap::new(),
@@ -146,6 +187,11 @@ impl NefState {
         self.peer_base(self.pcf_base.as_ref(), "PCF").await
     }
 
+    /// The UDR base URL — the explicit override, else NRF discovery.
+    async fn udr_base(&self) -> Option<String> {
+        self.peer_base(self.udr_base.as_ref(), "UDR").await
+    }
+
     async fn peer_base(&self, explicit: Option<&String>, nf_type: &str) -> Option<String> {
         if let Some(base) = explicit {
             return Some(base.clone());
@@ -160,11 +206,11 @@ impl NefState {
             .service_base()
     }
 
-    fn record(&self, supi: String, dnn: Option<String>, app_session: Option<String>) -> String {
+    fn record(&self, supi: String, dnn: Option<String>, applied: Applied) -> String {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
         let sub_id = format!("sub-{id}");
-        inner.subs.insert(sub_id.clone(), Subscription { supi, dnn, app_session });
+        inner.subs.insert(sub_id.clone(), Subscription { supi, dnn, applied });
         sub_id
     }
 
@@ -222,9 +268,6 @@ async fn create_subscription(
     Path(af_id): Path<String>,
     Json(sub): Json<TrafficInfluSub>,
 ) -> axum::response::Response {
-    let Some(supi) = sub.supi.clone().or_else(|| sub.gpsi.clone()) else {
-        return (StatusCode::BAD_REQUEST, "no UE identity (supi/gpsi)").into_response();
-    };
     let Some(prefix) = steer_prefix(&sub) else {
         return (StatusCode::BAD_REQUEST, "no traffic prefix (prefix or a filter destination)")
             .into_response();
@@ -232,24 +275,42 @@ async fn create_subscription(
     let Some(dnai) = sub.traffic_routes.first().map(|r| r.dnai.clone()) else {
         return (StatusCode::BAD_REQUEST, "no trafficRoutes[].dnai").into_response();
     };
-    // With a PCF deployed, authorize the influence **through it** (Npcf_PolicyAuthorization):
-    // the route then lands in the session's SM policy and composes with QoS, and the PCF
-    // notifies the SMF to re-authorize (design/135 Phase 2b). Without one, drive the SMF's
-    // breakout trigger directly (Phase 1). Either way the NEF passes the DNAI through —
-    // the SMF resolves it to a UP node via its topology (§D2).
-    let applied = match nef.pcf_base().await {
-        Some(pcf) => authorize_at_pcf(&pcf, &supi, sub.dnn.as_deref(), &prefix, &dnai).await,
-        None => match nef.smf_base().await {
-            Some(smf) => steer_at_smf(&smf, &supi, sub.dnn.as_deref(), &prefix, &dnai).await,
-            None => Err("no PCF or SMF discovered".to_string()),
-        },
+    let single_ue = sub.supi.clone().or_else(|| sub.gpsi.clone());
+    let group = sub.any_ue_ind || sub.external_group_id.is_some();
+
+    // A **group / any-UE** influence isn't tied to one live session, so it is stored in the
+    // UDR as application influence data (design/135 Phase 3): every PCF reads it when it
+    // authorizes a session, so it applies to sessions established later too. A **single-UE**
+    // influence targets a session that already exists, so it is authorized at the PCF
+    // (Phase 2b) or, with no PCF, applied straight at the SMF (Phase 1). Either way the NEF
+    // passes the DNAI through — the SMF resolves it to a UP node via its topology (§D2).
+    let applied = if group {
+        match nef.udr_base().await {
+            Some(udr) => store_group_influence(&udr, &sub, &prefix, &dnai).await,
+            None => Err("no UDR discovered for a group influence".to_string()),
+        }
+    } else {
+        let Some(supi) = single_ue.clone() else {
+            return (StatusCode::BAD_REQUEST, "no UE identity (supi/gpsi/anyUeInd/group)")
+                .into_response();
+        };
+        match nef.pcf_base().await {
+            Some(pcf) => authorize_at_pcf(&pcf, &supi, sub.dnn.as_deref(), &prefix, &dnai)
+                .await
+                .map(Applied::Pcf),
+            None => match nef.smf_base().await {
+                Some(smf) => steer_at_smf(&smf, &supi, sub.dnn.as_deref(), &prefix, &dnai)
+                    .await
+                    .map(|()| Applied::Smf),
+                None => Err("no PCF or SMF discovered".to_string()),
+            },
+        }
     };
     match applied {
-        Ok(app_session) => {
-            let via_pcf = app_session.is_some();
-            let sub_id = nef.record(supi, sub.dnn.clone(), app_session);
+        Ok(applied) => {
+            let sub_id = nef.record(single_ue.unwrap_or_default(), sub.dnn.clone(), applied.clone());
             let self_link = format!("/3gpp-traffic-influence/v1/{af_id}/subscriptions/{sub_id}");
-            tracing::info!(%af_id, %sub_id, %prefix, %dnai, via_pcf, "AF traffic influence authorized");
+            tracing::info!(%af_id, %sub_id, %prefix, %dnai, how = applied.label(), "AF traffic influence authorized");
             (
                 StatusCode::CREATED,
                 [(header::LOCATION, self_link.clone())],
@@ -261,6 +322,35 @@ async fn create_subscription(
     }
 }
 
+/// Store a group / any-UE influence in the UDR as application influence data.
+async fn store_group_influence(
+    udr: &str,
+    sub: &TrafficInfluSub,
+    prefix: &str,
+    dnai: &str,
+) -> Result<Applied, String> {
+    // A stable id derived from the AF's target, so re-submitting replaces rather than
+    // duplicating (the UDR document is keyed by influence id).
+    let influence_id = format!(
+        "{}-{}",
+        sub.external_group_id.as_deref().unwrap_or("any-ue"),
+        prefix.replace(['.', '/', ':'], "_")
+    );
+    let doc = serde_json::json!({
+        "dnn": sub.dnn,
+        "anyUeInd": sub.any_ue_ind,
+        "supis": sub.supis,
+        "externalGroupId": sub.external_group_id,
+        "routeToLocs": [{ "dnai": dnai }],
+        "trafficPrefix": prefix,
+    });
+    crate::nudr::UdrClient::new(udr.to_string())
+        .put_influence_data(&influence_id, &doc)
+        .await
+        .map_err(|e| format!("UDR influence-data store failed: {e}"))?;
+    Ok(Applied::Udr(influence_id))
+}
+
 /// Authorize the influence at the PCF as an application session; returns its id.
 async fn authorize_at_pcf(
     pcf: &str,
@@ -268,7 +358,7 @@ async fn authorize_at_pcf(
     dnn: Option<&str>,
     prefix: &str,
     dnai: &str,
-) -> Result<Option<String>, String> {
+) -> Result<String, String> {
     let body = serde_json::json!({ "ascReqData": {
         "supi": supi,
         "dnn": dnn,
@@ -292,7 +382,7 @@ async fn authorize_at_pcf(
         .and_then(|loc| loc.rsplit('/').next())
         .unwrap_or_default()
         .to_string();
-    Ok(Some(id))
+    Ok(id)
 }
 
 /// Drive the SMF's breakout trigger directly (no PCF deployed).
@@ -302,10 +392,10 @@ async fn steer_at_smf(
     dnn: Option<&str>,
     prefix: &str,
     dnai: &str,
-) -> Result<Option<String>, String> {
+) -> Result<(), String> {
     let body = serde_json::json!({ "supi": supi, "dnn": dnn, "prefix": prefix, "dnai": dnai });
     match crate::sbi_client().post(format!("{smf}/oam/v1/breakout")).json(&body).send().await {
-        Ok(r) if r.status().is_success() => Ok(None),
+        Ok(r) if r.status().is_success() => Ok(()),
         Ok(r) => Err(format!("SMF refused the breakout: {}", r.status())),
         Err(e) => Err(format!("SMF unreachable: {e}")),
     }
@@ -320,13 +410,24 @@ async fn delete_subscription(
         return StatusCode::NO_CONTENT.into_response();
     };
     // Withdraw the way it was authorized: delete the PCF app-session (the PCF drops the
-    // route from the policy and re-authorizes the SMF), else remove at the SMF directly.
-    match (&sub.app_session, nef.pcf_base().await) {
-        (Some(app_session), Some(pcf)) => {
+    // route from the policy and re-authorizes the SMF), delete the UDR influence data (a
+    // group influence — it then no longer applies to sessions authorized after this), or
+    // remove at the SMF directly.
+    match &sub.applied {
+        Applied::Pcf(app_session) => {
+            let Some(pcf) = nef.pcf_base().await else {
+                return (StatusCode::BAD_GATEWAY, "no PCF discovered").into_response();
+            };
             let url = format!("{pcf}/npcf-policyauthorization/v1/app-sessions/{app_session}");
             let _ = crate::sbi_client().delete(url).send().await;
         }
-        _ => {
+        Applied::Udr(influence_id) => {
+            let Some(udr) = nef.udr_base().await else {
+                return (StatusCode::BAD_GATEWAY, "no UDR discovered").into_response();
+            };
+            let _ = crate::nudr::UdrClient::new(udr).delete_influence_data(influence_id).await;
+        }
+        Applied::Smf => {
             let Some(smf) = nef.smf_base().await else {
                 return (StatusCode::BAD_GATEWAY, "no SMF discovered").into_response();
             };
@@ -335,7 +436,7 @@ async fn delete_subscription(
                 crate::sbi_client().post(format!("{smf}/oam/v1/breakout")).json(&body).send().await;
         }
     }
-    tracing::info!(%sub_id, via_pcf = sub.app_session.is_some(), "AF traffic influence withdrawn");
+    tracing::info!(%sub_id, how = sub.applied.label(), "AF traffic influence withdrawn");
     StatusCode::NO_CONTENT.into_response()
 }
 
