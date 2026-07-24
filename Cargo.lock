@@ -1837,6 +1837,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nf-nef"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "common",
+ "sbi-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nf-nrf"
 version = "0.1.0"
 dependencies = [

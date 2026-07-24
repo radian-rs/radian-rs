@@ -24,6 +24,7 @@ members = [
     "nf/nf-pcf",
     "nf/nf-chf",
     "nf/nf-nssf",
+    "nf/nf-nef",
     "ran/gnb",
     "tools/radian-pki",
     "bdd",

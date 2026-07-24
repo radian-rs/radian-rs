@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod nausf;
 pub mod nchf;
+pub mod nnef;
 pub mod nnrf;
 pub mod nnssf;
 pub mod npcf;
