@@ -540,6 +540,16 @@ impl SmfState {
         self.peers.get(name).cloned()
     }
 
+    /// Resolve a **DNAI** to a UP-node name via the topology — how a NEF's AF traffic
+    /// influence picks a breakout anchor (design/135). `None` in env-var (fixed) mode,
+    /// which has no topology to name DNAIs in.
+    fn node_for_dnai(&self, dnai: &str) -> Option<String> {
+        match &self.routing {
+            Routing::Graph(topo) => topo.node_for_dnai(dnai).map(String::from),
+            Routing::Fixed { .. } => None,
+        }
+    }
+
     /// PFCP Association Setup toward every UPF in the topology — required before any
     /// session.
     pub async fn associate(&self) -> anyhow::Result<()> {
@@ -1641,32 +1651,52 @@ const MID_SESSION_BREAKOUT_INDEX: usize = 0;
 #[serde(rename_all = "camelCase")]
 struct BreakoutReq {
     supi: String,
-    pdu_session_id: u8,
+    /// Identify the session by PDU-session id (the OAM/Phase-3e path) …
+    #[serde(default)]
+    pdu_session_id: Option<u8>,
+    /// … or by DNN (the AF/NEF path — an AF targets a DN, not a specific session,
+    /// design/135). At least one selector is required; both narrow the match.
+    #[serde(default)]
+    dnn: Option<String>,
     /// The destination prefix to steer (CIDR). Required on insert, ignored on remove.
     #[serde(default)]
     prefix: Option<String>,
-    /// The breakout anchor's UP-node name. Required on insert, ignored on remove.
+    /// The breakout anchor's UP-node name — or, from a NEF, resolved from `dnai`. Required
+    /// (directly or via `dnai`) on insert, ignored on remove.
     #[serde(default)]
     via: Option<String>,
+    /// A **DNAI** to resolve to a breakout node via the topology (the AF/NEF names a DNAI,
+    /// not a UP node, design/135). Used when `via` is absent.
+    #[serde(default)]
+    dnai: Option<String>,
     /// Remove the breakout instead of inserting one.
     #[serde(default)]
     remove: bool,
 }
 
-/// OAM: insert or remove an **uplink-classifier breakout** on a live PDU session
-/// (design/134 Phase 3e) — the dynamic counterpart to the establishment-time breakout of
-/// Phase 2/3c. The session must be **chained** (its classifier is the intermediate UPF,
-/// the only node that sees uplink before it is committed to an anchor). This OAM trigger
-/// stands in for NEF/AF traffic influence; the N4 mechanism it drives is identical.
+/// OAM / Nnef: insert or remove an **uplink-classifier breakout** on a live PDU session
+/// (design/134 Phase 3e). The session must be **chained** (its classifier is the
+/// intermediate UPF, the only node that sees uplink before it is committed to an anchor).
+/// This is the N4 mechanism behind AF traffic influence (design/135): a NEF resolves an AF
+/// request to `(supi, dnn, prefix, dnai)` and posts it here; the raw OAM caller may address
+/// by `(supi, pduSessionId, prefix, via)` instead.
 async fn oam_breakout(
     State(smf): State<Arc<SmfState>>,
     Json(req): Json<BreakoutReq>,
 ) -> axum::response::Response {
-    // Find the session by (SUPI, PDU-session id) and snapshot what the N4 work needs.
+    if req.pdu_session_id.is_none() && req.dnn.is_none() {
+        return (StatusCode::BAD_REQUEST, "supply pduSessionId or dnn").into_response();
+    }
+    // Find the session by (SUPI [+ PDU-session id] [+ DNN]) — an AF targets a UE on a DNN,
+    // the OAM caller a specific session; either narrows the same scan.
     let found = {
         let ctxs = smf.contexts.lock().unwrap();
         ctxs.iter()
-            .find(|(_, c)| c.supi == req.supi && c.pdu_session_id == req.pdu_session_id)
+            .find(|(_, c)| {
+                c.supi == req.supi
+                    && req.pdu_session_id.is_none_or(|psi| c.pdu_session_id == psi)
+                    && req.dnn.as_deref().is_none_or(|d| c.dnn == d)
+            })
             .map(|(r, c)| {
                 (r.clone(), c.chain, c.dnn.clone(), c.path.clone(), c.ue_ip, c.ue_ipv6)
             })
@@ -1683,8 +1713,10 @@ async fn oam_breakout(
     if req.remove {
         remove_breakout(&smf, &sm_ref, &leg, &iupf, &path).await
     } else {
-        let (Some(prefix), Some(via)) = (req.prefix, req.via) else {
-            return StatusCode::BAD_REQUEST.into_response();
+        // The breakout target: an explicit UP-node name, or a DNAI resolved via the topology.
+        let via = req.via.clone().or_else(|| req.dnai.as_deref().and_then(|d| smf.node_for_dnai(d)));
+        let (Some(prefix), Some(via)) = (req.prefix, via) else {
+            return (StatusCode::BAD_REQUEST, "supply prefix and via/dnai").into_response();
         };
         let ue = pfcp::UeAddr { v4: ue_ip, v6: ue_ipv6.map(|(p, _)| p) };
         insert_breakout(&smf, &sm_ref, &leg, &iupf, ue, &dnn, &prefix, &via).await
@@ -2935,6 +2967,109 @@ mod tests {
             .status();
         assert!(remove.is_success(), "remove failed: {remove}");
         assert_eq!(edge.lock().unwrap().session_count(), 0, "the breakout anchor's session is gone");
+        assert!(iupf.lock().unwrap().branches_for_teid(ran_teid).is_empty(), "the branch is gone");
+        assert_eq!(anchor.lock().unwrap().session_count(), 1, "the default anchor is untouched");
+    }
+
+    /// design/135 Phase 1: the same mid-session breakout, but driven by an **AF traffic
+    /// influence** request through a real NEF. The AF names a **DNAI** (`mec`) and targets
+    /// the UE by **SUPI + DNN** (no pduSessionId); the SMF resolves the DNAI to a node via
+    /// its topology and finds the session, then splices the breakout — end to end.
+    #[tokio::test]
+    async fn af_traffic_influence_through_the_nef_splices_a_breakout() {
+        let (anchor_ip, iupf_ip, edge_ip) = (
+            Ipv4Addr::new(127, 0, 0, 2),
+            Ipv4Addr::new(127, 0, 0, 3),
+            Ipv4Addr::new(127, 0, 0, 4),
+        );
+        let (anchor, anchor_n4) = spin_upf(anchor_ip).await;
+        let (iupf, iupf_n4) = spin_upf(iupf_ip).await;
+        let (edge, edge_n4) = spin_upf(edge_ip).await;
+
+        let (nrf_base, _udr) =
+            spin_subscription_backend("imsi-999700000000001", "99970").await;
+
+        // The breakout anchor `edge` exposes the DNAI "mec"; no route (added mid-session).
+        let topo = crate::topology::Topology::parse(&format!(
+            r#"{{
+                "upNodes": {{
+                    "gNB":    {{ "type": "AN" }},
+                    "iupf":   {{ "type": "UPF", "n4": "{iupf_n4}" }},
+                    "anchor": {{ "type": "UPF", "n4": "{anchor_n4}", "dnns": ["internet"] }},
+                    "edge":   {{ "type": "UPF", "n4": "{edge_n4}", "dnai": "mec" }}
+                }},
+                "links": [
+                    {{ "a": "gNB", "b": "iupf" }},
+                    {{ "a": "iupf", "b": "anchor" }},
+                    {{ "a": "iupf", "b": "edge" }}
+                ]
+            }}"#
+        ))
+        .unwrap();
+
+        let smf = Arc::new(
+            SmfState::connect_with_topology(topo, Ipv4Addr::new(127, 0, 0, 1), nrf_base)
+                .await
+                .unwrap(),
+        );
+        smf.associate().await.unwrap();
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+
+        // A NEF pointed straight at the SMF.
+        let nef = sbi_core::nnef::NefState::with_smf_base(format!("http://{smf_addr}"));
+        let nef_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nef_addr = nef_l.local_addr().unwrap();
+        tokio::spawn(async move { sbi_core::run_on(nef_l, sbi_core::nnef::router(nef)).await.unwrap() });
+
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+        let created: SmContextCreatedData = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 5, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ran_teid = u32::from_str_radix(&created.up_n3_teid, 16).unwrap();
+        assert_eq!(edge.lock().unwrap().session_count(), 0, "no breakout yet");
+
+        // AF POSTs a traffic-influence subscription: UE by SUPI on "internet", steer
+        // 10.99.0.0/16 to the "mec" edge.
+        let sub = client
+            .post(format!("http://{nef_addr}/3gpp-traffic-influence/v1/app1/subscriptions"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "dnn": "internet",
+                "trafficFilters": [{ "flowDescriptions": ["permit out ip from 10.0.0.0/8 to 10.99.0.0/16"] }],
+                "trafficRoutes": [{ "dnai": "mec" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sub.status().as_u16(), 201, "AF subscription created");
+        let self_link = sub.headers().get("location").unwrap().to_str().unwrap().to_string();
+
+        assert_eq!(edge.lock().unwrap().session_count(), 1, "the DNAI-named edge now anchors the breakout");
+        let branches = iupf.lock().unwrap().branches_for_teid(ran_teid);
+        assert_eq!(branches.len(), 1, "the classifier steers the AF-influenced prefix");
+        assert_eq!(branches[0].1, pfcp::Egress::ToPeer { teid: 1, addr: edge_ip });
+
+        // Delete the AF subscription → the breakout is withdrawn.
+        let del = client
+            .delete(format!("http://{nef_addr}{self_link}"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(del.as_u16(), 204, "AF subscription deleted");
+        assert_eq!(edge.lock().unwrap().session_count(), 0, "the breakout is gone");
         assert!(iupf.lock().unwrap().branches_for_teid(ran_teid).is_empty(), "the branch is gone");
         assert_eq!(anchor.lock().unwrap().session_count(), 1, "the default anchor is untouched");
     }

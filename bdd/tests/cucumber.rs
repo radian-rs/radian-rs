@@ -274,6 +274,9 @@ enum UpMode {
     /// The same three UPFs, but the topology carries **no route** — the breakout is added
     /// mid-session over the OAM endpoint (Phase 3e) rather than at establishment.
     BreakoutDeferred,
+    /// Like `BreakoutDeferred`, plus a running **NEF**: the breakout is inserted by an AF
+    /// traffic-influence request through the NEF, not the raw OAM endpoint (design/135).
+    BreakoutViaNef,
 }
 
 impl UpMode {
@@ -284,7 +287,12 @@ impl UpMode {
 
     /// Whether a third UPF (the breakout anchor) is spawned with its own N6 TUN.
     fn has_breakout_anchor(self) -> bool {
-        matches!(self, UpMode::Breakout | UpMode::BreakoutDeferred)
+        matches!(self, UpMode::Breakout | UpMode::BreakoutDeferred | UpMode::BreakoutViaNef)
+    }
+
+    /// Whether the topology declares a static breakout route (vs. inserted mid-session).
+    fn has_static_route(self) -> bool {
+        self == UpMode::Breakout
     }
 }
 
@@ -323,6 +331,13 @@ async fn start_core_breakout(world: &mut World) {
 #[when("I start the radian core with a deferred breakout anchor")]
 async fn start_core_breakout_deferred(world: &mut World) {
     start_core_inner(world, UpMode::BreakoutDeferred).await;
+}
+
+/// design/135: the same, plus a NEF — the breakout is driven by an AF traffic-influence
+/// request through the NEF rather than the raw OAM endpoint.
+#[when("I start the radian core with a NEF")]
+async fn start_core_with_nef(world: &mut World) {
+    start_core_inner(world, UpMode::BreakoutViaNef).await;
 }
 
 async fn start_core_inner(world: &mut World, mode: UpMode) {
@@ -458,11 +473,12 @@ async fn start_core_inner(world: &mut World, mode: UpMode) {
             std::fs::write(&topology_path, topology).expect("write UP topology config");
             smf_env.push(("RADIAN_SMF_TOPOLOGY", topology_path.as_str()));
         }
-        UpMode::Breakout | UpMode::BreakoutDeferred => {
-            // Same chain plus a breakout anchor `edge`. In `Breakout` a route steers the
-            // breakout prefix to it at establishment; in `BreakoutDeferred` the topology
-            // carries no route and the breakout is inserted mid-session over OAM (Phase 3e).
-            let routes = if mode == UpMode::Breakout {
+        UpMode::Breakout | UpMode::BreakoutDeferred | UpMode::BreakoutViaNef => {
+            // Same chain plus a breakout anchor `edge` (exposing DNAI "mec" for the NEF
+            // path). In `Breakout` a route steers the breakout prefix to it at
+            // establishment; otherwise the topology carries no route and the breakout is
+            // inserted mid-session — over OAM (Phase 3e) or an AF request through the NEF.
+            let routes = if mode.has_static_route() {
                 format!(
                     r#",
   "routes": [
@@ -478,7 +494,7 @@ async fn start_core_inner(world: &mut World, mode: UpMode) {
     "gNB":    {{ "type": "AN" }},
     "iupf":   {{ "type": "UPF", "n4": "{IUPF_N3_IP}:{N4_PORT}" }},
     "anchor": {{ "type": "UPF", "n4": "{UPF_N3_IP}:{N4_PORT}", "dnns": ["internet"] }},
-    "edge":   {{ "type": "UPF", "n4": "{PSA2_N3_IP}:{N4_PORT}" }}
+    "edge":   {{ "type": "UPF", "n4": "{PSA2_N3_IP}:{N4_PORT}", "dnai": "mec" }}
   }},
   "links": [
     {{ "a": "gNB",  "b": "iupf" }},
@@ -504,6 +520,18 @@ async fn start_core_inner(world: &mut World, mode: UpMode) {
     })
     .await;
     assert!(ready, "radian core did not become ready");
+
+    // A NEF (design/135) front-doors AF traffic influence onto the SMF's breakout trigger.
+    // Point it straight at the SMF (RADIAN_NEF_SMF) so it needs no NRF discovery timing.
+    if mode == UpMode::BreakoutViaNef {
+        world.procs.push(
+            spawn_core(&tag, false, &[("RADIAN_NEF_SMF", "http://127.0.0.1:8002")], "nef").await,
+        );
+        assert!(
+            wait_until(5, || netns::host_port_listening(8009, "tcp")).await,
+            "the NEF SBI did not come up"
+        );
+    }
 }
 
 /// Spawn one radian NF in the host namespace (under sudo when `root`), tracking it;
@@ -1165,6 +1193,23 @@ async fn insert_breakout_oam(world: &mut World, prefix: String, via: String) {
         format!(r#"{{"supi":"{supi}","pduSessionId":{psi},"prefix":"{prefix}","via":"{via}"}}"#);
     let ok = netns::http_post("http://127.0.0.1:8002/oam/v1/breakout", &body).await;
     assert!(ok, "the SMF refused the OAM breakout insertion");
+}
+
+/// design/135: an AF submits a traffic-influence subscription to the NEF — steer `prefix`
+/// to the edge named by DNAI `dnai`. The NEF resolves it into the SMF's breakout trigger,
+/// changing the live datapath.
+#[when(regex = r#"^the AF requests traffic influence for "([^"]+)" to DNAI "([^"]+)"$"#)]
+async fn af_traffic_influence(world: &mut World, prefix: String, dnai: String) {
+    let supi = world.ue.as_ref().expect("scripted UE").supi().to_string();
+    let body = format!(
+        r#"{{"supi":"{supi}","dnn":"internet","prefix":"{prefix}","trafficRoutes":[{{"dnai":"{dnai}"}}]}}"#
+    );
+    let ok = netns::http_post(
+        "http://127.0.0.1:8009/3gpp-traffic-influence/v1/app1/subscriptions",
+        &body,
+    )
+    .await;
+    assert!(ok, "the NEF refused the AF traffic-influence request");
 }
 
 #[then(regex = r#"^the UE can reach the data network gateway "([^"]+)" over the IPv6 datapath$"#)]

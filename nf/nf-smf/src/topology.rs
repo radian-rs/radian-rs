@@ -59,6 +59,12 @@ pub struct UpNode {
     /// (I-UPF), which forwards N3↔N9 and carries no URRs.
     #[serde(default)]
     pub dnns: Vec<String>,
+    /// The **DNAI** (DN Access Identifier, TS 23.501 §5.6.7) this UPF exposes as a local
+    /// edge — the abstract name an AF names in a traffic-influence request. Resolving a
+    /// DNAI to this node (`node_for_dnai`) is how AF influence picks a breakout anchor
+    /// (design/135); free5gc keeps the same mapping in `dnnUpfInfoList[].dnaiList`.
+    #[serde(default)]
+    pub dnai: Option<String>,
 }
 
 /// An undirected edge between two node names (order-insensitive, like free5gc's `A`/`B`).
@@ -136,6 +142,15 @@ impl Topology {
     /// The breakout rule for `dnn`, if the topology defines one (first match).
     pub fn breakout_for_dnn(&self, dnn: &str) -> Option<&Route> {
         self.routes.iter().find(|r| r.dnn == dnn)
+    }
+
+    /// The UP-node name exposing `dnai` — how AF traffic influence resolves a DNAI to a
+    /// breakout anchor (design/135).
+    pub fn node_for_dnai(&self, dnai: &str) -> Option<&str> {
+        self.up_nodes
+            .iter()
+            .find(|(_, n)| n.dnai.as_deref() == Some(dnai))
+            .map(|(name, _)| name.as_str())
     }
 
     /// The first AN node's name — the source of every default path.
@@ -353,5 +368,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid prefix"), "{err}");
+    }
+
+    #[test]
+    fn resolves_a_dnai_to_its_node() {
+        // A DNAI names a UP node — the mapping AF traffic influence uses (design/135).
+        let topo = Topology::parse(
+            r#"{
+                "upNodes": {
+                    "gNB":  { "type": "AN" },
+                    "edge": { "type": "UPF", "n4": "127.0.0.4:8805", "dnai": "mec" }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(topo.node_for_dnai("mec"), Some("edge"));
+        assert_eq!(topo.node_for_dnai("nope"), None);
     }
 }
