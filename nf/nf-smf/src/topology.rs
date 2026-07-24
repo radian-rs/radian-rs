@@ -20,13 +20,21 @@ use std::net::SocketAddr;
 
 use serde::Deserialize;
 
-/// A user-plane topology: named UP nodes and the undirected links between them.
+/// A user-plane topology: named UP nodes, the undirected links between them, and any
+/// **breakout routes** (uplink-classifier rules: a destination prefix on a DNN steered to
+/// a second anchor — design/134 Phase 2/3c).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Topology {
     #[serde(rename = "upNodes")]
     pub up_nodes: BTreeMap<String, UpNode>,
     #[serde(default)]
     pub links: Vec<Link>,
+    /// Uplink-classifier breakout rules. radian's take on free5gc's `uerouting.yaml`
+    /// `specificPath`: for a DNN, steer a destination prefix off the default path to a
+    /// second anchor. The classifier is the DNN's intermediate UPF, so a route only
+    /// applies where the DNN's path has one.
+    #[serde(default)]
+    pub routes: Vec<Route>,
 }
 
 /// The kind of a UP node: the access network (the RAN, a BFS source only) or a UPF.
@@ -58,6 +66,17 @@ pub struct UpNode {
 pub struct Link {
     pub a: String,
     pub b: String,
+}
+
+/// A breakout route: on `dnn`, uplink to `prefix` is steered off the default path to the
+/// second anchor `via` (a UPF node). The DNN's default path must have an intermediate,
+/// which is where the classifier branch is installed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Route {
+    pub dnn: String,
+    /// Destination prefix in CIDR form, e.g. `"10.99.0.0/16"` — validated at parse time.
+    pub prefix: String,
+    pub via: String,
 }
 
 /// A resolved UP path for a DNN: the ordered UPF node names from the RAN toward the DN.
@@ -97,7 +116,26 @@ impl Topology {
                 );
             }
         }
+        for route in &self.routes {
+            anyhow::ensure!(
+                self.up_nodes.get(&route.via).is_some_and(|n| n.kind == NodeKind::Upf),
+                "breakout route for DNN {:?} names unknown UPF {:?}",
+                route.dnn,
+                route.via
+            );
+            anyhow::ensure!(
+                valid_cidr(&route.prefix),
+                "breakout route for DNN {:?} has an invalid prefix {:?}",
+                route.dnn,
+                route.prefix
+            );
+        }
         Ok(())
+    }
+
+    /// The breakout rule for `dnn`, if the topology defines one (first match).
+    pub fn breakout_for_dnn(&self, dnn: &str) -> Option<&Route> {
+        self.routes.iter().find(|r| r.dnn == dnn)
     }
 
     /// The first AN node's name — the source of every default path.
@@ -153,6 +191,16 @@ impl Topology {
         }
         None
     }
+}
+
+/// Whether `s` is a valid CIDR (`addr/len`, v4 or v6). Kept dependency-free here; the SMF
+/// re-parses the accepted string into a `pfcp::IpPrefix` when it installs the branch.
+fn valid_cidr(s: &str) -> bool {
+    let Some((addr, len)) = s.split_once('/') else { return false };
+    let (Ok(ip), Ok(len)) = (addr.parse::<std::net::IpAddr>(), len.parse::<u8>()) else {
+        return false;
+    };
+    len <= if ip.is_ipv4() { 32 } else { 128 }
 }
 
 #[cfg(test)]
@@ -253,5 +301,57 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("no AN"), "{err}");
+    }
+
+    const BREAKOUT: &str = r#"{
+        "upNodes": {
+            "gNB":    { "type": "AN" },
+            "iupf":   { "type": "UPF", "n4": "127.0.0.3:8805" },
+            "anchor": { "type": "UPF", "n4": "127.0.0.2:8805", "dnns": ["internet"] },
+            "edge":   { "type": "UPF", "n4": "127.0.0.4:8805" }
+        },
+        "links": [
+            { "a": "gNB", "b": "iupf" },
+            { "a": "iupf", "b": "anchor" },
+            { "a": "iupf", "b": "edge" }
+        ],
+        "routes": [
+            { "dnn": "internet", "prefix": "10.99.0.0/16", "via": "edge" }
+        ]
+    }"#;
+
+    #[test]
+    fn parses_and_looks_up_a_breakout_route() {
+        let topo = Topology::parse(BREAKOUT).unwrap();
+        let route = topo.breakout_for_dnn("internet").expect("a breakout for internet");
+        assert_eq!(route.prefix, "10.99.0.0/16");
+        assert_eq!(route.via, "edge");
+        // The default path is still the chain to the anchor; the breakout is separate.
+        assert_eq!(topo.path_for_dnn("internet").unwrap().nodes, vec!["iupf", "anchor"]);
+        assert!(topo.breakout_for_dnn("ims").is_none());
+    }
+
+    #[test]
+    fn rejects_a_route_to_an_unknown_upf() {
+        let err = Topology::parse(
+            r#"{
+                "upNodes": { "gNB": { "type": "AN" }, "a": { "type": "UPF", "n4": "127.0.0.2:8805", "dnns": ["x"] } },
+                "routes": [ { "dnn": "x", "prefix": "10.0.0.0/8", "via": "ghost" } ]
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown UPF"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_route_with_a_bad_prefix() {
+        let err = Topology::parse(
+            r#"{
+                "upNodes": { "gNB": { "type": "AN" }, "a": { "type": "UPF", "n4": "127.0.0.2:8805", "dnns": ["x"] } },
+                "routes": [ { "dnn": "x", "prefix": "not-a-cidr", "via": "a" } ]
+            }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid prefix"), "{err}");
     }
 }
