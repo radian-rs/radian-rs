@@ -169,12 +169,17 @@ impl CblState {
     }
 
     /// Apply an OAM control body: `{"threshold": N}` arms the gate at N
-    /// (optionally with `"retry_ms": M`); `{"enable": false}` stands it down.
-    /// Returns `false` when the body carries nothing applicable.
+    /// (optionally with `"retry_ms": M` and/or `"decay_ms": D` — the slot lease,
+    /// applied to slots reserved from then on); `{"enable": false}` stands it
+    /// down. Returns `false` when the body carries nothing applicable.
     pub fn apply_control(&self, body: &serde_json::Value) -> bool {
         let mut applied = false;
         if let Some(ms) = body.get("retry_ms").and_then(|v| v.as_u64()) {
             self.retry_ms.store(ms as u32, Ordering::Relaxed);
+            applied = true;
+        }
+        if let Some(ms) = body.get("decay_ms").and_then(|v| v.as_u64()) {
+            self.decay_ms.store(ms, Ordering::Relaxed);
             applied = true;
         }
         if let Some(m) = body.get("threshold").and_then(|v| v.as_i64()) {
@@ -377,6 +382,8 @@ mod tests {
             Admission::Deferred { retry_ms } => assert_eq!(retry_ms, 1500),
             _ => panic!("threshold 0 defers everything"),
         }
+        assert!(state.apply_control(&serde_json::json!({ "decay_ms": 250 })));
+        assert_eq!(state.decay_ms.load(Ordering::Relaxed), 250, "lease retuned over OAM");
         assert!(state.apply_control(&serde_json::json!({ "enable": false })));
         assert!(matches!(state.admit(), Admission::Disabled));
         assert!(!state.apply_control(&serde_json::json!({ "nonsense": 1 })), "nothing applicable");
