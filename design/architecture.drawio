@@ -1,0 +1,131 @@
+<mxfile host="app.diagrams.net" agent="claude-code" version="24.7.8">
+  <diagram id="radian-rs-architecture" name="radian-rs architecture">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1300" pageHeight="750" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="&lt;b&gt;radian-rs — 5G system architecture&lt;/b&gt; (service-based architecture + RAN CU/DU split)" style="text;html=1;fontSize=16;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="200" y="0" width="850" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- ── SBI network functions (top row) ─────────────────────────── -->
+        <mxCell id="nf-nssf" value="&lt;b&gt;NSSF&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Nnssf · slice selection&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="50" y="40" width="110" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nf-nef" value="&lt;b&gt;NEF&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Nnef · exposure / AF influence&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="180" y="40" width="110" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nf-nrf" value="&lt;b&gt;NRF&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Nnrf · registry &amp;amp; discovery&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="310" y="40" width="110" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nf-pcf" value="&lt;b&gt;PCF&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Npcf · AM/SM policy&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="440" y="40" width="110" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nf-udr" value="&lt;b&gt;UDR&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Nudr · data repository (redb)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="570" y="40" width="110" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nf-udm" value="&lt;b&gt;UDM&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Nudm · subscriber mgmt&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="700" y="40" width="110" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nf-ausf" value="&lt;b&gt;AUSF&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Nausf · 5G-AKA auth&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="830" y="40" width="110" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nf-chf" value="&lt;b&gt;CHF&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Nchf · charging&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="960" y="40" width="110" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="nf-af" value="&lt;b&gt;AF&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;application function (external)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1090" y="40" width="110" height="55" as="geometry" />
+        </mxCell>
+
+        <!-- ── SBI bus ─────────────────────────────────────────────────── -->
+        <mxCell id="bus" value="" style="rounded=0;fillColor=#666666;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="40" y="170" width="1180" height="8" as="geometry" />
+        </mxCell>
+        <mxCell id="bus-label" value="Service-Based Interface — HTTP/2 + JSON (OAuth2 · mTLS)" style="text;html=1;fontSize=10;fontStyle=2;align=center;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="380" y="184" width="300" height="20" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-nssf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#666666;strokeWidth=2;exitX=0.5;exitY=1;" edge="1" parent="1" source="nf-nssf" target="bus"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e-nef" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#666666;strokeWidth=2;exitX=0.5;exitY=1;" edge="1" parent="1" source="nf-nef" target="bus"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e-nrf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#666666;strokeWidth=2;exitX=0.5;exitY=1;" edge="1" parent="1" source="nf-nrf" target="bus"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e-pcf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#666666;strokeWidth=2;exitX=0.5;exitY=1;" edge="1" parent="1" source="nf-pcf" target="bus"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e-udr" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#666666;strokeWidth=2;exitX=0.5;exitY=1;" edge="1" parent="1" source="nf-udr" target="bus"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e-udm" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#666666;strokeWidth=2;exitX=0.5;exitY=1;" edge="1" parent="1" source="nf-udm" target="bus"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e-ausf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#666666;strokeWidth=2;exitX=0.5;exitY=1;" edge="1" parent="1" source="nf-ausf" target="bus"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e-chf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#666666;strokeWidth=2;exitX=0.5;exitY=1;" edge="1" parent="1" source="nf-chf" target="bus"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e-af" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#666666;strokeWidth=2;dashed=1;exitX=0.5;exitY=1;" edge="1" parent="1" source="nf-af" target="bus"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ── AMF / SMF (below the bus) ───────────────────────────────── -->
+        <mxCell id="amf" value="&lt;b&gt;AMF&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Namf · access &amp;amp; mobility&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="240" y="230" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="smf" value="&lt;b&gt;SMF&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;Nsmf · session mgmt&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="695" y="230" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="e-amf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#666666;strokeWidth=2;exitX=0.5;exitY=0;" edge="1" parent="1" source="amf" target="bus"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e-smf" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#666666;strokeWidth=2;exitX=0.5;exitY=0;" edge="1" parent="1" source="smf" target="bus"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ── gNodeB: CU/DU split ─────────────────────────────────────── -->
+        <mxCell id="gnb" value="gNodeB — CU/DU split (design/128)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9673a6;dashed=1;verticalAlign=top;fontStyle=1;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="140" y="360" width="320" height="260" as="geometry" />
+        </mxCell>
+        <mxCell id="cu" value="&lt;b&gt;gNB-CU&lt;/b&gt; — radian-gnb (Rust)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;RRC · PDCP · SDAP · NGAP · GTP-U&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="gnb">
+          <mxGeometry x="40" y="35" width="240" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="du" value="&lt;b&gt;gNB-DU&lt;/b&gt; — OCUDU odu (C++)&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;MAC · RLC · scheduler · PHY&lt;br&gt;(CI stub: radian-du, Rust)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="gnb">
+          <mxGeometry x="40" y="165" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="f1c" value="F1-C&#10;F1AP/SCTP" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#9673a6;strokeWidth=1.5;fontSize=9;labelBackgroundColor=#ffffff;exitX=0.25;exitY=1;entryX=0.25;entryY=0;" edge="1" parent="gnb" source="cu" target="du"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="f1u" value="F1-U&#10;GTP-U + NR-U" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#9673a6;strokeWidth=1.5;fontSize=9;labelBackgroundColor=#ffffff;exitX=0.75;exitY=1;entryX=0.75;entryY=0;" edge="1" parent="gnb" source="cu" target="du"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ── UE / UPF / DN ───────────────────────────────────────────── -->
+        <mxCell id="ue" value="&lt;b&gt;UE&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;free-ran-ue / BDD sim&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="20" y="525" width="90" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="upf" value="&lt;b&gt;UPF&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;user plane · GTP-U / PFCP&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="690" y="395" width="130" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="dn" value="&lt;b&gt;DN&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:9px&quot;&gt;data network · N6 (TUN)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="960" y="395" width="150" height="75" as="geometry" />
+        </mxCell>
+
+        <!-- ── reference points ────────────────────────────────────────── -->
+        <mxCell id="n1" value="N1 · NAS" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#333333;strokeWidth=1.5;dashed=1;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=0;entryX=0;entryY=0.5;" edge="1" parent="1" source="ue" target="amf">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="65" y="260" /></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="n2" value="N2&#10;NGAP / SCTP" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#333333;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=0;entryX=0.5;entryY=1;" edge="1" parent="1" source="cu" target="amf"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="n3" value="N3 · GTP-U" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#333333;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="cu" target="upf"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="n4" value="N4 · PFCP" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#333333;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="smf" target="upf"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="n6" value="N6 · IP" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#333333;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="upf" target="dn"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="uu" value="Uu&#10;RRC" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=none;strokeColor=#333333;strokeWidth=1.5;fontSize=10;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="ue" target="du"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- ── legend ──────────────────────────────────────────────────── -->
+        <mxCell id="legend" value="Legend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#999999;verticalAlign=top;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="960" y="510" width="260" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="leg-rust" value="" style="rounded=0;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="975" y="545" width="14" height="14" as="geometry" />
+        </mxCell>
+        <mxCell id="leg-rust-t" value="radian-rs (Rust) — this repo" style="text;html=1;fontSize=10;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="995" y="542" width="220" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="leg-ocudu" value="" style="rounded=0;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="975" y="570" width="14" height="14" as="geometry" />
+        </mxCell>
+        <mxCell id="leg-ocudu-t" value="OCUDU (C++) — reference DU" style="text;html=1;fontSize=10;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="995" y="567" width="220" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="leg-ext" value="" style="rounded=0;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="975" y="595" width="14" height="14" as="geometry" />
+        </mxCell>
+        <mxCell id="leg-ext-t" value="external / peer component" style="text;html=1;fontSize=10;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="995" y="592" width="220" height="20" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
