@@ -31,6 +31,8 @@ anyhow.workspace = true
 [dev-dependencies]
 cucumber = "0.23"
 futures = "0.3"
+# The CBL telemetry assertion (design/136) reads the AMF's OAM JSON.
+serde_json.workspace = true
 
 [[test]]
 name = "cucumber"
