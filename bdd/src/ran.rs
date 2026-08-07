@@ -340,6 +340,39 @@ impl ScriptedGnb {
         let pdu = self.recv().await?;
         downlink_nas(&pdu).ok_or_else(|| anyhow!("expected DownlinkNASTransport, got {pdu}"))
     }
+
+    /// Receive, requiring a **"Come Back Later"** indication (design/136): the
+    /// overloaded AMF's SCTP-layer deferral, sent below NGAP with its own PPID.
+    /// Payload (big-endian, 10 bytes): `magic 0xCB,0x01 | RAN-UE-NGAP-ID u32 |
+    /// retry timer ms u32` — the same format the free-ran-ue gNB decodes; the
+    /// magic never begins a valid NGAP PDU (those start 0x00/0x20/0x40).
+    /// Returns `(RAN-UE-NGAP-ID, retry timer ms)`.
+    pub async fn recv_come_back_later(&self) -> Result<(u32, u32)> {
+        tokio::time::timeout(RECV_TIMEOUT, async {
+            loop {
+                match self.conn.sctp_recv().await.context("sctp_recv")? {
+                    NotificationOrData::Notification(_) => continue,
+                    NotificationOrData::Data(data) => {
+                        let b = &data.payload;
+                        if b.is_empty() {
+                            bail!("the AMF closed the N2 association");
+                        }
+                        if b.len() >= 10 && b[0] == 0xcb && b[1] == 0x01 {
+                            let ran_ue_id = u32::from_be_bytes(b[2..6].try_into().unwrap());
+                            let retry_ms = u32::from_be_bytes(b[6..10].try_into().unwrap());
+                            return Ok((ran_ue_id, retry_ms));
+                        }
+                        match ngap::NGAP_PDU::decode(b) {
+                            Ok(pdu) => bail!("expected a CBL indication, got {pdu}"),
+                            Err(_) => bail!("expected a CBL indication, got undecodable bytes"),
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("timed out waiting for a CBL indication from the AMF"))?
+    }
 }
 
 /// Extract `(AMF-UE-NGAP-ID, NAS PDU)` from a DownlinkNASTransport.

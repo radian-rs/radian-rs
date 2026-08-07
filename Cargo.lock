@@ -280,6 +280,7 @@ dependencies = [
  "sbi-core",
  "sctp-rs",
  "sdap",
+ "serde_json",
  "tokio",
 ]
 

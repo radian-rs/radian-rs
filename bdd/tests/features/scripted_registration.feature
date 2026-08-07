@@ -269,6 +269,30 @@ Feature: Scripted gNB/UE — full 5G-AKA registration against the live core
     When the operator clears AMF overload
     Then the gNB receives an Overload Stop
 
+  # design/136: "Come Back Later" (CBL) admission pacing, ported from the
+  # l5g_log_ai free5GC prototype. At the in-progress-registration threshold the
+  # AMF defers a fresh registration with an SCTP-layer retry indication (its own
+  # PPID, below NGAP) instead of admitting it; once capacity returns, the UE's
+  # retry is admitted and registers normally, and completing releases its slot.
+  Scenario: An overloaded AMF defers a registration with Come Back Later and admits the retry
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the operator sets the CBL admission threshold to 0 with retry timer 1500 ms
+    And the scripted UE sends its registration request from TAC "000001"
+    Then the gNB receives a Come Back Later indication with retry timer 1500 ms
+    And the "amf" log should contain "Come Back Later"
+    When the operator sets the CBL admission threshold to 150 with retry timer 1500 ms
+    And the scripted UE sends its registration request from TAC "000001"
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with RES*
+    Then the AMF selects NEA2/NIA2 in a security mode command
+    When the scripted UE completes the security mode procedure
+    Then the AMF sets up the initial context carrying the registration accept
+    When the gNB confirms the context and the UE completes the registration
+    Then the AMF nudges the registered UE with a configuration update
+    And the CBL gate reports 0 ongoing registrations
+    When the operator stands down CBL admission pacing
+
   Scenario: Teardown topology
     Given the scripted core is running
     When I stop the radian core

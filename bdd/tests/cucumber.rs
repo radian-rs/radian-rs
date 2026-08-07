@@ -1336,6 +1336,61 @@ async fn operator_overload(_world: &mut World, verb: String) {
     assert!(resp.status().is_success(), "OAM overload returned {}", resp.status());
 }
 
+// ── design/136: "Come Back Later" (CBL) admission pacing ──────────────────────────────
+
+/// POST an OAM control body to the AMF's CBL endpoint, asserting success.
+async fn post_cbl_control(body: &str) {
+    let resp = sbi_core::sbi_client()
+        .post("http://127.0.0.1:8001/oam/v1/cbl")
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("POST the AMF's OAM CBL endpoint");
+    assert!(resp.status().is_success(), "OAM CBL returned {}", resp.status());
+}
+
+#[when(regex = r#"^the operator sets the CBL admission threshold to (\d+) with retry timer (\d+) ms$"#)]
+async fn operator_sets_cbl(_world: &mut World, threshold: i64, retry_ms: u32) {
+    post_cbl_control(&format!(r#"{{"threshold":{threshold},"retry_ms":{retry_ms}}}"#)).await;
+}
+
+#[when("the operator stands down CBL admission pacing")]
+async fn operator_clears_cbl(_world: &mut World) {
+    post_cbl_control(r#"{"enable":false}"#).await;
+}
+
+#[then(regex = r#"^the gNB receives a Come Back Later indication with retry timer (\d+) ms$"#)]
+async fn gnb_receives_cbl(world: &mut World, retry_ms: u32) {
+    let gnb = world.gnb.as_ref().expect("gNB connected");
+    let (ran_ue_id, got) = gnb.recv_come_back_later().await.expect("the CBL indication");
+    assert_eq!(ran_ue_id, SCRIPTED_RAN_UE_ID, "CBL targets the deferred UE");
+    assert_eq!(got, retry_ms, "CBL retry timer");
+}
+
+#[then(regex = r#"^the CBL gate reports (\d+) ongoing registrations?$"#)]
+async fn cbl_reports_ongoing(_world: &mut World, want: i64) {
+    // The Registration Complete that frees the slot is processed after the
+    // test's last downlink read — poll briefly rather than race it.
+    let mut got = i64::MIN;
+    for _ in 0..20 {
+        let state: serde_json::Value = sbi_core::sbi_client()
+            .get("http://127.0.0.1:8001/oam/v1/cbl")
+            .send()
+            .await
+            .expect("GET the AMF's OAM CBL endpoint")
+            .json()
+            .await
+            .expect("CBL telemetry JSON");
+        got = state["ongoing_registrations"].as_i64().expect("ongoing_registrations");
+        if got == want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("CBL gate reports {got} ongoing registrations, want {want}");
+}
+
 #[then(regex = r#"^the gNB receives an Overload (Start|Stop)$"#)]
 async fn gnb_receives_overload(world: &mut World, which: String) {
     let gnb = world.gnb.as_ref().expect("gNB connected");

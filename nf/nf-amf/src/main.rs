@@ -16,6 +16,7 @@
 //! established. After that, uplink NAS is verified/deciphered before dispatch.
 
 mod auth;
+mod cbl;
 mod pdu_session;
 
 use std::collections::HashMap;
@@ -602,6 +603,11 @@ struct UeContext {
     /// been sent. Set when the command goes out, cleared by the UE's Configuration
     /// Update Complete; T3555 retransmits while it's `Some`. `None` = none awaiting ack.
     pending_config_update: Option<PendingConfigUpdate>,
+    /// The CBL admission slot this registration holds (design/136) — one unit of
+    /// the gate's in-progress count. Cleared on Registration Complete; any other
+    /// teardown path releases it by dropping the context. `None` when CBL was
+    /// disabled at admission (or the slot already decayed).
+    cbl_slot: Option<cbl::CblSlot>,
 }
 
 /// A service area restriction as `(allowed_tacs, non_allowed_tacs)` — the AMF signals
@@ -1116,8 +1122,25 @@ fn namf_callback_router() -> axum::Router {
         axum::http::StatusCode::NO_CONTENT
     }
 
+    /// OAM: **"Come Back Later"** admission pacing (design/136). `GET` returns the
+    /// gate's telemetry (threshold, live count, defer/stale counters) — what an
+    /// external controller reads to pick a threshold; `POST {"threshold": N[,
+    /// "retry_ms": M]}` arms the gate, `POST {"enable": false}` stands it down.
+    async fn cbl_get() -> axum::Json<serde_json::Value> {
+        axum::Json(cbl::CBL.snapshot())
+    }
+    async fn cbl_control(
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
+        if !cbl::CBL.apply_control(&body) {
+            return Err(axum::http::StatusCode::BAD_REQUEST);
+        }
+        Ok(axum::Json(cbl::CBL.snapshot()))
+    }
+
     axum::Router::new()
         .route("/oam/v1/overload", axum::routing::post(overload))
+        .route("/oam/v1/cbl", axum::routing::get(cbl_get).post(cbl_control))
         .route("/namf-callback/v1/{supi}/dereg-notify", axum::routing::post(dereg_notify))
         .route("/namf-callback/v1/{supi}/sdm-notify", axum::routing::post(sdm_notify))
         .route(
@@ -1650,13 +1673,47 @@ async fn handle_ngap(
                     }
                     return;
                 }
+                // CBL (design/136): at the in-progress-registration threshold,
+                // defer this fresh registration with an SCTP-layer Come Back
+                // Later indication instead of admitting it. Resumes above are
+                // exempt — a Service Request is not a registration and would
+                // never release the slot it held.
+                let slot = match cbl::CBL.admit() {
+                    cbl::Admission::Disabled => None,
+                    cbl::Admission::Admitted(slot) => Some(slot),
+                    cbl::Admission::Deferred { retry_ms } => {
+                        match initial_ue_ran_id(msg) {
+                            Some(ran_ue_id) => {
+                                cbl::send_come_back_later(conn, ran_ue_id, retry_ms).await
+                            }
+                            None => warn!(
+                                "CBL: deferred an InitialUEMessage with no RAN-UE-NGAP-ID \
+                                 (no indication sent)"
+                            ),
+                        }
+                        return;
+                    }
+                };
                 let amf_ue_id = NEXT_AMF_UE_ID.fetch_add(1, Ordering::Relaxed);
                 match on_initial_ue(ues, msg, amf_ue_id, dereg_tx) {
-                    Some(InitialUeOutcome::NeedIdentity(dl)) => {
-                        send_or_log(conn, &dl, "DownlinkNASTransport (IdentityRequest)").await;
-                    }
-                    Some(InitialUeOutcome::Identified { ran_ue_id, supi }) => {
-                        start_authentication(conn, ues, amf_auth, amf_ue_id, ran_ue_id, &supi).await;
+                    Some(outcome) => {
+                        // Bind the reserved slot to the context: released on
+                        // Registration Complete or any teardown that drops it.
+                        if let Some(ctx) = ues.get_mut(&amf_ue_id) {
+                            ctx.cbl_slot = slot;
+                        }
+                        match outcome {
+                            InitialUeOutcome::NeedIdentity(dl) => {
+                                send_or_log(conn, &dl, "DownlinkNASTransport (IdentityRequest)")
+                                    .await;
+                            }
+                            InitialUeOutcome::Identified { ran_ue_id, supi } => {
+                                start_authentication(
+                                    conn, ues, amf_auth, amf_ue_id, ran_ue_id, &supi,
+                                )
+                                .await;
+                            }
+                        }
                     }
                     None => warn!("InitialUEMessage missing RAN-UE-NGAP-ID; cannot respond"),
                 }
@@ -3062,6 +3119,7 @@ impl UeContext {
             pending_am_policy: None,
             releasing: std::collections::HashSet::new(),
             pending_config_update: None,
+            cbl_slot: None,
         }
     }
 
@@ -3288,6 +3346,9 @@ async fn dispatch_uplink_nas(
         Some(Nas5gmmMessageType::RegistrationComplete) => {
             let ctx = ues.get_mut(&amf_ue_id)?;
             ctx.state = RegState::Registered;
+            // CBL (design/136): the registration this slot was reserved for is
+            // done — release it so the gate can admit a deferred UE.
+            ctx.cbl_slot = None;
             // Record this AMF as the serving AMF (UECM) — the UDR delivers
             // subscription withdrawals to our callback from now on — and subscribe to
             // Nudm_SDM subscriber-data changes so a mid-registration change refreshes
