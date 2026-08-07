@@ -293,6 +293,35 @@ Feature: Scripted gNB/UE — full 5G-AKA registration against the live core
     And the CBL gate reports 0 ongoing registrations
     When the operator stands down CBL admission pacing
 
+  # design/136: an admitted UE that silently vanishes mid-registration must not
+  # wedge the gate. Its slot is reclaimed by the decay lease (counted stale) and
+  # the next attempt is admitted — C(t) cannot leak below M forever.
+  Scenario: An abandoned registration cannot wedge the CBL gate
+    Given the scripted core is running
+    When the scripted gNB connects and completes NG Setup
+    And the operator sets the CBL admission threshold to 1 with retry timer 1500 ms
+    And the operator sets the CBL slot decay to 1000 ms
+    And the scripted UE sends its registration request from TAC "000001"
+    Then the AMF challenges the UE with 5G-AKA
+    # The UE abandons the registration here — it never answers the challenge,
+    # but its admission slot is still held. The next fresh attempt is deferred.
+    When the scripted UE sends its registration request from TAC "000001"
+    Then the gNB receives a Come Back Later indication with retry timer 1500 ms
+    # The decay lease reclaims the abandoned slot...
+    And the CBL gate reports 0 ongoing registrations
+    And the CBL gate reports 1 stale slot reclaim
+    # ...so the UE's retry is admitted and registers normally.
+    When the scripted UE sends its registration request from TAC "000001"
+    Then the AMF challenges the UE with 5G-AKA
+    When the scripted UE answers the challenge with RES*
+    Then the AMF selects NEA2/NIA2 in a security mode command
+    When the scripted UE completes the security mode procedure
+    Then the AMF sets up the initial context carrying the registration accept
+    When the gNB confirms the context and the UE completes the registration
+    Then the AMF nudges the registered UE with a configuration update
+    And the CBL gate reports 0 ongoing registrations
+    When the operator stands down CBL admission pacing
+
   Scenario: Teardown topology
     Given the scripted core is running
     When I stop the radian core

@@ -1360,6 +1360,11 @@ async fn operator_clears_cbl(_world: &mut World) {
     post_cbl_control(r#"{"enable":false}"#).await;
 }
 
+#[when(regex = r#"^the operator sets the CBL slot decay to (\d+) ms$"#)]
+async fn operator_sets_cbl_decay(_world: &mut World, decay_ms: u64) {
+    post_cbl_control(&format!(r#"{{"decay_ms":{decay_ms}}}"#)).await;
+}
+
 #[then(regex = r#"^the gNB receives a Come Back Later indication with retry timer (\d+) ms$"#)]
 async fn gnb_receives_cbl(world: &mut World, retry_ms: u32) {
     let gnb = world.gnb.as_ref().expect("gNB connected");
@@ -1368,12 +1373,12 @@ async fn gnb_receives_cbl(world: &mut World, retry_ms: u32) {
     assert_eq!(got, retry_ms, "CBL retry timer");
 }
 
-#[then(regex = r#"^the CBL gate reports (\d+) ongoing registrations?$"#)]
-async fn cbl_reports_ongoing(_world: &mut World, want: i64) {
-    // The Registration Complete that frees the slot is processed after the
-    // test's last downlink read — poll briefly rather than race it.
+/// Poll the CBL telemetry until `field` reaches `want` (the AMF frees/reclaims
+/// slots asynchronously to the test's last read — up to 4 s covers a
+/// deliberately-shortened decay lease too), else panic with the last value.
+async fn cbl_gate_reports(field: &str, want: i64) {
     let mut got = i64::MIN;
-    for _ in 0..20 {
+    for _ in 0..40 {
         let state: serde_json::Value = sbi_core::sbi_client()
             .get("http://127.0.0.1:8001/oam/v1/cbl")
             .send()
@@ -1382,13 +1387,23 @@ async fn cbl_reports_ongoing(_world: &mut World, want: i64) {
             .json()
             .await
             .expect("CBL telemetry JSON");
-        got = state["ongoing_registrations"].as_i64().expect("ongoing_registrations");
+        got = state[field].as_i64().unwrap_or_else(|| panic!("no {field} in CBL telemetry"));
         if got == want {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("CBL gate reports {got} ongoing registrations, want {want}");
+    panic!("CBL gate reports {field} = {got}, want {want}");
+}
+
+#[then(regex = r#"^the CBL gate reports (\d+) ongoing registrations?$"#)]
+async fn cbl_reports_ongoing(_world: &mut World, want: i64) {
+    cbl_gate_reports("ongoing_registrations", want).await;
+}
+
+#[then(regex = r#"^the CBL gate reports (\d+) stale slot reclaims?$"#)]
+async fn cbl_reports_stale(_world: &mut World, want: i64) {
+    cbl_gate_reports("stale_total", want).await;
 }
 
 #[then(regex = r#"^the gNB receives an Overload (Start|Stop)$"#)]

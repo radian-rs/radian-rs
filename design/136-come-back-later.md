@@ -56,7 +56,8 @@ admitted past M(t) under concurrency. Radian implements that design directly.
   (default 10; 0 disables the lease) tune it. At runtime,
   **`GET`/`POST /oam/v1/cbl`** on the existing OAM surface (next to design/132's
   `/oam/v1/overload`) exposes telemetry and control: `{"threshold": N[,
-  "retry_ms": M]}` arms/retunes, `{"enable": false}` stands down. This is the
+  "retry_ms": M, "decay_ms": D]}` arms/retunes (the decay applies to slots
+  reserved from then on), `{"enable": false}` stands down. This is the
   prototype's external-controller seam (its `GET /cbl` + `POST /cbl/threshold`),
   by which the threshold policy can live outside the AMF (the l5g_log_ai
   MCP/LLM controller experiments).
@@ -91,11 +92,16 @@ admitted past M(t) under concurrency. Radian implements that design directly.
   Complete; `/oam/v1/cbl` routes on the callback router.
 - **BDD** — `ScriptedGnb::recv_come_back_later()` (decodes the raw SCTP
   payload exactly like free-ran-ue's `gnb/cbl.go`); operator steps driving
-  `/oam/v1/cbl`; a `scripted_reg` scenario: threshold 0 ⇒ the registration is
-  deferred with the configured 1500 ms retry timer, threshold restored ⇒ the
-  same UE's retry is admitted and completes the full 5G-AKA registration, after
-  which the gate reports 0 ongoing (the slot was released), and CBL is stood
-  down.
+  `/oam/v1/cbl`; two `scripted_reg` scenarios:
+  - *Defer → retry → admit*: threshold 0 ⇒ the registration is deferred with
+    the configured 1500 ms retry timer, threshold restored ⇒ the same UE's
+    retry is admitted and completes the full 5G-AKA registration, after which
+    the gate reports 0 ongoing (the slot was released), and CBL is stood down.
+  - *Abandoned registration cannot wedge the gate*: threshold 1, decay 1000 ms
+    ⇒ a UE is admitted and abandons mid-AKA (never answers the challenge); a
+    second attempt is deferred while its slot is held; the decay lease reclaims
+    the slot (`stale_total` = 1, ongoing back to 0) and the UE's retry is
+    admitted and registers normally — live proof of D3's leak ceiling.
 
 ## Verification
 
@@ -110,8 +116,8 @@ admitted past M(t) under concurrency. Radian implements that design directly.
     stay, overshoot recorded.
   - `the_payload_matches_the_free_ran_ue_decoder` — golden bytes.
   - `oam_control_arms_and_stands_down_the_gate`.
-- **BDD `scripted_reg`: 21 scenarios / 233 steps green** (20 pre-existing
-  unaffected + the CBL arc above).
+- **BDD `scripted_reg`: 22 scenarios / 253 steps green** (20 pre-existing
+  unaffected + the two CBL arcs above).
 - `cargo test --workspace --exclude bdd` — green (46 test binaries, 0
   failures). Clippy: no findings in the new code.
 
