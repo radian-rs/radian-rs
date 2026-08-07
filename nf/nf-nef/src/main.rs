@@ -26,7 +26,7 @@ const UDR_ENV: &str = "RADIAN_NEF_UDR";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    common::init_tracing();
+    common::init_telemetry("nef");
     common::banner("nef");
 
     // Mutual TLS (design/57): with RADIAN_SBI_TLS_DIR set, dial the NRF/SMF over mTLS and

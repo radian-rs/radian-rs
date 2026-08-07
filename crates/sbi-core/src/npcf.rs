@@ -11,6 +11,7 @@
 //! (config in production; here one demo default). Real PCFs also read policy from
 //! the UDR (`Nudr` policy-data) and apply operator/PCC rules — a later slice.
 
+use crate::otel::Traced;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -765,7 +766,7 @@ async fn notify_smf(uri: Option<String>) {
         tracing::debug!("AF influence: no SM policy association to notify");
         return;
     };
-    match crate::sbi_client().post(&uri).json(&serde_json::json!({})).send().await {
+    match crate::sbi_client().post(&uri).json(&serde_json::json!({})).traced().send().await {
         Ok(r) if r.status().is_success() => {
             tracing::info!(%uri, "notified the SMF of an AF-influenced policy change")
         }
@@ -918,6 +919,7 @@ impl PcfClient {
             .http
             .post(format!("{}/npcf-smpolicycontrol/v1/sm-policies", self.base))
             .json(ctx)
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -946,6 +948,7 @@ impl PcfClient {
                 self.base, policy_id
             ))
             .json(upd)
+            .traced()
             .send()
             .await?
             .error_for_status()?
@@ -961,6 +964,7 @@ impl PcfClient {
                 "{}/npcf-smpolicycontrol/v1/sm-policies/{}/delete",
                 self.base, policy_id
             ))
+            .traced()
             .send()
             .await?
             .error_for_status()?;

@@ -27,6 +27,7 @@
 //! auth — only a cert-holding AMF may register a callback. Do not expose this UDR
 //! on an untrusted network.
 
+use crate::otel::Traced;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -61,7 +62,7 @@ impl NudrState {
             return;
         };
         let url = format!("{udm}/nudm-sdm/v2/{ue_id}/notify-data-change");
-        match crate::sbi_client().post(&url).send().await {
+        match crate::sbi_client().post(&url).traced().send().await {
             Ok(r) if r.status().is_success() => {
                 tracing::info!(supi = %ue_id, "am-data change — notified the UDM (Nudm_SDM fan-out)")
             }
@@ -274,6 +275,7 @@ async fn notify_amf_deregistration(callback_uri: &str, supi: &str) -> Result<(),
     let resp = client
         .post(callback_uri)
         .json(&serde_json::json!({ "deregReason": "SUBSCRIPTION_WITHDRAWN" }))
+        .traced()
         .send()
         .await
         .map_err(|e| format!("callback failed: {e}"))?;
@@ -593,6 +595,7 @@ impl UdrClient {
                     .json(&GenerateAvRequest { mcc: mcc.to_string(), mnc: mnc.to_string() }),
             )
             .await
+            .traced()
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -616,6 +619,7 @@ impl UdrClient {
                     .json(&ResyncRequest { rand: rand.to_string(), auts: auts.to_string() }),
             )
             .await
+            .traced()
             .send()
             .await?;
         Ok(resp.status().is_success())
@@ -628,7 +632,7 @@ impl UdrClient {
         supi: &str,
         plmn: &str,
     ) -> Result<Option<serde_json::Value>, SbiError> {
-        let resp = self.bearer(self.http.get(self.doc_url(ds, supi, plmn))).await.send().await?;
+        let resp = self.bearer(self.http.get(self.doc_url(ds, supi, plmn))).await.traced().send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -641,7 +645,7 @@ impl UdrClient {
         &self,
         supi: &str,
     ) -> Result<Option<serde_json::Value>, SbiError> {
-        let resp = self.bearer(self.http.get(self.policy_data_url(supi))).await.send().await?;
+        let resp = self.bearer(self.http.get(self.policy_data_url(supi))).await.traced().send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -656,6 +660,7 @@ impl UdrClient {
     ) -> Result<(), SbiError> {
         self.bearer(self.http.put(self.policy_data_url(supi)).json(doc))
             .await
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -676,6 +681,7 @@ impl UdrClient {
     ) -> Result<(), SbiError> {
         self.bearer(self.http.put(self.influence_url(influence_id)).json(doc))
             .await
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -686,6 +692,7 @@ impl UdrClient {
     pub async fn delete_influence_data(&self, influence_id: &str) -> Result<(), SbiError> {
         self.bearer(self.http.delete(self.influence_url(influence_id)))
             .await
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -700,6 +707,7 @@ impl UdrClient {
         let map: serde_json::Map<String, serde_json::Value> = self
             .bearer(self.http.get(url))
             .await
+            .traced()
             .send()
             .await?
             .error_for_status()?
@@ -719,7 +727,7 @@ impl UdrClient {
         supi: &str,
     ) -> Result<Option<serde_json::Value>, SbiError> {
         let url = format!("{}/nudr-dr/v2/policy-data/ues/{}/am-data", self.base, supi);
-        let resp = self.bearer(self.http.get(url)).await.send().await?;
+        let resp = self.bearer(self.http.get(url)).await.traced().send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -733,7 +741,7 @@ impl UdrClient {
         doc: &serde_json::Value,
     ) -> Result<(), SbiError> {
         let url = format!("{}/nudr-dr/v2/policy-data/ues/{}/am-data", self.base, supi);
-        self.bearer(self.http.put(url).json(doc)).await.send().await?.error_for_status()?;
+        self.bearer(self.http.put(url).json(doc)).await.traced().send().await?.error_for_status()?;
         Ok(())
     }
 
@@ -743,6 +751,7 @@ impl UdrClient {
         let resp = self
             .bearer(self.http.delete(format!("{}/nudr-dr/v2/subscription-data/{}", self.base, supi)))
             .await
+            .traced()
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -757,7 +766,7 @@ impl UdrClient {
         &self,
         supi: &str,
     ) -> Result<Option<serde_json::Value>, SbiError> {
-        let resp = self.bearer(self.http.get(self.amf_reg_url(supi))).await.send().await?;
+        let resp = self.bearer(self.http.get(self.amf_reg_url(supi))).await.traced().send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -770,13 +779,13 @@ impl UdrClient {
         supi: &str,
         doc: &serde_json::Value,
     ) -> Result<(), SbiError> {
-        self.bearer(self.http.put(self.amf_reg_url(supi)).json(doc)).await.send().await?.error_for_status()?;
+        self.bearer(self.http.put(self.amf_reg_url(supi)).json(doc)).await.traced().send().await?.error_for_status()?;
         Ok(())
     }
 
     /// Purge the serving AMF's registration. `Ok(false)` if none was recorded.
     pub async fn delete_amf_registration(&self, supi: &str) -> Result<bool, SbiError> {
-        let resp = self.bearer(self.http.delete(self.amf_reg_url(supi))).await.send().await?;
+        let resp = self.bearer(self.http.delete(self.amf_reg_url(supi))).await.traced().send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
         }
@@ -797,6 +806,7 @@ impl UdrClient {
     ) -> Result<(), SbiError> {
         self.bearer(self.http.put(self.smf_reg_url(supi, pdu_session_id)).json(doc))
             .await
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -809,7 +819,7 @@ impl UdrClient {
         supi: &str,
         pdu_session_id: u8,
     ) -> Result<Option<serde_json::Value>, SbiError> {
-        let resp = self.bearer(self.http.get(self.smf_reg_url(supi, pdu_session_id))).await.send().await?;
+        let resp = self.bearer(self.http.get(self.smf_reg_url(supi, pdu_session_id))).await.traced().send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -822,7 +832,7 @@ impl UdrClient {
         supi: &str,
         pdu_session_id: u8,
     ) -> Result<bool, SbiError> {
-        let resp = self.bearer(self.http.delete(self.smf_reg_url(supi, pdu_session_id))).await.send().await?;
+        let resp = self.bearer(self.http.delete(self.smf_reg_url(supi, pdu_session_id))).await.traced().send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
         }
@@ -847,6 +857,7 @@ impl UdrClient {
     ) -> Result<(), SbiError> {
         self.bearer(self.http.put(self.doc_url(ds, supi, plmn)).json(doc))
             .await
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -973,6 +984,7 @@ mod tests {
         let resp = crate::h2c_client()
             .get(format!("{udr_url}/nudr-dr/v2/subscription-data/imsi-1/context-data/amf-3gpp-access"))
             .bearer_auth(forged)
+            .traced()
             .send()
             .await
             .unwrap();

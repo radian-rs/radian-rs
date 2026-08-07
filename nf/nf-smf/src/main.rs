@@ -44,7 +44,7 @@ const SBI_PORT: u16 = 8002;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    common::init_tracing();
+    common::init_telemetry("smf");
     common::banner("smf");
 
     // Mutual TLS (design/57): with RADIAN_SBI_TLS_DIR set, dial every NF (NRF/UDM/AMF)

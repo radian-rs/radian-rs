@@ -11,6 +11,7 @@
 //! config), so the NEF passes the DNAI through untouched — it never learns the UP topology.
 //! The first slice is AF → NEF → SMF **direct**; the PCF-mediated path is design/135 Phase 2.
 
+use crate::otel::Traced;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -368,6 +369,7 @@ async fn authorize_at_pcf(
     let resp = crate::sbi_client()
         .post(format!("{pcf}/npcf-policyauthorization/v1/app-sessions"))
         .json(&body)
+        .traced()
         .send()
         .await
         .map_err(|e| format!("PCF unreachable: {e}"))?;
@@ -394,7 +396,7 @@ async fn steer_at_smf(
     dnai: &str,
 ) -> Result<(), String> {
     let body = serde_json::json!({ "supi": supi, "dnn": dnn, "prefix": prefix, "dnai": dnai });
-    match crate::sbi_client().post(format!("{smf}/oam/v1/breakout")).json(&body).send().await {
+    match crate::sbi_client().post(format!("{smf}/oam/v1/breakout")).json(&body).traced().send().await {
         Ok(r) if r.status().is_success() => Ok(()),
         Ok(r) => Err(format!("SMF refused the breakout: {}", r.status())),
         Err(e) => Err(format!("SMF unreachable: {e}")),
@@ -419,7 +421,7 @@ async fn delete_subscription(
                 return (StatusCode::BAD_GATEWAY, "no PCF discovered").into_response();
             };
             let url = format!("{pcf}/npcf-policyauthorization/v1/app-sessions/{app_session}");
-            let _ = crate::sbi_client().delete(url).send().await;
+            let _ = crate::sbi_client().delete(url).traced().send().await;
         }
         Applied::Udr(influence_id) => {
             let Some(udr) = nef.udr_base().await else {
@@ -433,7 +435,7 @@ async fn delete_subscription(
             };
             let body = serde_json::json!({ "supi": sub.supi, "dnn": sub.dnn, "remove": true });
             let _ =
-                crate::sbi_client().post(format!("{smf}/oam/v1/breakout")).json(&body).send().await;
+                crate::sbi_client().post(format!("{smf}/oam/v1/breakout")).json(&body).traced().send().await;
         }
     }
     tracing::info!(%sub_id, how = sub.applied.label(), "AF traffic influence withdrawn");
@@ -507,6 +509,7 @@ mod tests {
                 "trafficFilters": [{ "flowDescriptions": ["permit out ip from 10.0.0.0/8 to 10.99.0.0/16"] }],
                 "trafficRoutes": [{ "dnai": "mec" }]
             }))
+            .traced()
             .send()
             .await
             .unwrap();
@@ -525,7 +528,7 @@ mod tests {
         }
 
         // Delete the subscription → the SMF sees a remove for the same UE/DNN.
-        let del = client.delete(format!("http://{nef_addr}{self_link}")).send().await.unwrap();
+        let del = client.delete(format!("http://{nef_addr}{self_link}")).traced().send().await.unwrap();
         assert_eq!(del.status(), StatusCode::NO_CONTENT);
         assert_eq!(nef.subscription_count(), 0);
         let seen = recorder.lock().unwrap();

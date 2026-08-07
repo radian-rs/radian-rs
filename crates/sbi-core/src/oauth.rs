@@ -23,6 +23,7 @@
 //! **Opt-in:** with neither configured, [`verifier`] is `None` and [`protect`]
 //! adds no layer — the SBI is open (the documented dev-phase posture).
 
+use crate::otel::Traced;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -364,6 +365,7 @@ impl JwksCache {
         let jwks: Jwks = self
             .http
             .get(format!("{}/oauth2/jwks", self.nrf_base))
+            .traced()
             .send()
             .await
             .ok()?
@@ -511,6 +513,7 @@ impl TokenSource {
                 "targetNfType": target_nf_type,
                 "scope": scope,
             }))
+            .traced()
             .send()
             .await
             .ok()?

@@ -27,7 +27,7 @@ static PCF_INSTANCE_ID: LazyLock<String> = LazyLock::new(sbi_core::new_nf_instan
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    common::init_tracing();
+    common::init_telemetry("pcf");
     common::banner("pcf");
 
     // Mutual TLS (design/57): with RADIAN_SBI_TLS_DIR set, dial the UDR/NRF over mTLS

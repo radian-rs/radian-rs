@@ -12,6 +12,7 @@
 //! deferred. Rating-group convention: **0** is session-level (non-flow) traffic,
 //! a non-zero value is the QoS flow's QFI.
 
+use crate::otel::Traced;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -210,6 +211,7 @@ impl ChfClient {
             .http
             .post(format!("{}/nchf-convergedcharging/v3/chargingdata", self.base))
             .json(req)
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -235,6 +237,7 @@ impl ChfClient {
                 self.base
             ))
             .json(req)
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -253,6 +256,7 @@ impl ChfClient {
                 self.base
             ))
             .json(req)
+            .traced()
             .send()
             .await?
             .error_for_status()?;

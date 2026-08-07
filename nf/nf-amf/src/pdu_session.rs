@@ -6,6 +6,7 @@
 //! will (a later slice) place in the N2 SM info of a PDU Session Resource Setup to the
 //! gNB. The SM container is relayed opaquely (TS 29.502 multipart is a later slice).
 
+use sbi_core::otel::Traced;
 use std::net::Ipv4Addr;
 
 use sbi_core::nnrf::NrfClient;
@@ -262,6 +263,7 @@ impl AmfSmf {
         let resp = sbi_core::sbi_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts"))
             .json(&body)
+            .traced()
             .send()
             .await
             .map_err(|e| format!("Nsmf CreateSMContext request failed: {e}"))?;
@@ -293,6 +295,7 @@ impl AmfSmf {
         let resp = sbi_core::sbi_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
             .json(&serde_json::json!({ "upCnxState": "ACTIVATING" }))
+            .traced()
             .send()
             .await
             .map_err(|e| format!("Nsmf UpdateSMContext (activate) request failed: {e}"))?;
@@ -309,6 +312,7 @@ impl AmfSmf {
     pub async fn release_sm_context(&self, smf_base: &str, sm_ref: &str) -> Result<(), String> {
         let resp = sbi_core::sbi_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release"))
+            .traced()
             .send()
             .await
             .map_err(|e| format!("Nsmf ReleaseSMContext request failed: {e}"))?;
@@ -333,6 +337,7 @@ impl AmfSmf {
                 "gnbN3Teid": format!("{gnb_teid:08x}"),
                 "gnbN3Addr": gnb_addr.to_string(),
             }))
+            .traced()
             .send()
             .await
             .map_err(|e| format!("Nsmf UpdateSMContext request failed: {e}"))?;
@@ -359,6 +364,7 @@ impl AmfSmf {
                 "targetN3Teid": format!("{target_teid:08x}"),
                 "targetN3Addr": target_addr.to_string(),
             }))
+            .traced()
             .send()
             .await
             .map_err(|e| format!("Nsmf indirect-forwarding request failed: {e}"))?;
@@ -386,6 +392,7 @@ impl AmfSmf {
         let resp = sbi_core::sbi_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/indirect-forwarding"))
             .json(&serde_json::json!({ "release": true }))
+            .traced()
             .send()
             .await
             .map_err(|e| format!("Nsmf indirect-forwarding release failed: {e}"))?;
@@ -402,6 +409,7 @@ impl AmfSmf {
         let resp = sbi_core::sbi_client()
             .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
             .json(&serde_json::json!({ "upCnxState": "DEACTIVATED" }))
+            .traced()
             .send()
             .await
             .map_err(|e| format!("Nsmf UpdateSMContext (deactivate) request failed: {e}"))?;

@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod telemetry;
+pub use telemetry::{init_telemetry, shutdown_telemetry};
+
 /// Initialise tracing/logging from `RUST_LOG` (default `info`).
 pub fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};

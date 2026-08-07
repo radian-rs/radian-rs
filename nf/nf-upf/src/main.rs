@@ -76,7 +76,7 @@ type Upf = Arc<Mutex<pfcp::UpfState>>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    common::init_tracing();
+    common::init_telemetry("upf");
     common::banner("upf");
 
     let state: Upf = Arc::new(Mutex::new(pfcp::UpfState::new()));

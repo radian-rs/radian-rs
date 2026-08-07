@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    common::init_tracing();
+    common::init_telemetry("nrf");
     common::banner("nrf");
 
     // Mutual TLS (design/57): with RADIAN_SBI_TLS_DIR set, serve Nnrf (registration,
