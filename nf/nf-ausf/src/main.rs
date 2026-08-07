@@ -10,7 +10,7 @@ const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    common::init_tracing();
+    common::init_telemetry("ausf");
     common::banner("ausf");
 
     // Mutual TLS (design/57): with RADIAN_SBI_TLS_DIR set, dial the UDM/NRF over mTLS

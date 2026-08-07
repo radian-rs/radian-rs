@@ -10,6 +10,7 @@
 //! [`AmPolicyConfig`]. An `Npcf_AMPolicyControl_UpdateNotify` trigger re-evaluates
 //! an association and pushes a changed policy to the AMF.
 
+use crate::otel::Traced;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -264,7 +265,7 @@ async fn update(State(pcf): State<AmPcfState>, Path(id): Path<String>) -> axum::
     // keeps any attribute the delta omits rather than treating absence as removal.
     if let (Some(uri), Some(delta)) = (&req.notification_uri, prev.diff(&fresh)) {
         tracing::info!(supi = %req.supi, assoc = %id, "AM policy changed — notifying the AMF (UpdateNotify, partial)");
-        if let Err(e) = crate::sbi_client().post(uri).json(&delta).send().await {
+        if let Err(e) = crate::sbi_client().post(uri).json(&delta).traced().send().await {
             tracing::warn!("Npcf_AMPolicyControl_UpdateNotify failed: {e}");
         }
     }
@@ -304,6 +305,7 @@ impl AmPolicyClient {
             .http
             .post(format!("{}/npcf-am-policy-control/v1/policies", self.base))
             .json(req)
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -325,6 +327,7 @@ impl AmPolicyClient {
         let resp = self
             .http
             .post(format!("{}/npcf-am-policy-control/v1/policies/{assoc_id}/update", self.base))
+            .traced()
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NO_CONTENT {
@@ -337,6 +340,7 @@ impl AmPolicyClient {
     pub async fn delete(&self, assoc_id: &str) -> Result<(), SbiError> {
         self.http
             .post(format!("{}/npcf-am-policy-control/v1/policies/{assoc_id}/delete", self.base))
+            .traced()
             .send()
             .await?
             .error_for_status()?;

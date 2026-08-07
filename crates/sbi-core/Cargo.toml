@@ -7,6 +7,9 @@ authors.workspace = true
 [dependencies]
 tokio.workspace = true
 tracing.workspace = true
+opentelemetry.workspace = true
+tracing-opentelemetry.workspace = true
+http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

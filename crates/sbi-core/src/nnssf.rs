@@ -14,6 +14,7 @@
 //! nested query parameters. This stack uses `POST` + a JSON body — the same
 //! simplification `Nsmf_PDUSession` already makes. The semantics follow the spec.
 
+use crate::otel::Traced;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -262,6 +263,7 @@ impl NssfClient {
             .http
             .post(format!("{}/nnssf-nsselection/v2/network-slice-information", self.base))
             .json(&req)
+            .traced()
             .send()
             .await?
             .error_for_status()?
@@ -276,6 +278,7 @@ impl NssfClient {
         self.http
             .put(format!("{}/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}", self.base))
             .json(tas)
+            .traced()
             .send()
             .await?
             .error_for_status()?;

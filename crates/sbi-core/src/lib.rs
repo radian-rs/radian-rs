@@ -18,6 +18,7 @@ pub mod nnrf;
 pub mod nnssf;
 pub mod npcf;
 pub mod npcf_am;
+pub mod otel;
 pub mod policy;
 pub mod oauth;
 pub mod tls;
@@ -59,7 +60,7 @@ pub async fn run(addr: SocketAddr, app: axum::Router) -> Result<(), SbiError> {
 /// Serve an SBI router on an already-bound listener (lets callers pick the port,
 /// e.g. an ephemeral `127.0.0.1:0` in tests).
 pub async fn run_on(listener: tokio::net::TcpListener, app: axum::Router) -> Result<(), SbiError> {
-    axum::serve(listener, app).await?;
+    axum::serve(listener, otel::traced_router(app)).await?;
     Ok(())
 }
 

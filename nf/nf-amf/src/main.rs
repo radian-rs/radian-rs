@@ -18,6 +18,7 @@
 mod auth;
 mod cbl;
 mod pdu_session;
+mod trace;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -39,7 +40,7 @@ use ngap::{
 use sctp_rs::{
     ConnectedSocket, NotificationOrData, SendData, SendInfo, Socket, SocketToAssociation,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 /// SCTP Payload Protocol Identifier for NGAP (TS 38.412 §7).
 const NGAP_PPID: u32 = 60;
@@ -233,7 +234,7 @@ fn spawn_uecm_register(supi: String) {
             }
             Err(e) => warn!(%supi, "UECM registration skipped (no UDM): {e}"),
         }
-    });
+    }.instrument(tracing::Span::current()));
 }
 
 /// Purge the SUPI's serving-AMF registration (deregistration of any flavour).
@@ -249,7 +250,7 @@ fn spawn_uecm_purge(supi: String) {
             },
             Err(e) => warn!(%supi, "UECM purge skipped (no UDM): {e}"),
         }
-    });
+    }.instrument(tracing::Span::current()));
 }
 
 /// Nudm_SDM change subscriptions this AMF holds: SUPI → subscription id — kept so a
@@ -277,7 +278,7 @@ fn spawn_sdm_subscribe(supi: String) {
             },
             Err(e) => warn!(%supi, "Nudm_SDM subscribe skipped (no UDM): {e}"),
         }
-    });
+    }.instrument(tracing::Span::current()));
 }
 
 /// Drop the SUPI's `Nudm_SDM` change subscription (deregistration of any flavour).
@@ -299,7 +300,7 @@ fn spawn_sdm_unsubscribe(supi: String) {
             }
             Err(e) => warn!(%supi, "Nudm_SDM unsubscribe skipped (no UDM): {e}"),
         }
-    });
+    }.instrument(tracing::Span::current()));
 }
 
 /// Directory of served UEs: SUPI → (AMF-UE-NGAP-ID, the owning association's
@@ -682,7 +683,7 @@ enum InitialUeOutcome {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    common::init_tracing();
+    common::init_telemetry("amf");
     common::banner("amf");
 
     // Mutual TLS (design/57): with RADIAN_SBI_TLS_DIR set, dial every NF over mTLS
@@ -1514,6 +1515,7 @@ fn implicit_deregister(
     if let Some(supi) = ctx.suci.clone() {
         // The subscription context is gone — its GUTI must not resolve again.
         GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
+        trace::end_ue_flow(&supi);
         spawn_sdm_unsubscribe(supi.clone());
         spawn_uecm_purge(supi);
     }
@@ -1619,6 +1621,21 @@ fn on_t3555_expiry(
 }
 
 /// Decode one NGAP PDU and dispatch it.
+/// Procedure span for the UE owning `amf_ue_id`, under its SUCI-keyed flow root
+/// — `Span::none()` when the UE (or its SUCI) is unknown, leaving the handler
+/// untraced rather than misattributed.
+fn ue_proc_span(
+    ues: &HashMap<u64, UeContext>,
+    amf_ue_id: Option<u64>,
+    name: &'static str,
+) -> tracing::Span {
+    amf_ue_id
+        .and_then(|id| ues.get(&id))
+        .and_then(|c| c.suci.as_deref())
+        .map(|suci| trace::procedure(suci, name))
+        .unwrap_or_else(tracing::Span::none)
+}
+
 async fn handle_ngap(
     conn: &ConnectedSocket,
     ues: &mut HashMap<u64, UeContext>,
@@ -1668,7 +1685,16 @@ async fn handle_ngap(
                 let resume = ngap::fiveg_s_tmsi_from_initial_ue(msg)
                     .filter(|tmsi| RETAINED.lock().unwrap().contains_key(tmsi));
                 if let Some(tmsi) = resume {
-                    for (dl, label) in on_service_request(ues, amf_smf, msg, tmsi, dereg_tx).await {
+                    let span = RETAINED
+                        .lock()
+                        .unwrap()
+                        .get(&tmsi)
+                        .and_then(|c| c.suci.as_deref())
+                        .map(|suci| trace::procedure(suci, "ServiceRequest"))
+                        .unwrap_or_else(tracing::Span::none);
+                    for (dl, label) in
+                        on_service_request(ues, amf_smf, msg, tmsi, dereg_tx).instrument(span).await
+                    {
                         send_or_log(conn, &dl, label).await;
                     }
                     return;
@@ -1708,9 +1734,13 @@ async fn handle_ngap(
                                     .await;
                             }
                             InitialUeOutcome::Identified { ran_ue_id, supi } => {
+                                // First entry point with a resolved identity:
+                                // this creates the UE's flow root span.
+                                let span = trace::procedure(&supi, "Authentication");
                                 start_authentication(
                                     conn, ues, amf_auth, amf_ue_id, ran_ue_id, &supi,
                                 )
+                                .instrument(span)
                                 .await;
                             }
                         }
@@ -1719,7 +1749,10 @@ async fn handle_ngap(
                 }
             }
             InitiatingMessageValue::Id_UplinkNASTransport(msg) => {
-                for (dl, label) in on_uplink_nas(ues, amf_auth, amf_smf, msg, dereg_tx).await {
+                let span = ue_proc_span(ues, uplink_amf_ue_id(msg), "UplinkNASTransport");
+                for (dl, label) in
+                    on_uplink_nas(ues, amf_auth, amf_smf, msg, dereg_tx).instrument(span).await
+                {
                     send_or_log(conn, &dl, label).await;
                 }
             }
@@ -1786,7 +1819,16 @@ async fn handle_ngap(
             value: SuccessfulOutcomeValue::Id_PDUSessionResourceSetup(_),
             ..
         }) => {
-            on_pdu_session_setup_response(ues, amf_smf, &pdu).await;
+            let amf_ue_id = setup_response_amf_ue_id(&pdu);
+            let span = ue_proc_span(ues, amf_ue_id, "PDUSessionResourceSetupResponse");
+            on_pdu_session_setup_response(ues, amf_smf, &pdu).instrument(span).await;
+            // The registration + session-establishment flow completes here: end
+            // the UE's flow root so the trace exports.
+            if let Some(suci) =
+                amf_ue_id.and_then(|id| ues.get(&id)).and_then(|c| c.suci.as_deref())
+            {
+                trace::end_ue_flow(suci);
+            }
         }
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
             value: SuccessfulOutcomeValue::Id_UEContextRelease(_),
@@ -1823,7 +1865,14 @@ async fn handle_ngap(
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
             value: SuccessfulOutcomeValue::Id_InitialContextSetup(_),
             ..
-        }) => on_initial_context_setup_response(ues, amf_smf, &pdu).await,
+        }) => {
+            let span = ue_proc_span(
+                ues,
+                ngap::initial_context_setup_response_ids(&pdu).map(|(id, _)| id),
+                "InitialContextSetupResponse",
+            );
+            on_initial_context_setup_response(ues, amf_smf, &pdu).instrument(span).await
+        }
         NGAP_PDU::SuccessfulOutcome(SuccessfulOutcome {
             value: SuccessfulOutcomeValue::Id_PDUSessionResourceRelease(_),
             ..
@@ -1980,6 +2029,7 @@ async fn evict_stale_retained(amf_smf: &pdu_session::AmfSmf, max_idle: std::time
         spawn_am_policy_delete(ctx.am_policy.clone());
         if let Some(supi) = supi {
             GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
+            trace::end_ue_flow(&supi);
             spawn_sdm_unsubscribe(supi.clone());
             spawn_uecm_purge(supi);
         }
@@ -3193,19 +3243,33 @@ async fn on_uplink_nas(
     // shape): Authentication Response (a rejected RES* → Authentication Reject + UE
     // Context Release), Security Mode Complete (a Registration Reject may be followed
     // by the release), and Deregistration (Accept + Release Command).
+    // One child span per NAS procedure, named after the 5GMM message type, so
+    // the SBI calls each procedure makes attribute to it in the trace.
+    let nas_span = |name: &'static str| tracing::info_span!("nas", otel.name = name);
     match nas::gmm_message_type(&nas_msg) {
         Some(Nas5gmmMessageType::AuthenticationResponse) => {
-            return complete_authentication(ues, amf_auth, amf_ue_id, &nas_msg).await;
+            return complete_authentication(ues, amf_auth, amf_ue_id, &nas_msg)
+                .instrument(nas_span("AuthenticationResponse"))
+                .await;
         }
         Some(Nas5gmmMessageType::SecurityModeComplete) => {
-            return on_security_mode_complete(ues, amf_ue_id, &NRF_BASE).await;
+            return on_security_mode_complete(ues, amf_ue_id, &NRF_BASE)
+                .instrument(nas_span("SecurityModeComplete"))
+                .await;
         }
         Some(Nas5gmmMessageType::DeregistrationRequestFromUe) => {
-            return on_deregistration(ues, amf_smf, amf_ue_id, &nas_msg).await;
+            return on_deregistration(ues, amf_smf, amf_ue_id, &nas_msg)
+                .instrument(nas_span("DeregistrationRequest"))
+                .await;
         }
         _ => {}
     }
+    let span = match nas::gmm_message_type(&nas_msg) {
+        Some(ty) => tracing::info_span!("nas", otel.name = %format!("{ty:?}")),
+        None => nas_span("UplinkNAS"),
+    };
     dispatch_uplink_nas(ues, amf_auth, amf_smf, amf_ue_id, nas_msg, dereg_tx)
+        .instrument(span)
         .await
         .into_iter()
         .collect()
@@ -3255,6 +3319,7 @@ async fn on_deregistration(
     ));
     if let Some(supi) = ues.get(&amf_ue_id).and_then(|c| c.suci.clone()) {
         UE_DIRECTORY.lock().unwrap().remove(&supi);
+        trace::end_ue_flow(&supi);
         spawn_sdm_unsubscribe(supi.clone());
         spawn_uecm_purge(supi);
     }
@@ -3334,6 +3399,7 @@ async fn dispatch_uplink_nas(
                 UE_DIRECTORY.lock().unwrap().remove(&supi);
                 // The subscription is gone — its GUTI must not resolve again.
                 GUTI_DIRECTORY.lock().unwrap().retain(|_, s| s != &supi);
+                trace::end_ue_flow(&supi);
                 spawn_sdm_unsubscribe(supi.clone());
                 spawn_uecm_purge(supi);
             }
@@ -4089,7 +4155,7 @@ fn spawn_am_policy_delete(am_policy: Option<(String, String)>) {
             Ok(()) => info!("deleted AM policy association {assoc_id}"),
             Err(e) => warn!("AM policy association delete failed: {e}"),
         }
-    });
+    }.instrument(tracing::Span::current()));
 }
 
 /// Fetch the subscriber's am-data via the NRF-discovered UDM (Nudm_SDM) and

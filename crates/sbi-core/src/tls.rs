@@ -166,6 +166,7 @@ pub async fn run_tls_on(
     app: axum::Router,
     config: Arc<rustls::ServerConfig>,
 ) -> Result<(), SbiError> {
+    let app = crate::otel::traced_router(app);
     loop {
         let (stream, peer) = listener.accept().await?;
         spawn_conn(stream, peer, config.clone(), app.clone());
@@ -195,6 +196,7 @@ pub async fn serve_on(
     let Some((dir, name)) = identity.source.clone() else {
         return run_tls_on(listener, app, identity.server_config()?).await;
     };
+    let app = crate::otel::traced_router(app);
     let mut config = identity.server_config()?;
     let mut stamp = source_stamp(&dir, &name);
     loop {

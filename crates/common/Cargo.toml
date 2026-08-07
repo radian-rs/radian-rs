@@ -8,3 +8,10 @@ authors.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
+# The OTLP exporter's reqwest client shares the workspace `rustls-no-provider`
+# build, so a crypto provider must be installed before telemetry init.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

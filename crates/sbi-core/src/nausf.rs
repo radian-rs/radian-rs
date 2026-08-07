@@ -5,6 +5,7 @@
 //! On `confirm` it compares the UE's RES* to the stored XRES* and, on success,
 //! returns the SUPI and K_SEAF.
 
+use crate::otel::Traced;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -254,6 +255,7 @@ impl AusfClient {
                 serving_network_name: serving_network_name.to_string(),
                 resynchronization_info,
             })
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -275,6 +277,7 @@ impl AusfClient {
             .json(&ConfirmationData {
                 res_star: res_star_hex.to_string(),
             })
+            .traced()
             .send()
             .await?
             .error_for_status()?;

@@ -14,6 +14,7 @@
 //! with the NRF as token endpoint — tracked as the "SBI security hardening" slice.
 //! Do not deploy this NRF on an untrusted network.
 
+use crate::otel::Traced;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -450,6 +451,7 @@ impl NrfClient {
             .http
             .put(self.nfm_url(&profile.nf_instance_id))
             .json(profile)
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -460,6 +462,7 @@ impl NrfClient {
     pub async fn heartbeat(&self, nf_instance_id: &str) -> Result<(), SbiError> {
         self.http
             .patch(self.nfm_url(nf_instance_id))
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -470,6 +473,7 @@ impl NrfClient {
     pub async fn deregister(&self, nf_instance_id: &str) -> Result<(), SbiError> {
         self.http
             .delete(self.nfm_url(nf_instance_id))
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -511,6 +515,7 @@ impl NrfClient {
             .http
             .get(format!("{}/nnrf-disc/v1/nf-instances", self.base))
             .query(&query)
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -523,6 +528,7 @@ impl NrfClient {
         let resp = self
             .http
             .get(format!("{}/nnrf-nfm/v1/nf-instances", self.base))
+            .traced()
             .send()
             .await?
             .error_for_status()?;

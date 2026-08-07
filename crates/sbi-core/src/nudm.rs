@@ -7,6 +7,7 @@
 //! vector (**the long-term key K never reaches this module or the UDM↔UDR wire**),
 //! and SDM proxies the provisioned-data documents verbatim.
 
+use crate::otel::Traced;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -237,7 +238,7 @@ async fn sdm_notify_change(
     let client = crate::sbi_client();
     let mut notified = 0u32;
     for cb in &callbacks {
-        match client.post(cb).json(&notification).send().await {
+        match client.post(cb).json(&notification).traced().send().await {
             Ok(r) if r.status().is_success() => notified += 1,
             Ok(r) => tracing::warn!(%supi, callback = %cb, status = %r.status(), "SDM notify rejected"),
             Err(e) => tracing::warn!(%supi, callback = %cb, "SDM notify failed: {e}"),
@@ -467,6 +468,7 @@ impl NudmClient {
                 serving_network_name: serving_network_name.to_string(),
                 ausf_instance_id: None,
             })
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -480,6 +482,7 @@ impl NudmClient {
             .http
             .post(format!("{}/nudm-ueau/v1/{}/auth-events/resync", self.base, supi))
             .json(&ResyncInfo { rand: rand.to_string(), auts: auts.to_string() })
+            .traced()
             .send()
             .await?;
         Ok(resp.status().is_success())
@@ -494,6 +497,7 @@ impl NudmClient {
         self.http
             .put(format!("{}/nudm-uecm/v1/{}/registrations/amf-3gpp-access", self.base, supi))
             .json(reg)
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -505,6 +509,7 @@ impl NudmClient {
         let resp = self
             .http
             .delete(format!("{}/nudm-uecm/v1/{}/registrations/amf-3gpp-access", self.base, supi))
+            .traced()
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -522,6 +527,7 @@ impl NudmClient {
                 self.base, supi, reg.pdu_session_id
             ))
             .json(reg)
+            .traced()
             .send()
             .await?
             .error_for_status()?;
@@ -540,6 +546,7 @@ impl NudmClient {
                 "{}/nudm-uecm/v1/{}/registrations/smf-registrations/{}",
                 self.base, supi, pdu_session_id
             ))
+            .traced()
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -587,6 +594,7 @@ impl NudmClient {
             .http
             .get(format!("{}/nudm-sdm/v2/{}/{}", self.base, supi, resource))
             .query(&[("plmn-id", plmn)])
+            .traced()
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -607,6 +615,7 @@ impl NudmClient {
             .http
             .post(format!("{}/nudm-sdm/v2/{}/sdm-subscriptions", self.base, supi))
             .json(&sub)
+            .traced()
             .send()
             .await?
             .error_for_status()?
@@ -620,6 +629,7 @@ impl NudmClient {
         let resp = self
             .http
             .delete(format!("{}/nudm-sdm/v2/{}/sdm-subscriptions/{}", self.base, supi, sub_id))
+            .traced()
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -696,6 +706,7 @@ mod tests {
         let http = crate::sbi_client();
         let out: serde_json::Value = http
             .post(format!("{udm_base}/nudm-sdm/v2/imsi-1/notify-data-change"))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -713,6 +724,7 @@ mod tests {
         assert!(sdm.sdm_unsubscribe("imsi-1", &sub_id).await.unwrap());
         let out: serde_json::Value = http
             .post(format!("{udm_base}/nudm-sdm/v2/imsi-1/notify-data-change"))
+            .traced()
             .send()
             .await
             .unwrap()

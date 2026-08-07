@@ -9,6 +9,7 @@
 //! Request/response bodies are simplified: TS 29.502 uses multipart with binary N1/N2
 //! SM containers, which arrive with the NAS-SM and N2-SM-info slices.
 
+use sbi_core::otel::Traced;
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -2058,7 +2059,7 @@ async fn handle_dl_data_report(smf: &Arc<SmfState>, cp_seid: u64, seq: u32) {
     match discover_endpoint(&smf.nrf_base, "AMF").await {
         Ok(amf) => {
             let url = format!("{amf}/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages");
-            match sbi_core::sbi_client().post(url).json(&serde_json::json!({})).send().await {
+            match sbi_core::sbi_client().post(url).json(&serde_json::json!({})).traced().send().await {
                 Ok(r) if r.status().is_success() => tracing::info!("AMF paging requested"),
                 Ok(r) => tracing::warn!(status = %r.status(), "AMF paging request refused"),
                 Err(e) => tracing::warn!("AMF paging request failed: {e}"),
@@ -2278,7 +2279,7 @@ fn spawn_amf_pdu_modify(
             "releasedQfis": released_qfis,
         });
         let url = format!("{amf}/namf-comm/v1/ue-contexts/{supi}/modify");
-        match sbi_core::sbi_client().post(url).json(&body).send().await {
+        match sbi_core::sbi_client().post(url).json(&body).traced().send().await {
             Ok(r) if r.status().is_success() => {
                 tracing::info!(psi, "notified serving AMF of the mid-session QoS change")
             }
@@ -2737,6 +2738,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -2780,6 +2782,7 @@ mod tests {
         let status = client
             .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
             .json(&serde_json::json!({"gnbN3Teid":"00005678","gnbN3Addr":"10.0.0.9"}))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -2801,6 +2804,7 @@ mod tests {
         let status = client
             .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
             .json(&serde_json::json!({"upCnxState":"DEACTIVATED"}))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -2817,6 +2821,7 @@ mod tests {
         let status = client
             .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
             .json(&serde_json::json!({"gnbN3Teid":"0000abcd","gnbN3Addr":"10.0.0.11"}))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -2839,6 +2844,7 @@ mod tests {
                 "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
                 created.sm_context_ref
             ))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -2898,6 +2904,7 @@ mod tests {
                     "servingNetwork": { "mcc": "999", "mnc": "70" },
                     "sNssai": { "sst": 1, "sd": "010203" }
                 }))
+                .traced()
                 .send()
                 .await
                 .unwrap()
@@ -2969,6 +2976,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3038,6 +3046,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3057,6 +3066,7 @@ mod tests {
                 "supi": "imsi-999700000000001", "pduSessionId": 5,
                 "prefix": "10.99.0.0/16", "via": "edge"
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3077,6 +3087,7 @@ mod tests {
             .json(&serde_json::json!({
                 "supi": "imsi-999700000000001", "pduSessionId": 5, "remove": true
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3148,6 +3159,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3166,6 +3178,7 @@ mod tests {
                 "trafficFilters": [{ "flowDescriptions": ["permit out ip from 10.0.0.0/8 to 10.99.0.0/16"] }],
                 "trafficRoutes": [{ "dnai": "mec" }]
             }))
+            .traced()
             .send()
             .await
             .unwrap();
@@ -3180,6 +3193,7 @@ mod tests {
         // Delete the AF subscription → the breakout is withdrawn.
         let del = client
             .delete(format!("http://{nef_addr}{self_link}"))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3254,6 +3268,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3273,7 +3288,7 @@ mod tests {
         } });
         udr.put_sm_policy_data("imsi-999700000000001", &influenced).await.unwrap();
         let refresh = |sm_ref: &str| {
-            client.post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/refresh-policy")).send()
+            client.post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/refresh-policy")).traced().send()
         };
         assert!(refresh(&sm_ref).await.unwrap().status().is_success(), "refresh (influence added)");
         assert_eq!(edge.lock().unwrap().session_count(), 1, "the influenced breakout is spliced in");
@@ -3357,6 +3372,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3372,6 +3388,7 @@ mod tests {
                 "supi": "imsi-999700000000001", "pduSessionId": 5,
                 "prefix": "10.99.0.0/16", "via": "edge"
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3385,6 +3402,7 @@ mod tests {
                 "{base}/nsmf-pdusession/v1/sm-contexts/{}/refresh-policy",
                 created.sm_context_ref
             ))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3483,6 +3501,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3501,6 +3520,7 @@ mod tests {
                 "prefix": "10.99.0.0/16",
                 "trafficRoutes": [{ "dnai": "mec" }]
             }))
+            .traced()
             .send()
             .await
             .unwrap();
@@ -3520,6 +3540,7 @@ mod tests {
         // the SMF with no route → the breakout is withdrawn.
         let del = client
             .delete(format!("http://{nef_addr}{self_link}"))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3605,6 +3626,7 @@ mod tests {
                 "prefix": "10.99.0.0/16",
                 "trafficRoutes": [{ "dnai": "mec" }]
             }))
+            .traced()
             .send()
             .await
             .unwrap();
@@ -3625,6 +3647,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3647,6 +3670,7 @@ mod tests {
         // Withdrawing the AF subscription drops the UDR influence data.
         let del = client
             .delete(format!("http://{nef_addr}{self_link}"))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3699,6 +3723,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3748,6 +3773,7 @@ mod tests {
         let status = client
             .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
             .json(&serde_json::json!({"gnbN3Teid":"00005678","gnbN3Addr":"10.0.0.9"}))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3763,6 +3789,7 @@ mod tests {
         let status = client
             .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
             .json(&serde_json::json!({"upCnxState":"DEACTIVATED"}))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3775,6 +3802,7 @@ mod tests {
         let status = client
             .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
             .json(&serde_json::json!({"gnbN3Teid":"0000abcd","gnbN3Addr":"10.0.0.11"}))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3789,6 +3817,7 @@ mod tests {
                 "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
                 created.sm_context_ref
             ))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3847,6 +3876,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3891,6 +3921,7 @@ mod tests {
         let status = client
             .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
             .json(&serde_json::json!({"gnbN3Teid":"00005678","gnbN3Addr":"10.0.0.9"}))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3916,6 +3947,7 @@ mod tests {
         let status = client
             .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
             .json(&serde_json::json!({"gnbN3Teid":"00009abc","gnbN3Addr":"10.0.0.10"}))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3933,6 +3965,7 @@ mod tests {
                 "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
                 created.sm_context_ref
             ))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -3956,6 +3989,7 @@ mod tests {
                 "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
                 created.sm_context_ref
             ))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -4011,6 +4045,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -4037,6 +4072,7 @@ mod tests {
                 "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
                 created.sm_context_ref
             ))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -4103,6 +4139,7 @@ mod tests {
                     "servingNetwork": { "mcc": "999", "mnc": "70" },
                     "sNssai": { "sst": 1, "sd": "010203" }
                 }))
+                .traced()
                 .send()
         };
 
@@ -4120,6 +4157,7 @@ mod tests {
                 "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
                 created.sm_context_ref
             ))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -4191,6 +4229,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -4233,6 +4272,7 @@ mod tests {
                 "{base}/nsmf-pdusession/v1/sm-contexts/{}/release",
                 created.sm_context_ref
             ))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -4349,6 +4389,7 @@ mod tests {
                 "servingNetwork": { "mcc": "999", "mnc": "70" },
                 "sNssai": { "sst": 1, "sd": "010203" }
             }))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -4394,6 +4435,7 @@ mod tests {
                 "{base}/nsmf-pdusession/v1/sm-contexts/{}/refresh-policy",
                 created.sm_context_ref
             ))
+            .traced()
             .send()
             .await
             .unwrap();
@@ -4448,6 +4490,7 @@ mod tests {
                 "{base}/nsmf-pdusession/v1/sm-contexts/{}/refresh-policy",
                 created.sm_context_ref
             ))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -4477,6 +4520,7 @@ mod tests {
         // refresh-policy on an unknown context → 404.
         let status = client
             .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/nope/refresh-policy"))
+            .traced()
             .send()
             .await
             .unwrap()
@@ -4523,7 +4567,7 @@ mod tests {
             let client = client.clone();
             let url = format!("{base}/nsmf-pdusession/v1/sm-contexts");
             async move {
-                let resp = client.post(url).json(&body).send().await.unwrap();
+                let resp = client.post(url).json(&body).traced().send().await.unwrap();
                 let status = resp.status().as_u16();
                 let cause = resp
                     .json::<serde_json::Value>()

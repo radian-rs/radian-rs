@@ -34,7 +34,7 @@ const DEFAULT_SWEEP_SECS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    common::init_tracing();
+    common::init_telemetry("udr");
     common::banner("udr");
 
     // Mutual TLS (design/57): with RADIAN_SBI_TLS_DIR set, serve Nudr over mTLS (every
