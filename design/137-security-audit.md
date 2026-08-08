@@ -40,7 +40,7 @@ state and predictable identifiers on unauthenticated network segments.
 | F2 | **HIGH** | NEF northbound fully unauthenticated (external trust boundary) | `nf-nef/src/main.rs:76`, `nnef.rs:266` | External AF / anyone reachable |
 | F3 | **HIGH** | UDM serves auth vectors (K_AUSF) + subscriber data with no token check | `nf-udm/src/main.rs:55`, `nudm.rs:383` | Plaintext: network; mTLS: any core cert |
 | F4 | **HIGH** | NRF issues OAuth tokens not bound to caller; scope never enforced | `nnrf.rs:308`, `oauth.rs:305,434` | Any registrable/core peer |
-| F5 | **HIGH** | User-plane anti-spoofing is family-conditional → source spoof onto N6 | `n6/src/lib.rs:98-109` | **Any ordinary subscriber** |
+| F5 | **HIGH** ✅ | User-plane anti-spoofing is family-conditional → source spoof onto N6 | `n6/src/lib.rs:98-109` | **Any ordinary subscriber** |
 | F6 | **HIGH** ✅ | AMF `UeContext` map unbounded; abandoned registrations never evicted → OOM | `nf-amf/src/main.rs:758,3084` | Unauthenticated N2 peer |
 | F7 | **HIGH** | N3 GTP-U + N4 PFCP trust the network; predictable TEID/SEID → cross-session injection, downlink hijack | `nf-upf/src/main.rs:277`, `pfcp/src/lib.rs:838,1568` | N3/N4 reachability (isolation assumption) |
 | F8 | MED | AKA SQN rollback via replayed AUTS (no freshness/monotonicity check) | `subscriber-db/src/lib.rs:277,624`, `aka/src/lib.rs:191` | Reach UDM/UDR resync |
@@ -70,6 +70,7 @@ line. Progress so far:
 |---|--------|-------|
 | F1 | **FIXED** | `crates/nas/src/lib.rs` `unprotect` — estimate-closest COUNT + reject any at/below one consumed; tests `nas_security_rejects_replay`, `nas_security_count_wraps_past_the_sn_block_boundary` |
 | F6 | **FIXED** | `nf/nf-amf/src/main.rs` — registration guard timer, re-armed from last progress (T3550/T3560-style), evicts stalled in-progress contexts (releasing the CBL slot via RAII); test `registration_guard_evicts_stalled_registrations` |
+| F5 | **FIXED** | `crates/n6/src/lib.rs` `uplink` — fail closed: an address-assigned session accepts only its assigned families; an unassigned-family or non-IP packet is dropped (`Uplink::UnassignedFamily`), address-less forwarding tunnels untouched; tests `uplink_drops_the_unassigned_family_on_a_single_family_session`, `uplink_dual_stack_session_accepts_both_families`; full BDD 45/501 green |
 
 All other findings are open.
 
@@ -154,6 +155,17 @@ All other findings are open.
 
 ### F5 — User-plane anti-spoofing is family-conditional
 
+- **Status:** ✅ **FIXED** (branch `audit`). `uplink` now fails closed: a session that
+  assigned the UE an address (an anchor, or a chain's first hop — both are provisioned
+  the full UE address via `session_establishment_request_via_peer`) accepts only its
+  assigned families; a packet in a family the session was *not* assigned, or a non-IP
+  packet, is dropped (`Uplink::UnassignedFamily`) instead of forwarded. A session with no
+  assigned address at all (a pure forwarding tunnel, e.g. indirect handover forwarding) is
+  left untouched, so N9/ULCL forwarding is preserved. Covered by
+  `uplink_drops_the_unassigned_family_on_a_single_family_session` and
+  `uplink_dual_stack_session_accepts_both_families`; full `cargo test -p bdd` green
+  (45/501). *Residual:* F16 (no uplink **destination** egress filtering) is still open —
+  this fix constrains the source, not the destination.
 - **Class:** IP source spoofing / traffic escaping the tunnel. **File:**
   `crates/n6/src/lib.rs:98-109` (`uplink`).
 - The L3 source check only fires for the family the session was *assigned*: the

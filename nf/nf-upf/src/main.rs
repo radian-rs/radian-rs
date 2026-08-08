@@ -319,6 +319,9 @@ async fn serve_n3(socket: Arc<tokio::net::UdpSocket>, state: Upf, tun: Option<Ar
                     n6::Uplink::Spoofed { claimed, assigned } => {
                         warn!(teid, %claimed, %assigned, "N3 uplink source spoofing — dropped")
                     }
+                    n6::Uplink::UnassignedFamily { claimed } => {
+                        warn!(teid, ?claimed, "N3 uplink from an address family not assigned to this session — dropped")
+                    }
                     n6::Uplink::RateLimited => {
                         trace!(teid, "N3 uplink over session AMBR — policed (dropped)")
                     }
