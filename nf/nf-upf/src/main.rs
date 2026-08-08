@@ -168,12 +168,13 @@ async fn serve_n4(
         };
         // A re-activation (Service Request resume) flushes the packets buffered while
         // the UE was CM-IDLE onto its restored gNB tunnel.
-        for (gnb_teid, gnb_ip, pkt) in flush {
+        for (gnb_teid, gnb_ip, qfi, pkt) in flush {
             let dst = SocketAddrV4::new(gnb_ip, gtpu::GTPU_PORT);
-            if let Err(e) = n3.send_to(&gtpu::encap(gnb_teid, &pkt), dst).await {
+            // Stamp the QFI just like a live downlink packet (design/137 G11).
+            if let Err(e) = n3.send_to(&gtpu::encap_dl_qfi(gnb_teid, qfi, false, &pkt), dst).await {
                 warn!(%gnb_ip, "buffered-downlink flush send error: {e}");
             } else {
-                info!(%gnb_ip, "flushed a buffered downlink packet to the resumed UE");
+                info!(%gnb_ip, qfi, "flushed a buffered downlink packet to the resumed UE");
             }
         }
         // A downlink path switch (SNDEM): send a GTP-U End Marker on the OLD gNB
@@ -192,7 +193,8 @@ async fn serve_n4(
         for (gnb_teid, gnb_ip, prefix) in ras {
             let dst = SocketAddrV4::new(gnb_ip, gtpu::GTPU_PORT);
             let ra = n6::router_advertisement(prefix, 64, n6::ALL_NODES);
-            if let Err(e) = n3.send_to(&gtpu::encap(gnb_teid, &ra), dst).await {
+            // The RA rides the default QoS flow (design/137 G11).
+            if let Err(e) = n3.send_to(&gtpu::encap_dl_qfi(gnb_teid, pfcp::DEFAULT_QFI, false, &ra), dst).await {
                 warn!(%gnb_ip, "unsolicited RA send error: {e}");
             } else {
                 info!(%gnb_ip, %prefix, "sent an unsolicited Router Advertisement (SLAAC) to the UE");
@@ -330,7 +332,11 @@ async fn serve_n3(socket: Arc<tokio::net::UdpSocket>, state: Upf, tun: Option<Ar
                             Some((prefix, gnb_teid, gnb_ip)) => {
                                 let ra = n6::router_advertisement(prefix, 64, n6::ALL_NODES);
                                 let dst = SocketAddrV4::new(gnb_ip, gtpu::GTPU_PORT);
-                                if let Err(e) = socket.send_to(&gtpu::encap(gnb_teid, &ra), dst).await {
+                                // The RA rides the default QoS flow (design/137 G11).
+                                if let Err(e) = socket
+                                    .send_to(&gtpu::encap_dl_qfi(gnb_teid, pfcp::DEFAULT_QFI, false, &ra), dst)
+                                    .await
+                                {
                                     warn!(teid, "RA send error: {e}");
                                 } else {
                                     info!(teid, %prefix, "answered a Router Solicitation with an RA (SLAAC)");

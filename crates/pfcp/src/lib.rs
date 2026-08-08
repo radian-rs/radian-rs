@@ -94,6 +94,12 @@ const PER_FLOW_PDR_BASE: u16 = 100;
 const ULCL_PDR_BASE: u16 = 400;
 const ULCL_FAR_BASE: u32 = 3;
 const ULCL_PRECEDENCE: u32 = 40;
+/// The default QoS flow's QFI (design/137 G11). Every PDU session carries a default
+/// QoS flow; in this stack the SMF always assigns it QFI 1 (matching the NAS default
+/// QoS rule in `crates/nas`). Downlink packets not matching a GBR flow are stamped
+/// with this QFI so a conformant gNB can map the flow to the default DRB. Carrying the
+/// QFI as a proper QER IE over N4 (rather than by this convention) is G18 territory.
+pub const DEFAULT_QFI: u8 = 1;
 /// The session-level volume URR id (usage measurement + final report at deletion).
 const SESSION_URR_ID: u32 = 1;
 /// A GBR flow's per-flow volume URR id is `PER_FLOW_URR_BASE + qfi` — its usage is
@@ -641,6 +647,16 @@ impl Session {
         }
         admitted
     }
+
+    /// The QFI to stamp on a downlink G-PDU carrying `pkt` (TS 38.415 §5.5.2.1):
+    /// the QFI of the GBR flow whose SDF filter matches, else the default QoS
+    /// flow's QFI ([`DEFAULT_QFI`]). A conformant gNB reads this to map the QoS
+    /// flow onto a DRB (design/137 G11).
+    fn downlink_qfi(&self, pkt: &[u8]) -> u8 {
+        packet_key(pkt)
+            .and_then(|key| self.flow_qers.iter().find(|f| f.filter.matches(&key)))
+            .map_or(DEFAULT_QFI, |f| f.qfi)
+    }
 }
 
 /// One URR's measured volume, as carried in usage reports.
@@ -667,9 +683,10 @@ pub struct UpfState {
     next_seid: u64,
     sessions: HashMap<u64, Session>,
     /// Buffered downlink packets to send on N3 after a re-activation, as
-    /// `(gNB TEID, gNB IP, inner IP packet)` — drained by
-    /// [`take_flush`](UpfState::take_flush) and GTP-U-encapsulated by the caller.
-    pending_flush: Vec<(u32, Ipv4Addr, Vec<u8>)>,
+    /// `(gNB TEID, gNB IP, QFI, inner IP packet)` — drained by
+    /// [`take_flush`](UpfState::take_flush) and GTP-U-encapsulated by the caller,
+    /// which stamps the QFI in a PDU Session Container (design/137 G11).
+    pending_flush: Vec<(u32, Ipv4Addr, u8, Vec<u8>)>,
     /// GTP-U End Markers to send on N3 after a downlink path switch, as the **old**
     /// `(gNB TEID, gNB IP)` — drained by [`take_end_markers`](UpfState::take_end_markers).
     pending_end_markers: Vec<(u32, Ipv4Addr)>,
@@ -774,6 +791,27 @@ impl UpfState {
             .values()
             .find(|s| s.ue_ipv6.is_some_and(|p| ipv6_in_prefix64(dst, p)))
             .and_then(|s| s.downlink)
+    }
+
+    /// Like [`route_downlink`](Self::route_downlink) but also returns the QFI to
+    /// stamp on the G-PDU (the matched GBR flow's, else the default) so the datapath
+    /// marks each downlink packet with a PDU Session Container (design/137 G11).
+    pub fn route_downlink_marked(&self, dst: Ipv4Addr, pkt: &[u8]) -> Option<(u32, Ipv4Addr, u8)> {
+        let s = self.sessions.values().find(|s| s.ue_ip == Some(dst))?;
+        let (teid, ip) = s.downlink?;
+        Some((teid, ip, s.downlink_qfi(pkt)))
+    }
+
+    /// IPv6 counterpart of [`route_downlink_marked`](Self::route_downlink_marked)
+    /// (design/131 routes by the session's /64; design/137 G11 marks the QFI).
+    pub fn route_downlink_marked_v6(
+        &self,
+        dst: Ipv6Addr,
+        pkt: &[u8],
+    ) -> Option<(u32, Ipv4Addr, u8)> {
+        let s = self.sessions.values().find(|s| s.ue_ipv6.is_some_and(|p| ipv6_in_prefix64(dst, p)))?;
+        let (teid, ip) = s.downlink?;
+        Some((teid, ip, s.downlink_qfi(pkt)))
     }
 
     /// The UE IP assigned to the session owning this uplink N3 TEID — the uplink datapath
@@ -933,8 +971,16 @@ impl UpfState {
         s.buffering = false;
         s.dl_data_report_due = false;
         let ue_ipv6 = s.ue_ipv6;
-        let flushed: Vec<(u32, Ipv4Addr, Vec<u8>)> =
-            s.dl_buffer.drain(..).map(|pkt| (gnb_teid, gnb_ip, pkt)).collect();
+        // Drain first (ends the &mut borrow of dl_buffer), then classify each held
+        // packet's QFI so the flush is stamped like any other downlink (design/137 G11).
+        let buffered: Vec<Vec<u8>> = s.dl_buffer.drain(..).collect();
+        let flushed: Vec<(u32, Ipv4Addr, u8, Vec<u8>)> = buffered
+            .into_iter()
+            .map(|pkt| {
+                let qfi = s.downlink_qfi(&pkt);
+                (gnb_teid, gnb_ip, qfi, pkt)
+            })
+            .collect();
         if !flushed.is_empty() {
             self.pending_flush.extend(flushed);
         }
@@ -988,8 +1034,9 @@ impl UpfState {
     }
 
     /// Drain the buffered downlink packets to send on N3 after re-activations, as
-    /// `(gNB TEID, gNB IP, inner IP packet)` — the caller GTP-U-encapsulates each.
-    pub fn take_flush(&mut self) -> Vec<(u32, Ipv4Addr, Vec<u8>)> {
+    /// `(gNB TEID, gNB IP, QFI, inner IP packet)` — the caller GTP-U-encapsulates
+    /// each with the QFI in a PDU Session Container (design/137 G11).
+    pub fn take_flush(&mut self) -> Vec<(u32, Ipv4Addr, u8, Vec<u8>)> {
         std::mem::take(&mut self.pending_flush)
     }
 
@@ -2698,7 +2745,10 @@ mod tests {
         assert!(!state.is_buffering(UE_IP), "no longer buffering after resume");
         let flushed = state.take_flush();
         assert_eq!(flushed.len(), 2, "both buffered packets flushed");
-        assert!(flushed.iter().all(|(teid, ip, _)| *teid == 0x9ABC && *ip == gnb), "to the new tunnel");
+        assert!(
+            flushed.iter().all(|(teid, ip, qfi, _)| *teid == 0x9ABC && *ip == gnb && *qfi == DEFAULT_QFI),
+            "to the new tunnel, stamped with the default QFI"
+        );
     }
 
     #[test]

@@ -144,7 +144,7 @@ pub enum Downlink {
 /// Handles IPv4 (by exact UE address) and IPv6 (by the session's /64, design/131).
 pub fn downlink(state: &mut UpfState, pkt: &[u8], now_nanos: u64) -> Downlink {
     if let Some((_src, dst)) = ipv4_addrs(pkt) {
-        let Some((gnb_teid, gnb_ip)) = state.route_downlink(dst) else {
+        let Some((gnb_teid, gnb_ip, qfi)) = state.route_downlink_marked(dst, pkt) else {
             // No installed tunnel: a CM-IDLE (buffering) session holds the packet and
             // triggers paging; otherwise there's no route.
             return if state.buffer_downlink(dst, pkt) { Downlink::Buffered } else { Downlink::NoRoute };
@@ -152,17 +152,19 @@ pub fn downlink(state: &mut UpfState, pkt: &[u8], now_nanos: u64) -> Downlink {
         if !state.admit_downlink(dst, now_nanos, pkt) {
             return Downlink::RateLimited;
         }
-        Downlink::ToN3 { gnb_ip, gpdu: gtpu::encap(gnb_teid, pkt) }
+        // Stamp the QFI in a DL PDU Session Container so the gNB maps the flow to a
+        // DRB (TS 38.415; design/137 G11). No reflective QoS, so RQI is always false.
+        Downlink::ToN3 { gnb_ip, gpdu: gtpu::encap_dl_qfi(gnb_teid, qfi, false, pkt) }
     } else if let Some((_src, dst)) = ipv6_addrs(pkt) {
         // IPv6 CM-IDLE buffering/paging is a later design/131 phase — an idle v6
         // session simply has no route for now.
-        let Some((gnb_teid, gnb_ip)) = state.route_downlink_v6(dst) else {
+        let Some((gnb_teid, gnb_ip, qfi)) = state.route_downlink_marked_v6(dst, pkt) else {
             return Downlink::NoRoute;
         };
         if !state.admit_downlink_v6(dst, now_nanos, pkt) {
             return Downlink::RateLimited;
         }
-        Downlink::ToN3 { gnb_ip, gpdu: gtpu::encap(gnb_teid, pkt) }
+        Downlink::ToN3 { gnb_ip, gpdu: gtpu::encap_dl_qfi(gnb_teid, qfi, false, pkt) }
     } else {
         Downlink::Unsupported
     }
@@ -349,6 +351,52 @@ mod tests {
         let stranger = ipv4_packet(Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(10, 45, 0, 3), b"x");
         assert_eq!(downlink(&mut state, &stranger, 0), Downlink::NoRoute, "no session owns that UE IP");
         assert_eq!(downlink(&mut state, &[0u8; 20], 0), Downlink::Unsupported, "non-IP dropped");
+    }
+
+    /// The QFI carried by a G-PDU built by [`downlink`], read back off the wire.
+    fn downlink_qfi(state: &mut UpfState, pkt: &[u8]) -> Option<u8> {
+        match downlink(state, pkt, 0) {
+            Downlink::ToN3 { gpdu, .. } => match gtpu::parse(&gpdu) {
+                Some(gtpu::N3Message::GPdu { teid, qfi, payload }) => {
+                    // The container is transparent to decap: the inner packet is intact.
+                    assert_eq!((teid, payload), (GNB_TEID, pkt), "TEID + inner payload preserved");
+                    qfi
+                }
+                other => panic!("expected a G-PDU, got {other:?}"),
+            },
+            other => panic!("expected ToN3, got {other:?}"),
+        }
+    }
+
+    /// A downlink packet not matching any GBR flow is stamped with the default QFI, in
+    /// a PDU Session Container the gNB reads to pick the DRB (design/137 G11).
+    #[test]
+    fn downlink_marks_default_qfi() {
+        let (mut state, _) = established_upf();
+        let inner = ipv4_packet(Ipv4Addr::new(8, 8, 8, 8), UE_IP, b"downlink");
+        assert_eq!(downlink_qfi(&mut state, &inner), Some(pfcp::DEFAULT_QFI), "default QoS flow QFI");
+    }
+
+    /// A downlink packet matching a GBR flow's SDF filter is stamped with that flow's
+    /// QFI; everything else falls back to the default flow (design/137 G11).
+    #[test]
+    fn downlink_marks_matched_gbr_flow_qfi() {
+        let ambr = pfcp::SessionAmbr { uplink_bps: 1_000_000_000, downlink_bps: 1_000_000_000 };
+        let flow = pfcp::FlowQer {
+            qfi: 7,
+            filter: pfcp::FlowFilter::transport(17, 5000, 5010),
+            mfbr_dl_bps: 1_000_000_000,
+            mfbr_ul_bps: 1_000_000_000,
+        };
+        let (mut state, _) = established_upf_flows(Some(ambr), &[flow]);
+
+        // DN→UE UDP whose source port is in the flow's range → the flow's QFI.
+        let matched = udp_packet(Ipv4Addr::new(8, 8, 8, 8), UE_IP, 5005, 40000, 200);
+        assert_eq!(downlink_qfi(&mut state, &matched), Some(7), "matched GBR flow QFI");
+
+        // A UDP packet on a port outside the range falls back to the default flow.
+        let other = udp_packet(Ipv4Addr::new(8, 8, 8, 8), UE_IP, 9999, 40000, 200);
+        assert_eq!(downlink_qfi(&mut state, &other), Some(pfcp::DEFAULT_QFI), "non-GBR → default");
     }
 
     #[test]
