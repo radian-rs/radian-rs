@@ -35,12 +35,58 @@ const FAR_ID: u32 = 2;
 /// (see nf-upf), so UEs start at `.2`. In a real deployment this is DNN/slice-scoped and
 /// coordinated with the UPF's N6 subnet; here one pool suffices.
 const UE_IP_POOL_START: u32 = 0x0A2D_0002; // 10.45.0.2
+/// Exclusive upper bound of the IPv4 pool: `10.45.0.0/16` ends at the broadcast
+/// `10.45.255.255` (`0x0A2D_FFFF`), so the last usable address is `10.45.255.254`.
+const UE_IP_POOL_END: u32 = 0x0A2D_FFFF;
 
 /// The SMF hands each IPv6/IPv4v6 PDU session a unique **/64** from `2001:db8::/32`
 /// (the /64 index is the full per-session `u32` counter in the 3rd+4th hextets, so the
 /// space matches the IPv4 pool and can't truncate) plus an interface identifier.
 /// TS 23.501 §5.8.2.2 (one /64 per PDU session). The UPF's N6 gateway covers this /32.
 const UE_IPV6_PREFIX_32: [u8; 4] = [0x20, 0x01, 0x0d, 0xb8];
+
+/// A lazy-reuse allocator over a contiguous `[start, end)` range of `u32`s
+/// (design/137 G6, mirroring free5gc's `lazyReusePool`). Allocation prefers a
+/// previously returned value, so a long-lived SMF **reuses** freed addresses
+/// instead of leaking the range; otherwise it takes the next never-used value
+/// until the range is exhausted, when it returns `None` (→ the session is refused
+/// for insufficient resources). `freed` is a set, so a double-release is a no-op
+/// and the same address can never be handed to two live sessions.
+struct U32Pool {
+    /// The lowest never-yet-allocated value (the high-water mark).
+    next: u32,
+    /// Exclusive upper bound of the range.
+    end: u32,
+    /// Returned values, reused before the high-water mark advances.
+    freed: std::collections::BTreeSet<u32>,
+}
+
+impl U32Pool {
+    fn new(start: u32, end: u32) -> Self {
+        Self { next: start, end, freed: std::collections::BTreeSet::new() }
+    }
+
+    /// The next free value: a returned one (lowest first) if any, else a fresh one
+    /// from the high-water mark. `None` when the range is exhausted.
+    fn alloc(&mut self) -> Option<u32> {
+        if let Some(v) = self.freed.pop_first() {
+            return Some(v);
+        }
+        (self.next < self.end).then(|| {
+            let v = self.next;
+            self.next += 1;
+            v
+        })
+    }
+
+    /// Return `v` to the pool. Ignored unless it was actually allocated (`v < next`);
+    /// the set membership makes a repeated release idempotent.
+    fn release(&mut self, v: u32) {
+        if v < self.next {
+            self.freed.insert(v);
+        }
+    }
+}
 
 /// This SMF's stable NF instance id — the `smfInstanceId` in every UECM
 /// smf-registration.
@@ -309,11 +355,12 @@ pub struct SmfState {
     reports_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
     cp_seid: AtomicU64,
     next_ref: AtomicU64,
-    /// Next UE IPv4 address to hand out (as a host-order u32), from the pool above.
-    next_ue_ip: AtomicU32,
-    /// Next IPv6 /64 index (and interface-identifier seed) to hand out, from
-    /// `2001:db8:a::/48`. Starts at 1 so no session gets the `::0` identifier.
-    next_ue_ipv6: AtomicU32,
+    /// UE IPv4 address pool (`10.45.0.2 ..= 10.45.255.254`), lazily reused so a
+    /// released session's address is handed back out rather than leaked (design/137 G6).
+    ue_ipv4_pool: Mutex<U32Pool>,
+    /// UE IPv6 /64-index pool (the index seeds both the /64 prefix and the interface
+    /// identifier). Starts at 1 so no session gets the `::0` identifier; reused on release.
+    ue_ipv6_pool: Mutex<U32Pool>,
     contexts: Mutex<HashMap<String, SmContext>>,
     /// GFBR admission control: the guaranteed-bit-rate budget `(downlink, uplink)`
     /// in bits/sec and the currently reserved total. A session whose GBR flows'
@@ -414,8 +461,9 @@ impl SmfState {
             reports_rx: tokio::sync::Mutex::new(reports_rx),
             cp_seid: AtomicU64::new(1),
             next_ref: AtomicU64::new(1),
-            next_ue_ip: AtomicU32::new(UE_IP_POOL_START),
-            next_ue_ipv6: AtomicU32::new(1),
+            ue_ipv4_pool: Mutex::new(U32Pool::new(UE_IP_POOL_START, UE_IP_POOL_END)),
+            // The /64 index rides the 3rd+4th hextets, so the whole u32 space is available.
+            ue_ipv6_pool: Mutex::new(U32Pool::new(1, u32::MAX)),
             contexts: Mutex::new(HashMap::new()),
             // Generous default so plain operation isn't gated; override for admission
             // control (config / tests).
@@ -529,26 +577,42 @@ impl SmfState {
         r.1 = r.1.saturating_sub(old.1).saturating_add(new.1);
     }
 
-    /// Allocate the next UE IPv4 address from the pool.
-    fn alloc_ue_ip(&self) -> Ipv4Addr {
-        Ipv4Addr::from(self.next_ue_ip.fetch_add(1, Ordering::Relaxed))
+    /// Allocate a UE IPv4 address from the pool. `None` when the pool is exhausted
+    /// (the establishment is then refused for insufficient resources, design/137 G6).
+    fn alloc_ue_ip(&self) -> Option<Ipv4Addr> {
+        self.ue_ipv4_pool.lock().unwrap().alloc().map(Ipv4Addr::from)
+    }
+
+    /// Return a UE IPv4 address to the pool (on session release, or an aborted
+    /// establishment) so it can be handed out again.
+    fn release_ue_ip(&self, addr: Ipv4Addr) {
+        self.ue_ipv4_pool.lock().unwrap().release(u32::from(addr));
     }
 
     /// Allocate a unique **/64** prefix (`2001:db8:H:L::/64`, where `HL` is the full
-    /// `u32` session counter) and an interface identifier (`::n`) for an IPv6/IPv4v6
-    /// PDU session (TS 23.501 §5.8.2.2 — one /64 per session). The UE forms its global
+    /// `u32` pool index) and an interface identifier (`::n`) for an IPv6/IPv4v6 PDU
+    /// session (TS 23.501 §5.8.2.2 — one /64 per session). The UE forms its global
     /// address `prefix ‖ iid` via SLAAC once the Router Advertisement lands (design/131
-    /// Phase C). The counter starts at 1, so no session gets the `::0` identifier and
-    /// the interface identifier `::n` sits within the session's own /64.
-    fn alloc_ue_ipv6(&self) -> (std::net::Ipv6Addr, [u8; 8]) {
-        let n = self.next_ue_ipv6.fetch_add(1, Ordering::Relaxed);
+    /// Phase C). The index starts at 1, so no session gets the `::0` identifier and
+    /// the interface identifier `::n` sits within the session's own /64. `None` when
+    /// the pool is exhausted.
+    fn alloc_ue_ipv6(&self) -> Option<(std::net::Ipv6Addr, [u8; 8])> {
+        let n = self.ue_ipv6_pool.lock().unwrap().alloc()?;
         let mut seg = [0u8; 16];
         seg[..4].copy_from_slice(&UE_IPV6_PREFIX_32);
         seg[4..8].copy_from_slice(&n.to_be_bytes()); // /64 index → full u32 (3rd+4th hextets)
         let prefix = std::net::Ipv6Addr::from(seg);
         let mut iid = [0u8; 8];
         iid[4..8].copy_from_slice(&n.to_be_bytes()); // interface identifier ::n
-        (prefix, iid)
+        Some((prefix, iid))
+    }
+
+    /// Return a UE IPv6 /64 to the pool, recovering the pool index from the 3rd+4th
+    /// hextets of `prefix` (where [`alloc_ue_ipv6`](Self::alloc_ue_ipv6) put it).
+    fn release_ue_ipv6(&self, prefix: std::net::Ipv6Addr) {
+        let o = prefix.octets();
+        let n = u32::from_be_bytes([o[4], o[5], o[6], o[7]]);
+        self.ue_ipv6_pool.lock().unwrap().release(n);
     }
 
     /// A connected UP peer by node name — used to reach a breakout anchor named by an OAM
@@ -772,6 +836,42 @@ fn problem(status: StatusCode, cause: &str, detail: &str) -> SbiProblem {
     )
 }
 
+/// Frees the leased UE IP(s) back to the SMF's pools on drop unless [`commit`](IpLease::commit)ed
+/// — so any early return between address allocation and storing the SM context releases
+/// them, and only a persisted context keeps them (design/137 G6). This makes the
+/// establishment's several failure paths leak-free without threading a release into each.
+struct IpLease<'a> {
+    smf: &'a SmfState,
+    v4: Option<Ipv4Addr>,
+    v6: Option<std::net::Ipv6Addr>,
+    committed: bool,
+}
+
+impl<'a> IpLease<'a> {
+    fn new(smf: &'a SmfState) -> Self {
+        Self { smf, v4: None, v6: None, committed: false }
+    }
+
+    /// The context now owns the addresses — don't release them on drop.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for IpLease<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(v4) = self.v4 {
+            self.smf.release_ue_ip(v4);
+        }
+        if let Some(v6) = self.v6 {
+            self.smf.release_ue_ipv6(v6);
+        }
+    }
+}
+
 /// `Nsmf_PDUSession_CreateSMContext`: authorize the (requested S-NSSAI, DNN) pair
 /// against the subscriber's UDR-provisioned data (via Nudm_SDM), establish the N4
 /// session, and return the UPF N3 F-TEID plus the serving S-NSSAI / session AMBR.
@@ -884,8 +984,47 @@ async fn create_sm_context(
     // PDR so it can route N6 traffic back to this session (design/131). An IPv4 address
     // is allocated when the selected type includes IPv4; an IPv6 /64 + interface
     // identifier when it includes IPv6 — a pure-IPv6 session carries no v4.
-    let ue_ip = selected_type.has_ipv4().then(|| smf.alloc_ue_ip());
-    let ue_ipv6 = selected_type.has_ipv6().then(|| smf.alloc_ue_ipv6());
+    // The lease frees the allocated address(es) back to the pool on any early return
+    // before the SM context is stored; only a persisted context keeps them (design/137 G6).
+    let mut lease = IpLease::new(&smf);
+    let ue_ip = if selected_type.has_ipv4() {
+        match smf.alloc_ue_ip() {
+            Some(ip) => {
+                lease.v4 = Some(ip);
+                Some(ip)
+            }
+            None => {
+                smf.release_gfbr(reserved_gfbr);
+                tracing::warn!(dnn = %req.dnn, "PDU session refused: IPv4 address pool exhausted");
+                return Err(problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "INSUFFICIENT_RESOURCES",
+                    "no UE IPv4 address available",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let ue_ipv6 = if selected_type.has_ipv6() {
+        match smf.alloc_ue_ipv6() {
+            Some(v6) => {
+                lease.v6 = Some(v6.0);
+                Some(v6)
+            }
+            None => {
+                smf.release_gfbr(reserved_gfbr);
+                tracing::warn!(dnn = %req.dnn, "PDU session refused: IPv6 prefix pool exhausted");
+                return Err(problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "INSUFFICIENT_RESOURCES",
+                    "no UE IPv6 prefix available",
+                ));
+            }
+        }
+    } else {
+        None
+    };
     // Install the authorized session AMBR (a QER for the aggregate rate) plus a
     // per-flow QER + classifier for each GBR flow, so the UPF polices them.
     let ambr = ambr_bps(&decision);
@@ -1011,6 +1150,8 @@ async fn create_sm_context(
             charging,
         },
     );
+    // The stored context now owns the UE address(es); keep them out of the pool.
+    lease.commit();
     // An AF influence already in this session's policy — a group / any-UE influence the
     // PCF read from the UDR — applies from the start: splice its breakout now, before the
     // session ever carries traffic (design/135 Phase 3).
@@ -1875,7 +2016,7 @@ async fn release_sm_context(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
 ) -> Result<StatusCode, SbiProblem> {
-    let (up_seid, chain, path, supi, psi, sm_policy, reserved_gfbr, charging, policy) = {
+    let (up_seid, chain, path, supi, psi, sm_policy, reserved_gfbr, charging, policy, ue_ip, ue_ipv6) = {
         let ctxs = smf.contexts.lock().unwrap();
         match ctxs.get(&sm_ref) {
             Some(c) => (
@@ -1888,6 +2029,8 @@ async fn release_sm_context(
                 c.reserved_gfbr,
                 c.charging.clone(),
                 c.policy.clone(),
+                c.ue_ip,
+                c.ue_ipv6,
             ),
             None => {
                 return Err(problem(
@@ -1947,6 +2090,13 @@ async fn release_sm_context(
         });
     }
     smf.contexts.lock().unwrap().remove(&sm_ref);
+    // Return the UE address(es) to the pool so they can be re-allocated (design/137 G6).
+    if let Some(v4) = ue_ip {
+        smf.release_ue_ip(v4);
+    }
+    if let Some((prefix, _)) = ue_ipv6 {
+        smf.release_ue_ipv6(prefix);
+    }
     // Free the GFBR admission reservation.
     smf.release_gfbr(reserved_gfbr);
     // Purge the serving-SMF registration (Nudm_UECM). Best-effort, off the path.
@@ -2457,6 +2607,44 @@ pub async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lazy-reuse pool: sequential allocation, reuse of freed values before the
+    /// high-water mark advances, exhaustion, and idempotent release (design/137 G6).
+    #[test]
+    fn u32_pool_reuses_freed_and_bounds_the_range() {
+        let mut pool = U32Pool::new(10, 13); // usable: 10, 11, 12
+        assert_eq!((pool.alloc(), pool.alloc(), pool.alloc()), (Some(10), Some(11), Some(12)));
+        assert_eq!(pool.alloc(), None, "range exhausted");
+
+        // Releasing returns values to the pool; the lowest freed is reused first.
+        pool.release(11);
+        pool.release(10);
+        assert_eq!((pool.alloc(), pool.alloc()), (Some(10), Some(11)), "freed values reused, lowest first");
+        assert_eq!(pool.alloc(), None, "exhausted again");
+
+        // A double-release is a no-op (set membership), so an address can't be handed
+        // to two sessions; releasing a never-allocated value is ignored.
+        pool.release(12);
+        pool.release(12);
+        pool.release(99); // >= next → never allocated → ignored
+        assert_eq!(pool.alloc(), Some(12));
+        assert_eq!(pool.alloc(), None, "the spurious releases added nothing");
+    }
+
+    /// The SMF's IPv4/IPv6 allocators reuse a released address instead of leaking it.
+    #[test]
+    fn ip_pools_round_trip_through_alloc_release() {
+        let pool = Mutex::new(U32Pool::new(UE_IP_POOL_START, UE_IP_POOL_END));
+        // Mirror SmfState::alloc_ue_ip / release_ue_ip against a bare pool.
+        let alloc = || Ipv4Addr::from(pool.lock().unwrap().alloc().unwrap());
+        let release = |a: Ipv4Addr| pool.lock().unwrap().release(u32::from(a));
+
+        assert_eq!(alloc(), Ipv4Addr::new(10, 45, 0, 2));
+        let second = alloc();
+        assert_eq!(second, Ipv4Addr::new(10, 45, 0, 3));
+        release(second);
+        assert_eq!(alloc(), Ipv4Addr::new(10, 45, 0, 3), "released .3 handed back out");
+    }
 
     /// PDU-session-type negotiation (design/131): the selected type + downgrade cause
     /// for every (requested × allowed) combination.
@@ -3995,6 +4183,28 @@ mod tests {
             .unwrap()
             .status();
         assert_eq!(status.as_u16(), 404, "released context is gone");
+
+        // A fresh session reuses the released UE IP rather than leaking the pool
+        // (design/137 G6): the released 10.45.0.2 is handed back out, not 10.45.0.3.
+        let created2: SmContextCreatedData = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+            .json(&serde_json::json!({
+                "supi": "imsi-999700000000001", "pduSessionId": 6, "dnn": "internet",
+                "servingNetwork": { "mcc": "999", "mnc": "70" },
+                "sNssai": { "sst": 1, "sd": "010203" }
+            }))
+            .traced()
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            created2.ue_ipv4_addr,
+            Some(Ipv4Addr::new(10, 45, 0, 2)),
+            "the released address is reused, not leaked"
+        );
     }
 
     /// With a PCF registered, the SMF sources the SM policy from it: a policy

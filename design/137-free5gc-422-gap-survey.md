@@ -129,10 +129,11 @@ Gaps:
   strands every session** (Go: `doPfcpHeartbeat` → release all). SMF never
   listens on 8805 (client-only, `pdu_session.rs:151`); single 2 s timeout, no
   retransmission. → **G4**
-- **IPAM**: monotonic `AtomicU32` over hardcoded `10.45.0.2/16` + `2001:db8::/32`
-  — **addresses are never released**; no per-(S-NSSAI,DNN,UPF) pools, no static
-  pools, no per-subscriber static IP from UDM, no overlap checks (Go:
-  `ue_ip_pool.go` + `lazyReusePool`). → **G6**
+- **IPAM**: ~~monotonic `AtomicU32`, addresses never released~~ **leak CLOSED**
+  ([140](140-smf-ipam-pool.md)): a bounded lazy-reuse `U32Pool` (v4 + v6) with an
+  RAII `IpLease` freeing addresses on every failure path; exhaustion → 503/#26.
+  *Remaining:* per-(S-NSSAI,DNN,UPF) pools, static pools, per-subscriber static
+  IP from UDM, overlap checks (Go: `ue_ip_pool.go` + `lazyReusePool`). → **G6** (leak done)
 - **No granted-quota loop**: no VolumeQuota/Volqu, no `updateGrantedQuota` —
   **online charging cannot be enforced at the UPF**; triggers limited to
   VOLTH+FINAL (no ADDITION_OF_UPF / USER_LOCATION_CHANGE / QUOTA_EXHAUSTED /
@@ -178,9 +179,10 @@ Gaps (control plane — Go is far more spec-faithful):
   RemoveUrr/UpdatePdr/QueryUrr unread; no PERIO/duration/quota measurement, no
   packet counts (flags hardcoded TOVOL|ULVOL|DLVOL), fake URSEQN, no
   StartTime/EndTime, no reports in Modification Response. → **G18**
-- **Downlink G-PDUs carry no QFI/PDU Session Container** — `encap_dl_qfi`
-  exists, UPF never calls it (`n6/src/lib.rs:155,165`); a conformant gNB needs
-  it for QoS-flow→DRB mapping (gtp5g always marks, incl. flushed buffers). → **G11**
+- ~~**Downlink G-PDUs carry no QFI/PDU Session Container**~~ **CLOSED**
+  ([139](139-upf-downlink-qfi.md)): `n6::downlink` (v4+v6), the buffered flush,
+  and SLAAC RAs now stamp the QFI (matched GBR flow's, else `DEFAULT_QFI`) — the
+  one gap all three references agreed on. → ~~**G11**~~ done
 - No ICMP/PMTUD generation (TUN MTU 1400 only); no forwarding-policy /
   NetworkInstance routing / per-DNN route install; single N3 socket.
 - Datapath scaling: **O(n) linear scans per packet under one global
@@ -382,12 +384,12 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 | **G3** | **EAP-AKA'** — AUSF eap-session routes + RFC 5448 PRF; UDM `EAP_AKA_PRIME` AV type; AMF EAP relay; fix the misleading doc-comment now | Moderate | M | P1 | 130's P3-6 confirmed |
 | **G4** | **PFCP liveness both sides** — SMF heartbeat loop + RecoveryTimeStamp restart detection + re-association + retransmission; UPF association state + pinned recovery timestamp + tx/rx transactions + error causes | Major (robustness) | M | **P1** | §3.2/3.3; a UPF restart currently strands every session silently |
 | **G5** | **Config files** — per-NF YAML (serde) replacing inline env reads; PLMN/TAC/GUAMI/tai-list/algorithm order/timers; keep env as override | Moderate | M | **P1** | §4.2; prerequisite-ish for G13/G21/G24 |
-| **G6** | **IPAM** — allocate/release pools per (S-NSSAI,DNN,UPF), static pools, per-subscriber static IP from UDM | Major (leak) | S–M | **P1** | §3.2; long-lived SMF exhausts the /16 |
+| **G6** | **IPAM** — allocate/release pools per (S-NSSAI,DNN,UPF), static pools, per-subscriber static IP from UDM | Major (leak) | S–M | **partial** | §3.2; **leak DONE** ([140](140-smf-ipam-pool.md)): bounded lazy-reuse pool + RAII release. Remaining: per-DNN/static pools, static IP from UDM |
 | **G7** | **AMF NAS retransmission timers T3550/T3560/T3570** (+ Service Reject on failed resume) | Moderate | S | **P1** | lost downlink = permanently stalled registration |
 | **G8** | **NGAP robustness pack** — emit ErrorIndication; handle InitialContextSetupFailure, NASNonDeliveryIndication, RAN Status Transfer relay (lossless HO), UEContextModificationFailure | Moderate | M | P1 | §3.1 |
 | **G9** | AMF standard SBI: TS 29.518 ue-contexts resource model + real N1N2MessageTransfer (N1/N2 containers) + Namf_EventExposure | Moderate | L | P2 | prerequisite for G13; overlaps G16 |
 | **G10** | NAS-SM fidelity: route UL 5GSM by request type (fix Modification→Create misroute), PCO/ePCO answers, SSC mode IE, richer 5GMM/5GSM causes | Moderate | M | P1 | §3.2 |
-| **G11** | **UPF downlink QFI marking** — call `encap_dl_qfi` (incl. buffered flush) | Moderate | **S** | **P1** | one-day fix, real-gNB correctness |
+| ~~**G11**~~ | ~~**UPF downlink QFI marking**~~ — **DONE** ([139](139-upf-downlink-qfi.md)): `n6::downlink` v4+v6 + buffered flush + SLAAC RAs stamp the QFI (matched GBR flow's, else `DEFAULT_QFI`); N9-chain final hop deferred | Moderate | **S** | ✓ | closed the one gap all three references agreed on |
 | **G12** | Admission checks: supportTaiList/plmnSupportList (#15/#11), AUSF serving-network authorization | Moderate | S | P1 | config from G5 |
 | **G13** | Multi-AMF: AMF set, GUAMI routing, UEContextTransfer/RegistrationStatusUpdate, RerouteNASRequest | Moderate | L | P2 | 130's P-item confirmed; needs G9 |
 | **G14** | Online charging: CHF quota grant (MultipleUnitInformation/FUI) + SMF VolumeQuota loop + UPF VOLQU + charging-notify callback | Moderate | M–L | P2 | §3.2/3.5 |
@@ -408,9 +410,10 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 | **G29** | Deployment: Makefile/justfile, run/kill scripts, CI workflow, container images | Moderate (ops) | S–M | P3 | §4.3 |
 | **G30** | Non-3GPP access: N3IWF (IKEv2/EAP-5G/xfrm) then TNGF (+RADIUS); AMF access-type dimension | Major | **XL** | P3 | 130's P3-8; only if WLAN access is a product goal |
 
-Suggested first wave by value-per-effort: **G1 → G11 → G6 → G4 → G7 → G2 →
-G23 → G5**, then decide the §7 pivot question before committing to
-G16/G18-class interop refactors.
+Suggested first wave by value-per-effort: **G1 → ~~G11~~ (done, [139](139-upf-downlink-qfi.md))
+→ ~~G6~~ (leak done, [140](140-smf-ipam-pool.md)) → G4 → G7 → G2 → G23 → G5**,
+then decide the §7 pivot question before committing to G16/G18-class interop
+refactors.
 
 ## Sources
 
