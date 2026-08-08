@@ -613,12 +613,15 @@ impl ScriptedUe {
     }
 
     /// Read a relayed **PDU Session Establishment Accept**, returning `(psi, PDU
-    /// address, optional 5GSM cause)` — handles IPv4, IPv6 (interface identifier),
-    /// and IPv4v6, plus the session-type downgrade cause (design/131).
+    /// address, optional 5GSM cause, SM container)` — handles IPv4, IPv6 (interface
+    /// identifier), and IPv4v6, plus the session-type downgrade cause (design/131). The
+    /// container is returned so a caller can read further fields (cause, PCO DNS) from
+    /// this single decode instead of unprotecting the ciphered accept again — which NAS
+    /// replay protection rejects (TS 33.501 §6.4.4).
     pub fn read_pdu_session_accept_addr(
         &mut self,
         dl_nas: &[u8],
-    ) -> Result<(u8, nas::PduAddress, Option<u8>)> {
+    ) -> Result<(u8, nas::PduAddress, Option<u8>, Vec<u8>)> {
         let msg = self.read_downlink(dl_nas)?;
         let (psi, container) =
             nas::sm_container_from_dl_nas_transport(&msg).context("no SM container in the DL NAS")?;
@@ -630,7 +633,7 @@ impl ScriptedUe {
         let addr = nas::pdu_address_from_establishment_accept(&container)
             .context("the accept carries no PDU address")?;
         let cause = nas::accept_5gsm_cause(&container);
-        Ok((psi, addr, cause))
+        Ok((psi, addr, cause, container))
     }
 
     /// Read a **PDU Session Establishment Reject** the network relayed in a protected

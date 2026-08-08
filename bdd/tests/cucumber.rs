@@ -62,6 +62,11 @@ struct World {
     amf_ue_id: Option<u64>,
     /// The last downlink NAS the gNB received, awaiting the UE's handling.
     pending_nas: Option<Vec<u8>>,
+    /// The SM container decoded from the relayed PDU Session Establishment Accept,
+    /// cached so later assertions (5GSM cause, PCO DNS) read the single decode rather
+    /// than unprotecting the ciphered accept again — which NAS replay protection now
+    /// rejects (TS 33.501 §6.4.4). Set when the UE reads the accept's PDU address.
+    pending_accept_container: Option<Vec<u8>>,
     /// The PDU session id the scripted UE established.
     pdu_psi: Option<u8>,
     /// The UPF's N3 F-TEID address learned from the N2 setup (datapath echo).
@@ -1031,7 +1036,7 @@ async fn ue_requests_typed_pdu_for_dnn(world: &mut World, ty: String, dnn: Strin
 #[then(regex = r#"^the UE reads an? "(IPV4|IPV6|IPV4V6)" PDU address$"#)]
 async fn ue_reads_pdu_address(world: &mut World, family: String) {
     let accept = world.pending_nas.take().expect("the relayed accept NAS");
-    let (psi, addr, _cause) =
+    let (psi, addr, _cause, container) =
         world.ue.as_mut().expect("UE").read_pdu_session_accept_addr(&accept).expect("read accept");
     assert_eq!(Some(psi), world.pdu_psi);
     match (family.as_str(), addr) {
@@ -1049,21 +1054,18 @@ async fn ue_reads_pdu_address(world: &mut World, family: String) {
         }
         (want, got) => panic!("expected a {want} PDU address, got {got:?}"),
     }
-    world.pending_nas = Some(accept); // keep it for a following cause assertion
+    // Cache the decoded container so a following cause / PCO-DNS assertion reads it
+    // without unprotecting the ciphered accept again (NAS replay protection).
+    world.pending_accept_container = Some(container);
 }
 
 /// Assert the accept carries a session-type downgrade 5GSM cause (#50/#51).
 #[then(regex = r#"^the accept carries 5GSM cause (\d+)$"#)]
 async fn accept_carries_cause(world: &mut World, cause: u8) {
-    let accept = world.pending_nas.as_ref().expect("the relayed accept NAS");
-    let got = world
-        .ue
-        .as_mut()
-        .expect("UE")
-        .read_pdu_session_accept_addr(accept)
-        .expect("read accept")
-        .2
-        .expect("the accept carries a 5GSM cause");
+    // Read the cause from the accept decoded by the preceding PDU-address step — the
+    // ciphered accept is unprotected once, not again (NAS replay protection).
+    let container = world.pending_accept_container.as_ref().expect("a decoded PDU accept container");
+    let got = nas::accept_5gsm_cause(container).expect("the accept carries a 5GSM cause");
     assert_eq!(got, cause, "5GSM downgrade cause");
 }
 
@@ -1087,14 +1089,11 @@ async fn ue_requests_typed_pdu_session_dns(world: &mut World, ty: String) {
 #[then(regex = r#"^the accept returns the IPv6 DNS server "([^"]+)"$"#)]
 async fn accept_returns_dns(world: &mut World, dns: String) {
     let expected: Ipv6Addr = dns.parse().expect("valid IPv6 DNS server");
-    let accept = world.pending_nas.as_ref().expect("the relayed accept NAS");
-    let got = world
-        .ue
-        .as_mut()
-        .expect("UE")
-        .read_pdu_session_dns_ipv6(accept)
-        .expect("read the accept")
-        .expect("the accept returned an IPv6 DNS server");
+    // Read the PCO DNS from the accept decoded by the preceding PDU-address step — the
+    // ciphered accept is unprotected once, not again (NAS replay protection).
+    let container = world.pending_accept_container.as_ref().expect("a decoded PDU accept container");
+    let got =
+        nas::dns_ipv6_from_establishment_accept(container).expect("the accept returned an IPv6 DNS server");
     assert_eq!(got, expected, "IPv6 DNS server from PCO");
 }
 
