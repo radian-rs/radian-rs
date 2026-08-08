@@ -1776,8 +1776,24 @@ impl NasSecurityContext {
         } else {
             &mut self.dl_count
         };
-        // Align the COUNT's low byte with the received SN (no overflow handling yet).
-        let c = (*count & !0xff) | sn as u32;
+        // Estimate the full 24-bit NAS COUNT (16-bit overflow ‖ 8-bit SN) from the 8-bit
+        // wire SN and the highest COUNT accepted so far in this direction — `*count` is
+        // the next expected value. Pick the COUNT congruent to the SN that is closest to
+        // `*count`, handling the 256-message block boundary in either direction.
+        let expected = *count;
+        let mut c = (expected & !0xff) | sn as u32;
+        if c + 0x80 < expected {
+            c = c.wrapping_add(0x100); // wire SN wrapped up into the next block
+        } else if c >= expected + 0x80 && c >= 0x100 {
+            c -= 0x100; // SN belongs to the previous block
+        }
+        // Replay protection (TS 33.501 §6.4.4): a COUNT at or below one already consumed
+        // must be rejected. Without this an on-path peer could replay a captured
+        // integrity-protected NAS PDU (e.g. a Deregistration Request) and have it
+        // re-accepted, since the reconstructed COUNT and MAC would match the original.
+        if c < expected {
+            return None;
+        }
 
         let mut mac_input = Vec::with_capacity(1 + payload.len());
         mac_input.push(sn);
@@ -1787,6 +1803,7 @@ impl NasSecurityContext {
         {
             return None;
         }
+        // Only a strictly-newer COUNT that also passed the MAC advances the receive window.
         *count = c + 1;
 
         if matches!(sht, sht::INTEGRITY_CIPHERED | sht::INTEGRITY_CIPHERED_NEW_CONTEXT) {
@@ -2660,5 +2677,51 @@ mod tests {
         let mut bad = amf.protect(&security_mode_complete(), sht::INTEGRITY, 1);
         bad[2] ^= 0xff;
         assert!(ue.unprotect(&bad, 1).is_none());
+    }
+
+    #[test]
+    fn nas_security_rejects_replay() {
+        // TS 33.501 §6.4.4: a NAS COUNT already consumed must never be accepted again.
+        let (ki, ke) = ([0x11u8; 16], [0x22u8; 16]);
+        let mut amf = NasSecurityContext::new(ki, ke, 2, 2);
+        let mut ue = NasSecurityContext::new(ki, ke, 2, 2);
+
+        // A protected downlink PDU the UE accepts once.
+        let smc = security_mode_command(2, 2, 0, &[0xE0, 0xE0]);
+        let pdu = amf.protect(&smc, sht::INTEGRITY_NEW_CONTEXT, 1);
+        assert!(ue.unprotect(&pdu, 1).is_some(), "first delivery accepted");
+        // Replaying the identical bytes is rejected — the COUNT and MAC still match the
+        // original, so only the receive-window check stops it.
+        assert!(ue.unprotect(&pdu, 1).is_none(), "replay of the same PDU rejected");
+
+        // The genuine next PDU still verifies (the replay attempt didn't disturb the window)…
+        let next = amf.protect(&security_mode_complete(), sht::INTEGRITY, 1);
+        assert!(ue.unprotect(&next, 1).is_some(), "genuine next PDU still accepted");
+        // …and the now-stale first PDU stays rejected.
+        assert!(ue.unprotect(&pdu, 1).is_none(), "out-of-window old PDU rejected");
+    }
+
+    #[test]
+    fn nas_security_count_wraps_past_the_sn_block_boundary() {
+        // The 8-bit wire SN wraps every 256 messages while the 24-bit COUNT keeps climbing;
+        // genuine in-order PDUs must keep verifying, and a pre-wrap frame must not be
+        // re-accepted when its SN value recurs.
+        let (ki, ke) = ([0x33u8; 16], [0x44u8; 16]);
+        let mut amf = NasSecurityContext::new(ki, ke, 2, 2);
+        let mut ue = NasSecurityContext::new(ki, ke, 2, 2);
+
+        // Capture the very first frame (COUNT 0, SN 0) to replay after the SN has wrapped.
+        let first = amf.protect(&security_mode_complete(), sht::INTEGRITY, 1);
+        assert!(ue.unprotect(&first, 1).is_some());
+
+        // Deliver enough in-order PDUs that the SN wraps past 255 twice.
+        for _ in 1..600 {
+            let pdu = amf.protect(&security_mode_complete(), sht::INTEGRITY, 1);
+            assert!(ue.unprotect(&pdu, 1).is_some(), "genuine PDU accepted across the SN wrap");
+        }
+        assert_eq!(ue.dl_count, 600);
+
+        // The captured COUNT-0 frame is still rejected long after SN 0 recurs.
+        assert!(ue.unprotect(&first, 1).is_none(), "pre-wrap frame not re-accepted when its SN recurs");
     }
 }
