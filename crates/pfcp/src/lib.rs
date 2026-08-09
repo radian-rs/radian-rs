@@ -660,12 +660,21 @@ pub struct DueReport {
     pub usage: UsageVolume,
 }
 
+/// Default ceiling on the number of concurrent PFCP sessions a UPF will hold. Bounds
+/// the memory an unauthenticated N4 peer can make the UPF allocate by flooding Session
+/// Establishment Requests (design/137 F7). Sized well above any realistic single-UPF
+/// subscriber count; override per deployment with [`UpfState::set_max_sessions`].
+pub const DEFAULT_MAX_SESSIONS: usize = 100_000;
+
 /// Minimal UPF state: the N3 F-TEID and UP-SEID allocators plus a session table
 /// (UP-SEID → [`Session`]).
 pub struct UpfState {
     next_teid: u32,
     next_seid: u64,
     sessions: HashMap<u64, Session>,
+    /// Ceiling on `sessions.len()` — a full table rejects further establishment with
+    /// `NoResourcesAvailable` rather than growing without bound (design/137 F7).
+    max_sessions: usize,
     /// Buffered downlink packets to send on N3 after a re-activation, as
     /// `(gNB TEID, gNB IP, inner IP packet)` — drained by
     /// [`take_flush`](UpfState::take_flush) and GTP-U-encapsulated by the caller.
@@ -692,6 +701,7 @@ impl UpfState {
             next_teid: 1,
             next_seid: 1,
             sessions: HashMap::new(),
+            max_sessions: DEFAULT_MAX_SESSIONS,
             pending_flush: Vec::new(),
             pending_end_markers: Vec::new(),
             pending_ra: Vec::new(),
@@ -700,6 +710,13 @@ impl UpfState {
 
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Set the ceiling on concurrent sessions (see [`DEFAULT_MAX_SESSIONS`]). A UPF at
+    /// the ceiling rejects further Session Establishment Requests with
+    /// `NoResourcesAvailable` — bounding memory against an N4 establishment flood.
+    pub fn set_max_sessions(&mut self, n: usize) {
+        self.max_sessions = n;
     }
 
     /// Whether any session owns this N3 TEID (used by the GTP-U datapath to route
@@ -1594,6 +1611,23 @@ pub fn handle_n4(
                 .ies(IeType::Fseid)
                 .next()
                 .and_then(|ie| Fseid::unmarshal(&ie.payload).ok())?;
+            // Bound the session table: an N4 peer that floods Session Establishment
+            // Requests must not be able to grow it without limit (design/137 F7). At the
+            // ceiling, reject with NoResourcesAvailable instead of allocating.
+            if state.session_count() >= state.max_sessions {
+                return Some(
+                    SessionEstablishmentResponseBuilder::new(
+                        cp_fseid.seid,
+                        seq,
+                        CauseValue::NoResourcesAvailable,
+                    )
+                    .node_id(node_ip)
+                    .fseid(0, node_ip) // no UP session allocated (SEID 0)
+                    .build()
+                    .ok()?
+                    .marshal(),
+                );
+            }
             // The SMF-allocated UE address(es) ride in a downlink PDR's PDI (UE IP
             // Address IE); the UPF records them to route N6 downlink traffic back to
             // this session — IPv4, an IPv6 /64 prefix, or both (design/131).
@@ -2018,6 +2052,40 @@ mod tests {
         assert_eq!(parsed.msg_type(), MsgType::SessionEstablishmentResponse);
         assert_eq!(parsed.ies(IeType::CreatedPdr).count(), 1, "Created PDR with allocated F-TEID");
         assert_eq!(parsed.ies(IeType::Fseid).count(), 1, "UP F-SEID returned");
+    }
+
+    #[test]
+    fn session_table_is_capped_against_an_establishment_flood() {
+        // design/137 F7: a UPF at its session ceiling rejects further establishment with
+        // NoResourcesAvailable instead of growing the table without bound.
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        state.set_max_sessions(2);
+
+        // Fill the table to the ceiling — each session with a distinct CP F-SEID.
+        for cp in 1..=2u64 {
+            let req =
+                session_establishment_request(cp, cp as u32, node_ip, UE_IP, "internet", None, &[], None);
+            let resp = handle_n4(&req, node_ip, &mut state, 0).expect("established");
+            assert!(response_accepted(&resp), "session {cp} accepted under the ceiling");
+        }
+        assert_eq!(state.session_count(), 2, "table filled to the ceiling");
+
+        // The next establishment is rejected and allocates nothing.
+        let req = session_establishment_request(3, 3, node_ip, UE_IP, "internet", None, &[], None);
+        let resp = handle_n4(&req, node_ip, &mut state, 0).expect("a reject response");
+        assert!(!response_accepted(&resp), "over-ceiling establishment rejected");
+        let cause = rs_pfcp::message::parse(&resp)
+            .unwrap()
+            .ies(IeType::Cause)
+            .next()
+            .and_then(|ie| ie.payload.first().copied());
+        assert_eq!(
+            cause,
+            Some(CauseValue::NoResourcesAvailable as u8),
+            "cause = No resources available"
+        );
+        assert_eq!(state.session_count(), 2, "no session allocated past the ceiling");
     }
 
     /// An IPv6 (and IPv4v6) session's /64 prefix rides the PFCP PDI and drives the UPF's

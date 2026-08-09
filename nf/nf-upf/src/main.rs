@@ -58,6 +58,8 @@ const N6_TUN_ENV: &str = "RADIAN_UPF_N6_TUN";
 const N6_ADDR_ENV: &str = "RADIAN_UPF_N6_ADDR";
 const N6_MASK_ENV: &str = "RADIAN_UPF_N6_MASK";
 const N6_ADDR6_ENV: &str = "RADIAN_UPF_N6_ADDR6";
+/// Override the ceiling on concurrent PFCP sessions (design/137 F7).
+const MAX_SESSIONS_ENV: &str = "RADIAN_UPF_MAX_SESSIONS";
 const N6_TUN_NAME: &str = "n6upf0";
 const N6_UPF_ADDR: Ipv4Addr = Ipv4Addr::new(10, 45, 0, 1);
 const N6_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 0, 0);
@@ -79,7 +81,12 @@ async fn main() -> anyhow::Result<()> {
     common::init_tracing();
     common::banner("upf");
 
-    let state: Upf = Arc::new(Mutex::new(pfcp::UpfState::new()));
+    let mut upf = pfcp::UpfState::new();
+    // Bound the session table (design/137 F7); override the default per deployment.
+    if let Some(n) = std::env::var(MAX_SESSIONS_ENV).ok().and_then(|v| v.parse().ok()) {
+        upf.set_max_sessions(n);
+    }
+    let state: Upf = Arc::new(Mutex::new(upf));
 
     let node_ip: Ipv4Addr = std::env::var(N3_ADDR_ENV)
         .ok()

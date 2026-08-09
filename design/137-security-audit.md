@@ -42,7 +42,7 @@ state and predictable identifiers on unauthenticated network segments.
 | F4 | **HIGH** | NRF issues OAuth tokens not bound to caller; scope never enforced | `nnrf.rs:308`, `oauth.rs:305,434` | Any registrable/core peer |
 | F5 | **HIGH** ✅ | User-plane anti-spoofing is family-conditional → source spoof onto N6 | `n6/src/lib.rs:98-109` | **Any ordinary subscriber** |
 | F6 | **HIGH** ✅ | AMF `UeContext` map unbounded; abandoned registrations never evicted → OOM | `nf-amf/src/main.rs:758,3084` | Unauthenticated N2 peer |
-| F7 | **HIGH** | N3 GTP-U + N4 PFCP trust the network; predictable TEID/SEID → cross-session injection, downlink hijack | `nf-upf/src/main.rs:277`, `pfcp/src/lib.rs:838,1568` | N3/N4 reachability (isolation assumption) |
+| F7 | **HIGH** ◐ | N3 GTP-U + N4 PFCP trust the network; predictable TEID/SEID → cross-session injection, downlink hijack | `nf-upf/src/main.rs:277`, `pfcp/src/lib.rs:838,1568` | N3/N4 reachability (isolation assumption) |
 | F8 | MED | AKA SQN rollback via replayed AUTS (no freshness/monotonicity check) | `subscriber-db/src/lib.rs:277,624`, `aka/src/lib.rs:191` | Reach UDM/UDR resync |
 | F9 | MED | Non-constant-time compare of RES*/XRES*/HXRES*/MAC-S | `nausf.rs:180`, `amf/auth.rs:128`, `aka/src/lib.rs:196` | Timing side channel |
 | F10 | MED | AUSF auth context not invalidated on failed RES* → AV reuse / online guessing | `nausf.rs:171-196` | Amplifies F9 |
@@ -71,6 +71,7 @@ line. Progress so far:
 | F1 | **FIXED** | `crates/nas/src/lib.rs` `unprotect` — estimate-closest COUNT + reject any at/below one consumed; tests `nas_security_rejects_replay`, `nas_security_count_wraps_past_the_sn_block_boundary` |
 | F6 | **FIXED** | `nf/nf-amf/src/main.rs` — registration guard timer, re-armed from last progress (T3550/T3560-style), evicts stalled in-progress contexts (releasing the CBL slot via RAII); test `registration_guard_evicts_stalled_registrations` |
 | F5 | **FIXED** | `crates/n6/src/lib.rs` `uplink` — fail closed: an address-assigned session accepts only its assigned families; an unassigned-family or non-IP packet is dropped (`Uplink::UnassignedFamily`), address-less forwarding tunnels untouched; tests `uplink_drops_the_unassigned_family_on_a_single_family_session`, `uplink_dual_stack_session_accepts_both_families`; full BDD 45/501 green |
+| F7 | **PARTIAL** | `crates/pfcp/src/lib.rs` — DoS sub-issue closed: the session table is capped (`DEFAULT_MAX_SESSIONS`, `set_max_sessions`, `RADIAN_UPF_MAX_SESSIONS`), a full UPF rejects further establishment with `NoResourcesAvailable`; test `session_table_is_capped_against_an_establishment_flood`. **Deferred** (see detail): unpredictable TEID/SEID, N3/N4 peer-source validation, `valid_gnb_target` RAN-prefix allowlist |
 
 All other findings are open.
 
@@ -216,6 +217,25 @@ All other findings are open.
 
 ### F7 — N3/N4 trust the network; predictable TEID/SEID
 
+- **Status:** ◐ **PARTIAL** (branch `audit`). **Done:** the unbounded-session memory DoS
+  ("Attack B") is closed — the UPF session table is now capped (`DEFAULT_MAX_SESSIONS`
+  = 100k, tunable via `UpfState::set_max_sessions` / `RADIAN_UPF_MAX_SESSIONS`), and a
+  full UPF answers further `SessionEstablishmentRequest`s with `NoResourcesAvailable`
+  instead of allocating (test `session_table_is_capped_against_an_establishment_flood`).
+  The cap also makes the `next_teid`/`next_seid` counter overflow unreachable.
+  **Deferred, with rationale:** (1) *Unpredictable TEID/SEID (CSPRNG)* — the datapath
+  contract is sound (SMF uses CHOOSE F-TEID and reads the allocated F-SEID from the
+  response), but ~20 unit tests and the n6 helpers assert the allocations are `1,2,3…`
+  and would fail *at runtime* (not compile time) under randomisation; doing it safely
+  needs those tests refactored to read the allocated ids. (2) *N3/N4 peer-source
+  validation* — `handle_n4` has 63 call sites, so binding a session to its establishing
+  SMF source means threading the peer address through all of them (or moving the check
+  into the `nf-upf` N4 loop, which already has `peer`); a focused follow-up. (3)
+  *`valid_gnb_target` RAN-prefix allowlist* — cannot be made fail-closed by default
+  without a deployment-supplied RAN CIDR, because the demo/BDD topology deliberately
+  uses loopback (`127.0.0.x`) gNB addresses. All three are **bounded today** by the
+  documented isolated-user-plane-segment / IPsec deployment assumption; the cap is the
+  part that is safe and effective to fix unconditionally now.
 - **Class:** Packet injection / session manipulation. **File:**
   `nf/nf-upf/src/main.rs:277-343` (`serve_n3` — `peer` never checked against the
   session's gNB), `crates/pfcp/src/lib.rs:838-847,690-698` (sequential TEID/SEID
