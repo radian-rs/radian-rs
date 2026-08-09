@@ -204,11 +204,12 @@ UECM AMF/SMF register/dereg, UDR provisioned-data + policy-data + influenceData,
 data-change notify UDR→UDM→subscribers, NRF registration.
 
 Gaps:
-- **No SUCI deconcealment at all** — no ECIES Profile A (X25519) or B (P-256),
-  **not even the null-scheme parse**: `nudm.rs:388` treats supiOrSuci as the
-  SUPI. A privacy-enabled UE cannot authenticate. (Null-scheme live-UE interop
-  was [19](19-suci-deconcealment-live-ue.md) — AMF-side; the UDM side is the
-  gap.) No `SuciProfile` config, no home-network key store. → **G2**
+- ~~**No SUCI deconcealment at all**~~ **CLOSED** ([143](143-suci-deconcealment.md)):
+  the UDM now deconceals null scheme + **ECIES Profile A (X25519)** and
+  **Profile B (P-256)** via `aka::suci`, home-network keys configured by env, and
+  returns the deconcealed SUPI; the AUSF already propagated it. A privacy-enabled
+  UE can now authenticate (live ECIES interop = matched free-ran-ue keys, a
+  follow-up). → **G2** done
 - **No EAP-AKA'**: zero EAP code; `nf-ausf/src/main.rs:2` doc-comment *claims*
   it — fix the comment or the gap. Go has the full RFC 5448 flow. → **G3**
 - **No serving-network authorization** in AUSF — any caller names any SNN and
@@ -382,7 +383,7 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 | ID | Item | Sev | Size | Pri | Notes |
 |---|---|---|---|---|---|
 | **G1** | **Enforce OAuth across all NFs + real token issuance** — `oauth::protect` (or successor) on every service group; scope validated against producer services at the NRF; cert/nfType checks; instance-scoped `aud` | Major (security) | M | **P0** | §4.1; builds on [46](46-sbi-oauth.md)/[55](55-sbi-asymmetric-oauth.md) |
-| **G2** | **SUCI deconcealment** — null-scheme parse + ECIES Profile A/B in UDM; home-net key in subscriber-db; `SuciProfile` config | Major | M | **P1** | §3.4; blocks any privacy-enabled UE |
+| ~~**G2**~~ | ~~**SUCI deconcealment**~~ — **DONE** ([143](143-suci-deconcealment.md)): null + ECIES Profile A (X25519) / B (P-256) in `aka::suci`, home-net keys by env, UDM returns the deconcealed SUPI | Major | M | ✓ | unblocked privacy-enabled UEs; live interop = matched free-ran-ue keys |
 | **G3** | **EAP-AKA'** — AUSF eap-session routes + RFC 5448 PRF; UDM `EAP_AKA_PRIME` AV type; AMF EAP relay; fix the misleading doc-comment now | Moderate | M | P1 | 130's P3-6 confirmed |
 | **G4** | **PFCP liveness both sides** — SMF heartbeat loop + RecoveryTimeStamp restart detection + re-association + retransmission; UPF association state + pinned recovery timestamp + tx/rx transactions + error causes | Major (robustness) | M | **partial** | §3.2/3.3; **liveness + restart recovery DONE** ([141](141-pfcp-liveness.md)): heartbeat loop, pinned recovery-ts, drop-stranded-sessions. Remaining: UPF assoc-state, tx/dedup layer, error causes |
 | **G5** | **Config files** — per-NF YAML (serde) replacing inline env reads; PLMN/TAC/GUAMI/tai-list/algorithm order/timers; keep env as override | Moderate | M | **P1** | §4.2; prerequisite-ish for G13/G21/G24 |
@@ -415,8 +416,8 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 Suggested first wave by value-per-effort: **G1 → ~~G11~~ (done, [139](139-upf-downlink-qfi.md))
 → ~~G6~~ (leak done, [140](140-smf-ipam-pool.md)) → ~~G4~~ (liveness done,
 [141](141-pfcp-liveness.md)) → ~~G7~~ (done, [142](142-amf-nas-retransmission.md))
-→ G2 → G23 → G5**, then decide the §7 pivot question before committing to
-G16/G18-class interop refactors.
+→ ~~G2~~ (done, [143](143-suci-deconcealment.md)) → G23 → G5**, then decide the
+§7 pivot question before committing to G16/G18-class interop refactors.
 
 ## Sources
 
