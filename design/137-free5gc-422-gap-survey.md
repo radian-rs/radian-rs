@@ -94,9 +94,11 @@ Gaps:
   reject causes limited to #62 + session #26/27/31/70 — no #15 TA-not-allowed /
   #11 PLMN-not-allowed / #7 / #22 congestion (no supportTaiList /
   plmnSupportList exists to check against). → **G10/G12**
-- **Missing NAS retransmission timers: T3550 (Registration Accept), T3560
-  (Auth Req / SMC), T3570 (Identity Req)** — a lost downlink stalls the
-  registration permanently. Rust has T3512/T3513/T3522/T3555 only. → **G7**
+- ~~**Missing NAS retransmission timers T3550/T3560/T3570**~~ **CLOSED**
+  ([142](142-amf-nas-retransmission.md)): a uniform single-slot `pending_retx`
+  retransmits the Identity Request / Auth Request / SMC / Registration Accept
+  until its reply, aborting at the send cap; and a failed CM-IDLE resume now
+  sends a **Service Reject** (re-register) instead of a silent drop. → **G7** done
 - **SBI producer surface**: no Namf_EventExposure (11 event types), Namf_MT,
   Namf_Location, Namf_OAM, AMFStatusChange subscriptions, CreateUEContext /
   UEContextTransfer / RegistrationStatusUpdate / AssignEbiData; N1N2Transfer
@@ -385,7 +387,7 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 | **G4** | **PFCP liveness both sides** — SMF heartbeat loop + RecoveryTimeStamp restart detection + re-association + retransmission; UPF association state + pinned recovery timestamp + tx/rx transactions + error causes | Major (robustness) | M | **partial** | §3.2/3.3; **liveness + restart recovery DONE** ([141](141-pfcp-liveness.md)): heartbeat loop, pinned recovery-ts, drop-stranded-sessions. Remaining: UPF assoc-state, tx/dedup layer, error causes |
 | **G5** | **Config files** — per-NF YAML (serde) replacing inline env reads; PLMN/TAC/GUAMI/tai-list/algorithm order/timers; keep env as override | Moderate | M | **P1** | §4.2; prerequisite-ish for G13/G21/G24 |
 | **G6** | **IPAM** — allocate/release pools per (S-NSSAI,DNN,UPF), static pools, per-subscriber static IP from UDM | Major (leak) | S–M | **partial** | §3.2; **leak DONE** ([140](140-smf-ipam-pool.md)): bounded lazy-reuse pool + RAII release. Remaining: per-DNN/static pools, static IP from UDM |
-| **G7** | **AMF NAS retransmission timers T3550/T3560/T3570** (+ Service Reject on failed resume) | Moderate | S | **P1** | lost downlink = permanently stalled registration |
+| ~~**G7**~~ | ~~**AMF NAS retransmission timers T3550/T3560/T3570**~~ (+ Service Reject on failed resume) — **DONE** ([142](142-amf-nas-retransmission.md)): uniform single-slot verbatim retransmit + abort-at-cap; Service Reject #10 on failed resume | Moderate | S | ✓ | closed the permanently-stalled-registration gap |
 | **G8** | **NGAP robustness pack** — emit ErrorIndication; handle InitialContextSetupFailure, NASNonDeliveryIndication, RAN Status Transfer relay (lossless HO), UEContextModificationFailure | Moderate | M | P1 | §3.1 |
 | **G9** | AMF standard SBI: TS 29.518 ue-contexts resource model + real N1N2MessageTransfer (N1/N2 containers) + Namf_EventExposure | Moderate | L | P2 | prerequisite for G13; overlaps G16 |
 | **G10** | NAS-SM fidelity: route UL 5GSM by request type (fix Modification→Create misroute), PCO/ePCO answers, SSC mode IE, richer 5GMM/5GSM causes | Moderate | M | P1 | §3.2 |
@@ -412,8 +414,9 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 
 Suggested first wave by value-per-effort: **G1 → ~~G11~~ (done, [139](139-upf-downlink-qfi.md))
 → ~~G6~~ (leak done, [140](140-smf-ipam-pool.md)) → ~~G4~~ (liveness done,
-[141](141-pfcp-liveness.md)) → G7 → G2 → G23 → G5**, then decide the §7 pivot
-question before committing to G16/G18-class interop refactors.
+[141](141-pfcp-liveness.md)) → ~~G7~~ (done, [142](142-amf-nas-retransmission.md))
+→ G2 → G23 → G5**, then decide the §7 pivot question before committing to
+G16/G18-class interop refactors.
 
 ## Sources
 
