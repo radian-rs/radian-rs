@@ -65,6 +65,12 @@ pub enum Uplink<'a> {
     /// The inner packet's source is not the UE's assigned address — likely spoofing;
     /// drop. For IPv6 `assigned` is the session's /64 prefix.
     Spoofed { claimed: IpAddr, assigned: IpAddr },
+    /// The inner packet is not one this session may source: an address family the session
+    /// was never assigned (e.g. an IPv6 packet on an IPv4-only session), or not an IP
+    /// packet at all — drop. Without this a single-family session could source-spoof the
+    /// *unassigned* family unchecked (design/137 F5). `claimed` is the source address when
+    /// the packet parsed as IP, `None` for a non-IP packet.
+    UnassignedFamily { claimed: Option<IpAddr> },
     /// The session's uplink AMBR is exceeded — policed (dropped).
     RateLimited,
     /// The UE sent an ICMPv6 **Router Solicitation** — the UPF answers it with a Router
@@ -75,10 +81,13 @@ pub enum Uplink<'a> {
 /// Decide the fate of an uplink packet (`inner`) that arrived on N3 under `teid`,
 /// at `now_nanos` (the UPF's monotonic clock, for AMBR policing).
 ///
-/// Anti-spoofing is best-effort at L3: an IPv4 inner's source must equal the UE's
-/// assigned IPv4; an IPv6 inner's source must fall in the UE's assigned /64 (the UE
-/// forms its address there via SLAAC); anything else is forwarded as-is (the DN device
-/// drops what it can't route). A packet that passes is metered against the uplink AMBR.
+/// Anti-spoofing at L3 (design/137 F5): a session with an assigned UE address accepts
+/// only that UE's own addresses — an IPv4 source must equal the assigned IPv4, an IPv6
+/// source must fall in the assigned /64 (the UE forms its address there via SLAAC), and a
+/// family the session was *not* assigned (or a non-IP packet) is dropped rather than
+/// forwarded, so a single-family session cannot source-spoof the other family. A session
+/// with no assigned address at all (a pure forwarding tunnel) is not checked. A packet
+/// that passes is metered against the uplink AMBR.
 pub fn uplink<'a>(state: &mut UpfState, teid: u32, inner: &'a [u8], now_nanos: u64) -> Uplink<'a> {
     // On an intermediate UPF, a TEID matching its downlink N9 ingress is traffic coming
     // *back* from the anchor — forward it on to the gNB rather than treating it as
@@ -95,17 +104,31 @@ pub fn uplink<'a>(state: &mut UpfState, teid: u32, inner: &'a [u8], now_nanos: u
     if state.ue_ipv6_for_teid(teid).is_some() && is_router_solicitation(inner) {
         return Uplink::RouterSolicitation;
     }
-    if let Some((src, _dst)) = ipv4_addrs(inner) {
-        if let Some(ue_ip) = state.ue_ip_for_teid(teid)
-            && src != ue_ip
-        {
-            return Uplink::Spoofed { claimed: src.into(), assigned: ue_ip.into() };
+    // A session that assigned the UE an address (an anchor, or a chain's first hop —
+    // both are provisioned the full UE address) accepts only that UE's own addresses.
+    // A session with no address assigned at all is a pure forwarding tunnel (e.g.
+    // indirect handover forwarding) and is left to forward untouched.
+    let assigned_v4 = state.ue_ip_for_teid(teid);
+    let assigned_v6 = state.ue_ipv6_for_teid(teid);
+    if assigned_v4.is_some() || assigned_v6.is_some() {
+        if let Some((src, _dst)) = ipv4_addrs(inner) {
+            match assigned_v4 {
+                Some(ue_ip) if src == ue_ip => {}
+                Some(ue_ip) => return Uplink::Spoofed { claimed: src.into(), assigned: ue_ip.into() },
+                // IPv4 on a session with no assigned IPv4 (e.g. IPv6-only) — not this UE's.
+                None => return Uplink::UnassignedFamily { claimed: Some(src.into()) },
+            }
+        } else if let Some((src, _dst)) = ipv6_addrs(inner) {
+            match assigned_v6 {
+                Some(prefix) if in_prefix64(src, prefix) => {}
+                Some(prefix) => return Uplink::Spoofed { claimed: src.into(), assigned: prefix.into() },
+                // IPv6 on a session with no assigned /64 (e.g. IPv4-only) — not this UE's.
+                None => return Uplink::UnassignedFamily { claimed: Some(src.into()) },
+            }
+        } else {
+            // Neither IPv4 nor IPv6: an address-assigned IP session may not source it.
+            return Uplink::UnassignedFamily { claimed: None };
         }
-    } else if let Some((src, _dst)) = ipv6_addrs(inner)
-        && let Some(prefix) = state.ue_ipv6_for_teid(teid)
-        && !in_prefix64(src, prefix)
-    {
-        return Uplink::Spoofed { claimed: src.into(), assigned: prefix.into() };
     }
     if !state.admit_uplink(teid, now_nanos, inner) {
         return Uplink::RateLimited;
@@ -641,6 +664,63 @@ mod tests {
             Uplink::Spoofed { claimed: IpAddr::V6(bad_src), assigned: IpAddr::V6(UE_V6_PREFIX) },
             "an IPv6 source outside the assigned /64 is rejected"
         );
+    }
+
+    #[test]
+    fn uplink_drops_the_unassigned_family_on_a_single_family_session() {
+        // design/137 F5: a single-family session must not be able to source-spoof the
+        // *other* family (previously the cross-family check was skipped and the packet
+        // was forwarded to N6 with no source validation at all).
+
+        // IPv4-only session → an IPv6 packet (any source) is dropped, not forwarded.
+        let (mut state, teid) = established_upf();
+        let v6 = ipv6_packet(UE_V6, GW_V6, b"spoof");
+        assert_eq!(
+            uplink(&mut state, teid, &v6, 0),
+            Uplink::UnassignedFamily { claimed: Some(IpAddr::V6(UE_V6)) },
+            "IPv6 on an IPv4-only session is dropped"
+        );
+        // …and a non-IP packet is likewise dropped rather than handed to N6.
+        assert_eq!(
+            uplink(&mut state, teid, &[0xffu8; 32], 0),
+            Uplink::UnassignedFamily { claimed: None },
+            "a non-IP packet is dropped"
+        );
+
+        // The symmetric case: an IPv6-only session drops an IPv4 packet.
+        let (mut v6_state, v6_teid) = established_upf_v6();
+        let v4 = ipv4_packet(UE_IP, Ipv4Addr::new(8, 8, 8, 8), b"spoof");
+        assert_eq!(
+            uplink(&mut v6_state, v6_teid, &v4, 0),
+            Uplink::UnassignedFamily { claimed: Some(IpAddr::V4(UE_IP)) },
+            "IPv4 on an IPv6-only session is dropped"
+        );
+    }
+
+    #[test]
+    fn uplink_dual_stack_session_accepts_both_families() {
+        // A genuinely dual-stack session forwards each family from its own assigned address.
+        let mut state = UpfState::new();
+        let ue = pfcp::UeAddr { v4: Some(UE_IP), v6: Some(UE_V6_PREFIX) };
+        pfcp::handle_n4(
+            &pfcp::session_establishment_request(0xCAFE, 1, UPF_IP, ue, "internet", None, &[], None),
+            UPF_IP,
+            &mut state,
+            0,
+        )
+        .expect("establish dual-stack");
+        pfcp::handle_n4(
+            &pfcp::session_modification_request(1, 2, 2, GNB_TEID, GNB_IP, "internet", false),
+            UPF_IP,
+            &mut state,
+            0,
+        )
+        .expect("modify");
+        let teid = 1;
+        let v4 = ipv4_packet(UE_IP, Ipv4Addr::new(8, 8, 8, 8), b"v4");
+        assert_eq!(uplink(&mut state, teid, &v4, 0), Uplink::ToN6(&v4[..]), "assigned IPv4 forwarded");
+        let v6 = ipv6_packet(UE_V6, GW_V6, b"v6");
+        assert_eq!(uplink(&mut state, teid, &v6, 0), Uplink::ToN6(&v6[..]), "assigned IPv6 forwarded");
     }
 
     #[test]

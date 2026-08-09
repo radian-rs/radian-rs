@@ -153,6 +153,10 @@ enum UeCmd {
     /// The release guard timer fired: the UE never sent its PDU Session Release
     /// Complete for `psi` — finalise the release at the SMF anyway.
     ReleaseGuardExpiry { amf_ue_id: u64, psi: u8 },
+    /// The registration guard timer fired: a registration never reached
+    /// `Registered` within the guard window — evict the abandoned in-progress
+    /// context so it cannot leak AMF state without bound (design/137 F6).
+    RegistrationGuardExpiry(u64),
     /// A Nudm_SDM data change: refresh the UE's cached subscription view (the newly
     /// fetched UE-AMBR and allowed NSSAI). `None` fields leave the current value.
     UpdateSubscribedData {
@@ -484,6 +488,92 @@ fn arm_release_guard(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64, psi: u8, secs:
     });
 }
 
+/// The registration guard: how long a registration may sit **without progress**
+/// before the AMF evicts the abandoned context. A malicious or broken peer that
+/// opens registrations (each an unauthenticated `InitialUEMessage`) and never
+/// advances them would otherwise leak a `UeContext` apiece — the context is freed
+/// only by a terminal procedure a vanished UE never sends — exhausting AMF memory
+/// without bound (design/137 F6). The window is measured from the last registration
+/// progress (T3550/T3560-style), not from admission, so a slow-but-genuine
+/// registration that keeps advancing is never cut off; only a genuine stall trips
+/// the guard. That makes the window safe to keep short: the resident abandoned set
+/// is bounded by arrival-rate × window. Override with
+/// `RADIAN_AMF_REGISTRATION_GUARD_SECS`.
+const REGISTRATION_GUARD_SECS: u64 = 10;
+const REGISTRATION_GUARD_ENV: &str = "RADIAN_AMF_REGISTRATION_GUARD_SECS";
+
+fn registration_guard_secs() -> u64 {
+    std::env::var(REGISTRATION_GUARD_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(REGISTRATION_GUARD_SECS)
+}
+
+/// Arm the registration guard: after `secs`, post an expiry for this UE onto its
+/// association — evicts the context if the registration never reached `Registered`.
+fn arm_registration_guard(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64, secs: u64) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        let _ = tx.send(UeCmd::RegistrationGuardExpiry(amf_ue_id));
+    });
+}
+
+/// The registration guard fired: evict a UE whose registration has stalled in a
+/// non-`Registered` state for the full guard window (design/137 F6). A registration
+/// that has since completed (`Registered`) or was already torn down is a no-op, and
+/// one that is still making progress re-arms the guard for its remaining window
+/// rather than being cut off — the window is measured from the last transition, not
+/// from admission. Evicting drops the context, which releases its CBL admission slot
+/// (RAII), so an abandoned registration can neither leak memory nor hold the gate.
+fn on_registration_guard_expiry(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_ue_id: u64,
+    tx: &UnboundedSender<UeCmd>,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let Some(ctx) = ues.get(&amf_ue_id) else {
+        return Vec::new(); // registration completed or was already torn down
+    };
+    if ctx.state == RegState::Registered {
+        return Vec::new(); // registration succeeded — nothing to reclaim
+    }
+    // Still advancing? Re-arm for the time left in the window and let a genuine stall
+    // trip the guard on a later firing (T3550/T3560-style per-step guarding).
+    let window = std::time::Duration::from_secs(registration_guard_secs());
+    let idle = ctx.reg_progress_at.elapsed();
+    if idle < window {
+        arm_registration_guard(tx, amf_ue_id, (window - idle).as_secs().max(1));
+        return Vec::new();
+    }
+    let ran_ue_id = ctx.ran_ue_id;
+    warn!(
+        "UE {amf_ue_id}: registration stalled in {:?} for {}s — evicting the in-progress \
+         context on the guard timer",
+        ctx.state,
+        idle.as_secs(),
+    );
+    // Drop the SBI-callback directory entry, but only if it still points at this
+    // context (a later re-registration for the same SUPI may own it now). No SDM/UECM
+    // purge and no charging teardown: an in-progress registration created none of those,
+    // and issuing spurious DELETEs would let the flood amplify into outbound requests.
+    // Only the PCF AM policy is torn down, and only if one was actually created.
+    if let Some(supi) = ctx.suci.clone() {
+        let mut dir = UE_DIRECTORY.lock().unwrap();
+        if dir.get(&supi).map(|(id, _)| *id) == Some(amf_ue_id) {
+            dir.remove(&supi);
+        }
+    }
+    spawn_am_policy_delete(ues.get_mut(&amf_ue_id).and_then(|c| c.am_policy.take()));
+    ues.remove(&amf_ue_id);
+    // Best-effort: ask the gNB to release its RAN context for this UE (the peer may
+    // already be gone, in which case the send simply fails and is logged).
+    vec![(
+        ngap::ue_context_release_command_radio(
+            amf_ue_id,
+            ran_ue_id,
+            ngap::CauseRadioNetwork::RELEASE_DUE_TO_5GC_GENERATED_REASON,
+        ),
+        "UEContextReleaseCommand",
+    )]
+}
+
 /// Where a UE is in the registration flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegState {
@@ -609,6 +699,12 @@ struct UeContext {
     /// teardown path releases it by dropping the context. `None` when CBL was
     /// disabled at admission (or the slot already decayed).
     cbl_slot: Option<cbl::CblSlot>,
+    /// When this registration last made progress (context created, or a state
+    /// transition to `Authenticating` / `SecurityMode`). The registration guard
+    /// measures its window from here, not from creation — a registration that keeps
+    /// advancing is never evicted, while one that stalls in a non-`Registered` state
+    /// is reclaimed the guard window after its last progress (design/137 F6).
+    reg_progress_at: std::time::Instant,
 }
 
 /// A service area restriction as `(allowed_tacs, non_allowed_tacs)` — the AMF signals
@@ -795,6 +891,9 @@ async fn serve_gnb(
                             finalize_release(&mut ues, &amf_smf, amf_ue_id, psi).await;
                         }
                         Vec::new()
+                    }
+                    UeCmd::RegistrationGuardExpiry(id) => {
+                        on_registration_guard_expiry(&mut ues, id, &dereg_tx)
                     }
                     UeCmd::UpdateAmPolicy { amf_ue_id, ue_ambr, rfsp, area_restriction } => {
                         on_am_policy_update(&mut ues, amf_ue_id, ue_ambr, rfsp, area_restriction, &dereg_tx)
@@ -1728,6 +1827,10 @@ async fn handle_ngap(
                         if let Some(ctx) = ues.get_mut(&amf_ue_id) {
                             ctx.cbl_slot = slot;
                         }
+                        // Guard the new registration: if it never reaches Registered,
+                        // the context (and its CBL slot) is evicted on expiry rather
+                        // than leaking until the association drops (design/137 F6).
+                        arm_registration_guard(dereg_tx, amf_ue_id, registration_guard_secs());
                         match outcome {
                             InitialUeOutcome::NeedIdentity(dl) => {
                                 send_or_log(conn, &dl, "DownlinkNASTransport (IdentityRequest)")
@@ -3170,6 +3273,7 @@ impl UeContext {
             releasing: std::collections::HashSet::new(),
             pending_config_update: None,
             cbl_slot: None,
+            reg_progress_at: std::time::Instant::now(),
         }
     }
 
@@ -3195,6 +3299,7 @@ async fn start_authentication(
             if let Some(ctx) = ues.get_mut(&amf_ue_id) {
                 ctx.auth = Some(pending);
                 ctx.state = RegState::Authenticating;
+                ctx.reg_progress_at = std::time::Instant::now();
             }
             let dl = ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, nas_req);
             send_or_log(conn, &dl, "DownlinkNASTransport (AuthenticationRequest)").await;
@@ -3372,6 +3477,7 @@ async fn dispatch_uplink_nas(
                     ctx.suci = Some(supi.clone());
                     ctx.auth = Some(pending);
                     ctx.state = RegState::Authenticating;
+                    ctx.reg_progress_at = std::time::Instant::now();
                     ctx.registration_area = registration_area;
                     // Reachable from the SBI callback surface from now on.
                     UE_DIRECTORY.lock().unwrap().insert(supi, (amf_ue_id, dereg_tx.clone()));
@@ -3803,6 +3909,7 @@ async fn complete_authentication(
     // Key IE (TS 33.501 Annex A.9).
     ctx.kamf = Some(kamf);
     ctx.state = RegState::SecurityMode;
+    ctx.reg_progress_at = std::time::Instant::now();
     let ran_ue_id = ctx.ran_ue_id;
     vec![(
         ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, smc_bytes),
@@ -4805,6 +4912,46 @@ mod tests {
         assert_eq!(RELEASES.load(AtomicOrdering::Relaxed), 1, "the stale UE's PDU session released");
 
         RETAINED.lock().unwrap().remove(&fresh_tmsi);
+    }
+
+    /// design/137 F6: the guard reclaims a registration that has stalled in a
+    /// non-`Registered` state for the full window (context + directory entry dropped),
+    /// re-arms one that is still progressing instead of cutting it off, and leaves a
+    /// completed registration (or an already-gone context) untouched.
+    #[tokio::test]
+    async fn registration_guard_evicts_stalled_registrations() {
+        let supi = "imsi-999700000009137";
+        let mut ues: HashMap<u64, UeContext> = HashMap::new();
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
+
+        // A stalled in-progress registration (last progress well past the window) plus
+        // the directory entry it created…
+        let mut stalled = UeContext::new(7, RegState::Authenticating, Some(supi.into()));
+        stalled.reg_progress_at = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        ues.insert(1, stalled);
+        UE_DIRECTORY.lock().unwrap().insert(supi.into(), (1, tx.clone()));
+
+        // …a completed registration that must survive…
+        ues.insert(2, UeContext::new(9, RegState::Registered, Some("imsi-999700000009138".into())));
+
+        // …and one still progressing (fresh timestamp): re-armed, not evicted.
+        ues.insert(3, UeContext::new(5, RegState::SecurityMode, Some("imsi-999700000009139".into())));
+        assert!(on_registration_guard_expiry(&mut ues, 3, &tx).is_empty(), "progressing UE re-armed");
+        assert!(ues.contains_key(&3), "progressing UE kept");
+
+        // The stalled context is evicted, and the gNB is asked to release its RAN side.
+        let dls = on_registration_guard_expiry(&mut ues, 1, &tx);
+        assert!(!ues.contains_key(&1), "stalled in-progress context evicted");
+        assert_eq!(dls.len(), 1, "a UE Context Release Command is emitted for the gNB");
+        assert!(
+            UE_DIRECTORY.lock().unwrap().get(supi).is_none(),
+            "the SBI-callback directory entry is reclaimed"
+        );
+
+        // A Registered UE is never touched, and an unknown id is a no-op.
+        assert!(on_registration_guard_expiry(&mut ues, 2, &tx).is_empty(), "Registered UE left alone");
+        assert!(ues.contains_key(&2), "Registered UE kept");
+        assert!(on_registration_guard_expiry(&mut ues, 999, &tx).is_empty(), "absent id is a no-op");
     }
 
     /// Network-initiated paging: the SMF's N1N2 message transfer (downlink data)
