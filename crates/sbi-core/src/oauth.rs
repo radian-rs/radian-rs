@@ -37,7 +37,7 @@ use hmac::{Hmac, Mac};
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -60,6 +60,19 @@ pub fn asymmetric_enabled() -> bool {
 /// token is opaque to the client, fetched from the NRF regardless of signing mode.
 pub fn client_tokens_enabled() -> bool {
     asymmetric_enabled() || sbi_secret().is_some()
+}
+
+/// The authenticated identity of an mTLS peer: the SHA-256 thumbprint (hex) of its
+/// client certificate (RFC 8705). The mTLS serve path ([`crate::tls`]) injects this as
+/// a request extension after the handshake; it is absent on a cleartext (h2c)
+/// connection. The NRF binds each NF's registration + access tokens to it (design/137
+/// F4), so a core NF cannot register or obtain a token under another NF's identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientCert(pub String);
+
+/// RFC 8705 certificate thumbprint — hex(SHA-256(DER)) — of a peer's client cert.
+pub fn cert_thumbprint(cert_der: &[u8]) -> String {
+    hex::encode(Sha256::digest(cert_der))
 }
 
 fn now_secs() -> u64 {

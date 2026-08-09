@@ -52,10 +52,22 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => warn!("NRF registration failed (continuing without discovery): {e}"),
     }
 
+    // Require an NRF-issued `UDM`-audience access token on every Nudm call when SBI
+    // security is on (design/137 F3) — the UDM serves authentication vectors (K_AUSF)
+    // and subscriber data, so it must not answer unauthenticated callers. Open SBI
+    // (no verifier configured) leaves the router unchanged.
+    let router = sbi_core::oauth::protect(
+        sbi_core::nudm::router(udr),
+        "UDM",
+        sbi_core::oauth::verifier(&nrf_base),
+    );
+    if sbi_core::oauth::verifier(&nrf_base).is_some() {
+        info!("Nudm protected by OAuth2 (audience UDM)");
+    }
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     match tls {
-        Some(id) => sbi_core::tls::serve(sbi, sbi_core::nudm::router(udr), id).await?,
-        None => sbi_core::run(sbi, sbi_core::nudm::router(udr)).await?,
+        Some(id) => sbi_core::tls::serve(sbi, router, id).await?,
+        None => sbi_core::run(sbi, router).await?,
     }
     Ok(())
 }

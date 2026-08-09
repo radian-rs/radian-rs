@@ -23,6 +23,9 @@ const PCF_ENV: &str = "RADIAN_NEF_PCF";
 /// Store group / any-UE influences at this UDR instead of discovering one (design/135
 /// Phase 3).
 const UDR_ENV: &str = "RADIAN_NEF_UDR";
+/// Per-AF API keys authenticating the northbound (design/137 F2), as
+/// `af1:key1,af2:key2`. Unset ⇒ the northbound is open (dev).
+const AF_KEYS_ENV: &str = "RADIAN_NEF_AF_KEYS";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -71,6 +74,23 @@ async fn main() -> anyhow::Result<()> {
         let udr = sbi_core::sbi_base(udr);
         info!(%udr, "group influences stored as UDR influence data");
         state = state.with_udr_base(udr);
+    }
+    // AF authentication (design/137 F2): the NEF is the external trust boundary, so an AF
+    // must present its provisioned API key. Unset ⇒ open (dev) — logged as a warning so an
+    // unauthenticated northbound is never silent.
+    match std::env::var(AF_KEYS_ENV) {
+        Ok(spec) => {
+            let keys: std::collections::HashMap<String, String> = spec
+                .split(',')
+                .filter_map(|kv| kv.split_once(':'))
+                .map(|(af, key)| (af.trim().to_string(), key.trim().to_string()))
+                .collect();
+            info!(afs = keys.len(), "NEF northbound requires per-AF API keys");
+            state = state.with_af_keys(keys);
+        }
+        Err(_) => warn!(
+            "NEF northbound is UNAUTHENTICATED — set {AF_KEYS_ENV}=af:key[,…] to require AF API keys"
+        ),
     }
 
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;

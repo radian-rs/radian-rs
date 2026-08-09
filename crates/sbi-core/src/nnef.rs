@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -128,6 +128,12 @@ pub struct NefState {
     /// application influence data (design/135 Phase 3) rather than authorized per session,
     /// so every PCF picks it up — including for sessions established later.
     udr_base: Option<String>,
+    /// Per-AF API keys (`af_id` → key) authenticating the **northbound** AF requests
+    /// (design/137 F2). `None` ⇒ the northbound is open (dev default); when set, a request
+    /// must carry the key provisioned for the `af_id` it targets, so an unauthenticated (or
+    /// wrong) AF cannot steer subscribers' traffic. The NEF is the external trust boundary,
+    /// so — unlike the intra-core OAuth mesh — the AF is authenticated by a shared key.
+    af_keys: Option<Arc<HashMap<String, String>>>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -160,6 +166,14 @@ impl NefState {
         self
     }
 
+    /// Require a per-AF API key on northbound requests (design/137 F2): a request must
+    /// carry `Authorization: Bearer <key>` matching the key provisioned here for its
+    /// `af_id`. An empty map is treated as "no keys configured" (open).
+    pub fn with_af_keys(mut self, keys: HashMap<String, String>) -> Self {
+        self.af_keys = (!keys.is_empty()).then(|| Arc::new(keys));
+        self
+    }
+
     fn build(
         nrf_base: Option<String>,
         smf_base: Option<String>,
@@ -170,10 +184,47 @@ impl NefState {
             smf_base,
             pcf_base,
             udr_base: None,
+            af_keys: None,
             inner: Arc::new(Mutex::new(Inner {
                 next_id: AtomicU64::new(1),
                 subs: HashMap::new(),
             })),
+        }
+    }
+
+    /// Authenticate + authorize the calling AF (design/137 F2). With no AF keys
+    /// configured the northbound is open (dev default); otherwise the request must carry
+    /// `Authorization: Bearer <key>` whose key is the one provisioned for this `af_id` —
+    /// so an unauthenticated AF, or an AF acting under another's identifier, is refused.
+    /// `Err` carries the 401 response to return; the same status is used for every failure
+    /// so a caller can't enumerate provisioned `af_id`s.
+    fn authorize_af(&self, af_id: &str, headers: &HeaderMap) -> Result<(), axum::response::Response> {
+        let Some(keys) = &self.af_keys else {
+            return Ok(()); // no AF keys configured — open (dev)
+        };
+        let presented = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .unwrap_or("");
+        let ok = keys
+            .get(af_id)
+            .is_some_and(|expected| ct_eq(presented.as_bytes(), expected.as_bytes()));
+        if ok {
+            Ok(())
+        } else {
+            tracing::warn!(%af_id, "NEF rejected an AF request: missing or invalid API key");
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(crate::ProblemDetails {
+                    status: Some(401),
+                    title: Some("Unauthorized".into()),
+                    cause: Some("UNAUTHORIZED".into()),
+                    detail: Some("AF authentication failed".into()),
+                    ..Default::default()
+                }),
+            )
+                .into_response())
         }
     }
 
@@ -264,11 +315,24 @@ fn dst_from_flow_description(desc: &str) -> Option<String> {
     None
 }
 
+/// Constant-time byte-slice equality — the AF API key must not be compared with an
+/// early-exit `==` that leaks its bytes via timing.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
 async fn create_subscription(
     State(nef): State<NefState>,
     Path(af_id): Path<String>,
+    headers: HeaderMap,
     Json(sub): Json<TrafficInfluSub>,
 ) -> axum::response::Response {
+    if let Err(resp) = nef.authorize_af(&af_id, &headers) {
+        return resp;
+    }
     let Some(prefix) = steer_prefix(&sub) else {
         return (StatusCode::BAD_REQUEST, "no traffic prefix (prefix or a filter destination)")
             .into_response();
@@ -405,8 +469,12 @@ async fn steer_at_smf(
 
 async fn delete_subscription(
     State(nef): State<NefState>,
-    Path((_af_id, sub_id)): Path<(String, String)>,
+    Path((af_id, sub_id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
+    if let Err(resp) = nef.authorize_af(&af_id, &headers) {
+        return resp;
+    }
     // Idempotent: an unknown subscription is already gone.
     let Some(sub) = nef.take(&sub_id) else {
         return StatusCode::NO_CONTENT.into_response();

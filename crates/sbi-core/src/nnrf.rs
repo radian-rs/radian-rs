@@ -192,6 +192,10 @@ pub struct SearchResult {
 struct Entry {
     profile: NfProfile,
     last_seen: Instant,
+    /// The mTLS client-cert thumbprint that registered this NF (RFC 8705), when the
+    /// registration arrived over mTLS. Access-token requests for this instance must
+    /// present the same certificate (design/137 F4); `None` under cleartext SBI.
+    cert_fp: Option<String>,
 }
 
 /// In-memory NF registry shared by the NRF router handlers.
@@ -308,6 +312,7 @@ async fn jwks(State(store): State<NrfStore>) -> Json<crate::oauth::Jwks> {
 /// that the requesting NF is registered. See [`crate::oauth`] for the trust model.
 async fn access_token(
     State(store): State<NrfStore>,
+    client_cert: Option<axum::Extension<crate::oauth::ClientCert>>,
     Json(req): Json<crate::oauth::AccessTokenReq>,
 ) -> Result<Json<crate::oauth::AccessTokenRsp>, (StatusCode, Json<crate::ProblemDetails>)> {
     let problem = |status: StatusCode, cause: &str, detail: &str| {
@@ -331,6 +336,23 @@ async fn access_token(
     if !store.is_registered(&req.nf_instance_id) {
         return Err(problem(StatusCode::FORBIDDEN, "UNAUTHORIZED_CLIENT", "requesting NF is not registered"));
     }
+    // Bind issuance to the authenticated mTLS caller (design/137 F4): the presenting
+    // certificate must be the one that registered this NF instance, so a core NF cannot
+    // obtain a token under another NF's identity. Skipped under cleartext SBI (no cert).
+    if let Some(axum::Extension(cert)) = &client_cert {
+        let bound = {
+            let mut g = store.entries.lock().unwrap();
+            store.purge_stale(&mut g);
+            g.get(&req.nf_instance_id).and_then(|e| e.cert_fp.clone())
+        };
+        if bound.as_deref() != Some(cert.0.as_str()) {
+            return Err(problem(
+                StatusCode::FORBIDDEN,
+                "UNAUTHORIZED_CLIENT",
+                "client certificate does not match the registered NF instance",
+            ));
+        }
+    }
     // Prefer asymmetric (ES256) signing when a private key is configured.
     let rsp = match (&store.signing_key, &store.secret) {
         (Some(key), _) => crate::oauth::issue_token_es256(key, "radian-nrf", &req),
@@ -346,6 +368,7 @@ async fn access_token(
 async fn register(
     State(store): State<NrfStore>,
     Path(id): Path<String>,
+    client_cert: Option<axum::Extension<crate::oauth::ClientCert>>,
     Json(mut profile): Json<NfProfile>,
 ) -> impl IntoResponse {
     profile.nf_instance_id = id.clone();
@@ -353,12 +376,29 @@ async fn register(
     // this interval or be evicted. The wire field is whole seconds — never
     // advertise 0 even if the store's timer is sub-second (tests).
     profile.heart_beat_timer = Some(store.heartbeat_timer.as_secs().max(1) as u32);
-    store
-        .entries
-        .lock()
-        .unwrap()
-        .insert(id, Entry { profile: profile.clone(), last_seen: Instant::now() });
-    (StatusCode::CREATED, Json(profile))
+    let fp = client_cert.map(|axum::Extension(c)| c.0);
+    let mut g = store.entries.lock().unwrap();
+    // A cert-bound registration may only be updated by the same certificate — a core NF
+    // (even one holding a valid core cert) must not hijack another NF's registration to
+    // redirect its discovery or impersonate it (design/137 F4).
+    if let Some(existing) = g.get(&id) {
+        if let Some(bound) = &existing.cert_fp {
+            if fp.as_deref() != Some(bound.as_str()) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(crate::ProblemDetails {
+                        status: Some(403),
+                        cause: Some("UNAUTHORIZED_CLIENT".into()),
+                        detail: Some("registration is bound to a different certificate".into()),
+                        ..Default::default()
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+    g.insert(id, Entry { profile: profile.clone(), last_seen: Instant::now(), cert_fp: fp });
+    (StatusCode::CREATED, Json(profile)).into_response()
 }
 
 async fn heartbeat(State(store): State<NrfStore>, Path(id): Path<String>) -> StatusCode {
@@ -568,6 +608,67 @@ pub async fn register_and_maintain(nrf_base: &str, profile: NfProfile) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An NRF endpoint over `store` that stamps every request with `cert_fp` as if it
+    /// arrived over mTLS under that client certificate (what [`crate::tls`] injects).
+    async fn spawn_nrf_as(store: NrfStore, cert_fp: &str) -> String {
+        let app = router(store).layer(axum::Extension(crate::oauth::ClientCert(cert_fp.to_string())));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(l, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// design/137 F4: with mTLS, the NRF binds each registration + access token to the
+    /// client certificate that registered the NF, so another core NF (a different cert)
+    /// can neither obtain a token as that NF nor hijack its registration.
+    #[tokio::test]
+    async fn nrf_binds_tokens_to_the_registering_client_certificate() {
+        let store = NrfStore::default().with_secret(Some(vec![0x44u8; 32]));
+        // Same registry, two callers distinguished by their certificate thumbprint.
+        let amf_ep = spawn_nrf_as(store.clone(), "amf-cert-fp").await;
+        let smf_ep = spawn_nrf_as(store.clone(), "smf-cert-fp").await;
+        let http = crate::sbi_client();
+        let token_req = serde_json::json!({
+            "grant_type": "client_credentials",
+            "nfInstanceId": "amf-1",
+            "targetNfType": "UDR",
+            "scope": "nudr-dr",
+        });
+
+        // The AMF registers over its cert, then obtains a token bound to that cert.
+        let reg = http
+            .put(format!("{amf_ep}/nnrf-nfm/v1/nf-instances/amf-1"))
+            .json(&NfProfile::new("amf-1", "AMF", "127.0.0.1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reg.status(), 201);
+        let ok = http.post(format!("{amf_ep}/oauth2/token")).json(&token_req).send().await.unwrap();
+        assert_eq!(ok.status(), 200, "the registering certificate gets a token");
+
+        // A different certificate cannot obtain a token as amf-1…
+        let stolen = http.post(format!("{smf_ep}/oauth2/token")).json(&token_req).send().await.unwrap();
+        assert_eq!(stolen.status(), 403, "a different certificate can't get a token as amf-1");
+
+        // …nor hijack amf-1's registration (which would redirect its discovery).
+        let hijack = http
+            .put(format!("{smf_ep}/nnrf-nfm/v1/nf-instances/amf-1"))
+            .json(&NfProfile::new("amf-1", "AMF", "6.6.6.6"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hijack.status(), 403, "a different certificate can't hijack amf-1's registration");
+
+        // The rightful cert still updates its own registration.
+        let reup = http
+            .put(format!("{amf_ep}/nnrf-nfm/v1/nf-instances/amf-1"))
+            .json(&NfProfile::new("amf-1", "AMF", "127.0.0.2"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reup.status(), 201, "the registering certificate can re-register");
+    }
 
     /// Full NF lifecycle over real h2c: register → discover → heartbeat → deregister.
     #[tokio::test]

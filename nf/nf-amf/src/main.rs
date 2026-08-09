@@ -216,6 +216,23 @@ struct ModifyPolicy {
 /// serving-AMF registration.
 static AMF_INSTANCE_ID: LazyLock<String> = LazyLock::new(sbi_core::new_nf_instance_id);
 
+/// The AMF's OAuth token source for calling the (protected) UDM — `Some` only when SBI
+/// security is enabled (design/137 F3), keyed by this AMF's registered instance id.
+static AMF_UDM_TOKENS: LazyLock<Option<Arc<sbi_core::oauth::TokenSource>>> = LazyLock::new(|| {
+    sbi_core::oauth::client_tokens_enabled().then(|| {
+        Arc::new(sbi_core::oauth::TokenSource::new(NRF_BASE.clone(), AMF_INSTANCE_ID.clone()))
+    })
+});
+
+/// A Nudm client for `base` that attaches an NRF-issued `UDM` access token when SBI
+/// security is on (design/137 F3), else calls the UDM openly.
+fn udm_client(base: impl Into<String>) -> sbi_core::nudm::NudmClient {
+    match &*AMF_UDM_TOKENS {
+        Some(t) => sbi_core::nudm::NudmClient::with_tokens(base, t.clone()),
+        None => sbi_core::nudm::NudmClient::new(base),
+    }
+}
+
 /// Record this AMF as the SUPI's serving AMF at the UDM (Nudm_UECM), carrying
 /// the deregistration callback the UDR will use on subscription withdrawal.
 /// Best-effort, off the signaling path.
@@ -232,7 +249,7 @@ fn spawn_uecm_register(supi: String) {
         match discover_nf(&NRF_BASE, "UDM").await {
             Ok(udm) => {
                 if let Err(e) =
-                    sbi_core::nudm::NudmClient::new(udm).uecm_register_amf(&supi, &reg).await
+                    udm_client(udm).uecm_register_amf(&supi, &reg).await
                 {
                     warn!(%supi, "UECM serving-AMF registration failed: {e}");
                 } else {
@@ -249,7 +266,7 @@ fn spawn_uecm_register(supi: String) {
 fn spawn_uecm_purge(supi: String) {
     tokio::spawn(async move {
         match discover_nf(&NRF_BASE, "UDM").await {
-            Ok(udm) => match sbi_core::nudm::NudmClient::new(udm).uecm_deregister_amf(&supi).await
+            Ok(udm) => match udm_client(udm).uecm_deregister_amf(&supi).await
             {
                 Ok(true) => info!(%supi, "UECM: serving-AMF registration purged"),
                 Ok(false) => {} // already gone (e.g. the withdrawal wiped the subscriber)
@@ -276,7 +293,7 @@ fn spawn_sdm_subscribe(supi: String) {
             &*ADVERTISE_ADDR
         );
         match discover_nf(&NRF_BASE, "UDM").await {
-            Ok(udm) => match sbi_core::nudm::NudmClient::new(udm).sdm_subscribe(&supi, &callback).await {
+            Ok(udm) => match udm_client(udm).sdm_subscribe(&supi, &callback).await {
                 Ok(sub_id) => {
                     info!(%supi, %sub_id, "Nudm_SDM: subscribed to subscriber-data changes");
                     SDM_SUBS.lock().unwrap().insert(supi, sub_id);
@@ -298,7 +315,7 @@ fn spawn_sdm_unsubscribe(supi: String) {
         match discover_nf(&NRF_BASE, "UDM").await {
             Ok(udm) => {
                 if let Err(e) =
-                    sbi_core::nudm::NudmClient::new(udm).sdm_unsubscribe(&supi, &sub_id).await
+                    udm_client(udm).sdm_unsubscribe(&supi, &sub_id).await
                 {
                     warn!(%supi, "Nudm_SDM unsubscribe failed: {e}");
                 } else {
@@ -4487,7 +4504,7 @@ async fn fetch_am_data(
     else {
         return (None, None);
     };
-    let am = match sbi_core::nudm::NudmClient::new(udm).get_am_data(supi, &format!("{PLMN_MCC}{PLMN_MNC}")).await {
+    let am = match udm_client(udm).get_am_data(supi, &format!("{PLMN_MCC}{PLMN_MNC}")).await {
         Ok(Some(am)) => am,
         Ok(None) => return (None, None),
         Err(e) => {

@@ -19,18 +19,27 @@ async fn main() -> anyhow::Result<()> {
     sbi_core::configure_transport(tls.as_ref());
 
     // Register with the NRF so the AMF can discover the Nausf_UEAuthentication service.
+    // The instance id is generated once and reused as this AUSF's OAuth client id.
     let ausf_ip = Ipv4Addr::LOCALHOST;
+    let ausf_id = sbi_core::new_nf_instance_id();
     let nrf_base =
         sbi_core::sbi_base(std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string()));
-    match register_with_nrf(&nrf_base, ausf_ip, SBI_PORT).await {
+    match register_with_nrf(&nrf_base, ausf_ip, SBI_PORT, &ausf_id).await {
         Ok(()) => tracing::info!(%nrf_base, "registered AUSF with NRF"),
         Err(e) => tracing::warn!("NRF registration failed (continuing without discovery): {e}"),
     }
 
     // Nausf_UEAuthentication (TS 29.509). UDM target is fixed for now; NRF-based
-    // discovery of the UDM is a follow-up.
+    // discovery of the UDM is a follow-up. With SBI security on, attach an NRF-issued
+    // `UDM` access token to each Nudm call (the UDM is protected, design/137 F3).
     let udm_base = sbi_core::sbi_base("http://127.0.0.1:8004");
-    let state = sbi_core::nausf::AusfState::new(udm_base);
+    let tokens = sbi_core::oauth::client_tokens_enabled().then(|| {
+        std::sync::Arc::new(sbi_core::oauth::TokenSource::new(nrf_base.clone(), ausf_id.clone()))
+    });
+    let state = match tokens {
+        Some(t) => sbi_core::nausf::AusfState::with_tokens(udm_base, t),
+        None => sbi_core::nausf::AusfState::new(udm_base),
+    };
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     match tls {
         Some(id) => sbi_core::tls::serve(sbi, sbi_core::nausf::router(state), id).await?,
@@ -41,9 +50,14 @@ async fn main() -> anyhow::Result<()> {
 
 /// Register this AUSF's `nausf-auth` service with the NRF (mirrors the SMF's
 /// registration) and keep it alive via the NRF-assigned heartbeat.
-async fn register_with_nrf(nrf_base: &str, ip: Ipv4Addr, sbi_port: u16) -> anyhow::Result<()> {
+async fn register_with_nrf(
+    nrf_base: &str,
+    ip: Ipv4Addr,
+    sbi_port: u16,
+    instance_id: &str,
+) -> anyhow::Result<()> {
     use sbi_core::nnrf::{IpEndPoint, NfProfile, NfService};
-    let mut profile = NfProfile::new(sbi_core::new_nf_instance_id(), "AUSF", ip.to_string());
+    let mut profile = NfProfile::new(instance_id.to_string(), "AUSF", ip.to_string());
     profile.nf_services = Some(vec![NfService {
         service_instance_id: "nausf-auth-1".into(),
         service_name: "nausf-auth".into(),
