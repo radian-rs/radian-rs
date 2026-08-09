@@ -41,6 +41,18 @@ impl AusfState {
             ctxs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+
+    /// Like [`new`], but the UDM client attaches an NRF-issued `UDM` access token to
+    /// every call — required once the UDM is protected (SBI security enabled).
+    pub fn with_tokens(
+        udm_base: impl Into<String>,
+        tokens: Arc<crate::oauth::TokenSource>,
+    ) -> Self {
+        Self {
+            udm: Arc::new(NudmClient::with_tokens(udm_base, tokens)),
+            ctxs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -38,7 +38,7 @@ state and predictable identifiers on unauthenticated network segments.
 |---|-----|---------|----------|--------------|
 | F1 | **HIGH** ✅ | NAS integrity has no COUNT monotonicity → message replay | `nas/src/lib.rs:1790` | Malicious gNB / on-path N2 |
 | F2 | **HIGH** | NEF northbound fully unauthenticated (external trust boundary) | `nf-nef/src/main.rs:76`, `nnef.rs:266` | External AF / anyone reachable |
-| F3 | **HIGH** | UDM serves auth vectors (K_AUSF) + subscriber data with no token check | `nf-udm/src/main.rs:55`, `nudm.rs:383` | Plaintext: network; mTLS: any core cert |
+| F3 | **HIGH** ✅ | UDM serves auth vectors (K_AUSF) + subscriber data with no token check | `nf-udm/src/main.rs:55`, `nudm.rs:383` | Plaintext: network; mTLS: any core cert |
 | F4 | **HIGH** | NRF issues OAuth tokens not bound to caller; scope never enforced | `nnrf.rs:308`, `oauth.rs:305,434` | Any registrable/core peer |
 | F5 | **HIGH** ✅ | User-plane anti-spoofing is family-conditional → source spoof onto N6 | `n6/src/lib.rs:98-109` | **Any ordinary subscriber** |
 | F6 | **HIGH** ✅ | AMF `UeContext` map unbounded; abandoned registrations never evicted → OOM | `nf-amf/src/main.rs:758,3084` | Unauthenticated N2 peer |
@@ -72,6 +72,7 @@ line. Progress so far:
 | F6 | **FIXED** | `nf/nf-amf/src/main.rs` — registration guard timer, re-armed from last progress (T3550/T3560-style), evicts stalled in-progress contexts (releasing the CBL slot via RAII); test `registration_guard_evicts_stalled_registrations` |
 | F5 | **FIXED** | `crates/n6/src/lib.rs` `uplink` — fail closed: an address-assigned session accepts only its assigned families; an unassigned-family or non-IP packet is dropped (`Uplink::UnassignedFamily`), address-less forwarding tunnels untouched; tests `uplink_drops_the_unassigned_family_on_a_single_family_session`, `uplink_dual_stack_session_accepts_both_families`; full BDD 45/501 green |
 | F7 | **PARTIAL** | `crates/pfcp/src/lib.rs` — DoS sub-issue closed: the session table is capped (`DEFAULT_MAX_SESSIONS`, `set_max_sessions`, `RADIAN_UPF_MAX_SESSIONS`), a full UPF rejects further establishment with `NoResourcesAvailable`; test `session_table_is_capped_against_an_establishment_flood`. **Deferred** (see detail): unpredictable TEID/SEID, N3/N4 peer-source validation, `valid_gnb_target` RAN-prefix allowlist |
+| F3 | **FIXED** | `nf/nf-udm/src/main.rs` wraps `nudm::router` in `oauth::protect(_, "UDM", verifier)`; the UDM's clients (AUSF, AMF, SMF) attach an NRF-issued `UDM` token when SBI security is on (`NudmClient::with_tokens`, `AusfState::with_tokens`). Opt-in — no change when OAuth is off. Test `protected_udm_requires_a_valid_access_token`; BDD 45/501 green |
 
 All other findings are open.
 
@@ -121,6 +122,17 @@ All other findings are open.
 
 ### F3 — UDM serves auth vectors + subscriber data with no token check
 
+- **Status:** ✅ **FIXED** (branch `audit`). `nf-udm` now wraps `nudm::router` in
+  `oauth::protect(_, "UDM", verifier(&nrf_base))`, so with SBI security on every Nudm
+  call must carry a valid `UDM`-audience access token (mirrors the UDR). Its clients
+  attach one: `NudmClient` gained `with_tokens` + a `UDM` bearer, the AUSF
+  (`AusfState::with_tokens`), the AMF (all Nudm calls via a token-aware `udm_client`
+  helper keyed by its registered `AMF_INSTANCE_ID`), and the SMF (UECM/SDM calls via its
+  own `udm_client`). Fully **opt-in** — with no OAuth configured, `verifier` is `None`,
+  `protect` is a no-op, and no tokens are attached, so the default/BDD path is unchanged.
+  Covered by `protected_udm_requires_a_valid_access_token`; BDD 45/501 green. *Note:* the
+  strength of this (and all SBI `protect`) still depends on **F4** — the NRF binding the
+  token to the authenticated caller and enforcing scope — which remains open.
 - **Class:** OAuth2 (token not required) / broken access control. **File:**
   `nf/nf-udm/src/main.rs:55-59`; handlers `crates/sbi-core/src/nudm.rs:383-410`
   (`generate_auth_data`), `343-381` (SDM), `260-333` (UECM).

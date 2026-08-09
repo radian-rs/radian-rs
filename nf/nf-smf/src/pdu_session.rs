@@ -1524,7 +1524,7 @@ async fn fetch_session_subscription(
         tracing::warn!("UDM discovery failed: {e}");
         problem(StatusCode::BAD_GATEWAY, "UDM_UNREACHABLE", "UDM discovery failed")
     })?;
-    let sdm = sbi_core::nudm::NudmClient::new(udm);
+    let sdm = udm_client(nrf_base, udm);
 
     let gateway = |e| {
         tracing::warn!("Nudm_SDM fetch failed: {e}");
@@ -1647,6 +1647,22 @@ async fn discover_endpoint(nrf_base: &str, nf_type: &str) -> Result<String, Stri
 /// Discover the UDM's Nudm service endpoint via the NRF.
 async fn discover_udm(nrf_base: &str) -> Result<String, String> {
     discover_endpoint(nrf_base, "UDM").await
+}
+
+/// A Nudm client for `udm_base` that attaches an NRF-issued `UDM` access token when SBI
+/// security is on (design/137 F3), else calls the UDM openly. The SMF's UDM calls are
+/// infrequent, so the token source is built per call (fetching from `nrf_base` as this
+/// SMF's registered instance id).
+fn udm_client(nrf_base: &str, udm_base: impl Into<String>) -> sbi_core::nudm::NudmClient {
+    if sbi_core::oauth::client_tokens_enabled() {
+        let tokens = std::sync::Arc::new(sbi_core::oauth::TokenSource::new(
+            nrf_base.to_string(),
+            SMF_INSTANCE_ID.clone(),
+        ));
+        sbi_core::nudm::NudmClient::with_tokens(udm_base, tokens)
+    } else {
+        sbi_core::nudm::NudmClient::new(udm_base)
+    }
 }
 
 /// Try to obtain the SM policy from a PCF (Npcf_SMPolicyControl). Returns the PCF
@@ -2645,7 +2661,7 @@ fn spawn_uecm_register(nrf_base: String, supi: String, pdu_session_id: u8, dnn: 
         match discover_udm(&nrf_base).await {
             Ok(udm) => {
                 if let Err(e) =
-                    sbi_core::nudm::NudmClient::new(udm).uecm_register_smf(&supi, &reg).await
+                    udm_client(&nrf_base, udm).uecm_register_smf(&supi, &reg).await
                 {
                     tracing::warn!(psi = pdu_session_id, "UECM SMF registration failed: {e}");
                 } else {
@@ -2662,7 +2678,7 @@ fn spawn_uecm_purge(nrf_base: String, supi: String, pdu_session_id: u8) {
     tokio::spawn(async move {
         match discover_udm(&nrf_base).await {
             Ok(udm) => {
-                match sbi_core::nudm::NudmClient::new(udm)
+                match udm_client(&nrf_base, udm)
                     .uecm_deregister_smf(&supi, pdu_session_id)
                     .await
                 {

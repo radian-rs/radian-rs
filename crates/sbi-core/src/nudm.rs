@@ -479,13 +479,39 @@ pub fn parse_snn(snn: &str) -> Option<(String, String)> {
 pub struct NudmClient {
     base: String,
     http: reqwest::Client,
+    tokens: Option<std::sync::Arc<crate::oauth::TokenSource>>,
 }
+
+/// The UDM services a single `UDM`-audience token authorizes — requested together so
+/// one cached token covers UEAU / SDM / UECM calls.
+const UDM_SCOPE: &str = "nudm-ueau nudm-sdm nudm-uecm";
 
 impl NudmClient {
     pub fn new(base: impl Into<String>) -> Self {
         Self {
             base: base.into(),
             http: crate::sbi_client(),
+            tokens: None,
+        }
+    }
+
+    /// Like [`new`], but obtains and attaches a `UDM` access token from the NRF (via
+    /// `tokens`) on every request — required once the UDM is protected (SBI security on).
+    pub fn with_tokens(
+        base: impl Into<String>,
+        tokens: std::sync::Arc<crate::oauth::TokenSource>,
+    ) -> Self {
+        Self { base: base.into(), http: crate::sbi_client(), tokens: Some(tokens) }
+    }
+
+    /// Attach a `UDM` Bearer token to a request when a token source is configured.
+    async fn bearer(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.tokens {
+            Some(ts) => match ts.token_for("UDM", UDM_SCOPE).await {
+                Some(tok) => rb.bearer_auth(tok),
+                None => rb,
+            },
+            None => rb,
         }
     }
 
@@ -500,12 +526,11 @@ impl NudmClient {
             self.base, supi_or_suci
         );
         let resp = self
-            .http
-            .post(url)
-            .json(&AuthenticationInfoRequest {
+            .bearer(self.http.post(url).json(&AuthenticationInfoRequest {
                 serving_network_name: serving_network_name.to_string(),
                 ausf_instance_id: None,
-            })
+            }))
+            .await
             .traced()
             .send()
             .await?
@@ -517,9 +542,12 @@ impl NudmClient {
     /// (hex `rand` + `auts`). `Ok(true)` when the SQN was adopted.
     pub async fn resync(&self, supi: &str, rand: &str, auts: &str) -> Result<bool, SbiError> {
         let resp = self
-            .http
-            .post(format!("{}/nudm-ueau/v1/{}/auth-events/resync", self.base, supi))
-            .json(&ResyncInfo { rand: rand.to_string(), auts: auts.to_string() })
+            .bearer(
+                self.http
+                    .post(format!("{}/nudm-ueau/v1/{}/auth-events/resync", self.base, supi))
+                    .json(&ResyncInfo { rand: rand.to_string(), auts: auts.to_string() }),
+            )
+            .await
             .traced()
             .send()
             .await?;
@@ -532,21 +560,29 @@ impl NudmClient {
         supi: &str,
         reg: &Amf3GppAccessRegistration,
     ) -> Result<(), SbiError> {
-        self.http
-            .put(format!("{}/nudm-uecm/v1/{}/registrations/amf-3gpp-access", self.base, supi))
-            .json(reg)
-            .traced()
-            .send()
-            .await?
-            .error_for_status()?;
+        self.bearer(
+            self.http
+                .put(format!("{}/nudm-uecm/v1/{}/registrations/amf-3gpp-access", self.base, supi))
+                .json(reg),
+        )
+        .await
+        .traced()
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
     /// Nudm_UECM — purge the serving-AMF registration. `Ok(false)` when none existed.
     pub async fn uecm_deregister_amf(&self, supi: &str) -> Result<bool, SbiError> {
         let resp = self
-            .http
-            .delete(format!("{}/nudm-uecm/v1/{}/registrations/amf-3gpp-access", self.base, supi))
+            .bearer(
+                self.http.delete(format!(
+                    "{}/nudm-uecm/v1/{}/registrations/amf-3gpp-access",
+                    self.base, supi
+                )),
+            )
+            .await
             .traced()
             .send()
             .await?;
@@ -559,16 +595,19 @@ impl NudmClient {
 
     /// Nudm_UECM — register as the serving SMF for a PDU session.
     pub async fn uecm_register_smf(&self, supi: &str, reg: &SmfRegistration) -> Result<(), SbiError> {
-        self.http
-            .put(format!(
-                "{}/nudm-uecm/v1/{}/registrations/smf-registrations/{}",
-                self.base, supi, reg.pdu_session_id
-            ))
-            .json(reg)
-            .traced()
-            .send()
-            .await?
-            .error_for_status()?;
+        self.bearer(
+            self.http
+                .put(format!(
+                    "{}/nudm-uecm/v1/{}/registrations/smf-registrations/{}",
+                    self.base, supi, reg.pdu_session_id
+                ))
+                .json(reg),
+        )
+        .await
+        .traced()
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
@@ -579,11 +618,11 @@ impl NudmClient {
         pdu_session_id: u8,
     ) -> Result<bool, SbiError> {
         let resp = self
-            .http
-            .delete(format!(
+            .bearer(self.http.delete(format!(
                 "{}/nudm-uecm/v1/{}/registrations/smf-registrations/{}",
                 self.base, supi, pdu_session_id
-            ))
+            )))
+            .await
             .traced()
             .send()
             .await?;
@@ -629,9 +668,12 @@ impl NudmClient {
         plmn: &str,
     ) -> Result<Option<serde_json::Value>, SbiError> {
         let resp = self
-            .http
-            .get(format!("{}/nudm-sdm/v2/{}/{}", self.base, supi, resource))
-            .query(&[("plmn-id", plmn)])
+            .bearer(
+                self.http
+                    .get(format!("{}/nudm-sdm/v2/{}/{}", self.base, supi, resource))
+                    .query(&[("plmn-id", plmn)]),
+            )
+            .await
             .traced()
             .send()
             .await?;
@@ -650,9 +692,12 @@ impl NudmClient {
             monitored_resource_uris: Some(vec![format!("{}/nudm-sdm/v2/{}/am-data", self.base, supi)]),
         };
         let created: SdmSubscription = self
-            .http
-            .post(format!("{}/nudm-sdm/v2/{}/sdm-subscriptions", self.base, supi))
-            .json(&sub)
+            .bearer(
+                self.http
+                    .post(format!("{}/nudm-sdm/v2/{}/sdm-subscriptions", self.base, supi))
+                    .json(&sub),
+            )
+            .await
             .traced()
             .send()
             .await?
@@ -665,8 +710,11 @@ impl NudmClient {
     /// `Nudm_SDM_Unsubscribe` — drop a change subscription. `Ok(false)` if unknown.
     pub async fn sdm_unsubscribe(&self, supi: &str, sub_id: &str) -> Result<bool, SbiError> {
         let resp = self
-            .http
-            .delete(format!("{}/nudm-sdm/v2/{}/sdm-subscriptions/{}", self.base, supi, sub_id))
+            .bearer(self.http.delete(format!(
+                "{}/nudm-sdm/v2/{}/sdm-subscriptions/{}",
+                self.base, supi, sub_id
+            )))
+            .await
             .traced()
             .send()
             .await?;
@@ -753,6 +801,68 @@ mod tests {
             udm.generate_auth_data("imsi-999700000000001", &snn).await.unwrap().supi,
             "imsi-999700000000001"
         );
+    }
+
+    /// design/137 F3: a protected UDM rejects a tokenless call and serves a client
+    /// carrying an NRF-issued `UDM` access token — the same OAuth2 flow that guards the
+    /// UDR, now covering the UDM's authentication-vector / subscriber-data surface.
+    #[tokio::test]
+    async fn protected_udm_requires_a_valid_access_token() {
+        let secret = vec![0x22u8; 32];
+
+        // NRF (token endpoint, injected secret) with the client NF ("ausf-1") registered.
+        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nrf_addr = nrf_l.local_addr().unwrap();
+        let nrf_store = crate::nnrf::NrfStore::default().with_secret(Some(secret.clone()));
+        tokio::spawn(async move { crate::run_on(nrf_l, crate::nnrf::router(nrf_store)).await.unwrap() });
+        let nrf_base = format!("http://{nrf_addr}");
+        crate::nnrf::NrfClient::new(nrf_base.clone())
+            .register(&crate::nnrf::NfProfile::new("ausf-1", "AUSF", "127.0.0.1"))
+            .await
+            .unwrap();
+
+        // A UDR with one am-data document, fronted by a UDM protected for the UDM audience.
+        let store = Arc::new(InMemoryStore::new());
+        let am = serde_json::json!({
+            "nssai": { "defaultSingleNssais": [{ "sst": 1, "sd": "010203" }] },
+            "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" }
+        });
+        store.put_provisioned(DataSet::Am, "imsi-1", "99970", &am).unwrap();
+        let store: Arc<dyn SubscriberStore> = store;
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udr_l, crate::nudr::router(store)).await.unwrap() });
+        let udr = Arc::new(UdrClient::new(format!("http://{udr_addr}")));
+
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        let protected = crate::oauth::protect(
+            router(udr),
+            "UDM",
+            Some(crate::oauth::TokenVerifier::Shared(secret.clone())),
+        );
+        tokio::spawn(async move { crate::run_on(udm_l, protected).await.unwrap() });
+        let udm_url = format!("http://{udm_addr}");
+
+        // Tokenless client → rejected by the auth layer (401).
+        let open = NudmClient::new(udm_url.clone());
+        assert!(open.get_am_data("imsi-1", "99970").await.is_err(), "the UDM rejects a tokenless call");
+
+        // Token-bearing client ("ausf-1") → the am-data is returned.
+        let tokens = std::sync::Arc::new(crate::oauth::TokenSource::new(nrf_base.clone(), "ausf-1"));
+        let client = NudmClient::with_tokens(udm_url.clone(), tokens);
+        assert_eq!(
+            client.get_am_data("imsi-1", "99970").await.unwrap(),
+            Some(am),
+            "a UDM-token-bearing client is authorized"
+        );
+
+        // A token for an unregistered client is refused by the NRF (→ no token → 401).
+        let rogue = NudmClient::with_tokens(
+            udm_url,
+            std::sync::Arc::new(crate::oauth::TokenSource::new(nrf_base, "rogue-1")),
+        );
+        assert!(rogue.get_am_data("imsi-1", "99970").await.is_err(), "an unregistered client can't get a UDM token");
     }
 
     /// A Nudm_SDM change subscription: subscribe a callback, a data-change fans a
