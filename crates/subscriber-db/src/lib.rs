@@ -514,6 +514,18 @@ impl RedbStore {
         let plain = self.decrypt(supi, guard.value())?;
         key_from_bytes(&plain)
     }
+
+    /// The SUPIs of every provisioned subscriber, sorted. The credential blobs stay
+    /// encrypted; only the (plaintext) SUPI keys are read — so this never touches K,
+    /// preserving the ARPF boundary. Used by the provisioning CLI's `list` (design/137 G23).
+    pub fn list_subscribers(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let r = self.db.begin_read()?;
+        let table = r.open_table(CREDENTIALS)?;
+        let mut supis: Vec<String> =
+            table.iter()?.filter_map(|kv| kv.ok()).map(|(k, _)| k.value().to_string()).collect();
+        supis.sort();
+        Ok(supis)
+    }
 }
 
 impl SubscriberDb for RedbStore {

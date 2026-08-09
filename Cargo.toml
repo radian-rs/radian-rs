@@ -27,6 +27,7 @@ members = [
     "nf/nf-nef",
     "ran/gnb",
     "tools/radian-pki",
+    "tools/radian-dbctl",
     "bdd",
 ]
 

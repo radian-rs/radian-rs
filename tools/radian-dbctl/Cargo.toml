@@ -1,0 +1,18 @@
+[package]
+name = "radian-dbctl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "radian-dbctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+subscriber-db = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+subscriber-db = { workspace = true }
