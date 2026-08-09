@@ -123,12 +123,12 @@ PDR/URR, session AMBR, DNN/S-NSSAI authorization, type negotiation with #50/#51,
 2-hop chains + ULCL branch + indirect forwarding, End Marker on re-point.
 
 Gaps:
-- **No PFCP heartbeat loop** (`pfcp::heartbeat_request` exists, never called),
-  **no RecoveryTimeStamp restart detection, no association release/retry/
-  re-association** — association is one-shot at boot; **a UPF restart silently
-  strands every session** (Go: `doPfcpHeartbeat` → release all). SMF never
-  listens on 8805 (client-only, `pdu_session.rs:151`); single 2 s timeout, no
-  retransmission. → **G4**
+- ~~**No PFCP heartbeat loop / RecoveryTimeStamp restart detection**~~
+  **liveness CLOSED** ([141](141-pfcp-liveness.md)): the SMF heartbeats every UPF
+  (`run_heartbeats`), and on a newer recovery timestamp re-associates and drops
+  the stranded sessions (freeing IP/GFBR/UECM) — the *silent-stranding* bug is
+  fixed. *Remaining:* PFCP retransmission/dedup transaction layer; SMF still
+  client-only on 8805 (single 2s timeout). → **G4** (liveness done)
 - **IPAM**: ~~monotonic `AtomicU32`, addresses never released~~ **leak CLOSED**
   ([140](140-smf-ipam-pool.md)): a bounded lazy-reuse `U32Pool` (v4 + v6) with an
   RAII `IpLease` freeing addresses on every failure path; exhaustion → 503/#26.
@@ -167,12 +167,12 @@ final, AMBR/MFBR token buckets, Echo reply, End Marker, ULCL/N9.
 
 Gaps (control plane — Go is far more spec-faithful):
 - **No association state** (sessions accepted with no association; no purge on
-  re-association; no NodeID validation); **recovery timestamp regenerated per
-  message** (`lib.rs:1581,1587` — a conformant SMF sees a permanently
-  restarting UPF; Go pins at startup); **no transaction layer** — no
+  re-association; no NodeID validation); ~~recovery timestamp regenerated per
+  message~~ **pinned at startup now** ([141](141-pfcp-liveness.md) — the UPF no
+  longer looks permanently restarting); **no transaction layer** — no
   retransmission of UPF-initiated reports, no request dedup (**a retransmitted
   Establishment allocates a second session+TEID**); no error causes — malformed
-  input gets **no PFCP response at all** (`main.rs:214`). → **G4**
+  input gets **no PFCP response at all** (`main.rs:214`). → **G4** (recovery-ts pinned; assoc-state/tx-layer/causes remain)
 - No BAR (fixed 64-pkt buffer; no notification delay / suggested count); OHR
   ignored (unconditional decap); **GateStatus unenforced**; GBR is ceiling-only;
   precedence written but never evaluated (branch order = PDR id); RemoveFar/
@@ -382,7 +382,7 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 | **G1** | **Enforce OAuth across all NFs + real token issuance** — `oauth::protect` (or successor) on every service group; scope validated against producer services at the NRF; cert/nfType checks; instance-scoped `aud` | Major (security) | M | **P0** | §4.1; builds on [46](46-sbi-oauth.md)/[55](55-sbi-asymmetric-oauth.md) |
 | **G2** | **SUCI deconcealment** — null-scheme parse + ECIES Profile A/B in UDM; home-net key in subscriber-db; `SuciProfile` config | Major | M | **P1** | §3.4; blocks any privacy-enabled UE |
 | **G3** | **EAP-AKA'** — AUSF eap-session routes + RFC 5448 PRF; UDM `EAP_AKA_PRIME` AV type; AMF EAP relay; fix the misleading doc-comment now | Moderate | M | P1 | 130's P3-6 confirmed |
-| **G4** | **PFCP liveness both sides** — SMF heartbeat loop + RecoveryTimeStamp restart detection + re-association + retransmission; UPF association state + pinned recovery timestamp + tx/rx transactions + error causes | Major (robustness) | M | **P1** | §3.2/3.3; a UPF restart currently strands every session silently |
+| **G4** | **PFCP liveness both sides** — SMF heartbeat loop + RecoveryTimeStamp restart detection + re-association + retransmission; UPF association state + pinned recovery timestamp + tx/rx transactions + error causes | Major (robustness) | M | **partial** | §3.2/3.3; **liveness + restart recovery DONE** ([141](141-pfcp-liveness.md)): heartbeat loop, pinned recovery-ts, drop-stranded-sessions. Remaining: UPF assoc-state, tx/dedup layer, error causes |
 | **G5** | **Config files** — per-NF YAML (serde) replacing inline env reads; PLMN/TAC/GUAMI/tai-list/algorithm order/timers; keep env as override | Moderate | M | **P1** | §4.2; prerequisite-ish for G13/G21/G24 |
 | **G6** | **IPAM** — allocate/release pools per (S-NSSAI,DNN,UPF), static pools, per-subscriber static IP from UDM | Major (leak) | S–M | **partial** | §3.2; **leak DONE** ([140](140-smf-ipam-pool.md)): bounded lazy-reuse pool + RAII release. Remaining: per-DNN/static pools, static IP from UDM |
 | **G7** | **AMF NAS retransmission timers T3550/T3560/T3570** (+ Service Reject on failed resume) | Moderate | S | **P1** | lost downlink = permanently stalled registration |
@@ -411,9 +411,9 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 | **G30** | Non-3GPP access: N3IWF (IKEv2/EAP-5G/xfrm) then TNGF (+RADIUS); AMF access-type dimension | Major | **XL** | P3 | 130's P3-8; only if WLAN access is a product goal |
 
 Suggested first wave by value-per-effort: **G1 → ~~G11~~ (done, [139](139-upf-downlink-qfi.md))
-→ ~~G6~~ (leak done, [140](140-smf-ipam-pool.md)) → G4 → G7 → G2 → G23 → G5**,
-then decide the §7 pivot question before committing to G16/G18-class interop
-refactors.
+→ ~~G6~~ (leak done, [140](140-smf-ipam-pool.md)) → ~~G4~~ (liveness done,
+[141](141-pfcp-liveness.md)) → G7 → G2 → G23 → G5**, then decide the §7 pivot
+question before committing to G16/G18-class interop refactors.
 
 ## Sources
 
