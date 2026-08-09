@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -187,6 +187,19 @@ struct N4Peer {
     /// response channel (shared with the reader task).
     pending: Arc<Mutex<HashMap<u32, tokio::sync::oneshot::Sender<Vec<u8>>>>>,
     seq: AtomicU32,
+    /// The UPF's last-known **recovery timestamp** (its start time), learned from the
+    /// Association Setup / Heartbeat response. A heartbeat reporting a *newer* value
+    /// means the UPF restarted and lost every session (design/137 G4).
+    recovery: Mutex<Option<SystemTime>>,
+}
+
+/// What a UPF's just-reported recovery timestamp means relative to what we knew.
+#[derive(Debug, PartialEq, Eq)]
+enum Recovery {
+    /// First timestamp learned (association), or unchanged since — nothing to do.
+    Unchanged,
+    /// A newer timestamp than before — the UPF restarted since we last heard from it.
+    Restarted,
 }
 
 impl N4Peer {
@@ -239,11 +252,29 @@ impl N4Peer {
                 }
             });
         }
-        Ok(Arc::new(Self { sock, pending, seq: AtomicU32::new(1) }))
+        Ok(Arc::new(Self { sock, pending, seq: AtomicU32::new(1), recovery: Mutex::new(None) }))
     }
 
     fn next_seq(&self) -> u32 {
         self.seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Record a recovery timestamp reported by the UPF and classify it: the first one
+    /// (or an equal/older one, which a well-behaved UPF never sends) is [`Recovery::Unchanged`];
+    /// a strictly newer one is [`Recovery::Restarted`] — the UPF came back up and its
+    /// session state is gone (design/137 G4).
+    fn note_recovery(&self, reported: SystemTime) -> Recovery {
+        let mut known = self.recovery.lock().unwrap();
+        let restarted = matches!(*known, Some(prev) if reported > prev);
+        // Always advance to the latest we've seen.
+        if known.is_none_or(|prev| reported >= prev) {
+            *known = Some(reported);
+        }
+        if restarted {
+            Recovery::Restarted
+        } else {
+            Recovery::Unchanged
+        }
     }
 
     /// Send one PFCP request on this association and await *its* response — correlated
@@ -264,7 +295,8 @@ impl N4Peer {
         }
     }
 
-    /// PFCP Association Setup toward this UPF — required before any session.
+    /// PFCP Association Setup toward this UPF — required before any session. Records
+    /// the UPF's recovery timestamp as the baseline for later restart detection.
     async fn associate(&self, smf_ip: Ipv4Addr) -> anyhow::Result<()> {
         let seq = self.next_seq();
         let req = pfcp::association_setup_request(smf_ip, seq);
@@ -273,7 +305,20 @@ impl N4Peer {
             .await
             .ok_or_else(|| anyhow::anyhow!("no PFCP association response from UPF"))?;
         anyhow::ensure!(pfcp::response_accepted(&resp), "UPF rejected PFCP association");
+        if let Some(ts) = pfcp::parse_recovery_timestamp(&resp) {
+            self.note_recovery(ts);
+        }
         Ok(())
+    }
+
+    /// Send one PFCP Heartbeat Request and classify the UPF's reported recovery
+    /// timestamp (design/137 G4). `None` if the UPF didn't answer (a lost heartbeat
+    /// isn't itself treated as a restart — the next one will catch a real one).
+    async fn heartbeat(&self) -> Option<Recovery> {
+        let seq = self.next_seq();
+        let resp = self.transact(&pfcp::heartbeat_request(seq), seq).await?;
+        let ts = pfcp::parse_recovery_timestamp(&resp)?;
+        Some(self.note_recovery(ts))
     }
 }
 
@@ -325,6 +370,16 @@ struct SessionPath {
     intermediate: Option<Arc<N4Peer>>,
     /// A breakout anchor + the destination prefix the classifier steers to it (Phase 2).
     breakout: Option<(Arc<N4Peer>, pfcp::IpPrefix)>,
+}
+
+impl SessionPath {
+    /// Whether this path runs on `peer` (as anchor, intermediate, or breakout) —
+    /// used to find the sessions a restarted UPF stranded (design/137 G4).
+    fn uses(&self, peer: &Arc<N4Peer>) -> bool {
+        Arc::ptr_eq(&self.anchor, peer)
+            || self.intermediate.as_ref().is_some_and(|p| Arc::ptr_eq(p, peer))
+            || self.breakout.as_ref().is_some_and(|(p, _)| Arc::ptr_eq(p, peer))
+    }
 }
 
 /// How the SMF turns a DNN into a [`SessionPath`].
@@ -646,6 +701,73 @@ impl SmfState {
                 .map_err(|e| anyhow::anyhow!("association with UP node {name:?}: {e}"))?;
         }
         Ok(())
+    }
+
+    /// One heartbeat round across every UP peer (design/137 G4): a peer that reports a
+    /// newer recovery timestamp restarted, so recover it. The [`run_heartbeats`] loop
+    /// calls this on a timer; tests call it directly.
+    async fn heartbeat_round(&self) {
+        // The peer set is fixed after `connect`; clone the handles so no map borrow is
+        // held across the awaits below.
+        let peers: Vec<Arc<N4Peer>> = self.peers.values().cloned().collect();
+        for peer in &peers {
+            match peer.heartbeat().await {
+                Some(Recovery::Restarted) => self.recover_from_upf_restart(peer).await,
+                Some(Recovery::Unchanged) => {}
+                // A single missed heartbeat isn't a restart; the next round re-checks.
+                None => tracing::debug!("no PFCP heartbeat response from a UP peer"),
+            }
+        }
+    }
+
+    /// A UPF reported a **restart** — its PDR/FAR/URR state is gone, so every session
+    /// on it is stranded. Re-associate it (so it accepts new sessions), then drop each
+    /// affected SM context, returning its UE address(es) and GFBR reservation to the
+    /// pools and purging its serving-SMF registration. The UE re-establishes on its
+    /// next activity. Mirrors free5gc's `releaseAllResourcesOfUPF` (design/137 G4).
+    ///
+    /// PCF policy / CHF charging teardown for the dropped sessions is left to the
+    /// normal release path when the AMF eventually releases the context; here we only
+    /// reclaim the SMF-local resources that would otherwise leak.
+    async fn recover_from_upf_restart(&self, peer: &Arc<N4Peer>) {
+        if let Err(e) = peer.associate(self.smf_ip).await {
+            tracing::warn!("re-association after UPF restart failed: {e}");
+        }
+        // Remove the affected contexts under the lock, then clean up off it.
+        let dropped: Vec<SmContext> = {
+            let mut ctxs = self.contexts.lock().unwrap();
+            let refs: Vec<String> =
+                ctxs.iter().filter(|(_, c)| c.path.uses(peer)).map(|(r, _)| r.clone()).collect();
+            refs.iter().filter_map(|r| ctxs.remove(r)).collect()
+        };
+        if dropped.is_empty() {
+            return;
+        }
+        for c in &dropped {
+            if let Some(v4) = c.ue_ip {
+                self.release_ue_ip(v4);
+            }
+            if let Some((prefix, _)) = c.ue_ipv6 {
+                self.release_ue_ipv6(prefix);
+            }
+            self.release_gfbr(c.reserved_gfbr);
+            spawn_uecm_purge(self.nrf_base.clone(), c.supi.clone(), c.pdu_session_id);
+        }
+        tracing::warn!(
+            dropped = dropped.len(),
+            "UPF restarted (new recovery timestamp) — released the stranded SM contexts"
+        );
+    }
+}
+
+/// Periodically heartbeat the user plane and recover any UPF that restarted
+/// (design/137 G4). Spawned once at startup; runs for the life of the SMF.
+pub async fn run_heartbeats(smf: Arc<SmfState>, interval: Duration) {
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        smf.heartbeat_round().await;
     }
 }
 
@@ -2646,6 +2768,22 @@ mod tests {
         assert_eq!(alloc(), Ipv4Addr::new(10, 45, 0, 3), "released .3 handed back out");
     }
 
+    /// A UPF's recovery timestamp only signals a restart when it's *newer* than what we
+    /// last recorded; the first one is the baseline and a stale/reordered one is ignored
+    /// (design/137 G4).
+    #[tokio::test]
+    async fn note_recovery_flags_only_a_newer_timestamp() {
+        // UDP connect needs no listener, so a throwaway address serves for the unit test.
+        let peer = N4Peer::connect("127.0.0.1:9".parse().unwrap(), None).await.unwrap();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(2000);
+        assert_eq!(peer.note_recovery(t0), Recovery::Unchanged, "first timestamp is the baseline");
+        assert_eq!(peer.note_recovery(t0), Recovery::Unchanged, "same timestamp — not a restart");
+        assert_eq!(peer.note_recovery(t1), Recovery::Restarted, "a newer timestamp — restart");
+        assert_eq!(peer.note_recovery(t0), Recovery::Unchanged, "a stale/reordered timestamp is ignored");
+        assert_eq!(peer.note_recovery(t1), Recovery::Unchanged, "still current after the stale one");
+    }
+
     /// PDU-session-type negotiation (design/131): the selected type + downgrade cause
     /// for every (requested × allowed) combination.
     #[test]
@@ -4205,6 +4343,80 @@ mod tests {
             Some(Ipv4Addr::new(10, 45, 0, 2)),
             "the released address is reused, not leaked"
         );
+    }
+
+    /// N4 liveness (design/137 G4): when a UPF restarts — reported by a newer recovery
+    /// timestamp on the next heartbeat — the SMF drops the now-stranded sessions and
+    /// reclaims their addresses, so the UE can re-establish. Before this, a UPF restart
+    /// left the SMF's contexts (and their leased IPs) pointing at sessions the UPF had
+    /// forgotten.
+    #[tokio::test]
+    async fn upf_restart_drops_stranded_sessions_and_frees_addresses() {
+        let upf_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let (upf_state, upf_n4) = spin_upf(upf_ip).await;
+        let (nrf_base, _udr_base) = spin_subscription_backend("imsi-999700000000001", "99970").await;
+        let smf =
+            Arc::new(SmfState::connect(UserPlane::single(upf_n4), upf_ip, nrf_base).await.unwrap());
+        smf.associate().await.unwrap(); // records the UPF's baseline recovery timestamp
+        let smf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf_listener.local_addr().unwrap();
+        {
+            let smf = smf.clone();
+            tokio::spawn(async move { sbi_core::run_on(smf_listener, router(smf)).await.unwrap() });
+        }
+        let client = sbi_core::h2c_client();
+        let base = format!("http://{smf_addr}");
+        let create = |psi: u8| {
+            let (client, base) = (client.clone(), base.clone());
+            async move {
+                client
+                    .post(format!("{base}/nsmf-pdusession/v1/sm-contexts"))
+                    .json(&serde_json::json!({
+                        "supi": "imsi-999700000000001", "pduSessionId": psi, "dnn": "internet",
+                        "servingNetwork": { "mcc": "999", "mnc": "70" },
+                        "sNssai": { "sst": 1, "sd": "010203" }
+                    }))
+                    .traced()
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<SmContextCreatedData>()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // A session establishes and leases 10.45.0.2; the UPF holds its N4 session.
+        let created = create(5).await;
+        assert_eq!(created.ue_ipv4_addr, Some(Ipv4Addr::new(10, 45, 0, 2)));
+        assert_eq!(upf_state.lock().unwrap().session_count(), 1);
+
+        // The UPF restarts: a fresh state (no sessions) with a strictly newer recovery
+        // timestamp. NTP is 1s-resolution, so +1000s is unambiguously later.
+        *upf_state.lock().unwrap() =
+            pfcp::UpfState::with_recovery_time(SystemTime::now() + Duration::from_secs(1000));
+
+        // One heartbeat round sees the new timestamp, re-associates, and drops the
+        // stranded context — returning its IP to the pool.
+        smf.heartbeat_round().await;
+
+        // Proof the context was dropped and its address freed: a new session reuses
+        // 10.45.0.2 rather than advancing to .0.3, and the old context is gone (404).
+        let created2 = create(6).await;
+        assert_eq!(
+            created2.ue_ipv4_addr,
+            Some(Ipv4Addr::new(10, 45, 0, 2)),
+            "the stranded session's address was reclaimed and reused"
+        );
+        let status = client
+            .post(format!("{base}/nsmf-pdusession/v1/sm-contexts/{}/modify", created.sm_context_ref))
+            .json(&serde_json::json!({"gnbN3Teid":"00001111","gnbN3Addr":"10.0.0.9"}))
+            .traced()
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 404, "the stranded context was dropped");
     }
 
     /// With a PCF registered, the SMF sources the SM policy from it: a policy

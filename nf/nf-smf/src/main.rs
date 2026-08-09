@@ -40,6 +40,10 @@ const GFBR_BUDGET_ENV: &str = "RADIAN_SMF_GFBR_BUDGET_MBPS";
 /// usage mid-session whenever it crosses the threshold (the charging trigger
 /// toward the CHF). Absent ⇒ usage is only reported at session deletion.
 const USAGE_THRESHOLD_ENV: &str = "RADIAN_SMF_USAGE_THRESHOLD_BYTES";
+/// N4 heartbeat interval (seconds): how often the SMF pings each UPF to detect a
+/// restart (design/137 G4). Absent ⇒ 10s.
+const HEARTBEAT_SECS_ENV: &str = "RADIAN_SMF_HEARTBEAT_SECS";
+const DEFAULT_HEARTBEAT_SECS: u64 = 10;
 const SBI_PORT: u16 = 8002;
 
 #[tokio::main]
@@ -131,6 +135,16 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("PFCP associations established with the user plane");
     // Consume UPF-initiated usage reports: ack + relay to the CHF (Nchf update).
     tokio::spawn(pdu_session::handle_usage_reports(smf.clone()));
+    // N4 liveness (design/137 G4): heartbeat every UPF and, on a restart (a newer
+    // recovery timestamp), re-associate it and drop its now-stranded sessions.
+    let heartbeat_secs = std::env::var(HEARTBEAT_SECS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_HEARTBEAT_SECS);
+    tokio::spawn(pdu_session::run_heartbeats(
+        smf.clone(),
+        std::time::Duration::from_secs(heartbeat_secs),
+    ));
 
     // Register with the NRF so the AMF can discover the Nsmf_PDUSession service.
     match pdu_session::register_with_nrf(&nrf_base, smf_ip, SBI_PORT).await {

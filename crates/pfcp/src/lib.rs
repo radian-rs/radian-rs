@@ -694,6 +694,12 @@ pub struct UpfState {
     /// downlink is installed, as `(gNB TEID, gNB IP, /64 prefix)` — drained by
     /// [`take_pending_ra`](UpfState::take_pending_ra) (design/131 Phase C).
     pending_ra: Vec<(u32, Ipv4Addr, Ipv6Addr)>,
+    /// This UPF's **recovery timestamp** — the moment it started, pinned once at
+    /// construction and echoed in every Association Setup / Heartbeat Response
+    /// (design/137 G4). A conformant SMF compares it across heartbeats to detect a
+    /// UPF restart; regenerating it per message (the old bug) made the UPF look
+    /// like it was permanently restarting.
+    recovery_time: SystemTime,
 }
 
 impl Default for UpfState {
@@ -704,6 +710,13 @@ impl Default for UpfState {
 
 impl UpfState {
     pub fn new() -> Self {
+        Self::with_recovery_time(SystemTime::now())
+    }
+
+    /// Construct a UPF state with an explicit recovery timestamp — the moment this
+    /// node "started". Tests use it to simulate a restart (a later timestamp); prod
+    /// uses [`new`](Self::new), which pins `SystemTime::now()`.
+    pub fn with_recovery_time(recovery_time: SystemTime) -> Self {
         // TEID/SEID 0 are avoided (reserved/"choose" semantics).
         Self {
             next_teid: 1,
@@ -712,6 +725,7 @@ impl UpfState {
             pending_flush: Vec::new(),
             pending_end_markers: Vec::new(),
             pending_ra: Vec::new(),
+            recovery_time,
         }
     }
 
@@ -1199,6 +1213,18 @@ pub fn heartbeat_request(seq: u32) -> Vec<u8> {
         .marshal()
 }
 
+/// Parse the **Recovery Time Stamp** (the peer's start time) from a PFCP message —
+/// an Association Setup or Heartbeat *Response* carries the UPF's. The SMF records
+/// it and, when a later heartbeat reports a newer one, knows the UPF restarted
+/// (design/137 G4). `None` if the message is unparseable or carries no such IE.
+pub fn parse_recovery_timestamp(data: &[u8]) -> Option<SystemTime> {
+    let msg = rs_pfcp::message::parse(data).ok()?;
+    let ie = msg.ies(IeType::RecoveryTimeStamp).next()?;
+    rs_pfcp::ie::recovery_time_stamp::RecoveryTimeStamp::unmarshal(&ie.payload)
+        .ok()
+        .map(|r| r.timestamp)
+}
+
 /// A **CHOOSE** uplink F-TEID (TS 29.244 §8.2.3, CH flag set): the SMF asks the UPF
 /// to allocate the ingress F-TEID (TEID + its own N3 address) and report it back in
 /// the Created PDR — the standard "UPF-assigned F-TEID" signal, rather than the
@@ -1625,13 +1651,15 @@ pub fn handle_n4(
             AssociationSetupResponseBuilder::new(seq)
                 .cause_accepted()
                 .node_id(node_ip)
-                .recovery_time_stamp(SystemTime::now())
+                // Pinned at startup, not regenerated — else the SMF sees a UPF that
+                // never stops restarting (design/137 G4).
+                .recovery_time_stamp(state.recovery_time)
                 .build()
                 .marshal(),
         ),
         MsgType::HeartbeatRequest => Some(
             HeartbeatResponseBuilder::new(seq)
-                .recovery_time_stamp(SystemTime::now())
+                .recovery_time_stamp(state.recovery_time)
                 .build()
                 .marshal(),
         ),
@@ -2866,6 +2894,29 @@ mod tests {
         // rate 0 means unlimited.
         let mut u = TokenBucket::new(0, 0);
         assert!(u.poll(0, 1_000_000));
+    }
+
+    /// The UPF's recovery timestamp is **pinned at construction**, so the Association
+    /// Setup and Heartbeat responses carry the *same* value — a conformant SMF must not
+    /// see a UPF that looks like it's constantly restarting (design/137 G4). A restart
+    /// (a fresh `UpfState`) reports a later timestamp.
+    #[test]
+    fn upf_recovery_timestamp_is_pinned_across_messages() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let started = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut state = UpfState::with_recovery_time(started);
+
+        let assoc = handle_n4(&association_setup_request(node_ip, 1), node_ip, &mut state, 0).unwrap();
+        let hb = handle_n4(&heartbeat_request(2), node_ip, &mut state, 0).unwrap();
+        assert_eq!(parse_recovery_timestamp(&assoc), Some(started), "association echoes the pinned time");
+        assert_eq!(parse_recovery_timestamp(&hb), Some(started), "heartbeat echoes the same time");
+
+        // A restarted UPF (new state) reports a strictly later recovery timestamp.
+        let restarted_at = started + std::time::Duration::from_secs(1);
+        let mut restarted = UpfState::with_recovery_time(restarted_at);
+        let hb2 = handle_n4(&heartbeat_request(3), node_ip, &mut restarted, 0).unwrap();
+        assert_eq!(parse_recovery_timestamp(&hb2), Some(restarted_at));
+        assert!(parse_recovery_timestamp(&hb2) > parse_recovery_timestamp(&hb), "restart looks newer");
     }
 
     /// Full N4 round-trip over real UDP: associate, heartbeat, establish a session.
