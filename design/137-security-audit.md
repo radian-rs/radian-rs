@@ -39,7 +39,7 @@ state and predictable identifiers on unauthenticated network segments.
 | F1 | **HIGH** ✅ | NAS integrity has no COUNT monotonicity → message replay | `nas/src/lib.rs:1790` | Malicious gNB / on-path N2 |
 | F2 | **HIGH** | NEF northbound fully unauthenticated (external trust boundary) | `nf-nef/src/main.rs:76`, `nnef.rs:266` | External AF / anyone reachable |
 | F3 | **HIGH** ✅ | UDM serves auth vectors (K_AUSF) + subscriber data with no token check | `nf-udm/src/main.rs:55`, `nudm.rs:383` | Plaintext: network; mTLS: any core cert |
-| F4 | **HIGH** | NRF issues OAuth tokens not bound to caller; scope never enforced | `nnrf.rs:308`, `oauth.rs:305,434` | Any registrable/core peer |
+| F4 | **HIGH** ◐ | NRF issues OAuth tokens not bound to caller; scope never enforced | `nnrf.rs:308`, `oauth.rs:305,434` | Any registrable/core peer |
 | F5 | **HIGH** ✅ | User-plane anti-spoofing is family-conditional → source spoof onto N6 | `n6/src/lib.rs:98-109` | **Any ordinary subscriber** |
 | F6 | **HIGH** ✅ | AMF `UeContext` map unbounded; abandoned registrations never evicted → OOM | `nf-amf/src/main.rs:758,3084` | Unauthenticated N2 peer |
 | F7 | **HIGH** ◐ | N3 GTP-U + N4 PFCP trust the network; predictable TEID/SEID → cross-session injection, downlink hijack | `nf-upf/src/main.rs:277`, `pfcp/src/lib.rs:838,1568` | N3/N4 reachability (isolation assumption) |
@@ -73,6 +73,7 @@ line. Progress so far:
 | F5 | **FIXED** | `crates/n6/src/lib.rs` `uplink` — fail closed: an address-assigned session accepts only its assigned families; an unassigned-family or non-IP packet is dropped (`Uplink::UnassignedFamily`), address-less forwarding tunnels untouched; tests `uplink_drops_the_unassigned_family_on_a_single_family_session`, `uplink_dual_stack_session_accepts_both_families`; full BDD 45/501 green |
 | F7 | **PARTIAL** | `crates/pfcp/src/lib.rs` — DoS sub-issue closed: the session table is capped (`DEFAULT_MAX_SESSIONS`, `set_max_sessions`, `RADIAN_UPF_MAX_SESSIONS`), a full UPF rejects further establishment with `NoResourcesAvailable`; test `session_table_is_capped_against_an_establishment_flood`. **Deferred** (see detail): unpredictable TEID/SEID, N3/N4 peer-source validation, `valid_gnb_target` RAN-prefix allowlist |
 | F3 | **FIXED** | `nf/nf-udm/src/main.rs` wraps `nudm::router` in `oauth::protect(_, "UDM", verifier)`; the UDM's clients (AUSF, AMF, SMF) attach an NRF-issued `UDM` token when SBI security is on (`NudmClient::with_tokens`, `AusfState::with_tokens`). Opt-in — no change when OAuth is off. Test `protected_udm_requires_a_valid_access_token`; BDD 45/501 green |
+| F4 | **PARTIAL** | mTLS cert-binding (RFC 8705): `tls.rs` surfaces the peer cert thumbprint (`oauth::ClientCert`/`cert_thumbprint`) to handlers; the NRF binds each NF registration to it and refuses to issue a token — or re-register — under a different certificate (`nnrf.rs` register/`access_token`). Closes identity-spoofing + registration-hijack. Tests `nrf_binds_tokens_to_the_registering_client_certificate`, mTLS thumbprint assertion; opt-in, BDD 45/501 green. **Deferred:** per-consumer-type authorization of `targetNfType`/`scope`, and resource-server `cnf` thumbprint verification (token non-replayability) |
 
 All other findings are open.
 
@@ -149,6 +150,24 @@ All other findings are open.
 
 ### F4 — NRF token issuance not bound to caller; scope unenforced
 
+- **Status:** ◐ **PARTIAL** (branch `audit`). **Done — mTLS certificate binding (RFC 8705,
+  the chosen approach):** the mTLS serve path (`tls.rs`) now surfaces the peer's
+  certificate thumbprint (SHA-256 hex, `oauth::ClientCert` / `oauth::cert_thumbprint`) to
+  handlers as a request extension. The NRF binds each NF registration to that thumbprint
+  and, on `access_token`, refuses to issue a token for an `nfInstanceId` unless the
+  presenting certificate matches the one that registered it — and refuses to re-register
+  an instance under a different certificate. So a core NF (even holding a valid core cert)
+  can no longer obtain a token *as* another NF, nor hijack another NF's registration to
+  redirect its discovery. Opt-in: with no client cert (cleartext SBI) the binding is
+  skipped, so the default/BDD path is unchanged. Tests
+  `nrf_binds_tokens_to_the_registering_client_certificate` and the `tls.rs` thumbprint
+  assertion; BDD 45/501 green. **Deferred:** (1) *per-consumer authorization* — a policy
+  of which consumer NF types may request which `targetNfType`/`scope` (cert-binding stops
+  identity spoofing, but a compromised NF can still request a token for *its own* identity
+  toward any target); (2) *resource-server `cnf` verification* — carrying the thumbprint in
+  the token and having each protected NF check the presenter's cert matches it, so a
+  captured token cannot be replayed by a different NF. Together those close the residual
+  privilege-escalation/replay surface on top of this binding.
 - **Class:** OAuth2 / authorization bypass (client-asserted identity). **File:**
   `crates/sbi-core/src/nnrf.rs:308-341` (`access_token`, sole check at `:330`
   `is_registered(&req.nf_instance_id)`); claims `oauth.rs:305-315`; resource check

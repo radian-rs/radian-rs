@@ -249,6 +249,15 @@ fn spawn_conn(
                 return;
             }
         };
+        // Surface the peer's authenticated identity to handlers: the RFC 8705 thumbprint
+        // of its (already CA-verified) client certificate, as a request extension. The
+        // NRF binds registrations/access tokens to it (design/137 F4).
+        let app = match tls.get_ref().1.peer_certificates().and_then(|c| c.first()) {
+            Some(cert) => app.layer(axum::Extension(crate::oauth::ClientCert(
+                crate::oauth::cert_thumbprint(cert.as_ref()),
+            ))),
+            None => app,
+        };
         let io = hyper_util::rt::TokioIo::new(tls);
         let service = hyper_util::service::TowerToHyperService::new(app);
         if let Err(e) =
@@ -312,9 +321,13 @@ mod tests {
         gen_pki(&tmp);
         let dir = tmp.to_str().unwrap();
 
-        // A trivial mTLS server that requires a core-signed client certificate.
+        // A trivial mTLS server that requires a core-signed client certificate and
+        // echoes the peer's RFC 8705 certificate thumbprint (the F4 identity binding).
+        async fn whoami(cert: Option<axum::Extension<crate::oauth::ClientCert>>) -> String {
+            cert.map(|axum::Extension(c)| c.0).unwrap_or_default()
+        }
         let server = TlsIdentity::load(dir, "server").unwrap();
-        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let app = axum::Router::new().route("/", axum::routing::get(whoami));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let cfg = server.server_config().unwrap();
@@ -325,7 +338,11 @@ mod tests {
         let client = TlsIdentity::load(dir, "client").unwrap().client().unwrap();
         let resp = client.get(&url).send().await.expect("mTLS handshake + request");
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.text().await.unwrap(), "ok");
+        // The handler received the peer's certificate thumbprint (SHA-256 hex) — the
+        // identity the NRF binds registrations/tokens to (design/137 F4).
+        let fp = resp.text().await.unwrap();
+        assert_eq!(fp.len(), 64, "client-cert thumbprint surfaced to handlers");
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()), "thumbprint is hex");
 
         // 2) A client presenting a rogue (non-core-CA) certificate is rejected — it
         //    trusts the core server (loads ca.crt) but its own cert isn't core-signed.
