@@ -144,6 +144,9 @@ enum UeCmd {
     /// T3555 fired for this UE — retransmit the Configuration Update Command (it
     /// requested acknowledgement) or give up.
     T3555Expiry(u64),
+    /// A registration NAS retransmission timer (T3550/T3560/T3570) fired for this UE —
+    /// resend the outstanding downlink or abort the registration (design/137 G7).
+    NasRetxExpiry { amf_ue_id: u64, kind: RetxKind },
     /// Push a mid-session PDU-session QoS change to the RAN/UE (from the SMF).
     ModifyPolicy(Box<ModifyPolicy>),
     /// Network-initiated release of one or more PDU sessions for this UE (from the
@@ -472,6 +475,81 @@ fn arm_t3555(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64) {
     });
 }
 
+// ── Registration NAS retransmission timers (TS 24.501 §10.2; design/137 G7) ──────
+//
+// The four downlink NAS messages of a registration each expect an uplink reply; a
+// lost one would otherwise stall the registration forever. Each is guarded by a
+// timer that retransmits the exact bytes until the reply arrives or the send budget
+// is exhausted. A registration runs these strictly in sequence (Identity → Auth →
+// Security Mode → Registration Accept), so one **`pending_retx`** slot on the
+// `UeContext` holds whichever is outstanding; the reply clears it (cancel), and a
+// stale expiry then no-ops.
+
+/// Default interval (s) for the registration NAS retransmission timers, overridable
+/// per timer via `RADIAN_AMF_T35{5,6,7}0_SECS`. Total transmissions cap at
+/// [`NAS_RETX_MAX_SENDS`] (initial + retransmissions).
+const T3550_SECS: u64 = 6; // Registration Accept
+const T3550_ENV: &str = "RADIAN_AMF_T3550_SECS";
+const T3560_SECS: u64 = 6; // Authentication Request / Security Mode Command
+const T3560_ENV: &str = "RADIAN_AMF_T3560_SECS";
+const T3570_SECS: u64 = 6; // Identity Request
+const T3570_ENV: &str = "RADIAN_AMF_T3570_SECS";
+const NAS_RETX_MAX_SENDS: u8 = 5; // initial + 4 retransmissions
+
+/// Which downlink NAS procedure a retransmission timer guards — the timer *number*
+/// differs by procedure (T3570 Identity, T3560 Auth + Security Mode, T3550
+/// Registration Accept), but the retransmit mechanism is identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetxKind {
+    IdentityRequest,     // T3570
+    AuthRequest,         // T3560
+    SecurityModeCommand, // T3560
+    RegistrationAccept,  // T3550
+}
+
+impl RetxKind {
+    /// The configured interval for this procedure's timer (env override, else default).
+    fn interval_secs(self) -> u64 {
+        let (env, default) = match self {
+            RetxKind::IdentityRequest => (T3570_ENV, T3570_SECS),
+            RetxKind::AuthRequest | RetxKind::SecurityModeCommand => (T3560_ENV, T3560_SECS),
+            RetxKind::RegistrationAccept => (T3550_ENV, T3550_SECS),
+        };
+        std::env::var(env).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+
+    /// The DownlinkNASTransport label used in logs / test assertions.
+    fn dl_label(self) -> &'static str {
+        match self {
+            RetxKind::IdentityRequest => "DownlinkNASTransport (IdentityRequest)",
+            RetxKind::AuthRequest => "DownlinkNASTransport (AuthenticationRequest)",
+            RetxKind::SecurityModeCommand => "DownlinkNASTransport (SecurityModeCommand)",
+            RetxKind::RegistrationAccept => "DownlinkNASTransport (RegistrationAccept)",
+        }
+    }
+}
+
+/// A downlink NAS message awaiting its uplink reply (design/137 G7): the exact bytes
+/// sent (resent verbatim — a NAS retransmission reuses the same message/COUNT; the UE
+/// aligns to the received sequence number) plus how many times it has gone out.
+#[derive(Debug, Clone)]
+struct PendingNasRetx {
+    kind: RetxKind,
+    nas_bytes: Vec<u8>,
+    attempts: u8, // 1 = the initial send
+}
+
+/// Arm the retransmission timer for `kind`: after its interval, post the expiry onto
+/// the UE's association (the retransmission runs from the association task).
+fn arm_nas_retx(tx: &UnboundedSender<UeCmd>, amf_ue_id: u64, kind: RetxKind) {
+    let secs = kind.interval_secs();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        let _ = tx.send(UeCmd::NasRetxExpiry { amf_ue_id, kind });
+    });
+}
+
 /// The release guard: how long the AMF waits for the UE's PDU Session Release
 /// Complete before finalising the release itself. Override with
 /// `RADIAN_AMF_RELEASE_GUARD_SECS`.
@@ -694,6 +772,12 @@ struct UeContext {
     /// been sent. Set when the command goes out, cleared by the UE's Configuration
     /// Update Complete; T3555 retransmits while it's `Some`. `None` = none awaiting ack.
     pending_config_update: Option<PendingConfigUpdate>,
+    /// The outstanding registration downlink NAS message awaiting its uplink reply
+    /// (Identity Request / Authentication Request / Security Mode Command /
+    /// Registration Accept): retransmitted by T3570/T3560/T3550 while `Some`, cleared
+    /// by the reply (design/137 G7). Registration procedures run in sequence, so at
+    /// most one is outstanding at a time.
+    pending_retx: Option<PendingNasRetx>,
     /// The CBL admission slot this registration holds (design/136) — one unit of
     /// the gate's in-progress count. Cleared on Registration Complete; any other
     /// teardown path releases it by dropping the context. `None` when CBL was
@@ -878,6 +962,9 @@ async fn serve_gnb(
                     }
                     UeCmd::T3522Expiry(id) => on_t3522_expiry(&mut ues, id, &dereg_tx, t3522_secs()),
                     UeCmd::T3555Expiry(id) => on_t3555_expiry(&mut ues, id, &dereg_tx),
+                    UeCmd::NasRetxExpiry { amf_ue_id, kind } => {
+                        on_nas_retx_expiry(&mut ues, amf_ue_id, kind, &dereg_tx)
+                    }
                     UeCmd::ModifyPolicy(m) => on_network_modification(&mut ues, &m),
                     UeCmd::ReleaseSession { amf_ue_id, psis, cause } => {
                         on_network_release(&mut ues, amf_ue_id, &psis, cause, &dereg_tx)
@@ -1719,6 +1806,45 @@ fn on_t3555_expiry(
     implicit_deregister(ues, amf_ue_id)
 }
 
+/// A registration NAS retransmission timer (T3570/T3560/T3550) fired (design/137 G7):
+/// while `kind` is still the outstanding message and sends remain, resend the exact
+/// bytes verbatim and re-arm; when the send budget is exhausted, abort the
+/// registration — release the RAN context and drop ours (the UE is unreachable). A
+/// stale expiry (the procedure already advanced, so `pending_retx` no longer matches)
+/// is a no-op, which is how the reply "cancels" the timer.
+fn on_nas_retx_expiry(
+    ues: &mut HashMap<u64, UeContext>,
+    amf_ue_id: u64,
+    kind: RetxKind,
+    tx: &UnboundedSender<UeCmd>,
+) -> Vec<(NGAP_PDU, &'static str)> {
+    let Some(ctx) = ues.get_mut(&amf_ue_id) else {
+        return Vec::new(); // context gone
+    };
+    // Only the currently-outstanding message retransmits; a superseded/cleared one no-ops.
+    let attempts = match ctx.pending_retx.as_ref() {
+        Some(p) if p.kind == kind => p.attempts,
+        _ => return Vec::new(),
+    };
+    if attempts >= NAS_RETX_MAX_SENDS {
+        warn!(
+            "UE {amf_ue_id}: {kind:?} retransmission exhausted after {NAS_RETX_MAX_SENDS} \
+             transmissions — no reply; aborting the registration (UE unreachable)"
+        );
+        return implicit_deregister(ues, amf_ue_id);
+    }
+    let ran_ue_id = ctx.ran_ue_id;
+    let bytes = ctx.pending_retx.as_ref().unwrap().nas_bytes.clone();
+    ctx.pending_retx.as_mut().unwrap().attempts = attempts + 1;
+    arm_nas_retx(tx, amf_ue_id, kind);
+    warn!(
+        "UE {amf_ue_id}: {kind:?} retransmission timer expired — resending \
+         (attempt {}/{NAS_RETX_MAX_SENDS})",
+        attempts + 1
+    );
+    vec![(ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes), kind.dl_label())]
+}
+
 /// Decode one NGAP PDU and dispatch it.
 /// Procedure span for the UE owning `amf_ue_id`, under its SUCI-keyed flow root
 /// — `Span::none()` when the UE (or its SUCI) is unknown, leaving the handler
@@ -1841,7 +1967,7 @@ async fn handle_ngap(
                                 // this creates the UE's flow root span.
                                 let span = trace::procedure(&supi, "Authentication");
                                 start_authentication(
-                                    conn, ues, amf_auth, amf_ue_id, ran_ue_id, &supi,
+                                    conn, ues, amf_auth, amf_ue_id, ran_ue_id, &supi, dereg_tx,
                                 )
                                 .instrument(span)
                                 .await;
@@ -2184,9 +2310,27 @@ async fn on_service_request(
     let is_periodic = reg_type == Some(nas::RegistrationType::PeriodicRegistrationUpdate);
     let is_registration_update = is_mobility_update || is_periodic;
     if !is_service_request && !is_registration_update {
-        warn!("CM-IDLE return (tmsi {tmsi:#010x}) failed NAS verification — ignored");
-        RETAINED.lock().unwrap().insert(tmsi, ctx);
-        return Vec::new();
+        // The resume can't be honoured (the NAS didn't verify against the retained
+        // security context, or it's an unexpected message). Rather than silently
+        // dropping the UE — which left it waiting forever — send a Service Reject that
+        // sends it back to registration, and release the N2 connection (design/137 G7).
+        // Cause #10 (implicitly de-registered) means "register afresh", so the retained
+        // context is discarded to match rather than re-retained.
+        warn!("CM-IDLE return (tmsi {tmsi:#010x}) failed NAS verification — Service Reject (re-register)");
+        let amf_ue_id = NEXT_AMF_UE_ID.fetch_add(1, Ordering::Relaxed);
+        let reject =
+            nas::encode_nas_5gs_message(&nas::service_reject(nas::mm_cause::IMPLICITLY_DEREGISTERED))
+                .unwrap_or_default();
+        return vec![
+            (
+                ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, reject),
+                "DownlinkNASTransport (ServiceReject)",
+            ),
+            (
+                ngap::ue_context_release_command(amf_ue_id, ran_ue_id, ngap::CauseNas::NORMAL_RELEASE),
+                "UEContextReleaseCommand",
+            ),
+        ];
     }
 
     let amf_ue_id = NEXT_AMF_UE_ID.fetch_add(1, Ordering::Relaxed);
@@ -3234,8 +3378,17 @@ fn on_initial_ue(
             ctx.replayed_ue_sec_cap = ue_sec_cap;
             ctx.requested_nssai = requested_nssai;
             ctx.tac = ngap::tac_from_initial_ue(msg);
+            // Guard the Identity Request with T3570 — retransmit until the UE answers
+            // (design/137 G7); the Identity Response clears it in dispatch_uplink_nas.
+            let ident = nas::identity_request_suci();
+            ctx.pending_retx = Some(PendingNasRetx {
+                kind: RetxKind::IdentityRequest,
+                nas_bytes: ident.clone(),
+                attempts: 1,
+            });
             ues.insert(amf_ue_id, ctx);
-            let dl = ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, nas::identity_request_suci());
+            arm_nas_retx(dereg_tx, amf_ue_id, RetxKind::IdentityRequest);
+            let dl = ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, ident);
             Some(InitialUeOutcome::NeedIdentity(dl))
         }
     }
@@ -3272,6 +3425,7 @@ impl UeContext {
             pending_am_policy: None,
             releasing: std::collections::HashSet::new(),
             pending_config_update: None,
+            pending_retx: None,
             cbl_slot: None,
             reg_progress_at: std::time::Instant::now(),
         }
@@ -3292,6 +3446,7 @@ async fn start_authentication(
     amf_ue_id: u64,
     ran_ue_id: u32,
     supi: &str,
+    dereg_tx: &UnboundedSender<UeCmd>,
 ) {
     info!("UE {amf_ue_id} identified ({supi}); starting authentication");
     match amf_auth.begin(supi).await {
@@ -3300,7 +3455,15 @@ async fn start_authentication(
                 ctx.auth = Some(pending);
                 ctx.state = RegState::Authenticating;
                 ctx.reg_progress_at = std::time::Instant::now();
+                // Guard the Authentication Request with T3560 — retransmit until the
+                // UE answers (design/137 G7); the Auth Response/Failure clears it.
+                ctx.pending_retx = Some(PendingNasRetx {
+                    kind: RetxKind::AuthRequest,
+                    nas_bytes: nas_req.clone(),
+                    attempts: 1,
+                });
             }
+            arm_nas_retx(dereg_tx, amf_ue_id, RetxKind::AuthRequest);
             let dl = ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, nas_req);
             send_or_log(conn, &dl, "DownlinkNASTransport (AuthenticationRequest)").await;
         }
@@ -3353,12 +3516,12 @@ async fn on_uplink_nas(
     let nas_span = |name: &'static str| tracing::info_span!("nas", otel.name = name);
     match nas::gmm_message_type(&nas_msg) {
         Some(Nas5gmmMessageType::AuthenticationResponse) => {
-            return complete_authentication(ues, amf_auth, amf_ue_id, &nas_msg)
+            return complete_authentication(ues, amf_auth, amf_ue_id, &nas_msg, dereg_tx)
                 .instrument(nas_span("AuthenticationResponse"))
                 .await;
         }
         Some(Nas5gmmMessageType::SecurityModeComplete) => {
-            return on_security_mode_complete(ues, amf_ue_id, &NRF_BASE)
+            return on_security_mode_complete(ues, amf_ue_id, &NRF_BASE, dereg_tx)
                 .instrument(nas_span("SecurityModeComplete"))
                 .await;
         }
@@ -3479,8 +3642,16 @@ async fn dispatch_uplink_nas(
                     ctx.state = RegState::Authenticating;
                     ctx.reg_progress_at = std::time::Instant::now();
                     ctx.registration_area = registration_area;
+                    // The Identity Response answered T3570; guard the Auth Request with
+                    // T3560 instead (the single slot supersedes the Identity retx). G7.
+                    ctx.pending_retx = Some(PendingNasRetx {
+                        kind: RetxKind::AuthRequest,
+                        nas_bytes: nas_req.clone(),
+                        attempts: 1,
+                    });
                     // Reachable from the SBI callback surface from now on.
                     UE_DIRECTORY.lock().unwrap().insert(supi, (amf_ue_id, dereg_tx.clone()));
+                    arm_nas_retx(dereg_tx, amf_ue_id, RetxKind::AuthRequest);
                     Some((
                         ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, nas_req),
                         "DownlinkNASTransport (AuthenticationRequest)",
@@ -3518,6 +3689,8 @@ async fn dispatch_uplink_nas(
         Some(Nas5gmmMessageType::RegistrationComplete) => {
             let ctx = ues.get_mut(&amf_ue_id)?;
             ctx.state = RegState::Registered;
+            // Registration Complete arrived — stop T3550 (design/137 G7).
+            ctx.pending_retx = None;
             // CBL (design/136): the registration this slot was reserved for is
             // done — release it so the gate can admit a deferred UE.
             ctx.cbl_slot = None;
@@ -3850,8 +4023,13 @@ async fn complete_authentication(
     amf_auth: &auth::AmfAuth,
     amf_ue_id: u64,
     nas_msg: &Nas5gsMessage,
+    dereg_tx: &UnboundedSender<UeCmd>,
 ) -> Vec<(NGAP_PDU, &'static str)> {
-    let Some(pending) = ues.get_mut(&amf_ue_id).and_then(|c| c.auth.take()) else {
+    let Some(pending) = ues.get_mut(&amf_ue_id).and_then(|c| {
+        // The Authentication Response arrived — stop T3560 (design/137 G7).
+        c.pending_retx = None;
+        c.auth.take()
+    }) else {
         warn!("UE {amf_ue_id}: Authentication Response with no pending authentication");
         return Vec::new();
     };
@@ -3910,7 +4088,15 @@ async fn complete_authentication(
     ctx.kamf = Some(kamf);
     ctx.state = RegState::SecurityMode;
     ctx.reg_progress_at = std::time::Instant::now();
+    // Guard the Security Mode Command with T3560 — retransmit until the UE completes
+    // the security-mode procedure (design/137 G7); the SMC Complete/Reject clears it.
+    ctx.pending_retx = Some(PendingNasRetx {
+        kind: RetxKind::SecurityModeCommand,
+        nas_bytes: smc_bytes.clone(),
+        attempts: 1,
+    });
     let ran_ue_id = ctx.ran_ue_id;
+    arm_nas_retx(dereg_tx, amf_ue_id, RetxKind::SecurityModeCommand);
     vec![(
         ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, smc_bytes),
         "DownlinkNASTransport (SecurityModeCommand)",
@@ -3950,7 +4136,13 @@ async fn on_security_mode_complete(
     ues: &mut HashMap<u64, UeContext>,
     amf_ue_id: u64,
     nrf_base: &str,
+    dereg_tx: &UnboundedSender<UeCmd>,
 ) -> Vec<(NGAP_PDU, &'static str)> {
+    // The Security Mode Complete arrived — stop T3560 before the awaits below, so a
+    // stale expiry can't retransmit the SMC mid-procedure (design/137 G7).
+    if let Some(c) = ues.get_mut(&amf_ue_id) {
+        c.pending_retx = None;
+    }
     // Fetch before taking the mutable borrow (the fetch awaits).
     let Some(supi) = ues.get(&amf_ue_id).map(|c| c.suci.clone()) else {
         return Vec::new();
@@ -4107,6 +4299,13 @@ async fn on_security_mode_complete(
         // No K_AMF retained (unreachable in practice: it is stored with `sec`) —
         // degrade to the plain NAS transport rather than hand the RAN a bogus key.
         warn!("UE {amf_ue_id}: no K_AMF to derive K_gNB — sending the accept without a context setup");
+        // Guard the Registration Accept with T3550 (design/137 G7).
+        ctx.pending_retx = Some(PendingNasRetx {
+            kind: RetxKind::RegistrationAccept,
+            nas_bytes: bytes.clone(),
+            attempts: 1,
+        });
+        arm_nas_retx(dereg_tx, amf_ue_id, RetxKind::RegistrationAccept);
         return vec![(
             ngap::downlink_nas_transport(amf_ue_id, ran_ue_id, bytes),
             "DownlinkNASTransport (RegistrationAccept)",
@@ -4119,6 +4318,15 @@ async fn on_security_mode_complete(
     // Seed the NH chain: the delivered K_gNB is the sync input for the first NH
     // (NCC 0 → the first path switch hands out {NH₁, NCC 1}).
     ctx.nh_chain = Some((security_key, 0));
+    // Guard the Registration Accept with T3550 — retransmit it (as a plain
+    // DownlinkNASTransport; the AS context now exists after this Initial Context
+    // Setup) until the UE sends Registration Complete (design/137 G7).
+    ctx.pending_retx = Some(PendingNasRetx {
+        kind: RetxKind::RegistrationAccept,
+        nas_bytes: bytes.clone(),
+        attempts: 1,
+    });
+    arm_nas_retx(dereg_tx, amf_ue_id, RetxKind::RegistrationAccept);
     let (allowed_tacs, not_allowed_tacs) = area_restriction.unwrap_or_default();
     let ic = ngap::InitialContext {
         allowed_nssai: allowed.clone(),
@@ -6014,7 +6222,8 @@ mod tests {
         ues.insert(amf_ue_id, ctx);
 
         // Bogus NRF base: am-data fetch + AM policy creation fail gracefully.
-        let dls = on_security_mode_complete(&mut ues, amf_ue_id, "http://127.0.0.1:1").await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dls = on_security_mode_complete(&mut ues, amf_ue_id, "http://127.0.0.1:1", &tx).await;
         assert_eq!(
             dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             ["InitialContextSetupRequest (RegistrationAccept)"]
@@ -6791,6 +7000,104 @@ mod tests {
         assert!(on_t3555_expiry(&mut ues, amf_ue_id, &tx).is_empty());
     }
 
+    /// A registration NAS message is retransmitted verbatim on each timer expiry up to
+    /// the cap, then the registration is aborted (the UE is unreachable) — releasing
+    /// the RAN context and dropping ours so it stops forever (design/137 G7).
+    #[tokio::test]
+    async fn nas_retx_retransmits_then_aborts() {
+        let amf_ue_id = 0x88u64;
+        let auth_req = nas::authentication_request(0, &[0xAA; 16], &[0xBB; 16]);
+        let mut ctx = UeContext::new(4, RegState::Authenticating, Some("imsi-999700000000088".into()));
+        ctx.pending_retx = Some(PendingNasRetx {
+            kind: RetxKind::AuthRequest,
+            nas_bytes: auth_req.clone(),
+            attempts: 1, // the initial send already went out
+        });
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
+
+        // Each expiry up to the cap resends the exact Authentication Request bytes.
+        for attempt in 2..=NAS_RETX_MAX_SENDS {
+            let dls = on_nas_retx_expiry(&mut ues, amf_ue_id, RetxKind::AuthRequest, &tx);
+            assert_eq!(dls.len(), 1, "retransmitted (attempt {attempt})");
+            assert_eq!(dls[0].1, "DownlinkNASTransport (AuthenticationRequest)");
+            assert_eq!(
+                downlink_nas_pdu(&dls[0].0).as_deref(),
+                Some(&auth_req[..]),
+                "verbatim retransmission"
+            );
+            assert_eq!(ues[&amf_ue_id].pending_retx.as_ref().unwrap().attempts, attempt);
+        }
+        // The cap is reached → the next expiry aborts the registration.
+        let dls = on_nas_retx_expiry(&mut ues, amf_ue_id, RetxKind::AuthRequest, &tx);
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["UEContextReleaseCommand"],
+            "give-up releases the RAN side"
+        );
+        assert!(!ues.contains_key(&amf_ue_id), "local context dropped on give-up");
+        // A stale expiry after the context is gone is a harmless no-op.
+        assert!(on_nas_retx_expiry(&mut ues, amf_ue_id, RetxKind::AuthRequest, &tx).is_empty());
+    }
+
+    /// The uplink reply "cancels" a retransmission by clearing `pending_retx`, and an
+    /// expiry for a *superseded* kind no-ops — so a stale timer can't resend a message
+    /// the sequential registration already moved past (design/137 G7).
+    #[tokio::test]
+    async fn nas_retx_expiry_no_ops_when_superseded_or_cleared() {
+        let amf_ue_id = 0x89u64;
+        let mut ctx = UeContext::new(5, RegState::SecurityMode, Some("imsi-999700000000089".into()));
+        // The Security Mode Command is the outstanding message.
+        ctx.pending_retx = Some(PendingNasRetx {
+            kind: RetxKind::SecurityModeCommand,
+            nas_bytes: vec![1, 2, 3],
+            attempts: 1,
+        });
+        let mut ues = HashMap::new();
+        ues.insert(amf_ue_id, ctx);
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
+
+        // A stale T3560-Auth expiry (the procedure advanced to the SMC) no-ops.
+        assert!(on_nas_retx_expiry(&mut ues, amf_ue_id, RetxKind::AuthRequest, &tx).is_empty());
+        assert!(ues[&amf_ue_id].pending_retx.is_some(), "the outstanding SMC is untouched");
+        // The reply cleared it → even the matching kind no-ops (no resend after the reply).
+        ues.get_mut(&amf_ue_id).unwrap().pending_retx = None;
+        assert!(on_nas_retx_expiry(&mut ues, amf_ue_id, RetxKind::SecurityModeCommand, &tx).is_empty());
+    }
+
+    /// A CM-IDLE resume whose NAS can't be verified against the retained security
+    /// context is answered with a Service Reject (re-register) + an N2 release, instead
+    /// of the old silent drop that left the UE stuck (design/137 G7).
+    #[tokio::test]
+    async fn failed_resume_sends_service_reject() {
+        let (ki, ke) = ([0x31u8; 16], [0x32u8; 16]);
+        // A 5G-TMSI no other test touches (RETAINED is a process-wide static).
+        let tmsi = 0x0000_0771u32;
+        let mut ctx = UeContext::new(7, RegState::Registered, Some("imsi-999700000000771".into()));
+        ctx.sec = Some(nas::NasSecurityContext::new(ki, ke, NAS_NIA, NAS_NEA));
+        ctx.guti_tmsi = Some(tmsi);
+        RETAINED.lock().unwrap().insert(tmsi, ctx);
+
+        let amf_smf = pdu_session::AmfSmf::new("http://127.0.0.1:1", "999", "70"); // NRF unused here
+        let (tx, _rx) = unbounded_channel::<UeCmd>();
+        let mut ues = HashMap::new();
+        // The resume carries an *unprotected* NAS PDU, so it fails the retained-context
+        // integrity check and classifies as neither service request nor reg update.
+        let pdu = ngap::initial_ue_message_with_nas(7, nas::identity_request_suci());
+        let dls = on_service_request(&mut ues, &amf_smf, as_initial_ue(&pdu), tmsi, &tx).await;
+
+        assert_eq!(
+            dls.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            ["DownlinkNASTransport (ServiceReject)", "UEContextReleaseCommand"]
+        );
+        let reject = downlink_nas_pdu(&dls[0].0).expect("NAS in the Service Reject");
+        let msg = nas::decode_nas_5gs_message(&reject).expect("plain Service Reject decodes");
+        assert_eq!(nas::gmm_message_type(&msg), Some(Nas5gmmMessageType::ServiceReject));
+        // The context was discarded (cause #10 = re-register), not re-retained.
+        assert!(RETAINED.lock().unwrap().remove(&tmsi).is_none(), "retained context discarded");
+    }
+
     /// A subscribed UE-AMBR change (Nudm_SDM) while a PCF AM-policy override is in
     /// effect: the subscribed value is stored but not signalled — the PCF override
     /// still governs the effective UE-AMBR.
@@ -7230,7 +7537,8 @@ mod tests {
         let mut ues = HashMap::new();
         ues.insert(1u64, ctx);
 
-        let downlinks = on_security_mode_complete(&mut ues, 1, &nrf_base).await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let downlinks = on_security_mode_complete(&mut ues, 1, &nrf_base, &tx).await;
         assert_eq!(
             downlinks.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
             ["DownlinkNASTransport (RegistrationReject)", "UEContextReleaseCommand"],
@@ -7309,8 +7617,9 @@ mod tests {
         assert_eq!(ues.get(&100).unwrap().state, RegState::Identified);
     }
 
-    #[test]
-    fn unidentified_initial_ue_needs_identity() {
+    // async so the Identity Request's T3570 arm (design/137 G7) has a Tokio runtime.
+    #[tokio::test]
+    async fn unidentified_initial_ue_needs_identity() {
         let mut ues = HashMap::new();
         let pdu = ngap::initial_ue_message_with_nas(8, nas::identity_request_suci());
         match on_initial_ue(&mut ues, as_initial_ue(&pdu), 200, &unbounded_channel().0) {
@@ -7382,8 +7691,9 @@ mod tests {
     /// assigned: the AMF resolves it from the GUTI directory — no Identity
     /// Request round trip — and re-authenticates. An unknown GUTI (e.g. lost on
     /// an AMF restart) falls back to the Identity Request.
-    #[test]
-    fn guti_reregistration_resolves_without_identity_request() {
+    // async so the unknown-GUTI Identity Request's T3570 arm has a Tokio runtime (G7).
+    #[tokio::test]
+    async fn guti_reregistration_resolves_without_identity_request() {
         // A SUPI no other test touches (UE_DIRECTORY / GUTI_DIRECTORY are
         // process-wide statics shared across parallel tests).
         let supi = "imsi-999700000000052";

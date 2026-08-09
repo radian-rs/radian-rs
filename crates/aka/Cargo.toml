@@ -9,6 +9,16 @@ authors.workspace = true
 milenage = "0.3.1"
 oxirush-security = "0.1.0"
 thiserror.workspace = true
+# SUCI deconcealment (TS 33.501 Annex C): ECIES Profile A (X25519) / B (P-256),
+# ANSI-X9.63 KDF (SHA-256), AES-128-CTR, HMAC-SHA-256 (design/137 G2).
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+p256 = { version = "0.13", features = ["ecdh"] }
+aes = "0.8"
+ctr = "0.9" # cipher 0.4, matching aes 0.8 (ctr 0.10 pulls the incompatible cipher 0.5)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+getrandom = "0.2"
 
 [dev-dependencies]
 hex-literal = "0.4"

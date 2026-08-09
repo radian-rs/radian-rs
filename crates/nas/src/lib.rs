@@ -643,6 +643,12 @@ pub fn rejected_nssai_from_registration_accept(
 
 /// 5GMM cause values (TS 24.501 §9.11.3.2) this stack emits.
 pub mod mm_cause {
+    /// #9 — UE identity cannot be derived by the network (TS 24.501 §9.11.3.2).
+    /// A Service Reject with this cause sends the UE back to registration.
+    pub const UE_IDENTITY_CANNOT_BE_DERIVED: u8 = 9;
+    /// #10 — implicitly de-registered: the network has no (valid) 5GMM context for
+    /// the UE, so it must register again rather than resume.
+    pub const IMPLICITLY_DEREGISTERED: u8 = 10;
     /// #62 — no network slices available.
     pub const NO_NETWORK_SLICES_AVAILABLE: u8 = 62;
 }
@@ -759,6 +765,18 @@ pub fn service_accept(active_pdu_sessions: Option<&[u8]>) -> Nas5gsMessage {
     Nas5gsMessage::new_5gmm(
         Nas5gmmMessageType::ServiceAccept,
         Nas5gmmMessage::ServiceAccept(accept),
+    )
+}
+
+/// Build a 5GMM **Service Reject** (TS 24.501 §8.2.18) with `cause` (pick from
+/// [`mm_cause`]) — the network's refusal of a Service Request it can't honour
+/// (e.g. it can't verify the request against a retained security context). A UE
+/// receiving one with a re-registration cause (#9 / #10) goes back to
+/// registration rather than silently retrying (design/137 G7).
+pub fn service_reject(cause: u8) -> Nas5gsMessage {
+    Nas5gsMessage::new_5gmm(
+        Nas5gmmMessageType::ServiceReject,
+        Nas5gmmMessage::ServiceReject(messages::NasServiceReject::new(NasFGmmCause::new(cause))),
     )
 }
 
@@ -2559,6 +2577,18 @@ mod tests {
         let bare = registration_reject(mm_cause::NO_NETWORK_SLICES_AVAILABLE, &[], None);
         let back = decode_nas_5gs_message(&encode_nas_5gs_message(&bare).unwrap()).unwrap();
         assert_eq!(parse_registration_reject(&back), Some((62, vec![], None)));
+    }
+
+    /// A Service Reject encodes its 5GMM cause and round-trips through the codec
+    /// (design/137 G7).
+    #[test]
+    fn service_reject_roundtrips() {
+        let msg = service_reject(mm_cause::IMPLICITLY_DEREGISTERED);
+        let bytes = encode_nas_5gs_message(&msg).unwrap();
+        // 5GMM plain header (EPD 0x7e, security header 0), Service Reject type 0x4d, cause #10.
+        assert_eq!(bytes, [0x7e, 0x00, 0x4d, 10]);
+        let back = decode_nas_5gs_message(&bytes).unwrap();
+        assert_eq!(gmm_message_type(&back), Some(Nas5gmmMessageType::ServiceReject));
     }
 
     #[test]

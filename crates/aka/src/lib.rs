@@ -8,6 +8,8 @@
 use milenage::Milenage;
 use oxirush_security::{compute_hres_star, derive_kausf, derive_kseaf};
 
+pub mod suci;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AkaError {
     #[error("milenage: {0}")]

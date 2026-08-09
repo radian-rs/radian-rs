@@ -87,6 +87,8 @@ impl SdmStore {
 struct UdmState {
     udr: Arc<UdrClient>,
     sdm: SdmStore,
+    /// Home-network private keys for SUCI deconcealment (design/137 G2).
+    suci: Arc<aka::suci::HomeNetworkKeys>,
 }
 
 impl FromRef<UdmState> for Arc<UdrClient> {
@@ -99,6 +101,35 @@ impl FromRef<UdmState> for SdmStore {
     fn from_ref(s: &UdmState) -> Self {
         s.sdm.clone()
     }
+}
+
+impl FromRef<UdmState> for Arc<aka::suci::HomeNetworkKeys> {
+    fn from_ref(s: &UdmState) -> Self {
+        s.suci.clone()
+    }
+}
+
+/// Load the home-network ECIES private keys from the environment (design/137 G2):
+/// `RADIAN_UDM_HNET_A_KEY` (64-hex X25519 private key, key id `…_A_KEY_ID`, default 1)
+/// for Profile A, `RADIAN_UDM_HNET_B_KEY` (64-hex P-256 scalar, id default 2) for
+/// Profile B. Absent ⇒ only null-scheme SUCIs (and plain SUPIs) deconceal.
+fn hnet_keys_from_env() -> aka::suci::HomeNetworkKeys {
+    fn key32(var: &str) -> Option<[u8; 32]> {
+        let hex = std::env::var(var).ok()?;
+        let bytes = hex::decode(hex.trim()).ok()?;
+        bytes.try_into().ok()
+    }
+    fn key_id(var: &str, default: u8) -> u8 {
+        std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+    let mut keys = aka::suci::HomeNetworkKeys::empty();
+    if let Some(k) = key32("RADIAN_UDM_HNET_A_KEY") {
+        keys = keys.with_profile_a(key_id("RADIAN_UDM_HNET_A_KEY_ID", 1), k);
+    }
+    if let Some(k) = key32("RADIAN_UDM_HNET_B_KEY") {
+        keys = keys.with_profile_b(key_id("RADIAN_UDM_HNET_B_KEY_ID", 2), k);
+    }
+    keys
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -161,7 +192,7 @@ pub fn router(udr: Arc<UdrClient>) -> Router {
         .route("/nudm-sdm/v2/{supi}/sdm-subscriptions", post(sdm_subscribe))
         .route("/nudm-sdm/v2/{supi}/sdm-subscriptions/{sub_id}", delete(sdm_unsubscribe))
         .route("/nudm-sdm/v2/{supi}/notify-data-change", post(sdm_notify_change))
-        .with_state(UdmState { udr, sdm: SdmStore::new() })
+        .with_state(UdmState { udr, sdm: SdmStore::new(), suci: Arc::new(hnet_keys_from_env()) })
 }
 
 /// `Nudm_SDM` subscription (TS 29.503 §6.1.6.2.10, trimmed): a consumer's callback
@@ -383,13 +414,19 @@ async fn sdm_fetch(
 
 async fn generate_auth_data(
     State(udr): State<Arc<UdrClient>>,
+    State(suci): State<Arc<aka::suci::HomeNetworkKeys>>,
     Path(supi_or_suci): Path<String>,
     Json(req): Json<AuthenticationInfoRequest>,
 ) -> Result<Json<AuthenticationInfoResult>, StatusCode> {
-    // NOTE: SUCI deconcealment is out of scope; supiOrSuci is treated as the SUPI.
+    // Recover the SUPI: deconceal a SUCI (null scheme, or ECIES Profile A/B with the
+    // home-network private key), or pass a plain SUPI through unchanged (design/137 G2).
+    let supi = aka::suci::deconceal(&supi_or_suci, &suci).map_err(|e| {
+        tracing::warn!("SUCI deconcealment failed: {e}");
+        StatusCode::FORBIDDEN
+    })?;
     let (mcc, mnc) = parse_snn(&req.serving_network_name).ok_or(StatusCode::BAD_REQUEST)?;
     let av = udr
-        .generate_av(&supi_or_suci, &mcc, &mnc)
+        .generate_av(&supi, &mcc, &mnc)
         .await
         .map_err(|e| {
             tracing::warn!("UDR generate-av failed: {e}");
@@ -406,7 +443,8 @@ async fn generate_auth_data(
             autn: av.autn,
             kausf: av.kausf,
         },
-        supi: supi_or_suci,
+        // The response carries the *deconcealed* SUPI (the AUSF/AMF key it by SUPI).
+        supi,
     }))
 }
 
@@ -669,6 +707,52 @@ mod tests {
         assert_eq!(sdm.get_am_data("imsi-1", "99970").await.unwrap(), Some(am));
         assert_eq!(sdm.get_am_data("imsi-1", "00101").await.unwrap(), None, "other PLMN");
         assert_eq!(sdm.get_am_data("imsi-2", "99970").await.unwrap(), None, "unknown SUPI");
+    }
+
+    /// The UDM deconceals a SUCI before looking up the subscriber (design/137 G2): a
+    /// null-scheme SUCI resolves to the SUPI the credentials were provisioned under, so
+    /// an AV comes back and the response carries the *deconcealed* SUPI. (The ECIES
+    /// profiles are exercised in `aka::suci`; here we prove the UDM is wired to it.)
+    #[tokio::test]
+    async fn generate_auth_data_deconceals_a_suci() {
+        let store = Arc::new(InMemoryStore::new());
+        // TS 35.208 test credentials, provisioned under the *deconcealed* SUPI.
+        store
+            .provision_hex(
+                "imsi-999700000000001",
+                "465b5ce8b199b49faa5f0a2ee238a6bc",
+                "cd63cb71954a9f4e48a5994e37a02baf",
+                "8000",
+            )
+            .unwrap();
+        let store: Arc<dyn SubscriberStore> = store;
+
+        let udr_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udr_addr = udr_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udr_l, crate::nudr::router(store)).await.unwrap() });
+
+        let udr = Arc::new(UdrClient::new(format!("http://{udr_addr}")));
+        let udm_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udm_addr = udm_l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(udm_l, router(udr)).await.unwrap() });
+
+        let udm = NudmClient::new(format!("http://{udm_addr}"));
+        let snn = aka::serving_network_name("999", "70");
+
+        // A null-scheme SUCI → imsi-999700000000001, which the UDR knows.
+        let result = udm
+            .generate_auth_data("suci-0-999-70-0-0-0-0000000001", &snn)
+            .await
+            .expect("AV for the deconcealed SUPI");
+        assert_eq!(result.supi, "imsi-999700000000001", "response carries the deconcealed SUPI");
+        assert_eq!(result.authentication_vector.av_type, "5G_HE_AKA");
+        assert!(!result.authentication_vector.rand.is_empty(), "an AV was generated");
+
+        // A plain SUPI still works (passthrough).
+        assert_eq!(
+            udm.generate_auth_data("imsi-999700000000001", &snn).await.unwrap().supi,
+            "imsi-999700000000001"
+        );
     }
 
     /// A Nudm_SDM change subscription: subscribe a callback, a data-change fans a
