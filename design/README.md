@@ -9,6 +9,7 @@ surface of the project and assesses build feasibility.
 
 | Doc | Topic |
 |---|---|
+| [145-codec-fuzzing.md](145-codec-fuzzing.md) | **Codec fuzzing harnesses (G36 — cheapest 138 first-wave item)**: a detached `fuzz/` cargo-fuzz crate with six libFuzzer targets over every codec that eats unauthenticated wire bytes — ngap/nas/pfcp/gtpu/rrc/f1ap — each driving the exact NF decode entry point and re-encoding what decodes. Rust closes the memory-safety class but a decode-path **panic** is still a remote DoS; the contract is never-panic. Seeded from radian's golden builders (`make_corpus`, 47 committed seeds) **plus open5gs's `tests/fuzzing` NAS-5GS/PFCP/GTP corpora**. A stable-toolchain `corpus_replays_clean` test replays every seed as a permanent regression net (fuzzers need nightly; the net doesn't). Smoke campaigns (20k runs each) all finished **zero crashes**. Detached from the root workspace so `cargo test --workspace` never pulls in nightly/sanitizer |
 | [01-asn1-rust-gap-analysis.md](01-asn1-rust-gap-analysis.md) | Rust ASN.1 ecosystem vs. 3GPP needs — how big is the gap? |
 | [02-nf-interface-encoding-map.md](02-nf-interface-encoding-map.md) | Full NF / interface ASN.1-vs-JSON split + phased build plan |
 | [03-n2-ngap-slice.md](03-n2-ngap-slice.md) | First protocol slice: AMF N2 (NGAP/SCTP) + NAS decode |

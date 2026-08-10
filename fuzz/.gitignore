@@ -1,0 +1,7 @@
+# cargo-fuzz build output and crash artifacts — never committed.
+/target
+/artifacts
+/coverage
+# Corpora grow unboundedly during a campaign; only the curated seeds under
+# corpus/<target>/ are tracked (see design/145). `git add -f` a seed to keep it.
+/Cargo.lock
