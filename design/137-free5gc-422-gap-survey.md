@@ -215,9 +215,11 @@ Gaps:
 - **No serving-network authorization** in AUSF — any caller names any SNN and
   gets a K_SEAF bound to it (Go: `IsServingNetworkAuthorized` → 403). Security
   relevant. → **G1-adjacent, folded into G12**
-- **No subscriber provisioning surface**: UDR exposes **no
-  `authentication-subscription` route**; only `RADIAN_UDR_PROVISION_DEMO=1` or
-  in-process `provision_hex`. No webconsole, no CLI. → **G20/G23**
+- ~~**No subscriber provisioning surface**~~ **CLI CLOSED**
+  ([144](144-subscriber-provisioning-cli.md)): `tools/radian-dbctl`
+  (`add`/`remove`/`list`) provisions credentials + a working profile straight into
+  the encrypted store — ARPF-preserving (K never on a wire), the G40 shape. No
+  webconsole yet. → **G23** done (CLI); UI outstanding
 - UDM: 3 of ~20 SDM datasets (missing nssai, trace-data, ue-context-in-*,
   shared-data, aggregate `GET /{supi}`, …); UECM PUT/DELETE-only (no GET, no
   PATCH, no non-3GPP); no ParameterProvision; no EventExposure (real in Go);
@@ -404,7 +406,7 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 | **G20** | **BSF** — new `nf-bsf` (Nbsf_Management pcfBindings) + PCF binding registration + SMF/NEF binding query | Moderate | M | P2 | the 130 correction; unlocks AF→PCF lookup |
 | **G21** | UP topology Phase 3 — config-driven graph (G5 format), >2-hop chains, >1 ULCL branch, PSA/ULCL selection | Moderate | L | P2 | [134](134-ulcl-multi-upf.md) Phase 3 |
 | **G22** | NEF completeness: subscription GET/PUT/PATCH, UE-by-IP, PFD management (north+south + SMF fan-out), AF notifications, RFC 7807 | Moderate | M–L | P2 | §3.5 |
-| **G23** | **Subscriber provisioning API** — UDR authentication-subscription CRUD (+ minimal admin UI or CLI over it) | Moderate (ops) | M | **P2** | §3.4; 130's P4-9, now sharper: *no* path exists |
+| ~~**G23**~~ | ~~**Subscriber provisioning**~~ — **DONE (CLI)** ([144](144-subscriber-provisioning-cli.md)): `radian-dbctl add/remove/list` direct-to-store, ARPF-preserving (the G40 shape, not a K-on-the-wire Nudr API). UI half outstanding | Moderate (ops) | M | ✓ | closed the sharpest operational gap |
 | **G24** | PCF depth: MediaComponent/AF-QoS in PolicyAuthorization, GBR budget pool, usage monitoring, UDR push callbacks, AuthorizedDefaultQos | Moderate | L | P2 | needed for AF-QoS scenarios |
 | **G25** | UDM/UDR breadth: nssai + ue-context-in-* SDM datasets, UECM GET/PATCH, EventExposure, GPSI↔SUPI identity-data, generic subs-to-notify, PLMN-partitioned policy data, advertise nudm-sdm/uecm in NRF profile | Moderate | M–L | P2 | the profile-advertising fix is **S** — do early |
 | **G26** | Observability: Prometheus metrics per NF + OAM read surfaces (registered-ue-context, pdu-session-info) | Moderate | M | P2 | §4.3 |
@@ -416,8 +418,9 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 Suggested first wave by value-per-effort: **G1 → ~~G11~~ (done, [139](139-upf-downlink-qfi.md))
 → ~~G6~~ (leak done, [140](140-smf-ipam-pool.md)) → ~~G4~~ (liveness done,
 [141](141-pfcp-liveness.md)) → ~~G7~~ (done, [142](142-amf-nas-retransmission.md))
-→ ~~G2~~ (done, [143](143-suci-deconcealment.md)) → G23 → G5**, then decide the
-§7 pivot question before committing to G16/G18-class interop refactors.
+→ ~~G2~~ (done, [143](143-suci-deconcealment.md)) → ~~G23~~ (CLI done,
+[144](144-subscriber-provisioning-cli.md)) → G5**, then decide the §7 pivot
+question before committing to G16/G18-class interop refactors.
 
 ## Sources
 
