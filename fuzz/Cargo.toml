@@ -1,0 +1,66 @@
+[package]
+name = "radian-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gtpu = { path = "../crates/gtpu" }
+nas = { path = "../crates/nas" }
+ngap = { path = "../crates/ngap" }
+pfcp = { path = "../crates/pfcp" }
+rrc = { path = "../crates/rrc" }
+f1ap = { path = "../crates/f1ap" }
+
+# Corpus generator (stable): `cargo run --bin make_corpus` refreshes the
+# radian-built seeds under corpus/<target>/.
+[[bin]]
+name = "make_corpus"
+path = "src/bin/make_corpus.rs"
+test = false
+doc = false
+
+# The fuzz targets are libFuzzer binaries (run via `cargo +nightly fuzz run`);
+# the corpus-replay regression test lives in the lib and runs on stable.
+[[bin]]
+name = "ngap"
+path = "fuzz_targets/ngap.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "nas"
+path = "fuzz_targets/nas.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pfcp"
+path = "fuzz_targets/pfcp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gtpu"
+path = "fuzz_targets/gtpu.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rrc"
+path = "fuzz_targets/rrc.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "f1ap"
+path = "fuzz_targets/f1ap.rs"
+test = false
+doc = false
+
+# Detached from the root workspace (cargo-fuzz convention).
+[workspace]

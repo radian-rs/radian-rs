@@ -38,7 +38,8 @@ use ngap::{
     UplinkNASTransportProtocolIEs_EntryValue,
 };
 use sctp_rs::{
-    ConnectedSocket, NotificationOrData, SendData, SendInfo, Socket, SocketToAssociation,
+    AssocChangeState, ConnectedSocket, Notification, NotificationOrData, SendData, SendInfo,
+    Socket, SocketToAssociation,
 };
 use tracing::{debug, error, info, warn, Instrument};
 
@@ -963,7 +964,31 @@ async fn serve_gnb(
         tokio::select! {
             received = conn.sctp_recv() => match received {
                 Err(e) => break Err(e.into()),
-                Ok(NotificationOrData::Notification(n)) => info!("SCTP notification: {n:?}"),
+                // SCTP notifications (G35, TS 38.412 / RFC 6458 §6.1): a **terminal**
+                // association event — COMM_LOST (the gNB crashed / the link failed),
+                // SHUTDOWN_COMPLETE, CANT_START, or a peer-initiated Shutdown — means
+                // this gNB is gone. Break so the association task tears down its UEs
+                // (open5gs does the same on `amf-sm.c` COMM_LOST); pre-G35 radian only
+                // logged it and the task ran on forever, leaking the UEs + the
+                // GNB_LINKS entry. COMM_UP / RESTART are non-terminal — keep serving.
+                Ok(NotificationOrData::Notification(n)) => match &n {
+                    Notification::AssociationChange(c)
+                        if matches!(
+                            c.state,
+                            AssocChangeState::CommLost
+                                | AssocChangeState::ShutdownComplete
+                                | AssocChangeState::CannotStartAssoc
+                        ) =>
+                    {
+                        warn!(ues = ues.len(), "SCTP association down ({:?}) — tearing down this gNB's UEs", c.state);
+                        break Ok(());
+                    }
+                    Notification::Shutdown(_) => {
+                        warn!(ues = ues.len(), "gNB initiated SCTP shutdown — tearing down its UEs");
+                        break Ok(());
+                    }
+                    _ => info!("SCTP notification: {n:?}"),
+                },
                 Ok(NotificationOrData::Data(data)) => {
                     if data.payload.is_empty() {
                         info!("gNB association closed");
@@ -1023,10 +1048,21 @@ async fn serve_gnb(
             }
         }
     };
-    // This association is gone — drop its UEs from the directory (their senders
-    // are now closed) so withdrawals for them answer 404 instead of queueing.
+    // This association is gone (G35). The UE contexts in `ues` drop here, which
+    // releases each one's CBL admission slot (RAII) and any AM-policy association —
+    // so a vanished gNB can't leak AMF memory or hold the CBL gate. Then drop the
+    // receiver so every clone of this association's `dereg_tx` reports `is_closed()`,
+    // and sweep both the UE directory and the `GNB_LINKS` entry by that flag. Pre-G35
+    // the `GNB_LINKS` entry was never removed, so a dead gNB leaked a stale link that
+    // paging kept trying (audit LOW).
+    let torn_down = ues.len();
+    drop(ues);
     drop(dereg_rx);
     UE_DIRECTORY.lock().unwrap().retain(|_, (_, tx)| !tx.is_closed());
+    GNB_LINKS.lock().unwrap().retain(|link| !link.tx.is_closed());
+    if torn_down > 0 {
+        info!(ues = torn_down, "gNB association torn down — released its UE contexts");
+    }
     result
 }
 
