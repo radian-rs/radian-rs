@@ -45,6 +45,28 @@ const USAGE_THRESHOLD_ENV: &str = "RADIAN_SMF_USAGE_THRESHOLD_BYTES";
 const HEARTBEAT_SECS_ENV: &str = "RADIAN_SMF_HEARTBEAT_SECS";
 const DEFAULT_HEARTBEAT_SECS: u64 = 10;
 const SBI_PORT: u16 = 8002;
+/// Path to this SMF's YAML config file (design/147, G5). Every setting below can
+/// come from it; each `RADIAN_SMF_*` env var still **overrides** the file value.
+const CONFIG_ENV: &str = "RADIAN_SMF_CONFIG";
+
+/// The SMF's YAML config (design/147, G5) — one file replacing the scattered
+/// `RADIAN_SMF_*` env reads. Every field is optional: an absent field falls through
+/// to its env var (which always overrides) or the built-in default. Keys are
+/// kebab-case (`upf-n4`, `gfbr-budget-mbps`, …).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct SmfConfig {
+    nrf: Option<String>,
+    upf_n4: Option<String>,
+    iupf_n4: Option<String>,
+    psa2_n4: Option<String>,
+    ulcl_prefix: Option<String>,
+    topology: Option<String>,
+    advertise_addr: Option<String>,
+    gfbr_budget_mbps: Option<u64>,
+    usage_threshold_bytes: Option<u64>,
+    heartbeat_secs: Option<u64>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -56,16 +78,20 @@ async fn main() -> anyhow::Result<()> {
     let tls = sbi_core::tls::TlsIdentity::from_env("smf")?;
     sbi_core::configure_transport(tls.as_ref());
 
-    let smf_ip = Ipv4Addr::new(127, 0, 0, 1); // TODO: real N4 source address / config
-    let nrf_base =
-        sbi_core::sbi_base(std::env::var(NRF_ENV).unwrap_or_else(|_| DEFAULT_NRF.to_string()));
+    // Per-NF config (design/147, G5): load the YAML file if RADIAN_SMF_CONFIG points
+    // at one, then read each setting as env > file > default via `config::resolve`.
+    let cfg: SmfConfig = common::config::load(CONFIG_ENV)?;
+    use common::config::{resolve, resolve_opt};
 
-    // A config-file UP topology (design/134 Phase 3b) takes precedence over the env-var
+    let smf_ip = Ipv4Addr::new(127, 0, 0, 1); // TODO: real N4 source address / config
+    let nrf_base = sbi_core::sbi_base(resolve(NRF_ENV, cfg.nrf, DEFAULT_NRF.to_string()));
+
+    // A config-file UP topology (design/134 Phase 3b) takes precedence over the scalar
     // user plane: it expresses a named-node graph and the SMF selects a path per DNN.
-    // Absent ⇒ the anchor / optional I-UPF / optional breakout come from the scalar vars.
-    // The NRF base is also how the SMF finds the UDM for Nudm_SDM subscription checks.
-    let mut smf = match std::env::var(TOPOLOGY_ENV) {
-        Ok(path) => {
+    // Absent ⇒ the anchor / optional I-UPF / optional breakout come from the scalar
+    // settings. The NRF base is also how the SMF finds the UDM for Nudm_SDM checks.
+    let mut smf = match resolve_opt::<String>(TOPOLOGY_ENV, cfg.topology) {
+        Some(path) => {
             let json = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow::anyhow!("read UP topology config {path}: {e}"))?;
             let topo = topology::Topology::parse(&json)?;
@@ -76,18 +102,20 @@ async fn main() -> anyhow::Result<()> {
             );
             SmfState::connect_with_topology(topo, smf_ip, nrf_base.clone()).await?
         }
-        Err(_) => {
-            let upf_n4: SocketAddr = std::env::var(UPF_N4_ENV)
-                .unwrap_or_else(|_| DEFAULT_UPF_N4.to_string())
-                .parse()?;
+        None => {
+            let upf_n4: SocketAddr =
+                resolve(UPF_N4_ENV, cfg.upf_n4, DEFAULT_UPF_N4.to_string()).parse()?;
             let iupf_n4: Option<SocketAddr> =
-                std::env::var(IUPF_N4_ENV).ok().map(|v| v.parse()).transpose()?;
+                resolve_opt::<String>(IUPF_N4_ENV, cfg.iupf_n4).map(|v| v.parse()).transpose()?;
             let mut user_plane = match iupf_n4 {
                 Some(iupf) => UserPlane::chained(upf_n4, iupf),
                 None => UserPlane::single(upf_n4),
             };
             // A second anchor + the prefix classified to it (both or neither).
-            match (std::env::var(PSA2_N4_ENV).ok(), std::env::var(ULCL_PREFIX_ENV).ok()) {
+            match (
+                resolve_opt::<String>(PSA2_N4_ENV, cfg.psa2_n4),
+                resolve_opt::<String>(ULCL_PREFIX_ENV, cfg.ulcl_prefix),
+            ) {
                 (Some(psa2), Some(prefix)) => {
                     let prefix: pfcp::IpPrefix = prefix
                         .parse()
@@ -112,21 +140,19 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     // How the PCF reaches us for a policy-update notification (design/135 Phase 2b).
-    let advertise =
-        std::env::var(ADVERTISE_ENV).unwrap_or_else(|_| DEFAULT_ADVERTISE_ADDR.to_string());
+    let advertise = resolve(ADVERTISE_ENV, cfg.advertise_addr, DEFAULT_ADVERTISE_ADDR.to_string());
     smf = smf.with_callback_base(format!(
         "{}://{advertise}:{SBI_PORT}",
         sbi_core::sbi_scheme()
     ));
     // Optional GFBR admission-control budget (else unlimited).
-    if let Some(mbps) = std::env::var(GFBR_BUDGET_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
+    if let Some(mbps) = resolve_opt::<u64>(GFBR_BUDGET_ENV, cfg.gfbr_budget_mbps) {
         let bps = mbps.saturating_mul(1_000_000);
         smf = smf.with_gfbr_budget(bps, bps);
         tracing::info!(gfbr_budget_mbps = mbps, "GFBR admission control enabled");
     }
     // Optional mid-session usage reporting (the charging trigger, design/59).
-    if let Some(bytes) = std::env::var(USAGE_THRESHOLD_ENV).ok().and_then(|v| v.parse::<u64>().ok())
-    {
+    if let Some(bytes) = resolve_opt::<u64>(USAGE_THRESHOLD_ENV, cfg.usage_threshold_bytes) {
         smf = smf.with_usage_threshold(bytes);
         tracing::info!(usage_threshold_bytes = bytes, "mid-session usage reporting enabled");
     }
@@ -137,10 +163,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(pdu_session::handle_usage_reports(smf.clone()));
     // N4 liveness (design/137 G4): heartbeat every UPF and, on a restart (a newer
     // recovery timestamp), re-associate it and drop its now-stranded sessions.
-    let heartbeat_secs = std::env::var(HEARTBEAT_SECS_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_HEARTBEAT_SECS);
+    let heartbeat_secs = resolve(HEARTBEAT_SECS_ENV, cfg.heartbeat_secs, DEFAULT_HEARTBEAT_SECS);
     tokio::spawn(pdu_session::run_heartbeats(
         smf.clone(),
         std::time::Duration::from_secs(heartbeat_secs),
@@ -158,4 +181,41 @@ async fn main() -> anyhow::Result<()> {
         None => sbi_core::run(sbi, pdu_session::router(smf)).await?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// The shipped sample config must parse into `SmfConfig` — `deny_unknown_fields`
+    /// makes this fail if `configs/smf.yaml` grows a key the struct doesn't have (or a
+    /// field is renamed), keeping the sample and the code from drifting apart.
+    #[test]
+    fn sample_config_matches_struct() {
+        let text = include_str!("../../../configs/smf.yaml");
+        let cfg: SmfConfig = serde_yml::from_str(text).expect("configs/smf.yaml parses");
+        // The keys left uncommented in the sample are the always-present ones.
+        assert_eq!(cfg.nrf.as_deref(), Some("http://127.0.0.1:8000"));
+        assert_eq!(cfg.upf_n4.as_deref(), Some("127.0.0.1:8805"));
+        assert_eq!(cfg.advertise_addr.as_deref(), Some("127.0.0.1"));
+        assert_eq!(cfg.heartbeat_secs, Some(10));
+        // The optional multi-UPF / charging keys are commented out in the sample.
+        assert!(cfg.iupf_n4.is_none() && cfg.gfbr_budget_mbps.is_none());
+    }
+
+    /// An env var overrides the file value, and the file value is used when the env
+    /// var is unset — the G5 precedence, exercised through the SMF's own settings.
+    #[test]
+    fn env_overrides_file_value() {
+        use common::config::resolve;
+        let cfg = SmfConfig { heartbeat_secs: Some(30), ..Default::default() };
+        // File value used when the env var is unset.
+        assert_eq!(resolve(HEARTBEAT_SECS_ENV, cfg.heartbeat_secs, DEFAULT_HEARTBEAT_SECS), 30);
+        // env wins over the file value.
+        // SAFETY: single-threaded test, key is unique to the SMF.
+        unsafe { std::env::set_var(HEARTBEAT_SECS_ENV, "5") };
+        let cfg = SmfConfig { heartbeat_secs: Some(30), ..Default::default() };
+        assert_eq!(resolve(HEARTBEAT_SECS_ENV, cfg.heartbeat_secs, DEFAULT_HEARTBEAT_SECS), 5);
+        unsafe { std::env::remove_var(HEARTBEAT_SECS_ENV) };
+    }
 }
