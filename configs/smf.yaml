@@ -1,0 +1,50 @@
+# SMF configuration (design/147, G5).
+#
+# Point RADIAN_SMF_CONFIG at this file. Every key is optional — an omitted key
+# falls through to its RADIAN_SMF_* env var (which always OVERRIDES this file) and
+# then to the built-in default. So you can adopt this file incrementally and any
+# existing env var still wins where set. Precedence: env var > this file > default.
+
+# NRF base URL — how the SMF registers itself and discovers the UDM (Nudm_SDM).
+# env: RADIAN_SMF_NRF   default: http://127.0.0.1:8000
+nrf: http://127.0.0.1:8000
+
+# N4 (PFCP) address of the anchor UPF (the PSA).
+# env: RADIAN_SMF_UPF_N4   default: 127.0.0.1:8805
+upf-n4: 127.0.0.1:8805
+
+# --- Optional multi-UPF user plane (design/134). Omit for single-UPF. ---
+# Intermediate UPF: when set, every session chains gNB -> I-UPF -> N9 -> anchor.
+# env: RADIAN_SMF_IUPF_N4
+# iupf-n4: 127.0.0.1:8815
+#
+# Uplink classifier: a second anchor + the destination prefix steered to it.
+# Both are required together and both need iupf-n4 (the classifier runs on it).
+# env: RADIAN_SMF_PSA2_N4 / RADIAN_SMF_ULCL_PREFIX
+# psa2-n4: 127.0.0.1:8825
+# ulcl-prefix: 10.45.1.0/24
+#
+# Or, instead of the scalar user plane above, a JSON UP-topology file that
+# supersedes iupf-n4/psa2-n4/ulcl-prefix and routes per DNN (design/134 Phase 3b).
+# env: RADIAN_SMF_TOPOLOGY
+# topology: /etc/radian/smf-topology.json
+
+# Address other NFs use to reach this SMF's SBI (baked into the SM policy
+# notificationUri so a PCF-initiated re-authorization reaches this SM context).
+# env: RADIAN_SMF_ADVERTISE_ADDR   default: 127.0.0.1
+advertise-addr: 127.0.0.1
+
+# --- Optional charging / admission control. Omit to disable each. ---
+# GFBR admission-control budget in Mbps, each direction (absent => unlimited).
+# env: RADIAN_SMF_GFBR_BUDGET_MBPS
+# gfbr-budget-mbps: 100
+#
+# Usage-reporting volume threshold in bytes: the UPF reports each session's usage
+# mid-session on crossing it (the charging trigger). Absent => report at deletion.
+# env: RADIAN_SMF_USAGE_THRESHOLD_BYTES
+# usage-threshold-bytes: 1000000
+
+# N4 heartbeat interval (seconds): how often the SMF pings each UPF to detect a
+# restart (design/141, G4).
+# env: RADIAN_SMF_HEARTBEAT_SECS   default: 10
+heartbeat-secs: 10

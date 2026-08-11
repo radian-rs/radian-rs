@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod config;
 pub mod telemetry;
 pub use telemetry::{init_telemetry, shutdown_telemetry};
 

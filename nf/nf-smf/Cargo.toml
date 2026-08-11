@@ -20,3 +20,4 @@ hex = "0.4"
 
 [dev-dependencies]
 subscriber-db.workspace = true
+serde_yml = "0.0.12"
