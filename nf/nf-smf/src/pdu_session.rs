@@ -1616,6 +1616,7 @@ async fn fetch_session_subscription(
         gbr: None,
         filter: None,
         ref_chg_data: None,
+        flow_status: sbi_core::npcf::FlowStatus::Enabled,
     }];
     if let Some(extra) = dnn_config.get("qosFlows").and_then(|v| v.as_array()) {
         qos_flows.extend(
@@ -2630,6 +2631,7 @@ fn flow_qers(decision: &sbi_core::npcf::SmPolicyDecision) -> Vec<pfcp::FlowQer> 
         .filter_map(|f| {
             let gbr = f.gbr.as_ref()?;
             let filter = f.filter.as_ref()?;
+            let (uplink, downlink) = f.flow_status.gate();
             Some(pfcp::FlowQer {
                 qfi: f.qfi,
                 filter: pfcp::FlowFilter::transport(
@@ -2639,6 +2641,8 @@ fn flow_qers(decision: &sbi_core::npcf::SmPolicyDecision) -> Vec<pfcp::FlowQer> 
                 ),
                 mfbr_dl_bps: sbi_core::npcf::bitrate_to_bps(&gbr.mfbr_dl)?,
                 mfbr_ul_bps: sbi_core::npcf::bitrate_to_bps(&gbr.mfbr_ul)?,
+                // The PCC rule's flowStatus becomes the flow's QER gate (design/151).
+                gate: pfcp::Gate { uplink, downlink },
             })
         })
         .collect()
@@ -2657,7 +2661,11 @@ fn diff_flows(
         match old.iter().find(|o| o.qfi == n.qfi) {
             None => create.push(*n),
             Some(o) if o.filter != n.filter => create.push(*n),
-            Some(o) if (o.mfbr_dl_bps, o.mfbr_ul_bps) != (n.mfbr_dl_bps, n.mfbr_ul_bps) => {
+            // An MFBR re-rate or a gate (flowStatus) flip is a mid-session update.
+            Some(o)
+                if (o.mfbr_dl_bps, o.mfbr_ul_bps, o.gate)
+                    != (n.mfbr_dl_bps, n.mfbr_ul_bps, n.gate) =>
+            {
                 update.push(*n)
             }
             Some(_) => {}
@@ -4772,7 +4780,7 @@ mod tests {
     /// and a flow with no charging decision falls back to the QFI.
     #[test]
     fn container_charges_under_the_flows_rating_group() {
-        use sbi_core::npcf::{ChargingData, QosFlowPolicy, SmPolicyDecision};
+        use sbi_core::npcf::{ChargingData, FlowStatus, QosFlowPolicy, SmPolicyDecision};
         let flow = |qfi, chg: Option<&str>| QosFlowPolicy {
             qfi,
             five_qi: 1,
@@ -4782,6 +4790,7 @@ mod tests {
             gbr: None,
             filter: None,
             ref_chg_data: chg.map(String::from),
+            flow_status: FlowStatus::Enabled,
         };
         // QFI 2 is charged under "chg" (rating group 100); QFI 3 has no charging decision.
         let mut decision = SmPolicyDecision {
@@ -4799,6 +4808,50 @@ mod tests {
         assert_eq!(container_for(&usage(pfcp::PER_FLOW_URR_BASE + 3), &decision).rating_group, 3);
         // The session-level URR → rating group 0.
         assert_eq!(container_for(&usage(1), &decision).rating_group, 0);
+    }
+
+    /// The PCF→SMF gate bridge (design/151, G18): a GBR flow whose bound PCC rule
+    /// carries a directional `flowStatus` becomes a `FlowQer` with the matching QER gate
+    /// — proving the (uplink, downlink) pair is not transposed on the way to the UPF.
+    #[test]
+    fn flow_status_becomes_the_qer_gate() {
+        use sbi_core::npcf::{
+            FlowStatus, GbrPolicy, PacketFilterPolicy, PccRule, QosData, SmPolicyDecision,
+        };
+        let mut d = SmPolicyDecision::default();
+        d.qos_descs.insert(
+            "qos".into(),
+            QosData {
+                qfi: 5,
+                five_qi: 1,
+                arp_priority: 8,
+                pre_empt_cap: false,
+                pre_empt_vuln: false,
+                gbr: Some(GbrPolicy {
+                    gfbr_dl: "1 Mbps".into(),
+                    gfbr_ul: "1 Mbps".into(),
+                    mfbr_dl: "2 Mbps".into(),
+                    mfbr_ul: "2 Mbps".into(),
+                }),
+            },
+        );
+        d.pcc_rules.insert(
+            "pcc".into(),
+            PccRule {
+                precedence: 10,
+                flow_info: Some(PacketFilterPolicy { protocol: 17, port_low: 5000, port_high: 5010 }),
+                ref_qos_data: Some("qos".into()),
+                ref_chg_data: None,
+                flow_status: FlowStatus::EnabledUplink, // uplink open, downlink closed
+            },
+        );
+        let flows = flow_qers(&d);
+        assert_eq!(flows.len(), 1, "the GBR flow is emitted");
+        assert_eq!(
+            flows[0].gate,
+            pfcp::Gate { uplink: true, downlink: false },
+            "ENABLED-UPLINK maps to an uplink-open, downlink-closed QER gate",
+        );
     }
 
     /// A UDR-backed PCF + the SMF's refresh-policy trigger: a mid-session change to

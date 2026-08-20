@@ -410,6 +410,7 @@ mod tests {
             filter: pfcp::FlowFilter::transport(17, 5000, 5010),
             mfbr_dl_bps: 1_000_000_000,
             mfbr_ul_bps: 1_000_000_000,
+            gate: pfcp::Gate::OPEN,
         };
         let (mut state, _) = established_upf_flows(Some(ambr), &[flow]);
 
@@ -841,6 +842,7 @@ mod tests {
             filter: pfcp::FlowFilter::transport(17, 5000, 5010),
             mfbr_dl_bps: 80_000,
             mfbr_ul_bps: 80_000,
+            gate: pfcp::Gate::OPEN,
         };
         let (mut state, teid) = established_upf_flows(Some(ambr), &[flow]);
 
