@@ -363,6 +363,32 @@ agree on where the codecs live, so if foreign-NF interop is ever a goal, the
 answer is known; if not, G34/G32/G33 are the breadth items worth weighing
 against RAN-side work.
 
+### First-wave status (updated 2026-08-11) — **complete**
+
+Every first-wave item has landed. Where a design doc is cited, that is the
+implementing slice.
+
+| Item | Status | Landed as |
+|---|---|---|
+| **G11** QFI marking | ✅ done | [139](139-upf-downlink-qfi.md) — downlink + buffered flush |
+| **G36** codec fuzzing | ✅ done | [145](145-codec-fuzzing.md) — cargo-fuzz harnesses + seed corpora |
+| **G40** provisioning CLI | ✅ done | [144](144-subscriber-provisioning-cli.md) — `radian-dbctl` |
+| **G6** IPAM | ✅ done | [140](140-smf-ipam-pool.md) — releasable UE address pool |
+| **G4** PFCP liveness | ✅ done | [141](141-pfcp-liveness.md) — heartbeat both directions |
+| **G7** NAS timers | ✅ done | [142](142-amf-nas-retransmission.md) — T3550/T3560/T3570 |
+| **G35** teardown half | ✅ done | [146](146-sctp-teardown.md) — SCTP COMM_LOST/SHUTDOWN → gNB teardown |
+| **G2** SUCI ECIES A/B | ✅ done | [143](143-suci-deconcealment.md) — deconcealment at the UDM |
+| **G5** per-NF config | ✅ done | [147](147-per-nf-config.md) foundation + SMF; [148](148-config-upf-ausf.md) UPF/AUSF |
+| **G1** OAuth enforcement | ✅ done | mechanism + UDM/UDR ([137-security-audit](137-security-audit.md) F2–F4); **enforced across all six remaining producers** ([149](149-oauth-enforcement-rollout.md)) + **consumer-side token attachment on every edge** ([150](150-oauth-consumer-tokens.md)) |
+
+G1 is now proven end-to-end across processes: a `@sbi_security` BDD run brings the
+whole mesh up with `RADIAN_SBI_SECRET` on and completes registration + a PDU
+session with every producer enforcing and every consumer attaching tokens
+([152](152-sbi-security-bdd.md)). Remaining G1 follow-up: per-scope authorization
+(vs audience-only), plus an asymmetric-mode variant of the secured BDD run.
+**Next after the wave**: the §7-of-137 pivot decision above (G16/G18 codec-home vs
+G34/G32/G33 breadth vs RAN-side work).
+
 ## Sources
 
 - open5gs v2.8.0 @ `8f25f3bea`: `src/{amf,smf,upf,ausf,udm,udr,pcf,nssf,bsf,
