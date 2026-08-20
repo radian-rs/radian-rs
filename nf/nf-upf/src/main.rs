@@ -193,7 +193,9 @@ async fn serve_n4(
         *smf_addr.lock().unwrap() = Some(peer);
         let (resp, flush, end_markers, ras) = {
             let mut g = state.lock().unwrap();
-            let resp = pfcp::handle_n4(&buf[..n], node_ip, &mut g, now_nanos());
+            // Bind each session to its establishing N4 source and reject modify/delete from
+            // any other peer (design/137 F7).
+            let resp = pfcp::handle_n4_from(&buf[..n], node_ip, &mut g, now_nanos(), Some(peer.ip()));
             (resp, g.take_flush(), g.take_end_markers(), g.take_pending_ra())
         };
         // A re-activation (Service Request resume) flushes the packets buffered while
