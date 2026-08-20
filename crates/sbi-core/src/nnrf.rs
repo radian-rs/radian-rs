@@ -15,7 +15,7 @@
 //! Do not deploy this NRF on an untrusted network.
 
 use crate::otel::Traced;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -213,6 +213,12 @@ pub struct NrfStore {
     /// The NRF's ES256 private key (asymmetric mode) — signs tokens; its public key
     /// is served at `/oauth2/jwks`. Takes precedence over `secret`.
     signing_key: Option<Arc<crate::oauth::Es256Key>>,
+    /// Optional per-consumer authorization policy: consumer NF type → the target NF types it
+    /// may request a token for (design/137 F4). `None` ⇒ any registered NF may request any
+    /// target (the prior behavior). `Some` ⇒ deny-by-default: a consumer type absent from the
+    /// map, or a target not listed for it, is refused. `"*"` in a consumer's set grants any
+    /// target. Keys/values are upper-cased for case-insensitive matching.
+    authz_policy: Option<Arc<HashMap<String, HashSet<String>>>>,
 }
 
 impl Default for NrfStore {
@@ -229,6 +235,7 @@ impl NrfStore {
             heartbeat_timer,
             secret: None,
             signing_key: None,
+            authz_policy: None,
         }
     }
 
@@ -243,6 +250,16 @@ impl NrfStore {
     /// public key is served at `/oauth2/jwks`.
     pub fn with_signing_key(mut self, key: crate::oauth::Es256Key) -> Self {
         self.signing_key = Some(Arc::new(key));
+        self
+    }
+
+    /// Authorize `(consumer NF type → targetNfType)` at token issuance (design/137 F4): once
+    /// set, the NRF issues a token only if the requesting NF's *registered* type is permitted
+    /// to target the requested `targetNfType`. Deny-by-default — a consumer absent from the
+    /// map, or a target not in its set, is refused; `"*"` grants any target. An empty map is
+    /// treated as "no policy" (disabled). See [`parse_authz_policy`] for the env grammar.
+    pub fn with_authz_policy(mut self, policy: HashMap<String, HashSet<String>>) -> Self {
+        self.authz_policy = (!policy.is_empty()).then(|| Arc::new(policy));
         self
     }
 
@@ -283,6 +300,29 @@ impl NrfStore {
             alive
         });
     }
+}
+
+/// Parse the `RADIAN_NRF_AUTHZ` grammar into a consumer→targets authorization policy
+/// (design/137 F4). Consumers are separated by `;`; each is `consumer:target,target,…`
+/// (targets comma-separated, `*` = any). NF types are upper-cased for case-insensitive
+/// matching, and malformed entries (no `:`, empty consumer, or empty target set) are skipped.
+/// Example: `AMF:UDM,AUSF,SMF,PCF,NSSF;SMF:UDM,PCF,CHF;AUSF:UDM;UDM:UDR`.
+pub fn parse_authz_policy(spec: &str) -> HashMap<String, HashSet<String>> {
+    spec.split(';')
+        .filter_map(|entry| {
+            let (consumer, targets) = entry.split_once(':')?;
+            let consumer = consumer.trim().to_uppercase();
+            if consumer.is_empty() {
+                return None;
+            }
+            let targets: HashSet<String> = targets
+                .split(',')
+                .map(|t| t.trim().to_uppercase())
+                .filter(|t| !t.is_empty())
+                .collect();
+            (!targets.is_empty()).then_some((consumer, targets))
+        })
+        .collect()
 }
 
 /// Build the NRF router: Nnrf_NFManagement + Nnrf_NFDiscovery (TS 29.510).
@@ -336,27 +376,54 @@ async fn access_token(
     if !store.is_registered(&req.nf_instance_id) {
         return Err(problem(StatusCode::FORBIDDEN, "UNAUTHORIZED_CLIENT", "requesting NF is not registered"));
     }
+    // Look up the registered profile once: the certificate it registered under (F4
+    // cert-binding) and its NF type (F4 per-consumer authorization).
+    let (bound_fp, consumer_type) = {
+        let mut g = store.entries.lock().unwrap();
+        store.purge_stale(&mut g);
+        match g.get(&req.nf_instance_id) {
+            Some(e) => (e.cert_fp.clone(), Some(e.profile.nf_type.clone())),
+            None => (None, None),
+        }
+    };
     // Bind issuance to the authenticated mTLS caller (design/137 F4): the presenting
     // certificate must be the one that registered this NF instance, so a core NF cannot
     // obtain a token under another NF's identity. Skipped under cleartext SBI (no cert).
+    let mut cnf = None;
     if let Some(axum::Extension(cert)) = &client_cert {
-        let bound = {
-            let mut g = store.entries.lock().unwrap();
-            store.purge_stale(&mut g);
-            g.get(&req.nf_instance_id).and_then(|e| e.cert_fp.clone())
-        };
-        if bound.as_deref() != Some(cert.0.as_str()) {
+        if bound_fp.as_deref() != Some(cert.0.as_str()) {
             return Err(problem(
                 StatusCode::FORBIDDEN,
                 "UNAUTHORIZED_CLIENT",
                 "client certificate does not match the registered NF instance",
             ));
         }
+        // RFC 8705: sender-constrain the issued token to this certificate (its `cnf`), so a
+        // resource server refuses it if a different NF replays it.
+        cnf = Some(cert.0.clone());
+    }
+    // Per-consumer authorization (design/137 F4): even bound to its own identity, an NF may
+    // only obtain a token for a target its *registered* type is contracted to call. Enforced
+    // only when a policy is configured (deny-by-default); the consumer type comes from the
+    // registry, never the attacker-controlled request body.
+    if let Some(policy) = &store.authz_policy {
+        let target = req.target_nf_type.to_uppercase();
+        let allowed = consumer_type
+            .as_deref()
+            .and_then(|ct| policy.get(&ct.to_uppercase()))
+            .is_some_and(|targets| targets.contains("*") || targets.contains(&target));
+        if !allowed {
+            return Err(problem(
+                StatusCode::FORBIDDEN,
+                "UNAUTHORIZED_CLIENT",
+                "consumer NF type is not authorized to request this target",
+            ));
+        }
     }
     // Prefer asymmetric (ES256) signing when a private key is configured.
     let rsp = match (&store.signing_key, &store.secret) {
-        (Some(key), _) => crate::oauth::issue_token_es256(key, "radian-nrf", &req),
-        (None, Some(secret)) => crate::oauth::issue_token(secret, "radian-nrf", &req),
+        (Some(key), _) => crate::oauth::issue_token_es256(key, "radian-nrf", &req, cnf),
+        (None, Some(secret)) => crate::oauth::issue_token(secret, "radian-nrf", &req, cnf),
         (None, None) => unreachable!("oauth_enabled() checked above"),
     };
     tracing::info!(client = %req.nf_instance_id, target = %req.target_nf_type, "issued SBI access token");
@@ -646,6 +713,15 @@ mod tests {
         assert_eq!(reg.status(), 201);
         let ok = http.post(format!("{amf_ep}/oauth2/token")).json(&token_req).send().await.unwrap();
         assert_eq!(ok.status(), 200, "the registering certificate gets a token");
+        // The token is sender-constrained (RFC 8705) to the registering certificate: its
+        // `cnf` carries that thumbprint, so a resource server can refuse a replay.
+        let rsp: crate::oauth::AccessTokenRsp = ok.json().await.unwrap();
+        let claims = crate::oauth::validate(&[0x44u8; 32], &rsp.access_token, "UDR", 0).unwrap();
+        assert_eq!(
+            claims.cnf.map(|c| c.x5t_s256),
+            Some("amf-cert-fp".to_string()),
+            "the issued token is bound to the registering certificate"
+        );
 
         // A different certificate cannot obtain a token as amf-1…
         let stolen = http.post(format!("{smf_ep}/oauth2/token")).json(&token_req).send().await.unwrap();
@@ -668,6 +744,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reup.status(), 201, "the registering certificate can re-register");
+    }
+
+    /// The `RADIAN_NRF_AUTHZ` grammar parses consumer→targets, upper-cases NF types, keeps
+    /// the `*` wildcard, and skips malformed (empty-consumer / empty-target) entries.
+    #[test]
+    fn parse_authz_policy_reads_the_grammar() {
+        let p = parse_authz_policy("amf:udm,AUSF,smf ; SMF:* ; :UDR ; PCF:");
+        assert_eq!(p.len(), 2, "empty-consumer and empty-target entries are dropped");
+        assert_eq!(
+            p["AMF"],
+            HashSet::from(["UDM".to_string(), "AUSF".to_string(), "SMF".to_string()]),
+            "consumer and targets are upper-cased"
+        );
+        assert!(p["SMF"].contains("*"), "the wildcard is kept");
+        assert!(!p.contains_key("PCF"), "a consumer with an empty target set is dropped");
+    }
+
+    /// design/137 F4 (per-consumer authorization): with a policy configured, the NRF issues a
+    /// token only for a target the requesting NF's *registered* type is contracted to call;
+    /// an out-of-scope target, or a consumer type with no policy entry, is refused.
+    #[tokio::test]
+    async fn authz_policy_confines_a_consumer_to_its_targets() {
+        let policy = HashMap::from([
+            ("AMF".to_string(), HashSet::from(["UDM".to_string(), "AUSF".to_string()])),
+            ("SMF".to_string(), HashSet::from(["*".to_string()])),
+        ]);
+        let store = NrfStore::default().with_secret(Some(vec![0x55u8; 32])).with_authz_policy(policy);
+        // A plain NRF (no client-cert layer) exercises the policy alone.
+        let base = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move { crate::run_on(l, router(store)).await.unwrap() });
+            format!("http://{addr}")
+        };
+        let http = crate::sbi_client();
+        for (id, ty) in [("amf-1", "AMF"), ("smf-1", "SMF"), ("pcf-1", "PCF")] {
+            let r = http
+                .put(format!("{base}/nnrf-nfm/v1/nf-instances/{id}"))
+                .json(&NfProfile::new(id, ty, "127.0.0.1"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 201);
+        }
+        async fn req_token(base: &str, id: &str, target: &str) -> u16 {
+            crate::sbi_client()
+                .post(format!("{base}/oauth2/token"))
+                .json(&serde_json::json!({
+                    "grant_type": "client_credentials",
+                    "nfInstanceId": id,
+                    "targetNfType": target,
+                    "scope": "",
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+        // AMF may target UDM/AUSF, but not UDR.
+        assert_eq!(req_token(&base, "amf-1", "UDM").await, 200);
+        assert_eq!(req_token(&base, "amf-1", "AUSF").await, 200);
+        assert_eq!(req_token(&base, "amf-1", "UDR").await, 403, "AMF is not contracted to call the UDR");
+        assert_eq!(req_token(&base, "amf-1", "udm").await, 200, "target match is case-insensitive");
+        // SMF has a wildcard grant.
+        assert_eq!(req_token(&base, "smf-1", "CHF").await, 200, "SMF's wildcard permits any target");
+        // PCF has no policy entry → deny-by-default.
+        assert_eq!(req_token(&base, "pcf-1", "UDM").await, 403, "a consumer with no policy entry is refused");
     }
 
     /// Full NF lifecycle over real h2c: register → discover → heartbeat → deregister.

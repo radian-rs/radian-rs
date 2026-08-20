@@ -980,6 +980,7 @@ mod tests {
             scope: "nudr-dr".into(),
             iat: 0,
             exp: u64::MAX,
+            cnf: None,
         });
         let resp = crate::h2c_client()
             .get(format!("{udr_url}/nudr-dr/v2/subscription-data/imsi-1/context-data/amf-3gpp-access"))
