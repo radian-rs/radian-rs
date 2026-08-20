@@ -386,9 +386,11 @@ whole mesh up with `RADIAN_SBI_SECRET` on and completes registration + a PDU
 session with every producer enforcing and every consumer attaching tokens
 ([152](152-sbi-security-bdd.md)). The authorization model is complete — **both
 audience and scope** are enforced ([154](154-oauth-per-scope-authz.md)), proven
-through that same BDD. Remaining G1 nicety: an asymmetric (ES256/JWKS) variant of
-the secured BDD run. **Next after the wave**: the §7-of-137 pivot decision above
-(G16/G18 codec-home vs G34/G32/G33 breadth vs RAN-side work).
+through that same BDD in **both signing modes** — shared-secret HS256 and
+asymmetric ES256/JWKS ([156](156-secured-bdd-asymmetric.md), which also fixed a
+PCF consumer that only tokened its UDR calls under a shared secret). **G1 is
+done.** **Next after the wave**: the §7-of-137 pivot decision above (G16/G18
+codec-home vs G34/G32/G33 breadth vs RAN-side work).
 
 ## Sources
 

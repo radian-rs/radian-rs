@@ -46,9 +46,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Policy from the UDR (Nudr policy-data). With SBI security on, present a `UDR`
-    // access token on each call; otherwise call it openly.
+    // access token on each call; otherwise call it openly. Gate on
+    // `client_tokens_enabled()`, not `sbi_secret()` — SBI security also comes in the
+    // asymmetric (ES256/JWKS) mode, which sets no shared secret (design/154).
     info!(%udr_base, "PCF sourcing policy from the UDR over Nudr policy-data");
-    let udr = Arc::new(if sbi_core::oauth::sbi_secret().is_some() {
+    let udr = Arc::new(if sbi_core::oauth::client_tokens_enabled() {
         let tokens =
             Arc::new(sbi_core::oauth::TokenSource::new(nrf_base.clone(), PCF_INSTANCE_ID.clone()));
         sbi_core::nudr::UdrClient::with_tokens(udr_base, tokens)
