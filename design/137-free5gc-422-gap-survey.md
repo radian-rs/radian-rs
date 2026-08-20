@@ -312,12 +312,13 @@ NF can then call anything: no least-privilege between NFs. → **G1**
 
 ### 4.2 Configuration
 
-**Zero config files in the repo** (only 3 BDD fixture YAMLs for free-ran-ue).
-Every NF reads env vars inline in `main.rs`; no schema/validation, no logger
-config, no CLI flags (`clap` only in radian-pki). free5gc: 20 YAML files with
-per-NF `pkg/factory` validated schemas, `multiAMF/`, `multiUPF/`,
-`uerouting.yaml`. Config-driven UP topology is also [134](134-ulcl-multi-upf.md)
-Phase 3. → **G5**
+~~Zero config files~~ **FOUNDATION + 3 NFs LANDED** ([147](147-per-nf-config.md)
++ [148](148-config-upf-ausf.md)): `common::config::load`/`resolve` layer struct
+defaults → a per-NF YAML file (`RADIAN_<NF>_CONFIG`) → `RADIAN_*` env overrides,
+with serde `deny_unknown_fields` as the schema; **SMF, UPF, AUSF** converted +
+`configs/{smf,upf,ausf}.yaml`. *Remaining:* the other NFs (AMF's PLMN/TAC/timers
+need a global-config refactor), logger config. Config-driven UP topology is also
+[134](134-ulcl-multi-upf.md) Phase 3. → **G5** (foundation + 3 NFs done)
 
 ### 4.3 Observability & deployment
 
@@ -388,7 +389,7 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 | ~~**G2**~~ | ~~**SUCI deconcealment**~~ — **DONE** ([143](143-suci-deconcealment.md)): null + ECIES Profile A (X25519) / B (P-256) in `aka::suci`, home-net keys by env, UDM returns the deconcealed SUPI | Major | M | ✓ | unblocked privacy-enabled UEs; live interop = matched free-ran-ue keys |
 | **G3** | **EAP-AKA'** — AUSF eap-session routes + RFC 5448 PRF; UDM `EAP_AKA_PRIME` AV type; AMF EAP relay; fix the misleading doc-comment now | Moderate | M | P1 | 130's P3-6 confirmed |
 | **G4** | **PFCP liveness both sides** — SMF heartbeat loop + RecoveryTimeStamp restart detection + re-association + retransmission; UPF association state + pinned recovery timestamp + tx/rx transactions + error causes | Major (robustness) | M | **partial** | §3.2/3.3; **liveness + restart recovery DONE** ([141](141-pfcp-liveness.md)): heartbeat loop, pinned recovery-ts, drop-stranded-sessions. Remaining: UPF assoc-state, tx/dedup layer, error causes |
-| **G5** | **Config files** — per-NF YAML (serde) replacing inline env reads; PLMN/TAC/GUAMI/tai-list/algorithm order/timers; keep env as override | Moderate | M | **P1** | §4.2; prerequisite-ish for G13/G21/G24 |
+| **G5** | **Config files** — per-NF YAML (serde) replacing inline env reads; PLMN/TAC/GUAMI/tai-list/algorithm order/timers; keep env as override | Moderate | M | **partial** | §4.2; **foundation + SMF/UPF/AUSF DONE** ([147](147-per-nf-config.md) + [148](148-config-upf-ausf.md)): defaults→YAML→env, `configs/{smf,upf,ausf}.yaml`. Remaining: other NFs, AMF deep refactor, logger |
 | **G6** | **IPAM** — allocate/release pools per (S-NSSAI,DNN,UPF), static pools, per-subscriber static IP from UDM | Major (leak) | S–M | **partial** | §3.2; **leak DONE** ([140](140-smf-ipam-pool.md)): bounded lazy-reuse pool + RAII release. Remaining: per-DNN/static pools, static IP from UDM |
 | ~~**G7**~~ | ~~**AMF NAS retransmission timers T3550/T3560/T3570**~~ (+ Service Reject on failed resume) — **DONE** ([142](142-amf-nas-retransmission.md)): uniform single-slot verbatim retransmit + abort-at-cap; Service Reject #10 on failed resume | Moderate | S | ✓ | closed the permanently-stalled-registration gap |
 | **G8** | **NGAP robustness pack** — emit ErrorIndication; handle InitialContextSetupFailure, NASNonDeliveryIndication, RAN Status Transfer relay (lossless HO), UEContextModificationFailure | Moderate | M | P1 | §3.1 |
@@ -419,8 +420,10 @@ Suggested first wave by value-per-effort: **G1 → ~~G11~~ (done, [139](139-upf-
 → ~~G6~~ (leak done, [140](140-smf-ipam-pool.md)) → ~~G4~~ (liveness done,
 [141](141-pfcp-liveness.md)) → ~~G7~~ (done, [142](142-amf-nas-retransmission.md))
 → ~~G2~~ (done, [143](143-suci-deconcealment.md)) → ~~G23~~ (CLI done,
-[144](144-subscriber-provisioning-cli.md)) → G5**, then decide the §7 pivot
-question before committing to G16/G18-class interop refactors.
+[144](144-subscriber-provisioning-cli.md)) → ~~G5~~ (foundation + SMF/UPF/AUSF done,
+[147](147-per-nf-config.md) + [148](148-config-upf-ausf.md))**. **First wave
+complete** — next, decide the §7 pivot question before committing to G16/G18-class
+interop refactors.
 
 ## Sources
 

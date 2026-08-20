@@ -1,0 +1,21 @@
+# radian-rs UPF configuration (design/147 G5 foundation, extended to the UPF in
+# design/148). Point RADIAN_UPF_CONFIG at this file. Any RADIAN_UPF_* env var overrides
+# the value here (env > file > default). Unknown keys are rejected (deny-unknown-fields).
+
+# N3/N4 address advertised to peers — the F-TEID address the gNB sends uplink G-PDUs to.
+n3-addr: 127.0.0.1
+# Local bind address for the N3 (GTP-U) and N4 (PFCP) sockets. 0.0.0.0 = all interfaces.
+bind: 0.0.0.0
+# Ceiling on concurrent PFCP sessions (design/137 F7). Uncomment to override the default.
+# max-sessions: 65536
+
+# N6 (data network) TUN.
+# A second anchor needs a distinct device/subnet (design/134).
+n6-tun: n6upf0
+# The UPF's N6 gateway; sits inside the UE IP pool (10.45.0.0/16) so the kernel routes
+# UE return traffic to this interface.
+n6-addr: 10.45.0.1
+n6-mask: 255.255.0.0
+# IPv6 gateway covering the SMF's 2001:db8::/32 UE IPv6 pool (design/131). Set to the
+# string "none" for a v4-only N6 (a breakout anchor that skips the shared v6 route).
+n6-addr6: "2001:db8::1"
