@@ -292,19 +292,46 @@ pub struct AmPolicyCreated {
 pub struct AmPolicyClient {
     base: String,
     http: reqwest::Client,
+    tokens: Option<std::sync::Arc<crate::oauth::TokenSource>>,
 }
+
+/// The PCF AM-policy service a `PCF`-audience token authorizes.
+const PCF_AM_SCOPE: &str = "npcf-am-policy-control";
 
 impl AmPolicyClient {
     pub fn new(base: impl Into<String>) -> Self {
-        Self { base: base.into(), http: crate::sbi_client() }
+        Self { base: base.into(), http: crate::sbi_client(), tokens: None }
+    }
+
+    /// Like [`new`], but attaches an NRF-issued `PCF` access token on every request —
+    /// required once the PCF AM-policy is protected (SBI security on, design/149).
+    pub fn with_tokens(
+        base: impl Into<String>,
+        tokens: std::sync::Arc<crate::oauth::TokenSource>,
+    ) -> Self {
+        Self { base: base.into(), http: crate::sbi_client(), tokens: Some(tokens) }
+    }
+
+    /// Attach a `PCF` Bearer token to a request when a token source is configured.
+    async fn bearer(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.tokens {
+            Some(ts) => match ts.token_for("PCF", PCF_AM_SCOPE).await {
+                Some(tok) => rb.bearer_auth(tok),
+                None => rb,
+            },
+            None => rb,
+        }
     }
 
     /// Create an AM policy association; returns the id (from `Location`) + policy.
     pub async fn create(&self, req: &PolicyAssociationRequest) -> Result<AmPolicyCreated, SbiError> {
         let resp = self
-            .http
-            .post(format!("{}/npcf-am-policy-control/v1/policies", self.base))
-            .json(req)
+            .bearer(
+                self.http
+                    .post(format!("{}/npcf-am-policy-control/v1/policies", self.base))
+                    .json(req),
+            )
+            .await
             .traced()
             .send()
             .await?
@@ -325,8 +352,11 @@ impl AmPolicyClient {
     /// Returns the fresh policy (`Some`) when it changed, `None` when unchanged.
     pub async fn update(&self, assoc_id: &str) -> Result<Option<PolicyAssociation>, SbiError> {
         let resp = self
-            .http
-            .post(format!("{}/npcf-am-policy-control/v1/policies/{assoc_id}/update", self.base))
+            .bearer(
+                self.http
+                    .post(format!("{}/npcf-am-policy-control/v1/policies/{assoc_id}/update", self.base)),
+            )
+            .await
             .traced()
             .send()
             .await?;
@@ -338,12 +368,15 @@ impl AmPolicyClient {
 
     /// Delete an AM policy association (best-effort at deregistration).
     pub async fn delete(&self, assoc_id: &str) -> Result<(), SbiError> {
-        self.http
-            .post(format!("{}/npcf-am-policy-control/v1/policies/{assoc_id}/delete", self.base))
-            .traced()
-            .send()
-            .await?
-            .error_for_status()?;
+        self.bearer(
+            self.http
+                .post(format!("{}/npcf-am-policy-control/v1/policies/{assoc_id}/delete", self.base)),
+        )
+        .await
+        .traced()
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 }

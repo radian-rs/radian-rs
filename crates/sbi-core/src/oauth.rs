@@ -543,6 +543,27 @@ impl TokenSource {
     }
 }
 
+/// Attach a Bearer token (audience `aud`, `scope`) from `tokens` to `rb` when a token
+/// source is configured, else return `rb` unchanged. The client-side counterpart to
+/// [`protect`] for a consumer that builds requests **inline** (e.g. the AMF's Nsmf
+/// calls) rather than through a typed client that owns a `bearer` helper — and it
+/// spares callers from naming `reqwest::RequestBuilder`, which crates without a direct
+/// `reqwest` dependency cannot do.
+pub async fn with_bearer(
+    rb: reqwest::RequestBuilder,
+    tokens: &Option<std::sync::Arc<TokenSource>>,
+    aud: &str,
+    scope: &str,
+) -> reqwest::RequestBuilder {
+    match tokens {
+        Some(ts) => match ts.token_for(aud, scope).await {
+            Some(tok) => rb.bearer_auth(tok),
+            None => rb,
+        },
+        None => rb,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

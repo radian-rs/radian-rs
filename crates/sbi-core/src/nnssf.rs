@@ -235,11 +235,35 @@ async fn get_availability(
 pub struct NssfClient {
     base: String,
     http: reqwest::Client,
+    tokens: Option<std::sync::Arc<crate::oauth::TokenSource>>,
 }
+
+/// The NSSF services an `NSSF`-audience token authorizes.
+const NSSF_SCOPE: &str = "nnssf-nsselection nnssf-nssaiavailability";
 
 impl NssfClient {
     pub fn new(base: impl Into<String>) -> Self {
-        Self { base: base.into(), http: crate::sbi_client() }
+        Self { base: base.into(), http: crate::sbi_client(), tokens: None }
+    }
+
+    /// Like [`new`], but attaches an NRF-issued `NSSF` access token on every request —
+    /// required once the NSSF is protected (SBI security on, design/149).
+    pub fn with_tokens(
+        base: impl Into<String>,
+        tokens: std::sync::Arc<crate::oauth::TokenSource>,
+    ) -> Self {
+        Self { base: base.into(), http: crate::sbi_client(), tokens: Some(tokens) }
+    }
+
+    /// Attach an `NSSF` Bearer token to a request when a token source is configured.
+    async fn bearer(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.tokens {
+            Some(ts) => match ts.token_for("NSSF", NSSF_SCOPE).await {
+                Some(tok) => rb.bearer_auth(tok),
+                None => rb,
+            },
+            None => rb,
+        }
     }
 
     /// Ask which of `requested` the UE may be granted in tracking area `tac`, given
@@ -260,9 +284,12 @@ impl NssfClient {
             subscribed: to_wire(subscribed),
         };
         let resp: NsSelectionResponse = self
-            .http
-            .post(format!("{}/nnssf-nsselection/v2/network-slice-information", self.base))
-            .json(&req)
+            .bearer(
+                self.http
+                    .post(format!("{}/nnssf-nsselection/v2/network-slice-information", self.base))
+                    .json(&req),
+            )
+            .await
             .traced()
             .send()
             .await?
@@ -275,13 +302,16 @@ impl NssfClient {
 
     /// Publish the slices a set of tracking areas supports.
     pub async fn put_availability(&self, nf_id: &str, tas: &[TaAvailability]) -> Result<(), SbiError> {
-        self.http
-            .put(format!("{}/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}", self.base))
-            .json(tas)
-            .traced()
-            .send()
-            .await?
-            .error_for_status()?;
+        self.bearer(
+            self.http
+                .put(format!("{}/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}", self.base))
+                .json(tas),
+        )
+        .await
+        .traced()
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 }
@@ -303,6 +333,56 @@ mod tests {
     const SLICE2: (u8, Option<[u8; 3]>) = (2, None);
     const TAC1: [u8; 3] = [0, 0, 1];
     const TAC2: [u8; 3] = [0, 0, 2];
+
+    /// design/149 G1: a protected NSSF rejects a tokenless call and serves a client
+    /// carrying an NRF-issued `NSSF` access token — proving the AMF's consumer-side
+    /// token attachment (`NssfClient::with_tokens`) reaches the enforced producer.
+    #[tokio::test]
+    async fn protected_nssf_requires_a_valid_access_token() {
+        let secret = vec![0x33u8; 32];
+
+        // NRF (token endpoint, injected secret) with the client NF ("amf-1") registered.
+        let nrf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nrf_addr = nrf_l.local_addr().unwrap();
+        let nrf_store = crate::nnrf::NrfStore::default().with_secret(Some(secret.clone()));
+        tokio::spawn(async move { crate::run_on(nrf_l, crate::nnrf::router(nrf_store)).await.unwrap() });
+        let nrf_base = format!("http://{nrf_addr}");
+        crate::nnrf::NrfClient::new(nrf_base.clone())
+            .register(&crate::nnrf::NfProfile::new("amf-1", "AMF", "127.0.0.1"))
+            .await
+            .unwrap();
+
+        // An NSSF protected for the `NSSF` audience, deploying slice 1 in TAC 000001.
+        let state = NssfState::new(NssfConfig::permissive());
+        state.set_availability(&[TaAvailability {
+            tac: "000001".into(),
+            supported_snssai_list: vec![Snssai::from_parts(1, Some([1, 2, 3]))],
+        }]);
+        let nssf_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nssf_addr = nssf_l.local_addr().unwrap();
+        let protected = crate::oauth::protect(
+            router(state),
+            "NSSF",
+            Some(crate::oauth::TokenVerifier::Shared(secret)),
+        );
+        tokio::spawn(async move { crate::run_on(nssf_l, protected).await.unwrap() });
+        let nssf_url = format!("http://{nssf_addr}");
+
+        // Tokenless client → rejected by the auth layer (401).
+        let open = NssfClient::new(nssf_url.clone());
+        assert!(
+            open.ns_selection(Some(TAC1), &[SLICE1], &[SLICE1]).await.is_err(),
+            "the NSSF rejects a tokenless call"
+        );
+
+        // Token-bearing client ("amf-1") → the selection is authorized.
+        let tokens = std::sync::Arc::new(crate::oauth::TokenSource::new(nrf_base, "amf-1"));
+        let client = NssfClient::with_tokens(nssf_url, tokens);
+        assert!(
+            client.ns_selection(Some(TAC1), &[SLICE1], &[SLICE1]).await.is_ok(),
+            "an NSSF-token-bearing client is authorized"
+        );
+    }
 
     #[test]
     fn snssai_parts_round_trip() {

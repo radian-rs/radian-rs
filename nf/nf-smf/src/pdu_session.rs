@@ -1230,7 +1230,7 @@ async fn create_sm_context(
                 ),
                 used_unit_containers: vec![],
             };
-            match sbi_core::nchf::ChfClient::new(chf_base.clone()).create(&create).await {
+            match chf_client(&smf.nrf_base, chf_base.clone()).create(&create).await {
                 Ok(charging_ref) => {
                     tracing::info!(charging_ref = %charging_ref, "charging session opened at the CHF");
                     Some((chf_base, charging_ref))
@@ -1665,6 +1665,36 @@ fn udm_client(nrf_base: &str, udm_base: impl Into<String>) -> sbi_core::nudm::Nu
     }
 }
 
+/// This SMF's shared token source for the protected producers it consumes (PCF, CHF),
+/// built per call from `nrf_base` — mirrors [`udm_client`]. `None` unless SBI security
+/// is on. One source caches a separate token per (target NF, scope).
+fn smf_tokens(nrf_base: &str) -> Option<std::sync::Arc<sbi_core::oauth::TokenSource>> {
+    sbi_core::oauth::client_tokens_enabled().then(|| {
+        std::sync::Arc::new(sbi_core::oauth::TokenSource::new(
+            nrf_base.to_string(),
+            SMF_INSTANCE_ID.clone(),
+        ))
+    })
+}
+
+/// An Npcf SM-policy client for `pcf_base` that attaches an NRF-issued `PCF` access
+/// token when SBI security is on (design/149 G1), else calls the PCF openly.
+fn pcf_client(nrf_base: &str, pcf_base: impl Into<String>) -> sbi_core::npcf::PcfClient {
+    match smf_tokens(nrf_base) {
+        Some(t) => sbi_core::npcf::PcfClient::with_tokens(pcf_base, t),
+        None => sbi_core::npcf::PcfClient::new(pcf_base),
+    }
+}
+
+/// An Nchf client for `chf_base` that attaches an NRF-issued `CHF` access token when
+/// SBI security is on (design/149 G1), else calls the CHF openly.
+fn chf_client(nrf_base: &str, chf_base: impl Into<String>) -> sbi_core::nchf::ChfClient {
+    match smf_tokens(nrf_base) {
+        Some(t) => sbi_core::nchf::ChfClient::with_tokens(chf_base, t),
+        None => sbi_core::nchf::ChfClient::new(chf_base),
+    }
+}
+
 /// Try to obtain the SM policy from a PCF (Npcf_SMPolicyControl). Returns the PCF
 /// base + the created decision on success; `None` when no PCF is registered or the
 /// call fails — the caller then uses the sm-data policy instead.
@@ -1679,7 +1709,7 @@ async fn fetch_sm_policy(
             return None;
         }
     };
-    match sbi_core::npcf::PcfClient::new(pcf_base.clone()).create_sm_policy(ctx).await {
+    match pcf_client(nrf_base, pcf_base.clone()).create_sm_policy(ctx).await {
         Ok(created) => Some((pcf_base, created)),
         Err(e) => {
             tracing::warn!("PCF SM policy create failed ({e}); using sm-data policy");
@@ -2220,8 +2250,9 @@ async fn release_sm_context(
             pdu_session_charging_information: None,
             used_unit_containers: usages.iter().map(|u| container_for(u, &policy)).collect(),
         };
+        let chf = chf_client(&smf.nrf_base, chf_base);
         tokio::spawn(async move {
-            match sbi_core::nchf::ChfClient::new(chf_base).release(&charging_ref, &release).await {
+            match chf.release(&charging_ref, &release).await {
                 Ok(()) => tracing::info!(charging_ref = %charging_ref, "charging session released at the CHF"),
                 Err(e) => tracing::warn!("Nchf release failed: {e}"),
             }
@@ -2242,7 +2273,7 @@ async fn release_sm_context(
     // Delete the PCF SM policy association (Npcf_SMPolicyControl_Delete), if the
     // session had one. Best-effort, off the path.
     if let Some((pcf_base, policy_id)) = sm_policy {
-        spawn_sm_policy_delete(pcf_base, policy_id);
+        spawn_sm_policy_delete(smf.nrf_base.clone(), pcf_base, policy_id);
     }
     tracing::info!(%sm_ref, up_seid, "released SM context; N4 session deleted");
     Ok(StatusCode::NO_CONTENT)
@@ -2316,7 +2347,7 @@ pub async fn handle_usage_reports(smf: Arc<SmfState>) {
                 pdu_session_charging_information: None,
                 used_unit_containers: vec![container_for(&usage, &policy)],
             };
-            match sbi_core::nchf::ChfClient::new(chf_base).update(&charging_ref, &update).await {
+            match chf_client(&smf.nrf_base, chf_base).update(&charging_ref, &update).await {
                 Ok(()) => tracing::info!(charging_ref = %charging_ref, "usage relayed to the CHF"),
                 Err(e) => tracing::warn!("Nchf update failed: {e}"),
             }
@@ -2461,7 +2492,7 @@ async fn refresh_sm_policy(
         // sm-data fallback session — no PCF association to re-authorize.
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
-    let update = sbi_core::npcf::PcfClient::new(pcf_base)
+    let update = pcf_client(&smf.nrf_base, pcf_base)
         .update_sm_policy(&policy_id, &sbi_core::npcf::SmPolicyUpdateContextData::default())
         .await
         .map_err(|e| {
@@ -2693,9 +2724,10 @@ fn spawn_uecm_purge(nrf_base: String, supi: String, pdu_session_id: u8) {
 }
 
 /// Delete the PCF SM policy association for a released session. Best-effort.
-fn spawn_sm_policy_delete(pcf_base: String, policy_id: String) {
+fn spawn_sm_policy_delete(nrf_base: String, pcf_base: String, policy_id: String) {
+    let pcf = pcf_client(&nrf_base, pcf_base);
     tokio::spawn(async move {
-        match sbi_core::npcf::PcfClient::new(pcf_base).delete_sm_policy(&policy_id).await {
+        match pcf.delete_sm_policy(&policy_id).await {
             Ok(()) => tracing::info!(%policy_id, "PCF: SM policy association deleted"),
             Err(e) => tracing::warn!(%policy_id, "PCF SM policy delete failed: {e}"),
         }

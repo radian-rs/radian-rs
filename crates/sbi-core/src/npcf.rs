@@ -903,11 +903,35 @@ pub struct SmPolicyCreated {
 pub struct PcfClient {
     base: String,
     http: reqwest::Client,
+    tokens: Option<std::sync::Arc<crate::oauth::TokenSource>>,
 }
+
+/// The PCF SM-policy service a `PCF`-audience token authorizes.
+const PCF_SM_SCOPE: &str = "npcf-smpolicycontrol";
 
 impl PcfClient {
     pub fn new(base: impl Into<String>) -> Self {
-        Self { base: base.into(), http: crate::sbi_client() }
+        Self { base: base.into(), http: crate::sbi_client(), tokens: None }
+    }
+
+    /// Like [`new`], but attaches an NRF-issued `PCF` access token on every request —
+    /// required once the PCF is protected (SBI security on, design/149).
+    pub fn with_tokens(
+        base: impl Into<String>,
+        tokens: std::sync::Arc<crate::oauth::TokenSource>,
+    ) -> Self {
+        Self { base: base.into(), http: crate::sbi_client(), tokens: Some(tokens) }
+    }
+
+    /// Attach a `PCF` Bearer token to a request when a token source is configured.
+    async fn bearer(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.tokens {
+            Some(ts) => match ts.token_for("PCF", PCF_SM_SCOPE).await {
+                Some(tok) => rb.bearer_auth(tok),
+                None => rb,
+            },
+            None => rb,
+        }
     }
 
     /// Create an SM policy association; returns the id (from `Location`) + decision.
@@ -916,9 +940,12 @@ impl PcfClient {
         ctx: &SmPolicyContextData,
     ) -> Result<SmPolicyCreated, SbiError> {
         let resp = self
-            .http
-            .post(format!("{}/npcf-smpolicycontrol/v1/sm-policies", self.base))
-            .json(ctx)
+            .bearer(
+                self.http
+                    .post(format!("{}/npcf-smpolicycontrol/v1/sm-policies", self.base))
+                    .json(ctx),
+            )
+            .await
             .traced()
             .send()
             .await?
@@ -942,12 +969,15 @@ impl PcfClient {
         upd: &SmPolicyUpdateContextData,
     ) -> Result<SmPolicyUpdate, SbiError> {
         let update = self
-            .http
-            .post(format!(
-                "{}/npcf-smpolicycontrol/v1/sm-policies/{}/update",
-                self.base, policy_id
-            ))
-            .json(upd)
+            .bearer(
+                self.http
+                    .post(format!(
+                        "{}/npcf-smpolicycontrol/v1/sm-policies/{}/update",
+                        self.base, policy_id
+                    ))
+                    .json(upd),
+            )
+            .await
             .traced()
             .send()
             .await?
@@ -959,15 +989,17 @@ impl PcfClient {
 
     /// Delete an SM policy association.
     pub async fn delete_sm_policy(&self, policy_id: &str) -> Result<(), SbiError> {
-        self.http
-            .post(format!(
+        self.bearer(
+            self.http.post(format!(
                 "{}/npcf-smpolicycontrol/v1/sm-policies/{}/delete",
                 self.base, policy_id
-            ))
-            .traced()
-            .send()
-            .await?
-            .error_for_status()?;
+            )),
+        )
+        .await
+        .traced()
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 }
