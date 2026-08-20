@@ -615,6 +615,12 @@ struct Session {
     /// The SMF's F-SEID for this session — the header SEID a UPF-initiated
     /// Session Report Request must carry (TS 29.244 messages address the peer).
     cp_seid: u64,
+    /// The N4 source address that established this session (the SMF's datagram source).
+    /// A Session Modification / Deletion is honored only from this address (design/137 F7),
+    /// so a peer that guesses a live UP-SEID cannot hijack the downlink or tear the session
+    /// down. `None` when established via the peer-less entry point (`handle_n4` / tests),
+    /// which leaves the check inactive.
+    peer_ip: Option<IpAddr>,
     ue_ip: Option<Ipv4Addr>,
     /// The assigned IPv6 /64 prefix (design/131) — downlink packets whose destination
     /// falls in it route to this session; `None` for an IPv4-only session.
@@ -823,6 +829,13 @@ impl UpfState {
         self.sessions.len()
     }
 
+    /// The N4 source that established `up_seid` (its bound SMF address), if recorded.
+    /// `None` when the session is unknown or was established without peer info — the
+    /// source-binding check (design/137 F7) treats `None` as "unbound" and does not reject.
+    fn session_peer(&self, up_seid: u64) -> Option<IpAddr> {
+        self.sessions.get(&up_seid).and_then(|s| s.peer_ip)
+    }
+
     /// Set the ceiling on concurrent sessions (see [`DEFAULT_MAX_SESSIONS`]). A UPF at
     /// the ceiling rejects further Session Establishment Requests with
     /// `NoResourcesAvailable` — bounding memory against an N4 establishment flood.
@@ -1002,6 +1015,7 @@ impl UpfState {
     fn establish(
         &mut self,
         cp_seid: u64,
+        peer: Option<IpAddr>,
         ue: UeAddr,
         ambr: Option<SessionAmbr>,
         flows: &[FlowQer],
@@ -1041,6 +1055,7 @@ impl UpfState {
             Session {
                 n3_teid: teid,
                 cp_seid,
+                peer_ip: peer,
                 ue_ip: ue.v4,
                 ue_ipv6: ue.v6,
                 downlink: None,
@@ -1799,6 +1814,23 @@ pub fn handle_n4(
     state: &mut UpfState,
     now_nanos: u64,
 ) -> Option<Vec<u8>> {
+    // Peer-less entry point: the source-binding check (design/137 F7) is inactive, so a
+    // session established this way accepts modification/deletion from any source. The
+    // library's own callers and tests use this; production (`nf-upf`) uses `handle_n4_from`.
+    handle_n4_from(data, node_ip, state, now_nanos, None)
+}
+
+/// As [`handle_n4`], but binds each established session to the N4 datagram source `peer` and
+/// refuses a Session Modification / Deletion arriving from a different address (design/137
+/// F7) — so a peer that reaches N4 and guesses a live UP-SEID can neither retarget the
+/// victim's downlink (Update FAR) nor tear its session down.
+pub fn handle_n4_from(
+    data: &[u8],
+    node_ip: Ipv4Addr,
+    state: &mut UpfState,
+    now_nanos: u64,
+    peer: Option<IpAddr>,
+) -> Option<Vec<u8>> {
     let msg = rs_pfcp::message::parse(data).ok()?;
     let seq = msg.sequence();
     match msg.msg_type() {
@@ -1895,6 +1927,7 @@ pub fn handle_n4(
             let branches = parse_branches(msg.as_ref());
             let (up_seid, teid, dl_ingress_teid) = state.establish(
                 cp_fseid.seid.into(),
+                peer,
                 ue,
                 ambr,
                 &flows,
@@ -1924,6 +1957,19 @@ pub fn handle_n4(
         MsgType::SessionModificationRequest => {
             // Addressed by UP-SEID (the header SEID the UPF handed out at establishment).
             let up_seid = u64::from(msg.seid()?);
+            // Source-bind (design/137 F7): only the SMF that established the session may
+            // modify it. A peer that guessed a live UP-SEID and sent an Update FAR to
+            // retarget the downlink is refused before any state change is applied.
+            if let (Some(req), Some(bound)) = (peer, state.session_peer(up_seid)) {
+                if req != bound {
+                    return Some(
+                        SessionModificationResponseBuilder::new(up_seid, seq)
+                            .cause_rejected()
+                            .build()
+                            .marshal(),
+                    );
+                }
+            }
             // PFCPSMReq-Flags SNDEM (TS 29.244 §8.2.79): on a downlink path switch the
             // SMF asks for a GTP-U End Marker on the old tunnel.
             let send_end_marker = msg
@@ -2042,6 +2088,18 @@ pub fn handle_n4(
         }
         MsgType::SessionDeletionRequest => {
             let up_seid = u64::from(msg.seid()?);
+            // Source-bind (design/137 F7): only the establishing SMF may delete the session,
+            // so a peer cannot tear down a victim's session by guessing its UP-SEID.
+            if let (Some(req), Some(bound)) = (peer, state.session_peer(up_seid)) {
+                if req != bound {
+                    return Some(
+                        SessionDeletionResponseBuilder::new(up_seid, seq)
+                            .cause_rejected()
+                            .build()
+                            .marshal(),
+                    );
+                }
+            }
             let usages = state.remove(up_seid);
             let cause = if usages.is_some() {
                 CauseValue::RequestAccepted
@@ -2295,6 +2353,59 @@ mod tests {
     use super::*;
 
     const UE_IP: Ipv4Addr = Ipv4Addr::new(10, 45, 0, 2);
+
+    /// design/137 F7: a session is bound to its establishing N4 source — a Session
+    /// Modification or Deletion from a different peer is refused (the downlink is not
+    /// retargeted, the session not torn down), while the establishing SMF is honored. The
+    /// peer-less `handle_n4` path leaves the binding inactive (backward compatible).
+    #[test]
+    fn n4_binds_a_session_to_its_establishing_peer() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let smf: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+        let attacker: IpAddr = Ipv4Addr::new(10, 0, 0, 9).into();
+        let gnb = (0x5678u32, Ipv4Addr::new(10, 0, 0, 5));
+        let mut state = UpfState::new();
+
+        // Establish from the SMF's address → UP-SEID 1.
+        handle_n4_from(
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[], None),
+            node_ip,
+            &mut state,
+            0,
+            Some(smf),
+        )
+        .expect("session established");
+        let modify = session_modification_request(1, 2, 2, gnb.0, gnb.1, "internet", false);
+
+        // A modification from a foreign peer is rejected — the downlink stays uninstalled.
+        handle_n4_from(&modify, node_ip, &mut state, 0, Some(attacker)).expect("a response");
+        assert!(state.downlink_for(1).is_none(), "a foreign peer cannot install the downlink");
+
+        // The establishing SMF's modification is honored.
+        handle_n4_from(&modify, node_ip, &mut state, 0, Some(smf)).expect("accepted");
+        assert_eq!(state.downlink_for(1), Some(gnb), "the owning SMF installs the downlink");
+
+        // Deletion from a foreign peer is refused; the session survives.
+        handle_n4_from(&session_deletion_request(1, 3), node_ip, &mut state, 0, Some(attacker));
+        assert_eq!(state.session_count(), 1, "a foreign peer cannot delete the session");
+
+        // The owning SMF deletes it.
+        handle_n4_from(&session_deletion_request(1, 4), node_ip, &mut state, 0, Some(smf));
+        assert_eq!(state.session_count(), 0, "the owning SMF deletes its session");
+
+        // Backward compatible: the peer-less `handle_n4` leaves the binding inactive, so a
+        // modification applies regardless of source (the default/test path).
+        let mut open = UpfState::new();
+        handle_n4(
+            &session_establishment_request(0xBEEF, 1, node_ip, UE_IP, "internet", None, &[], None),
+            node_ip,
+            &mut open,
+            0,
+        )
+        .expect("established (peer-less)");
+        handle_n4(&modify, node_ip, &mut open, 0).expect("modified (peer-less)");
+        assert_eq!(open.downlink_for(1), Some(gnb), "the peer-less path applies the modification");
+    }
 
     #[test]
     fn session_establishment_allocates_and_tracks() {

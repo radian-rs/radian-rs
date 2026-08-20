@@ -64,19 +64,22 @@ state and predictable identifiers on unauthenticated network segments.
 ## Remediation status
 
 Fixes land on branch `audit`; each finding's detail section carries its own status
-line. Progress so far:
+line. **The entire HIGH tier is now remediated** — F1–F6 fully, and F7 partially (its
+user-plane hardening — unpredictable TEID/SEID, N3/N4 peer-source validation — is
+deferred; see the F7 detail). The MED/LOW tier (F8–F24) is not yet started. Progress
+so far:
 
 | # | Status | Where |
 |---|--------|-------|
 | F1 | **FIXED** | `crates/nas/src/lib.rs` `unprotect` — estimate-closest COUNT + reject any at/below one consumed; tests `nas_security_rejects_replay`, `nas_security_count_wraps_past_the_sn_block_boundary` |
 | F6 | **FIXED** | `nf/nf-amf/src/main.rs` — registration guard timer, re-armed from last progress (T3550/T3560-style), evicts stalled in-progress contexts (releasing the CBL slot via RAII); test `registration_guard_evicts_stalled_registrations` |
 | F5 | **FIXED** | `crates/n6/src/lib.rs` `uplink` — fail closed: an address-assigned session accepts only its assigned families; an unassigned-family or non-IP packet is dropped (`Uplink::UnassignedFamily`), address-less forwarding tunnels untouched; tests `uplink_drops_the_unassigned_family_on_a_single_family_session`, `uplink_dual_stack_session_accepts_both_families`; full BDD 45/501 green |
-| F7 | **PARTIAL** | `crates/pfcp/src/lib.rs` — DoS sub-issue closed: the session table is capped (`DEFAULT_MAX_SESSIONS`, `set_max_sessions`, `RADIAN_UPF_MAX_SESSIONS`), a full UPF rejects further establishment with `NoResourcesAvailable`; test `session_table_is_capped_against_an_establishment_flood`. **Deferred** (see detail): unpredictable TEID/SEID, N3/N4 peer-source validation, `valid_gnb_target` RAN-prefix allowlist |
+| F7 | **PARTIAL** | `crates/pfcp/src/lib.rs` + `nf/nf-upf`. DoS sub-issue closed: the session table is capped (`DEFAULT_MAX_SESSIONS`, `RADIAN_UPF_MAX_SESSIONS`), a full UPF rejects further establishment with `NoResourcesAvailable`. **N4 source-binding** now closes the control-plane hijack: each session records its establishing N4 source (`handle_n4_from` / `Session::peer_ip`; peer-less `handle_n4` keeps the check inactive for the lib/tests), and a Session Modification / Deletion from a different peer is refused `RequestRejected` — so a peer that guessed a live UP-SEID can neither retarget the victim's downlink (Update FAR) nor tear the session down. Tests `session_table_is_capped_against_an_establishment_flood`, `n4_binds_a_session_to_its_establishing_peer`. **Still deferred** (see detail): unpredictable TEID/SEID (CSPRNG), N3 *uplink* source validation, `valid_gnb_target` RAN-prefix allowlist |
 | F3 | **FIXED** | `nf/nf-udm/src/main.rs` wraps `nudm::router` in `oauth::protect(_, "UDM", verifier)`; the UDM's clients (AUSF, AMF, SMF) attach an NRF-issued `UDM` token when SBI security is on (`NudmClient::with_tokens`, `AusfState::with_tokens`). Opt-in — no change when OAuth is off. Test `protected_udm_requires_a_valid_access_token`; BDD 45/501 green |
 | F4 | **FIXED** | mTLS cert-binding (RFC 8705): `tls.rs` surfaces the peer cert thumbprint; the NRF binds each registration to it and refuses to issue a token — or re-register — under a different certificate. **Plus the two deferred items:** (a) *per-consumer authorization* — `RADIAN_NRF_AUTHZ` / `with_authz_policy` / `parse_authz_policy`; `access_token` issues a token only if the requesting NF's **registered** type may target the requested `targetNfType` (deny-by-default; consumer type read from the registry, never the request body). (b) *sender-constrained tokens* — the NRF stamps the caller's cert thumbprint as the token `cnf` (`x5t#S256`), and every protected NF (`oauth::require_token`) refuses a `cnf`-bearing token unless the presenting client cert matches, so a captured token can't be replayed by a different NF. Opt-in (cleartext ⇒ no cnf, no policy). Tests `authz_policy_confines_a_consumer_to_its_targets`, `cnf_binds_a_token_to_the_presenting_certificate`, `parse_authz_policy_reads_the_grammar`, `nrf_binds_tokens_to_the_registering_client_certificate`. **Residual:** authorization is at `targetNfType` granularity; the resource server enforces audience + `cnf` but not per-service `scope` |
 | F2 | **FIXED** | `crates/sbi-core/src/nnef.rs` + `nf/nf-nef/src/main.rs`. **Authentication:** with `RADIAN_NEF_AF_KEYS=af:key[,…]` (`with_af_keys`), a request must carry `Authorization: Bearer <key>` matching the key provisioned for its path `af_id` (constant-time `ct_eq`); missing/wrong key — or an AF reusing another's `af_id` — is `401` (uniform, no enumeration). **Authorization:** with `RADIAN_NEF_AF_SLA=af\|dnns\|dnais\|supis\|group` (`with_af_slas`/`parse_af_slas`, `AfSla`), `authorize_request` bounds each request to the AF's contracted DNN, DNAIs (all routes), SUPI scope (prefix), and group/any-UE permission — out-of-scope ⇒ `403`, deny-by-default (an AF with no SLA is refused). A subscription is owned by its creating `af_id`, so one AF cannot delete another's (`take_owned`). Both opt-in; unset ⇒ open (dev), warned. Tests `api_key_authenticates_the_af`, `sla_confines_an_af_to_its_contracted_scope`, `an_af_cannot_delete_another_afs_subscription`, `parse_af_slas_reads_the_env_grammar` |
 
-All other findings are open.
+The MED/LOW findings (F8–F24) remain open.
 
 ## HIGH findings (detail)
 
@@ -286,25 +289,30 @@ All other findings are open.
 
 ### F7 — N3/N4 trust the network; predictable TEID/SEID
 
-- **Status:** ◐ **PARTIAL** (branch `audit`). **Done:** the unbounded-session memory DoS
-  ("Attack B") is closed — the UPF session table is now capped (`DEFAULT_MAX_SESSIONS`
-  = 100k, tunable via `UpfState::set_max_sessions` / `RADIAN_UPF_MAX_SESSIONS`), and a
-  full UPF answers further `SessionEstablishmentRequest`s with `NoResourcesAvailable`
-  instead of allocating (test `session_table_is_capped_against_an_establishment_flood`).
-  The cap also makes the `next_teid`/`next_seid` counter overflow unreachable.
-  **Deferred, with rationale:** (1) *Unpredictable TEID/SEID (CSPRNG)* — the datapath
-  contract is sound (SMF uses CHOOSE F-TEID and reads the allocated F-SEID from the
-  response), but ~20 unit tests and the n6 helpers assert the allocations are `1,2,3…`
-  and would fail *at runtime* (not compile time) under randomisation; doing it safely
-  needs those tests refactored to read the allocated ids. (2) *N3/N4 peer-source
-  validation* — `handle_n4` has 63 call sites, so binding a session to its establishing
-  SMF source means threading the peer address through all of them (or moving the check
-  into the `nf-upf` N4 loop, which already has `peer`); a focused follow-up. (3)
-  *`valid_gnb_target` RAN-prefix allowlist* — cannot be made fail-closed by default
-  without a deployment-supplied RAN CIDR, because the demo/BDD topology deliberately
-  uses loopback (`127.0.0.x`) gNB addresses. All three are **bounded today** by the
-  documented isolated-user-plane-segment / IPsec deployment assumption; the cap is the
-  part that is safe and effective to fix unconditionally now.
+- **Status:** ◐ **PARTIAL** (branch `audit`). **Done:** (a) the unbounded-session memory
+  DoS ("Attack B") is closed — the UPF session table is capped (`DEFAULT_MAX_SESSIONS` =
+  100k, tunable via `UpfState::set_max_sessions` / `RADIAN_UPF_MAX_SESSIONS`), a full UPF
+  answers further `SessionEstablishmentRequest`s with `NoResourcesAvailable` (test
+  `session_table_is_capped_against_an_establishment_flood`), which also makes the
+  `next_teid`/`next_seid` overflow unreachable. (b) **N4 source-binding** closes the
+  control-plane hijack — each session records the N4 datagram source that established it
+  (`handle_n4_from`, `Session::peer_ip`; the peer-less `handle_n4` keeps the check inactive
+  for the library's own callers and tests), and a Session Modification or Deletion arriving
+  from a different address is refused `RequestRejected` **before** any state change, so a
+  peer reaching N4 (`0.0.0.0:8805`) that guesses a live UP-SEID can neither install an
+  Update FAR to retarget the victim's downlink nor tear the session down (test
+  `n4_binds_a_session_to_its_establishing_peer`). **Deferred, with rationale:** (1)
+  *Unpredictable TEID/SEID (CSPRNG)* — the datapath contract is sound (SMF uses CHOOSE
+  F-TEID and reads the allocated F-SEID from the response), but ~20 unit tests and the n6
+  helpers assert the allocations are `1,2,3…` and would fail *at runtime* (not compile
+  time) under randomisation; doing it safely needs those tests refactored to read the
+  allocated ids. (2) *N3 uplink source validation* — the N4 control plane is now
+  source-bound; the remaining datapath check (validate an uplink G-PDU's GTP-U source
+  against the session's gNB before forwarding) threads a peer into the `n6::uplink`
+  datapath — a focused follow-up. (3) *`valid_gnb_target` RAN-prefix allowlist* — cannot be
+  made fail-closed by default without a deployment-supplied RAN CIDR, because the demo/BDD
+  topology deliberately uses loopback (`127.0.0.x`) gNB addresses. The remaining items are
+  **bounded** by the documented isolated-user-plane-segment / IPsec deployment assumption.
 - **Class:** Packet injection / session manipulation. **File:**
   `nf/nf-upf/src/main.rs:277-343` (`serve_n3` — `peer` never checked against the
   session's gNB), `crates/pfcp/src/lib.rs:838-847,690-698` (sequential TEID/SEID
