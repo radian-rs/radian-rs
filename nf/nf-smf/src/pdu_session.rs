@@ -2298,6 +2298,9 @@ fn container_for(
         uplink_volume: u.uplink,
         downlink_volume: u.downlink,
         total_volume: u.total,
+        uplink_packets: u.uplink_pkts,
+        downlink_packets: u.downlink_pkts,
+        total_packets: u.total_pkts,
     }
 }
 
@@ -4801,7 +4804,8 @@ mod tests {
             ..Default::default()
         };
         decision.set_flows([flow(2, Some("chg")), flow(3, None)]);
-        let usage = |urr_id| pfcp::UsageVolume { urr_id, total: 30, uplink: 10, downlink: 20 };
+        let usage =
+            |urr_id| pfcp::UsageVolume { urr_id, total: 30, uplink: 10, downlink: 20, ..Default::default() };
         // The per-flow URR of QFI 2 → the charging decision's rating group (100), not 2.
         assert_eq!(container_for(&usage(pfcp::PER_FLOW_URR_BASE + 2), &decision).rating_group, 100);
         // QFI 3 has no charging decision → legacy fallback (rating group = QFI).

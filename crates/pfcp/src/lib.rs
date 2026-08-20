@@ -312,9 +312,11 @@ struct FlowEnforcer {
     gate: Gate,
     ul_bucket: TokenBucket,
     dl_bucket: TokenBucket,
-    /// Per-flow URR volume measurement: forwarded bytes each direction.
+    /// Per-flow URR measurement: forwarded bytes and packets each direction.
     ul_bytes: u64,
     dl_bytes: u64,
+    ul_pkts: u64,
+    dl_pkts: u64,
 }
 
 /// Extract the classification inputs from a bare IP packet: protocol, ports and
@@ -648,16 +650,20 @@ struct Session {
     dl_bucket: Option<TokenBucket>,
     /// Per-GBR-flow policers (MFBR), checked by classifier before the session AMBR.
     flow_qers: Vec<FlowEnforcer>,
-    /// URR volume measurement: forwarded (admitted) bytes each direction.
+    /// Session URR measurement: forwarded (admitted) bytes and packets each direction.
     ul_bytes: u64,
     dl_bytes: u64,
+    ul_pkts: u64,
+    dl_pkts: u64,
     /// Volume threshold (bytes, total) from the session URR's Reporting Triggers —
     /// crossing it flags a usage report toward the SMF (VOLTH).
     usage_threshold: Option<u64>,
-    /// Bytes already covered by previous threshold reports (per direction), so each
-    /// report carries the delta since the last one.
+    /// Bytes and packets already covered by previous threshold reports (per direction),
+    /// so each report carries the delta since the last one.
     reported_ul: u64,
     reported_dl: u64,
+    reported_ul_pkts: u64,
+    reported_dl_pkts: u64,
     /// A threshold crossing awaiting pickup by [`UpfState::take_due_report`].
     report_due: bool,
     /// The downlink FAR is **buffering** (CM-IDLE, AN release): downlink packets are
@@ -709,15 +715,19 @@ impl Session {
                     let f = &mut self.flow_qers[i];
                     if uplink {
                         f.ul_bytes = f.ul_bytes.saturating_add(bytes as u64);
+                        f.ul_pkts = f.ul_pkts.saturating_add(1);
                     } else {
                         f.dl_bytes = f.dl_bytes.saturating_add(bytes as u64);
+                        f.dl_pkts = f.dl_pkts.saturating_add(1);
                     }
                 }
                 None => {
                     if uplink {
                         self.ul_bytes = self.ul_bytes.saturating_add(bytes as u64);
+                        self.ul_pkts = self.ul_pkts.saturating_add(1);
                     } else {
                         self.dl_bytes = self.dl_bytes.saturating_add(bytes as u64);
+                        self.dl_pkts = self.dl_pkts.saturating_add(1);
                     }
                     // VOLTH: unreported session-URR volume crossed the threshold →
                     // a report is due. (Per-flow thresholds are deferred.)
@@ -745,13 +755,19 @@ impl Session {
     }
 }
 
-/// One URR's measured volume, as carried in usage reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One URR's measured usage, as carried in usage reports: volume (bytes) and packet
+/// counts, each direction. A UPF measures both (TS 29.244 Volume Measurement carries a
+/// Number-of-Packets alongside the octet counts); radian reports both so the CHF can
+/// charge per-packet as well as per-byte (design/155, G18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UsageVolume {
     pub urr_id: u32,
     pub total: u64,
     pub uplink: u64,
     pub downlink: u64,
+    pub total_pkts: u64,
+    pub uplink_pkts: u64,
+    pub downlink_pkts: u64,
 }
 
 /// A threshold-triggered usage report awaiting transmission to the SMF.
@@ -966,17 +982,24 @@ impl UpfState {
     fn remove(&mut self, up_seid: u64) -> Option<Vec<UsageVolume>> {
         self.sessions.remove(&up_seid).map(|s| {
             let (ul, dl) = (s.ul_bytes - s.reported_ul, s.dl_bytes - s.reported_dl);
+            let (ulp, dlp) = (s.ul_pkts - s.reported_ul_pkts, s.dl_pkts - s.reported_dl_pkts);
             let mut usages = vec![UsageVolume {
                 urr_id: SESSION_URR_ID,
                 total: ul + dl,
                 uplink: ul,
                 downlink: dl,
+                total_pkts: ulp + dlp,
+                uplink_pkts: ulp,
+                downlink_pkts: dlp,
             }];
             usages.extend(s.flow_qers.iter().map(|f| UsageVolume {
                 urr_id: PER_FLOW_URR_BASE + u32::from(f.qfi),
                 total: f.ul_bytes + f.dl_bytes,
                 uplink: f.ul_bytes,
                 downlink: f.dl_bytes,
+                total_pkts: f.ul_pkts + f.dl_pkts,
+                uplink_pkts: f.ul_pkts,
+                downlink_pkts: f.dl_pkts,
             }));
             usages
         })
@@ -995,6 +1018,9 @@ impl UpfState {
                 total: s.ul_bytes + s.dl_bytes,
                 uplink: s.ul_bytes,
                 downlink: s.dl_bytes,
+                total_pkts: s.ul_pkts + s.dl_pkts,
+                uplink_pkts: s.ul_pkts,
+                downlink_pkts: s.dl_pkts,
             });
         }
         // A per-flow URR id is PER_FLOW_URR_BASE + qfi (qfi a u8) — anything outside that
@@ -1006,6 +1032,9 @@ impl UpfState {
             total: f.ul_bytes + f.dl_bytes,
             uplink: f.ul_bytes,
             downlink: f.dl_bytes,
+            total_pkts: f.ul_pkts + f.dl_pkts,
+            uplink_pkts: f.ul_pkts,
+            downlink_pkts: f.dl_pkts,
         })
     }
 
@@ -1048,6 +1077,8 @@ impl UpfState {
                 dl_bucket: TokenBucket::new(f.mfbr_dl_bps, now_nanos),
                 ul_bytes: 0,
                 dl_bytes: 0,
+                ul_pkts: 0,
+                dl_pkts: 0,
             })
             .collect();
         self.sessions.insert(
@@ -1067,9 +1098,13 @@ impl UpfState {
                 flow_qers,
                 ul_bytes: 0,
                 dl_bytes: 0,
+                ul_pkts: 0,
+                dl_pkts: 0,
                 usage_threshold,
                 reported_ul: 0,
                 reported_dl: 0,
+                reported_ul_pkts: 0,
+                reported_dl_pkts: 0,
                 report_due: false,
                 buffering: false,
                 dl_buffer: std::collections::VecDeque::new(),
@@ -1088,11 +1123,22 @@ impl UpfState {
         let s = self.sessions.values_mut().find(|s| s.report_due)?;
         s.report_due = false;
         let (ul, dl) = (s.ul_bytes - s.reported_ul, s.dl_bytes - s.reported_dl);
+        let (ulp, dlp) = (s.ul_pkts - s.reported_ul_pkts, s.dl_pkts - s.reported_dl_pkts);
         s.reported_ul = s.ul_bytes;
         s.reported_dl = s.dl_bytes;
+        s.reported_ul_pkts = s.ul_pkts;
+        s.reported_dl_pkts = s.dl_pkts;
         Some(DueReport {
             cp_seid: s.cp_seid,
-            usage: UsageVolume { urr_id: SESSION_URR_ID, total: ul + dl, uplink: ul, downlink: dl },
+            usage: UsageVolume {
+                urr_id: SESSION_URR_ID,
+                total: ul + dl,
+                uplink: ul,
+                downlink: dl,
+                total_pkts: ulp + dlp,
+                uplink_pkts: ulp,
+                downlink_pkts: dlp,
+            },
         })
     }
 
@@ -1257,6 +1303,8 @@ impl UpfState {
                 dl_bucket: TokenBucket::new(f.mfbr_dl_bps, now_nanos),
                 ul_bytes: 0,
                 dl_bytes: 0,
+                ul_pkts: 0,
+                dl_pkts: 0,
             });
         }
     }
@@ -2138,13 +2186,14 @@ pub fn handle_n4_from(
 /// Query URR immediate read).
 fn usage_report_for(u: &UsageVolume, ur_seqn: u32, trigger: u8) -> UsageReport {
     let vm = VolumeMeasurement::new(
-        0b0000_0111, // TOVOL | ULVOL | DLVOL present
+        // TOVOL|ULVOL|DLVOL (volume) + TONOP|ULNOP|DLNOP (packet counts) present.
+        0b0011_1111,
         Some(u.total),
         Some(u.uplink),
         Some(u.downlink),
-        None,
-        None,
-        None,
+        Some(u.total_pkts),
+        Some(u.uplink_pkts),
+        Some(u.downlink_pkts),
     );
     let mut report = UsageReport::new(
         UrrId::new(u.urr_id),
@@ -2153,6 +2202,21 @@ fn usage_report_for(u: &UsageVolume, ur_seqn: u32, trigger: u8) -> UsageReport {
     );
     report.volume_measurement = Some(vm);
     report
+}
+
+/// Read a [`UsageVolume`] off a decoded Usage Report's Volume Measurement — volume
+/// (required) plus packet counts (optional: `0` for a peer that omits them, design/155).
+fn usage_volume_from(report: &UsageReport) -> Option<UsageVolume> {
+    let vm = report.volume_measurement.as_ref()?;
+    Some(UsageVolume {
+        urr_id: report.urr_id.id,
+        total: vm.total_volume?,
+        uplink: vm.uplink_volume?,
+        downlink: vm.downlink_volume?,
+        total_pkts: vm.total_packets.unwrap_or(0),
+        uplink_pkts: vm.uplink_packets.unwrap_or(0),
+        downlink_pkts: vm.downlink_packets.unwrap_or(0),
+    })
 }
 
 /// UPF: build a Session Report Request carrying a **Downlink Data Report**
@@ -2201,13 +2265,7 @@ pub fn parse_session_report_request(data: &[u8]) -> Option<(u64, u32, UsageVolum
     let cp_seid = u64::from(msg.seid()?);
     let ie = msg.ies(IeType::UsageReportWithinSessionReportRequest).next()?;
     let report = UsageReport::unmarshal(&ie.payload).ok()?;
-    let vm = report.volume_measurement?;
-    let usage = UsageVolume {
-        urr_id: report.urr_id.id,
-        total: vm.total_volume?,
-        uplink: vm.uplink_volume?,
-        downlink: vm.downlink_volume?,
-    };
+    let usage = usage_volume_from(&report)?;
     Some((cp_seid, u32::from(msg.sequence()), usage))
 }
 
@@ -2307,15 +2365,7 @@ pub fn usages_from_deletion_response(data: &[u8]) -> Vec<UsageVolume> {
     };
     msg.ies(IeType::UsageReportWithinSessionDeletionResponse)
         .filter_map(|ie| UsageReport::unmarshal(&ie.payload).ok())
-        .filter_map(|report| {
-            let vm = report.volume_measurement?;
-            Some(UsageVolume {
-                urr_id: report.urr_id.id,
-                total: vm.total_volume?,
-                uplink: vm.uplink_volume?,
-                downlink: vm.downlink_volume?,
-            })
-        })
+        .filter_map(|report| usage_volume_from(&report))
         .collect()
 }
 
@@ -2327,15 +2377,7 @@ pub fn usages_from_modification_response(data: &[u8]) -> Vec<UsageVolume> {
     };
     msg.ies(IeType::UsageReportWithinSessionModificationResponse)
         .filter_map(|ie| UsageReport::unmarshal(&ie.payload).ok())
-        .filter_map(|report| {
-            let vm = report.volume_measurement?;
-            Some(UsageVolume {
-                urr_id: report.urr_id.id,
-                total: vm.total_volume?,
-                uplink: vm.uplink_volume?,
-                downlink: vm.downlink_volume?,
-            })
-        })
+        .filter_map(|report| usage_volume_from(&report))
         .collect()
 }
 
@@ -3225,7 +3267,7 @@ mod tests {
         assert_eq!(parse_dl_data_report(&req), Some((0xBEEF, 9)));
         // A usage report is NOT a downlink data report, and vice versa.
         let usage = session_report_request(
-            &DueReport { cp_seid: 0xBEEF, usage: UsageVolume { urr_id: 1, total: 10, uplink: 10, downlink: 0 } },
+            &DueReport { cp_seid: 0xBEEF, usage: UsageVolume { urr_id: 1, total: 10, uplink: 10, downlink: 0, ..Default::default() } },
             9,
         );
         assert_eq!(parse_dl_data_report(&usage), None);
@@ -3271,10 +3313,26 @@ mod tests {
         assert_eq!(
             usages,
             vec![
-                UsageVolume { urr_id: SESSION_URR_ID, total: 1500, uplink: 1500, downlink: 0 },
-                UsageVolume { urr_id: PER_FLOW_URR_BASE + 2, total: 2000, uplink: 2000, downlink: 0 },
+                UsageVolume {
+                    urr_id: SESSION_URR_ID,
+                    total: 1500,
+                    uplink: 1500,
+                    downlink: 0,
+                    total_pkts: 3,
+                    uplink_pkts: 3,
+                    downlink_pkts: 0,
+                },
+                UsageVolume {
+                    urr_id: PER_FLOW_URR_BASE + 2,
+                    total: 2000,
+                    uplink: 2000,
+                    downlink: 0,
+                    total_pkts: 2,
+                    uplink_pkts: 2,
+                    downlink_pkts: 0,
+                },
             ],
-            "the flow URR counts its matched traffic; the session URR the rest"
+            "the flow URR counts its matched traffic + packets; the session URR the rest"
         );
     }
 
@@ -3322,8 +3380,24 @@ mod tests {
         assert_eq!(
             usages,
             vec![
-                UsageVolume { urr_id: SESSION_URR_ID, total: 1500, uplink: 1500, downlink: 0 },
-                UsageVolume { urr_id: PER_FLOW_URR_BASE + 2, total: 2000, uplink: 2000, downlink: 0 },
+                UsageVolume {
+                    urr_id: SESSION_URR_ID,
+                    total: 1500,
+                    uplink: 1500,
+                    downlink: 0,
+                    total_pkts: 3,
+                    uplink_pkts: 3,
+                    downlink_pkts: 0,
+                },
+                UsageVolume {
+                    urr_id: PER_FLOW_URR_BASE + 2,
+                    total: 2000,
+                    uplink: 2000,
+                    downlink: 0,
+                    total_pkts: 2,
+                    uplink_pkts: 2,
+                    downlink_pkts: 0,
+                },
             ],
             "each URR answers with its live cumulative usage"
         );
@@ -3340,8 +3414,24 @@ mod tests {
         assert_eq!(
             final_usages,
             vec![
-                UsageVolume { urr_id: SESSION_URR_ID, total: 1500, uplink: 1500, downlink: 0 },
-                UsageVolume { urr_id: PER_FLOW_URR_BASE + 2, total: 2000, uplink: 2000, downlink: 0 },
+                UsageVolume {
+                    urr_id: SESSION_URR_ID,
+                    total: 1500,
+                    uplink: 1500,
+                    downlink: 0,
+                    total_pkts: 3,
+                    uplink_pkts: 3,
+                    downlink_pkts: 0,
+                },
+                UsageVolume {
+                    urr_id: PER_FLOW_URR_BASE + 2,
+                    total: 2000,
+                    uplink: 2000,
+                    downlink: 0,
+                    total_pkts: 2,
+                    uplink_pkts: 2,
+                    downlink_pkts: 0,
+                },
             ],
             "the mid-session query was non-destructive"
         );
@@ -3373,7 +3463,15 @@ mod tests {
         assert_eq!(due.cp_seid, 0xCAFE, "addressed by the SMF's F-SEID");
         assert_eq!(
             due.usage,
-            UsageVolume { urr_id: SESSION_URR_ID, total: 3000, uplink: 3000, downlink: 0 }
+            UsageVolume {
+                urr_id: SESSION_URR_ID,
+                total: 3000,
+                uplink: 3000,
+                downlink: 0,
+                total_pkts: 3,
+                uplink_pkts: 3,
+                downlink_pkts: 0,
+            }
         );
         assert!(state.take_due_report().is_none(), "taking the report clears it");
 
