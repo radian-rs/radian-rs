@@ -46,6 +46,7 @@ use rs_pfcp::ie::network_instance::NetworkInstance;
 use rs_pfcp::ie::pfcpsm_req_flags::PfcpsmReqFlags;
 use rs_pfcp::ie::outer_header_creation::OuterHeaderCreation;
 use rs_pfcp::ie::qer_id::QerId;
+use rs_pfcp::ie::query_urr::QueryUrr;
 use rs_pfcp::ie::remove_far::RemoveFar;
 use rs_pfcp::ie::remove_pdr::RemovePdr;
 use rs_pfcp::ie::remove_qer::RemoveQer;
@@ -968,6 +969,33 @@ impl UpfState {
         })
     }
 
+    /// The **current** cumulative usage measured for one URR on a live session — the
+    /// answer to a Query URR (TS 29.244 §7.5.4.9). Unlike a threshold or final report
+    /// this is an *immediate read*: it neither resets the measurement nor advances the
+    /// threshold-report watermark. `urr_id` is the session URR ([`SESSION_URR_ID`]) or a
+    /// per-flow URR (`PER_FLOW_URR_BASE + qfi`). `None` if the session or URR is unknown.
+    fn query_urr_usage(&self, up_seid: u64, urr_id: u32) -> Option<UsageVolume> {
+        let s = self.sessions.get(&up_seid)?;
+        if urr_id == SESSION_URR_ID {
+            return Some(UsageVolume {
+                urr_id,
+                total: s.ul_bytes + s.dl_bytes,
+                uplink: s.ul_bytes,
+                downlink: s.dl_bytes,
+            });
+        }
+        // A per-flow URR id is PER_FLOW_URR_BASE + qfi (qfi a u8) — anything outside that
+        // band, or a flow that isn't installed, has no usage to report.
+        let qfi = u8::try_from(urr_id.checked_sub(PER_FLOW_URR_BASE)?).ok()?;
+        let f = s.flow_qers.iter().find(|f| f.qfi == qfi)?;
+        Some(UsageVolume {
+            urr_id,
+            total: f.ul_bytes + f.dl_bytes,
+            uplink: f.ul_bytes,
+            downlink: f.dl_bytes,
+        })
+    }
+
     /// Allocate a UP-SEID + N3 TEID for a new session and record it (with the
     /// SMF-allocated UE IP, if the establishment carried one).
     #[allow(clippy::too_many_arguments)]
@@ -1596,6 +1624,21 @@ pub fn session_qer_update_request(up_seid: u64, seq: u32, ambr: SessionAmbr) -> 
         .marshal()
 }
 
+/// SMF: build a Session Modification that **queries** one or more URRs (TS 29.244
+/// §7.5.4.9, G18) — the UPF answers with each URR's current usage as a Usage Report in
+/// the Modification Response. Lets the SMF poll live usage mid-session (a quota check,
+/// an on-demand CHF update) without waiting for a volume threshold or session end.
+pub fn session_urr_query_request(up_seid: u64, seq: u32, urr_ids: &[u32]) -> Vec<u8> {
+    let queries = urr_ids
+        .iter()
+        .map(|&id| Ie::new(IeType::QueryUrr, QueryUrr::new(id).marshal()))
+        .collect();
+    SessionModificationRequestBuilder::new(up_seid, seq)
+        .query_urrs(queries)
+        .build()
+        .marshal()
+}
+
 /// SMF: build a PFCP Session Modification Request for a **mid-session per-flow QoS
 /// change** — `create` new GBR flows (Create QER + classifier PDR), `update`
 /// existing flows' MFBR (Update QER), and `remove` flows by QFI (Remove QER + PDR).
@@ -1974,12 +2017,28 @@ pub fn handle_n4(
             for (id, filter, egress) in parse_branches(msg.as_ref()) {
                 state.add_branch(up_seid, id, filter, egress);
             }
-            Some(
-                SessionModificationResponseBuilder::new(up_seid, seq)
-                    .cause_accepted()
-                    .build()
-                    .marshal(),
-            )
+            // Query URR (TS 29.244 §7.5.4.9, G18): answer each queried URR with its
+            // current cumulative usage as a Usage Report in the response — an immediate
+            // read (no reset). Lets the SMF poll live usage mid-session (e.g. a quota
+            // check) instead of only at a volume threshold or session end.
+            let usage_reports: Vec<Ie> = msg
+                .ies(IeType::QueryUrr)
+                .filter_map(|ie| QueryUrr::unmarshal(&ie.payload).ok())
+                .enumerate()
+                .filter_map(|(i, q)| {
+                    let u = state.query_urr_usage(up_seid, q.urr_id)?;
+                    Some(Ie::new(
+                        IeType::UsageReportWithinSessionModificationResponse,
+                        // 0x40 = IMMER (immediate/query-triggered report).
+                        usage_report_for(&u, (i + 1) as u32, 0x40).marshal(),
+                    ))
+                })
+                .collect();
+            let mut builder = SessionModificationResponseBuilder::new(up_seid, seq).cause_accepted();
+            if !usage_reports.is_empty() {
+                builder = builder.ies(usage_reports);
+            }
+            Some(builder.build().marshal())
         }
         MsgType::SessionDeletionRequest => {
             let up_seid = u64::from(msg.seid()?);
@@ -2017,7 +2076,8 @@ pub fn handle_n4(
 }
 
 /// Build one URR usage report carrying a volume measurement (`trigger`: `0x20`
-/// TERMR at deletion, `0x02` VOLTH at a threshold crossing).
+/// TERMR at deletion, `0x02` VOLTH at a threshold crossing, `0x40` IMMER for a
+/// Query URR immediate read).
 fn usage_report_for(u: &UsageVolume, ur_seqn: u32, trigger: u8) -> UsageReport {
     let vm = VolumeMeasurement::new(
         0b0000_0111, // TOVOL | ULVOL | DLVOL present
@@ -2188,6 +2248,26 @@ pub fn usages_from_deletion_response(data: &[u8]) -> Vec<UsageVolume> {
         return Vec::new();
     };
     msg.ies(IeType::UsageReportWithinSessionDeletionResponse)
+        .filter_map(|ie| UsageReport::unmarshal(&ie.payload).ok())
+        .filter_map(|report| {
+            let vm = report.volume_measurement?;
+            Some(UsageVolume {
+                urr_id: report.urr_id.id,
+                total: vm.total_volume?,
+                uplink: vm.uplink_volume?,
+                downlink: vm.downlink_volume?,
+            })
+        })
+        .collect()
+}
+
+/// SMF: parse the URR usage reports (volume) a UPF returned in a Session Modification
+/// Response — the answers to a [`session_urr_query_request`] (G18). Empty if none.
+pub fn usages_from_modification_response(data: &[u8]) -> Vec<UsageVolume> {
+    let Ok(msg) = rs_pfcp::message::parse(data) else {
+        return Vec::new();
+    };
+    msg.ies(IeType::UsageReportWithinSessionModificationResponse)
         .filter_map(|ie| UsageReport::unmarshal(&ie.payload).ok())
         .filter_map(|report| {
             let vm = report.volume_measurement?;
@@ -3084,6 +3164,75 @@ mod tests {
                 UsageVolume { urr_id: PER_FLOW_URR_BASE + 2, total: 2000, uplink: 2000, downlink: 0 },
             ],
             "the flow URR counts its matched traffic; the session URR the rest"
+        );
+    }
+
+    /// Query URR (G18): a mid-session Session Modification carrying Query URR IEs makes
+    /// the UPF answer with each URR's current cumulative usage — an immediate read that
+    /// does NOT reset the measurement (a later deletion still reports the full total).
+    #[test]
+    fn query_urr_reports_live_usage_without_resetting() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        let f2 = FlowQer {
+            qfi: 2,
+            filter: FlowFilter::transport(17, 5000, 5010),
+            mfbr_dl_bps: 100_000_000,
+            mfbr_ul_bps: 100_000_000,
+            gate: Gate::OPEN,
+        };
+        handle_n4(
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[f2], None),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("establish");
+        let (up_seid, teid) = (1u64, 1u32);
+
+        // 2×1000 on the GBR flow (→ per-flow URR) + 3×500 off-flow (→ session URR).
+        for _ in 0..2 {
+            assert!(state.admit_uplink(teid, 0, &udp_packet(40000, 5005, 1000)));
+        }
+        for _ in 0..3 {
+            assert!(state.admit_uplink(teid, 0, &udp_packet(40000, 9999, 500)));
+        }
+
+        // Query both URRs mid-session → a Usage Report per queried URR in the response.
+        let resp = handle_n4(
+            &session_urr_query_request(up_seid, 2, &[SESSION_URR_ID, PER_FLOW_URR_BASE + 2]),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("query");
+        let mut usages = usages_from_modification_response(&resp);
+        usages.sort_by_key(|u| u.urr_id);
+        assert_eq!(
+            usages,
+            vec![
+                UsageVolume { urr_id: SESSION_URR_ID, total: 1500, uplink: 1500, downlink: 0 },
+                UsageVolume { urr_id: PER_FLOW_URR_BASE + 2, total: 2000, uplink: 2000, downlink: 0 },
+            ],
+            "each URR answers with its live cumulative usage"
+        );
+
+        // A query for an unknown URR yields no report (the modification still succeeds).
+        let resp = handle_n4(&session_urr_query_request(up_seid, 3, &[9999]), node_ip, &mut state, 0)
+            .expect("query unknown");
+        assert!(usages_from_modification_response(&resp).is_empty(), "unknown URR → no report");
+
+        // The query reset nothing: deletion still reports the full cumulative usage.
+        let resp = handle_n4(&session_deletion_request(up_seid, 4), node_ip, &mut state, 0).expect("delete");
+        let mut final_usages = usages_from_deletion_response(&resp);
+        final_usages.sort_by_key(|u| u.urr_id);
+        assert_eq!(
+            final_usages,
+            vec![
+                UsageVolume { urr_id: SESSION_URR_ID, total: 1500, uplink: 1500, downlink: 0 },
+                UsageVolume { urr_id: PER_FLOW_URR_BASE + 2, total: 2000, uplink: 2000, downlink: 0 },
+            ],
+            "the mid-session query was non-destructive"
         );
     }
 
