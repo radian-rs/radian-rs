@@ -67,6 +67,7 @@ fn main() {
                 filter: pfcp::FlowFilter::transport(17, 5000, 5010),
                 mfbr_dl_bps: 80_000,
                 mfbr_ul_bps: 80_000,
+                gate: pfcp::Gate::OPEN,
             }],
             Some(1_000_000),
         ),
