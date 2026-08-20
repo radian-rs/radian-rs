@@ -70,10 +70,55 @@ pub struct QosFlowPolicy {
     /// `None` ⇒ the flow falls back to the legacy rating-group-equals-QFI convention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ref_chg_data: Option<String>,
+    /// The flow's **gate** (from the bound PCC rule's `flowStatus`) — whether it passes,
+    /// per direction. The SMF installs it as the UPF's QER Gate Status (design/151, G18).
+    /// Default [`FlowStatus::Enabled`], so a flow with no policy restriction passes.
+    #[serde(default, skip_serializing_if = "FlowStatus::is_enabled")]
+    pub flow_status: FlowStatus,
 }
 
 fn default_arp_priority() -> u8 {
     8
+}
+
+/// A PCC rule's **flow status** (TS 29.512 §5.6.2.6 `FlowStatus`) — whether the network
+/// lets the rule's service data flow pass, per direction. The SMF installs it as the
+/// UPF's PFCP QER **Gate Status** (TS 29.244 §8.2.7): a closed gate makes the UPF drop
+/// the flow's packets in that direction. Absent ⇒ [`FlowStatus::Enabled`] (design/151,
+/// G18) — so existing policy with no `flowStatus` keeps passing traffic unchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum FlowStatus {
+    #[default]
+    #[serde(rename = "ENABLED")]
+    Enabled,
+    #[serde(rename = "ENABLED-UPLINK")]
+    EnabledUplink,
+    #[serde(rename = "ENABLED-DOWNLINK")]
+    EnabledDownlink,
+    #[serde(rename = "DISABLED")]
+    Disabled,
+    #[serde(rename = "REMOVED")]
+    Removed,
+}
+
+impl FlowStatus {
+    /// The `(uplink_open, downlink_open)` gate this status maps to — `true` = pass,
+    /// `false` = drop. `REMOVED` is treated as blocked in both directions (rule
+    /// teardown itself is a separate mechanism: a `null` PCC rule in an update).
+    pub fn gate(self) -> (bool, bool) {
+        match self {
+            FlowStatus::Enabled => (true, true),
+            FlowStatus::EnabledUplink => (true, false),
+            FlowStatus::EnabledDownlink => (false, true),
+            FlowStatus::Disabled | FlowStatus::Removed => (false, false),
+        }
+    }
+
+    /// Whether this is the default (both directions open) — used to keep `flowStatus`
+    /// out of serialized policy when it carries no restriction.
+    fn is_enabled(&self) -> bool {
+        matches!(self, FlowStatus::Enabled)
+    }
 }
 
 /// `ChargingData` (TS 29.512 §5.6.2.11), trimmed — a charging decision referenced by
@@ -193,6 +238,11 @@ pub struct PccRule {
     /// The charging this rule is metered under (`refChgData` → [`SmPolicyDecision::charging_descs`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ref_chg_data: Option<String>,
+    /// Whether the rule's flow passes, per direction (TS 29.512 `flowStatus`). Absent ⇒
+    /// ENABLED. Surfaced onto the bound QoS flow by [`SmPolicyDecision::qos_flows`] and
+    /// installed as the UPF's QER Gate Status (design/151, G18).
+    #[serde(default, skip_serializing_if = "FlowStatus::is_enabled")]
+    pub flow_status: FlowStatus,
 }
 
 /// A route target — an abstract edge named by its DNAI (TS 23.501 §5.6.7). The SMF
@@ -372,6 +422,8 @@ impl SmPolicyDecision {
                     gbr: qos.gbr.clone(),
                     filter: rep.flow_info,
                     ref_chg_data: rep.ref_chg_data.clone(),
+                    // The representative rule's flowStatus gates the whole flow.
+                    flow_status: rep.flow_status,
                 })
             })
             .collect();
@@ -403,6 +455,7 @@ impl SmPolicyDecision {
                     flow_info: f.filter,
                     ref_qos_data: Some(qos_id),
                     ref_chg_data: f.ref_chg_data,
+                    flow_status: f.flow_status,
                 },
             );
         }
@@ -578,6 +631,7 @@ impl PolicyConfig {
                 gbr: None,
                 filter: None,
                 ref_chg_data: None,
+                flow_status: FlowStatus::Enabled,
             },
             QosFlowPolicy {
                 qfi: 2,
@@ -595,6 +649,7 @@ impl PolicyConfig {
                 filter: Some(PacketFilterPolicy { protocol: 17, port_low: 5000, port_high: 5010 }),
                 // Charged under the "chg-voice" decision (rating group 100).
                 ref_chg_data: Some("chg-voice".into()),
+                flow_status: FlowStatus::Enabled,
             },
         ]);
         Self { per_dnn: HashMap::new(), default: decision }
@@ -1058,6 +1113,7 @@ mod tests {
             gbr: None,
             filter: None,
             ref_chg_data: None,
+            flow_status: FlowStatus::Enabled,
         }]);
         let config = PolicyConfig::demo().with_dnn("ims", ims);
         // The override applies to its DNN...
@@ -1177,6 +1233,7 @@ mod tests {
             flow_info: None,
             ref_qos_data: Some(format!("qos-{qfi}")),
             ref_chg_data: None,
+            flow_status: FlowStatus::Enabled,
         };
         let prev = SmPolicyDecision {
             session_rules: SmPolicyDecision::session_rules_for(Some(SessionAmbrPolicy {
@@ -1241,6 +1298,7 @@ mod tests {
             gbr: None,
             filter: None,
             ref_chg_data: chg_id.map(String::from),
+            flow_status: FlowStatus::Enabled,
         };
         // A flow charged under "chg-a" (rating group 100); an unreferenced "chg-b". The
         // PCC rule bound to QFI 2 carries `refChgData = "chg-a"` (via set_flows).
@@ -1315,6 +1373,7 @@ mod tests {
                 flow_info: Some(PacketFilterPolicy { protocol: 17, port_low: 5000, port_high: 5010 }),
                 ref_qos_data: Some("qos-gbr".into()),
                 ref_chg_data: Some("chg".into()),
+                flow_status: FlowStatus::Enabled,
             },
         );
         d.pcc_rules.insert(
@@ -1324,6 +1383,7 @@ mod tests {
                 flow_info: Some(PacketFilterPolicy { protocol: 6, port_low: 80, port_high: 80 }),
                 ref_qos_data: Some("qos-gbr".into()),
                 ref_chg_data: None,
+                flow_status: FlowStatus::Enabled,
             },
         );
         // Binding: two rules → ONE QoS flow (QFI 5), not two.
@@ -1339,9 +1399,62 @@ mod tests {
         // A QoS decision that no rule binds to yields no flow; a rule with an unknown
         // refQosData binds to nothing — neither produces a flow.
         d.qos_descs.insert("qos-idle".into(), QosData { qfi: 9, five_qi: 9, arp_priority: 8, pre_empt_cap: false, pre_empt_vuln: false, gbr: None });
-        d.pcc_rules.insert("pcc-dangling".into(), PccRule { precedence: 30, flow_info: None, ref_qos_data: Some("missing".into()), ref_chg_data: None });
+        d.pcc_rules.insert("pcc-dangling".into(), PccRule { precedence: 30, flow_info: None, ref_qos_data: Some("missing".into()), ref_chg_data: None, flow_status: FlowStatus::Enabled });
         let flows = d.qos_flows();
         assert_eq!(flows.iter().map(|f| f.qfi).collect::<Vec<_>>(), vec![5], "unbound QoS + dangling rule → still one flow");
+    }
+
+    /// A PCC rule's `flowStatus` surfaces onto the bound QoS flow and maps to the
+    /// per-direction gate the SMF installs as the UPF's QER Gate Status (design/151, G18).
+    #[test]
+    fn flow_status_gates_the_bound_flow() {
+        let gbr = GbrPolicy {
+            gfbr_dl: "1 Mbps".into(),
+            gfbr_ul: "1 Mbps".into(),
+            mfbr_dl: "2 Mbps".into(),
+            mfbr_ul: "2 Mbps".into(),
+        };
+        let mut d = SmPolicyDecision::default();
+        d.qos_descs.insert(
+            "qos".into(),
+            QosData {
+                qfi: 5,
+                five_qi: 1,
+                arp_priority: 8,
+                pre_empt_cap: false,
+                pre_empt_vuln: false,
+                gbr: Some(gbr),
+            },
+        );
+        d.pcc_rules.insert(
+            "pcc".into(),
+            PccRule {
+                precedence: 10,
+                flow_info: Some(PacketFilterPolicy { protocol: 17, port_low: 5000, port_high: 5010 }),
+                ref_qos_data: Some("qos".into()),
+                ref_chg_data: None,
+                flow_status: FlowStatus::Disabled,
+            },
+        );
+        // The rule's DISABLED status rides through qos_flows() onto the flow.
+        let flows = d.qos_flows();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].flow_status, FlowStatus::Disabled, "flowStatus surfaces onto the flow");
+        assert_eq!(flows[0].flow_status.gate(), (false, false), "DISABLED closes both directions");
+
+        // The gate mapping for each status.
+        assert_eq!(FlowStatus::default().gate(), (true, true), "absent flowStatus ⇒ ENABLED, open");
+        assert_eq!(FlowStatus::EnabledUplink.gate(), (true, false));
+        assert_eq!(FlowStatus::EnabledDownlink.gate(), (false, true));
+        assert_eq!(FlowStatus::Removed.gate(), (false, false));
+
+        // The TS 29.512 wire strings are hyphenated; an absent flowStatus deserializes to
+        // the open default (so pre-existing policy is unchanged).
+        assert_eq!(serde_json::to_string(&FlowStatus::EnabledUplink).unwrap(), "\"ENABLED-UPLINK\"");
+        assert_eq!(serde_json::from_str::<FlowStatus>("\"DISABLED\"").unwrap(), FlowStatus::Disabled);
+        let rule: PccRule =
+            serde_json::from_str(r#"{"precedence":1,"refQosData":"qos"}"#).expect("parse");
+        assert_eq!(rule.flow_status, FlowStatus::Enabled, "no flowStatus ⇒ ENABLED");
     }
 
     /// Session rules (`sessRules`) are a keyed partial map carrying the session AMBR:

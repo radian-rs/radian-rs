@@ -176,11 +176,13 @@ Gaps (control plane — Go is far more spec-faithful):
   Establishment allocates a second session+TEID**); no error causes — malformed
   input gets **no PFCP response at all** (`main.rs:214`). → **G4** (recovery-ts pinned; assoc-state/tx-layer/causes remain)
 - No BAR (fixed 64-pkt buffer; no notification delay / suggested count); OHR
-  ignored (unconditional decap); **GateStatus unenforced**; GBR is ceiling-only;
-  precedence written but never evaluated (branch order = PDR id); RemoveFar/
-  RemoveUrr/UpdatePdr/QueryUrr unread; no PERIO/duration/quota measurement, no
-  packet counts (flags hardcoded TOVOL|ULVOL|DLVOL), fake URSEQN, no
-  StartTime/EndTime, no reports in Modification Response. → **G18**
+  ignored (unconditional decap); ~~GateStatus unenforced~~ **enforced now**
+  ([151](151-n4-qer-gate-status.md) — a PCC rule's `flowStatus` → per-flow QER Gate
+  Status → the UPF drops a closed-gate flow, per direction, at establishment and
+  mid-session); GBR is ceiling-only; precedence written but never evaluated (branch
+  order = PDR id); RemoveFar/RemoveUrr/UpdatePdr/QueryUrr unread; no PERIO/duration/quota
+  measurement, no packet counts (flags hardcoded TOVOL|ULVOL|DLVOL), fake URSEQN, no
+  StartTime/EndTime, no reports in Modification Response. → **G18** (GateStatus done; rest remain)
 - ~~**Downlink G-PDUs carry no QFI/PDU Session Container**~~ **CLOSED**
   ([139](139-upf-downlink-qfi.md)): `n6::downlink` (v4+v6), the buffered flush,
   and SLAAC RAs now stamp the QFI (matched GBR flow's, else `DEFAULT_QFI`) — the
@@ -368,6 +370,12 @@ BDD tiers · in-proc e2e test volume.
   radian's product is a vertically-integrated core+RAN, G30 (interop tiers
   against free5gc peers) may matter more as a *conformance oracle* than as a
   deployment mode. Decide before sinking L-sized effort into G16/G18.
+  **G18 update:** entered incrementally — the GateStatus slice
+  ([151](151-n4-qer-gate-status.md)) delivers a real policy capability (per-flow
+  blocking) with *no* wire-fidelity commitment, so it stands on its own whatever
+  the pivot decides. The genuinely pivot-gated half of G18 (generic rule tables +
+  IPFilterRule SDF, which unlock *foreign*-NF interop) is untouched and still awaits
+  that call.
 - **G1 first.** Every new SBI route added before enforcement exists widens the
   unauthenticated surface. Small, self-contained, already-designed
   ([46](46-sbi-oauth.md)/[55](55-sbi-asymmetric-oauth.md) plumbing exists).
@@ -402,7 +410,7 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 | **G15** | SMContextStatusNotify + UpPathChg event notification (SMF→AMF, SMF→NEF/AF) | Minor–Mod | S | P2 | completes the NEF story ([135](135-nef-af-traffic-influence.md)) |
 | **G16** | **Nsmf wire fidelity** — multipart N1/N2 containers, SMF-side NAS-SM + N2 transfer-IE codecs, n2SmInfoType/hoState | Moderate (interop) | **L** | P2 | §2; decide via §7 pivot question first |
 | **G17** | NSSF conformance: GET+query wire shape, PDU-session path, NsiInformation, TAI keying, rejected-in-PLMN/TA split | Moderate | M | P2 | §3.5 |
-| **G18** | **N4 generic rule engine** — real PDR/FAR/QER/URR tables, precedence evaluation, IPFilterRule SDF parser, GateStatus, BAR, OHR honoured | Major (interop) | **L** | P2 | §2/§3.3; the other half of the pivot question |
+| **G18** | **N4 generic rule engine** — real PDR/FAR/QER/URR tables, precedence evaluation, IPFilterRule SDF parser, ~~GateStatus~~, BAR, OHR honoured | Major (interop) | **L** | **partial** | §2/§3.3; **GateStatus DONE** ([151](151-n4-qer-gate-status.md)): PCC `flowStatus` → per-flow QER Gate Status → UPF drops a closed-gate flow (per direction, establishment + mid-session). Remaining: precedence eval, IPFilterRule SDF, OHR, BAR, URR packet-counts/StartTime |
 | **G19** | UPF datapath scaling: TEID/UE-IP hash indexes, drop the global mutex (sharded or lock-free), TEID/SEID reclaim | Moderate | M | P2 | O(n)+Mutex per packet today |
 | **G20** | **BSF** — new `nf-bsf` (Nbsf_Management pcfBindings) + PCF binding registration + SMF/NEF binding query | Moderate | M | P2 | the 130 correction; unlocks AF→PCF lookup |
 | **G21** | UP topology Phase 3 — config-driven graph (G5 format), >2-hop chains, >1 ULCL branch, PSA/ULCL selection | Moderate | L | P2 | [134](134-ulcl-multi-upf.md) Phase 3 |
@@ -421,9 +429,11 @@ Suggested first wave by value-per-effort: **G1 → ~~G11~~ (done, [139](139-upf-
 [141](141-pfcp-liveness.md)) → ~~G7~~ (done, [142](142-amf-nas-retransmission.md))
 → ~~G2~~ (done, [143](143-suci-deconcealment.md)) → ~~G23~~ (CLI done,
 [144](144-subscriber-provisioning-cli.md)) → ~~G5~~ (foundation + SMF/UPF/AUSF done,
-[147](147-per-nf-config.md) + [148](148-config-upf-ausf.md))**. **First wave
-complete** — next, decide the §7 pivot question before committing to G16/G18-class
-interop refactors.
+[147](147-per-nf-config.md) + [148](148-config-upf-ausf.md)) → **G18 first slice**
+(GateStatus, [151](151-n4-qer-gate-status.md))**. **First wave complete + G18 opened**
+— the GateStatus slice took the self-contained *capability* half of G18 (policy-driven
+flow blocking); the §7 pivot question still governs the remaining wire-fidelity refactors
+(G16 + generic rule tables / IPFilterRule).
 
 ## Sources
 

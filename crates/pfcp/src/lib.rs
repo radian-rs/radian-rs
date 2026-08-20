@@ -29,6 +29,7 @@ use rs_pfcp::ie::precedence::Precedence;
 use rs_pfcp::ie::ue_ip_address::UeIpAddress;
 use rs_pfcp::ie::apply_action::ApplyAction;
 use rs_pfcp::ie::create_qer::CreateQer;
+use rs_pfcp::ie::gate_status::{GateStatus, GateStatusValue};
 use rs_pfcp::ie::create_urr::CreateUrr;
 use rs_pfcp::ie::measurement_method::MeasurementMethod;
 use rs_pfcp::ie::reporting_triggers::ReportingTriggers;
@@ -239,13 +240,65 @@ impl FlowFilter {
     }
 }
 
-/// A GBR flow's per-flow QER the SMF installs at the UPF: its classifier + MFBR.
+/// A service-data-flow **gate** — the PFCP QER Gate Status (TS 29.244 §8.2.7), one
+/// bit per direction: `true` = **open** (forward the flow's packets), `false` =
+/// **closed** (drop them). The SMF derives it from a PCC rule's `flowStatus`
+/// (TS 29.512) and installs it on the flow's QER; the UPF enforces it in
+/// [`Session::admit`] (design/151, G18). Default open — no Gate Status IE ⇒ unblocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gate {
+    pub uplink: bool,
+    pub downlink: bool,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Gate::OPEN
+    }
+}
+
+impl Gate {
+    /// Both directions open — the unrestricted default.
+    pub const OPEN: Gate = Gate { uplink: true, downlink: true };
+
+    /// Whether either direction is closed (so a Gate Status IE is worth sending).
+    fn is_restricted(self) -> bool {
+        !self.uplink || !self.downlink
+    }
+
+    fn gate_value(open: bool) -> GateStatusValue {
+        if open {
+            GateStatusValue::Open
+        } else {
+            GateStatusValue::Closed
+        }
+    }
+
+    /// The rs-pfcp Gate Status IE for this gate. `GateStatus::new` takes
+    /// `(downlink, uplink)`.
+    fn to_gate_status(self) -> GateStatus {
+        GateStatus::new(Gate::gate_value(self.downlink), Gate::gate_value(self.uplink))
+    }
+
+    /// Read a gate off a decoded QER's Gate Status IE.
+    fn from_gate_status(gs: &GateStatus) -> Self {
+        Gate {
+            uplink: matches!(gs.uplink_gate, GateStatusValue::Open),
+            downlink: matches!(gs.downlink_gate, GateStatusValue::Open),
+        }
+    }
+}
+
+/// A GBR flow's per-flow QER the SMF installs at the UPF: its classifier + MFBR + gate.
 #[derive(Debug, Clone, Copy)]
 pub struct FlowQer {
     pub qfi: u8,
     pub filter: FlowFilter,
     pub mfbr_dl_bps: u64,
     pub mfbr_ul_bps: u64,
+    /// The flow's gate (from the PCC rule's `flowStatus`) — a closed direction makes
+    /// the UPF drop this flow's packets that way. Default [`Gate::OPEN`].
+    pub gate: Gate,
 }
 
 /// A per-flow policer at the UPF: the classifier + its MFBR token buckets, plus
@@ -253,6 +306,9 @@ pub struct FlowQer {
 struct FlowEnforcer {
     qfi: u8,
     filter: FlowFilter,
+    /// The flow's gate (QER Gate Status): a closed direction drops the flow's packets
+    /// that way, before policing — so blocked traffic is neither forwarded nor measured.
+    gate: Gate,
     ul_bucket: TokenBucket,
     dl_bucket: TokenBucket,
     /// Per-flow URR volume measurement: forwarded bytes each direction.
@@ -304,10 +360,13 @@ fn packet_key(pkt: &[u8]) -> Option<PacketKey> {
 fn flow_create_ies(f: &FlowQer) -> (Ie, Ie, Ie) {
     let flow_qer_id = QerId::new(PER_FLOW_QER_BASE + u32::from(f.qfi));
     let flow_urr_id = UrrId::new(PER_FLOW_URR_BASE + u32::from(f.qfi));
-    let qer = CreateQer::builder(flow_qer_id)
-        .rate_limit(f.mfbr_ul_bps, f.mfbr_dl_bps)
-        .build()
-        .expect("build per-flow Create QER");
+    let mut qer_builder = CreateQer::builder(flow_qer_id).rate_limit(f.mfbr_ul_bps, f.mfbr_dl_bps);
+    // Only carry a Gate Status IE when the flow is actually restricted — an open gate is
+    // the default, so an unblocked flow's QER stays byte-for-byte as before (design/151).
+    if f.gate.is_restricted() {
+        qer_builder = qer_builder.gate_status(f.gate.to_gate_status());
+    }
+    let qer = qer_builder.build().expect("build per-flow Create QER");
     // Per-flow volume URR: this flow's usage measured separately (its own
     // rating group toward charging), reported at deletion.
     let urr = CreateUrr::new(
@@ -417,19 +476,30 @@ fn parse_branches(msg: &dyn rs_pfcp::message::Message) -> Vec<(u16, FlowFilter, 
 /// linked by `qer_id` to a Create QER's MBR. Used at establishment and when a
 /// mid-session modification adds flows.
 fn parse_created_flows(msg: &dyn rs_pfcp::message::Message) -> Vec<FlowQer> {
-    let qer_mbrs: HashMap<u32, Mbr> = msg
+    // Each per-flow QER carries its MBR and (optionally) a Gate Status — an absent IE
+    // means an open gate.
+    let qer_info: HashMap<u32, (Mbr, Gate)> = msg
         .ies(IeType::CreateQer)
         .filter_map(|ie| CreateQer::unmarshal(&ie.payload).ok())
-        .filter_map(|q| q.mbr.map(|m| (q.qer_id.value, m)))
+        .filter_map(|q| {
+            let gate = q.gate_status.as_ref().map(Gate::from_gate_status).unwrap_or_default();
+            q.mbr.map(|m| (q.qer_id.value, (m, gate)))
+        })
         .collect();
     msg.ies(IeType::CreatePdr)
         .filter_map(|ie| CreatePdr::unmarshal(&ie.payload).ok())
         .filter_map(|pdr| {
             let filter = FlowFilter::from_flow_description(&pdr.pdi.sdf_filter?.flow_description)?;
             let qer_id = pdr.qer_id?.value;
-            let mbr = qer_mbrs.get(&qer_id)?;
+            let (mbr, gate) = qer_info.get(&qer_id)?;
             let qfi = qer_id.saturating_sub(PER_FLOW_QER_BASE) as u8;
-            Some(FlowQer { qfi, filter, mfbr_dl_bps: mbr.downlink, mfbr_ul_bps: mbr.uplink })
+            Some(FlowQer {
+                qfi,
+                filter,
+                mfbr_dl_bps: mbr.downlink,
+                mfbr_ul_bps: mbr.uplink,
+                gate: *gate,
+            })
         })
         .collect()
 }
@@ -610,6 +680,15 @@ impl Session {
         let bytes = pkt.len();
         let flow_idx = packet_key(pkt)
             .and_then(|key| self.flow_qers.iter().position(|f| f.filter.matches(&key)));
+        // Gate Status (TS 29.244 §8.2.7): a matched flow whose gate is CLOSED in this
+        // direction is dropped outright — before policing and without counting bytes (a
+        // URR measures only forwarded traffic). Unmatched traffic has no per-flow gate.
+        if let Some(i) = flow_idx {
+            let gate = self.flow_qers[i].gate;
+            if !(if uplink { gate.uplink } else { gate.downlink }) {
+                return false;
+            }
+        }
         let bucket: Option<&mut TokenBucket> = match flow_idx {
             Some(i) if uplink => Some(&mut self.flow_qers[i].ul_bucket),
             Some(i) => Some(&mut self.flow_qers[i].dl_bucket),
@@ -922,6 +1001,7 @@ impl UpfState {
             .map(|f| FlowEnforcer {
                 qfi: f.qfi,
                 filter: f.filter,
+                gate: f.gate,
                 ul_bucket: TokenBucket::new(f.mfbr_ul_bps, now_nanos),
                 dl_bucket: TokenBucket::new(f.mfbr_dl_bps, now_nanos),
                 ul_bytes: 0,
@@ -1129,6 +1209,7 @@ impl UpfState {
             s.flow_qers.push(FlowEnforcer {
                 qfi: f.qfi,
                 filter: f.filter,
+                gate: f.gate,
                 ul_bucket: TokenBucket::new(f.mfbr_ul_bps, now_nanos),
                 dl_bucket: TokenBucket::new(f.mfbr_dl_bps, now_nanos),
                 ul_bytes: 0,
@@ -1144,6 +1225,16 @@ impl UpfState {
         {
             e.ul_bucket.set_rate(mfbr_ul_bps, now_nanos);
             e.dl_bucket.set_rate(mfbr_dl_bps, now_nanos);
+        }
+    }
+
+    /// Set a per-flow policer's gate (a mid-session Update QER Gate Status) — block or
+    /// unblock the flow's traffic per direction without disturbing its policer state.
+    fn set_flow_gate(&mut self, up_seid: u64, qfi: u8, gate: Gate) {
+        if let Some(e) =
+            self.sessions.get_mut(&up_seid).and_then(|s| s.flow_qers.iter_mut().find(|e| e.qfi == qfi))
+        {
+            e.gate = gate;
         }
     }
 
@@ -1530,8 +1621,12 @@ pub fn session_flow_modification_request(
         let uqers = update
             .iter()
             .map(|f| {
+                // Always carry the gate on an update: unlike a create (where an absent IE
+                // means the default open gate), a mid-session change must state the gate
+                // explicitly so re-opening a previously-closed flow reaches the UPF.
                 UpdateQer::builder(QerId::new(PER_FLOW_QER_BASE + u32::from(f.qfi)))
                     .mbr(Mbr::new(f.mfbr_ul_bps, f.mfbr_dl_bps))
+                    .gate_status(f.gate.to_gate_status())
                     .build()
                     .expect("build per-flow Update QER")
                     .to_ie()
@@ -1839,21 +1934,29 @@ pub fn handle_n4(
             for f in parse_created_flows(msg.as_ref()) {
                 state.add_flow(up_seid, f, now_nanos);
             }
-            // Update QERs re-rate the session AMBR (id 1) or a per-flow MFBR.
+            // Update QERs re-rate the session AMBR (id 1) or a per-flow QER — its MFBR
+            // (when the IE carries an MBR) and/or its Gate Status (a mid-session flow
+            // block/unblock, design/151 G18). A gate change may arrive with no MBR.
             for uq in msg
                 .ies(IeType::UpdateQer)
                 .filter_map(|ie| UpdateQer::unmarshal(&ie.payload).ok())
             {
-                let Some(mbr) = uq.mbr else { continue };
                 if uq.qer_id.value == AMBR_QER_ID {
-                    state.set_ambr(
-                        up_seid,
-                        SessionAmbr { uplink_bps: mbr.uplink, downlink_bps: mbr.downlink },
-                        now_nanos,
-                    );
+                    if let Some(mbr) = uq.mbr {
+                        state.set_ambr(
+                            up_seid,
+                            SessionAmbr { uplink_bps: mbr.uplink, downlink_bps: mbr.downlink },
+                            now_nanos,
+                        );
+                    }
                 } else {
                     let qfi = uq.qer_id.value.saturating_sub(PER_FLOW_QER_BASE) as u8;
-                    state.update_flow_rate(up_seid, qfi, mbr.downlink, mbr.uplink, now_nanos);
+                    if let Some(mbr) = uq.mbr {
+                        state.update_flow_rate(up_seid, qfi, mbr.downlink, mbr.uplink, now_nanos);
+                    }
+                    if let Some(gs) = uq.gate_status.as_ref() {
+                        state.set_flow_gate(up_seid, qfi, Gate::from_gate_status(gs));
+                    }
                 }
             }
             // Mid-session uplink-classifier changes (design/134 Phase 3e): a Create PDR+FAR
@@ -2666,6 +2769,7 @@ mod tests {
             filter: FlowFilter::transport(17, 5000, 5010),
             mfbr_dl_bps: 80_000,
             mfbr_ul_bps: 80_000,
+            gate: Gate::OPEN,
         };
         handle_n4(
             &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", Some(ambr), &[flow], None),
@@ -2690,6 +2794,81 @@ mod tests {
         // exhausted per-flow bucket.
         let other = udp_packet(40000, 9999, 1000);
         assert!(state.admit_uplink(teid, 0, &other), "non-GBR traffic still admitted on the session AMBR");
+    }
+
+    /// A gate survives the round-trip through the rs-pfcp Gate Status IE with its two
+    /// directions kept straight (the IE constructor takes downlink first, uplink second).
+    #[test]
+    fn gate_round_trips_through_gate_status_ie() {
+        for gate in [
+            Gate::OPEN,
+            Gate { uplink: false, downlink: false },
+            Gate { uplink: false, downlink: true },
+            Gate { uplink: true, downlink: false },
+        ] {
+            let back = Gate::from_gate_status(&gate.to_gate_status());
+            assert_eq!(back, gate, "gate {gate:?} preserved through the IE");
+        }
+        assert!(!Gate::OPEN.is_restricted(), "open gate carries no IE");
+        assert!(Gate { uplink: true, downlink: false }.is_restricted(), "a closed direction is restricted");
+    }
+
+    /// QER Gate Status (design/151, G18): a flow whose gate is CLOSED is dropped
+    /// outright — at establishment and via a mid-session Update QER, per direction —
+    /// while unmatched traffic (no per-flow gate) is unaffected.
+    #[test]
+    fn per_flow_gate_status_blocks_and_reopens_the_flow() {
+        let node_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let mut state = UpfState::new();
+        let (up_seid, teid) = (1u64, 1u32);
+        // Establish a GBR flow (QFI 2, UDP 5000–5010, huge MFBR) with its gate CLOSED
+        // both ways — so any drop is the gate, not the policer.
+        let mut flow = FlowQer {
+            qfi: 2,
+            filter: FlowFilter::transport(17, 5000, 5010),
+            mfbr_dl_bps: 1_000_000_000,
+            mfbr_ul_bps: 1_000_000_000,
+            gate: Gate { uplink: false, downlink: false },
+        };
+        handle_n4(
+            &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[flow], None),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("establish");
+
+        // Matched uplink is dropped by the closed gate; unmatched traffic still passes.
+        let matched = udp_packet(40000, 5005, 1000);
+        assert_eq!(state.admit_uplink(teid, 0, &matched), false, "closed uplink gate drops the flow");
+        let unmatched = udp_packet(40000, 9999, 1000);
+        assert!(state.admit_uplink(teid, 0, &unmatched), "unmatched traffic has no per-flow gate");
+
+        // Mid-session reopen (Update QER, gate OPEN): the flow passes again.
+        flow.gate = Gate::OPEN;
+        handle_n4(
+            &session_flow_modification_request(up_seid, 2, &[], &[flow], &[]),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("reopen");
+        assert!(state.admit_uplink(teid, 0, &matched), "reopened gate admits the flow");
+
+        // Mid-session per-direction close: uplink shut, downlink left open.
+        flow.gate = Gate { uplink: false, downlink: true };
+        handle_n4(
+            &session_flow_modification_request(up_seid, 2, &[], &[flow], &[]),
+            node_ip,
+            &mut state,
+            0,
+        )
+        .expect("close uplink");
+        assert_eq!(state.admit_uplink(teid, 0, &matched), false, "uplink re-closed drops uplink");
+        // A downlink packet whose source port is in the flow's range still matches the
+        // flow — and its gate direction is open.
+        let dl = udp_packet(5005, 40000, 1000);
+        assert!(state.admit_downlink(UE_IP, 0, &dl), "downlink gate left open still admits");
     }
 
     #[test]
@@ -2727,6 +2906,7 @@ mod tests {
             filter: FlowFilter::transport(17, 5000, 5010),
             mfbr_dl_bps: 80_000,
             mfbr_ul_bps: 80_000,
+            gate: Gate::OPEN,
         };
         handle_n4(
             &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[f2], None),
@@ -2743,6 +2923,7 @@ mod tests {
             filter: FlowFilter::transport(17, 6000, 6010),
             mfbr_dl_bps: 160_000,
             mfbr_ul_bps: 160_000,
+            gate: Gate::OPEN,
         };
         let f2_fast = FlowQer { mfbr_dl_bps: 800_000, mfbr_ul_bps: 800_000, ..f2 };
         handle_n4(
@@ -2870,6 +3051,7 @@ mod tests {
             filter: FlowFilter::transport(17, 5000, 5010),
             mfbr_dl_bps: 100_000_000,
             mfbr_ul_bps: 100_000_000,
+            gate: Gate::OPEN,
         };
         handle_n4(
             &session_establishment_request(0xCAFE, 1, node_ip, UE_IP, "internet", None, &[f2], None),
