@@ -79,6 +79,17 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// RFC 8705 certificate confirmation (`cnf`) — binds a token to the client certificate it
+/// was issued to via `x5t#S256`, the cert thumbprint. A resource server serving over mTLS
+/// refuses a token whose `cnf` does not match the presenting certificate, so a captured
+/// token cannot be replayed by a different NF (design/137 F4). radian uses hex(SHA-256(DER))
+/// as the thumbprint throughout (matching [`cert_thumbprint`] / [`ClientCert`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cnf {
+    #[serde(rename = "x5t#S256")]
+    pub x5t_s256: String,
+}
+
 /// Access-token claims (TS 29.510 §6.3.5.2.4 `AccessTokenClaims`, trimmed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessTokenClaims {
@@ -92,6 +103,11 @@ pub struct AccessTokenClaims {
     pub scope: String,
     pub iat: u64,
     pub exp: u64,
+    /// RFC 8705 certificate confirmation (design/137 F4). Present when the token was issued
+    /// to an mTLS caller; the resource server then binds the token to that certificate. Absent
+    /// (and unenforced) for tokens issued over cleartext SBI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Cnf>,
 }
 
 /// Sign an access token (HS256 JWT) with `secret`.
@@ -315,8 +331,9 @@ pub struct AccessTokenRsp {
 }
 
 /// The claims for a `client_credentials` request (issuer = NRF, subject = client,
-/// audience = target NF type).
-fn token_claims(nrf_id: &str, req: &AccessTokenReq) -> AccessTokenClaims {
+/// audience = target NF type). `cnf` sender-constrains the token to the caller's mTLS
+/// certificate thumbprint (design/137 F4) when one is present.
+fn token_claims(nrf_id: &str, req: &AccessTokenReq, cnf: Option<String>) -> AccessTokenClaims {
     let now = now_secs();
     AccessTokenClaims {
         iss: nrf_id.to_string(),
@@ -325,6 +342,7 @@ fn token_claims(nrf_id: &str, req: &AccessTokenReq) -> AccessTokenClaims {
         scope: req.scope.clone(),
         iat: now,
         exp: now + TOKEN_TTL_SECS,
+        cnf: cnf.map(|x5t_s256| Cnf { x5t_s256 }),
     }
 }
 
@@ -333,14 +351,21 @@ fn token_rsp(access_token: String) -> AccessTokenRsp {
 }
 
 /// Mint an HS256 access token (shared-secret mode). The NRF calls this once it has
-/// validated the request (e.g. the client is registered).
-pub fn issue_token(secret: &[u8], nrf_id: &str, req: &AccessTokenReq) -> AccessTokenRsp {
-    token_rsp(mint(secret, &token_claims(nrf_id, req)))
+/// validated the request (e.g. the client is registered). `cnf` sender-constrains the token
+/// to the caller's certificate thumbprint (design/137 F4) when issued over mTLS.
+pub fn issue_token(secret: &[u8], nrf_id: &str, req: &AccessTokenReq, cnf: Option<String>) -> AccessTokenRsp {
+    token_rsp(mint(secret, &token_claims(nrf_id, req, cnf)))
 }
 
-/// Mint an ES256 access token (asymmetric mode), signed with the NRF's private key.
-pub fn issue_token_es256(key: &Es256Key, nrf_id: &str, req: &AccessTokenReq) -> AccessTokenRsp {
-    token_rsp(key.mint(&token_claims(nrf_id, req)))
+/// Mint an ES256 access token (asymmetric mode), signed with the NRF's private key. `cnf`
+/// sender-constrains the token to the caller's certificate thumbprint (design/137 F4).
+pub fn issue_token_es256(
+    key: &Es256Key,
+    nrf_id: &str,
+    req: &AccessTokenReq,
+    cnf: Option<String>,
+) -> AccessTokenRsp {
+    token_rsp(key.mint(&token_claims(nrf_id, req, cnf)))
 }
 
 // ── Resource server (any protected NF) ────────────────────────────────────────
@@ -446,6 +471,22 @@ pub fn protect(router: Router, nf_type: &str, verifier: Option<TokenVerifier>) -
     }
 }
 
+/// The `401` a protected NF returns when a token is missing, invalid, or not bound to the
+/// presenting certificate.
+fn unauthorized(detail: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(crate::ProblemDetails {
+            status: Some(401),
+            title: Some("Unauthorized".into()),
+            cause: Some("UNAUTHORIZED".into()),
+            detail: Some(detail.into()),
+            ..Default::default()
+        }),
+    )
+        .into_response()
+}
+
 async fn require_token(State(cfg): State<AuthConfig>, req: Request, next: Next) -> Response {
     let bearer = req
         .headers()
@@ -458,7 +499,21 @@ async fn require_token(State(cfg): State<AuthConfig>, req: Request, next: Next) 
         None => None,
     };
     match result {
-        Some(Ok(_)) => next.run(req).await,
+        Some(Ok(claims)) => {
+            // RFC 8705 sender-constraint (design/137 F4): a token carrying a `cnf` thumbprint
+            // is bound to the certificate it was issued to, so the presenter must show that
+            // same client certificate — a captured token replayed by a different NF is
+            // refused. A token with no `cnf` was issued without mTLS and is not
+            // sender-constrained (the cleartext dev posture), so it passes.
+            if let Some(cnf) = &claims.cnf {
+                let presented = req.extensions().get::<ClientCert>().map(|c| c.0.as_str());
+                if presented != Some(cnf.x5t_s256.as_str()) {
+                    tracing::warn!(nf_type = %cfg.nf_type, "SBI request rejected: access token not bound to the presenting certificate");
+                    return unauthorized("access token bound to a different certificate");
+                }
+            }
+            next.run(req).await
+        }
         other => {
             let detail = match other {
                 None => "missing Bearer access token",
@@ -468,17 +523,7 @@ async fn require_token(State(cfg): State<AuthConfig>, req: Request, next: Next) 
                 _ => "malformed access token",
             };
             tracing::warn!(nf_type = %cfg.nf_type, "SBI request rejected: {detail}");
-            (
-                StatusCode::UNAUTHORIZED,
-                axum::Json(crate::ProblemDetails {
-                    status: Some(401),
-                    title: Some("Unauthorized".into()),
-                    cause: Some("UNAUTHORIZED".into()),
-                    detail: Some(detail.into()),
-                    ..Default::default()
-                }),
-            )
-                .into_response()
+            unauthorized(detail)
         }
     }
 }
@@ -578,6 +623,7 @@ mod tests {
             scope: "nudr-dr".into(),
             iat: 1000,
             exp,
+            cnf: None,
         }
     }
 
@@ -651,7 +697,7 @@ mod tests {
             target_nf_type: "UDR".into(),
             scope: "nudr-dr".into(),
         };
-        let rsp = issue_token(SECRET, "nrf-1", &req);
+        let rsp = issue_token(SECRET, "nrf-1", &req, None);
         assert_eq!(rsp.token_type, "Bearer");
         let claims = validate(SECRET, &rsp.access_token, "UDR", now_secs()).expect("valid now");
         assert_eq!((claims.iss.as_str(), claims.sub.as_str()), ("nrf-1", "udm-1"));
@@ -704,5 +750,58 @@ mod tests {
         let open = protect(Router::new().route("/x", get(|| async { "ok" })), "AUSF", None);
         let rsp = open.oneshot(get_x(None)).await.unwrap();
         assert_eq!(rsp.status(), StatusCode::OK);
+    }
+
+    /// design/137 F4 (RFC 8705 sender-constraint): a protected NF binds a `cnf`-carrying
+    /// token to the presenting client certificate — accepted only from the matching cert,
+    /// refused if replayed by a different (or no) certificate; a token with no `cnf` is not
+    /// sender-constrained and passes.
+    #[tokio::test]
+    async fn cnf_binds_a_token_to_the_presenting_certificate() {
+        // A UDR-audience token, optionally bound to a certificate thumbprint.
+        let bound = |fp: Option<&str>| AccessTokenClaims {
+            cnf: fp.map(|f| Cnf { x5t_s256: f.into() }),
+            ..claims("UDR", now_secs() + 3600)
+        };
+        // A protected router that presents `client_cert` as the mTLS serve path would.
+        fn make(client_cert: Option<&str>) -> Router {
+            let mut app = protect(
+                Router::new().route("/x", axum::routing::get(|| async { StatusCode::OK })),
+                "UDR",
+                Some(TokenVerifier::Shared(SECRET.to_vec())),
+            );
+            if let Some(fp) = client_cert {
+                app = app.layer(axum::Extension(ClientCert(fp.to_string())));
+            }
+            app
+        }
+        async fn spawn(app: Router) -> String {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            tokio::spawn(async move { crate::run_on(l, app).await.unwrap() });
+            format!("http://{addr}")
+        }
+        async fn status(base: &str, tok: String) -> StatusCode {
+            crate::sbi_client().get(format!("{base}/x")).bearer_auth(tok).send().await.unwrap().status()
+        }
+
+        // A server that presents client cert "cert-A".
+        let mtls = spawn(make(Some("cert-A"))).await;
+        // Bound to cert-A, presented at the cert-A server → accepted.
+        assert_eq!(status(&mtls, mint(SECRET, &bound(Some("cert-A")))).await, StatusCode::OK);
+        // Bound to a different certificate → refused (a replayed token).
+        assert_eq!(
+            status(&mtls, mint(SECRET, &bound(Some("cert-B")))).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // No `cnf` (cleartext issuance) → not sender-constrained → accepted.
+        assert_eq!(status(&mtls, mint(SECRET, &bound(None))).await, StatusCode::OK);
+
+        // A cleartext server (no presented certificate) refuses a cert-bound token.
+        let cleartext = spawn(make(None)).await;
+        assert_eq!(
+            status(&cleartext, mint(SECRET, &bound(Some("cert-A")))).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 }

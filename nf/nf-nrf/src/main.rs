@@ -38,6 +38,17 @@ async fn main() -> anyhow::Result<()> {
         }
         store
     };
+    // Per-consumer token authorization (design/137 F4): RADIAN_NRF_AUTHZ scopes which target
+    // NF types each consumer NF type may request a token for (grammar: consumer:targets;…,
+    // see nnrf::parse_authz_policy). Unset ⇒ any registered NF may request any target.
+    let store = match std::env::var("RADIAN_NRF_AUTHZ") {
+        Ok(spec) => {
+            let policy = sbi_core::nnrf::parse_authz_policy(&spec);
+            tracing::info!(consumers = policy.len(), "NRF authorizes access tokens per consumer NF type");
+            store.with_authz_policy(policy)
+        }
+        Err(_) => store,
+    };
     let sbi: SocketAddr = "0.0.0.0:8000".parse()?;
     match tls {
         Some(id) => sbi_core::tls::serve(sbi, sbi_core::nnrf::router(store), id).await?,
