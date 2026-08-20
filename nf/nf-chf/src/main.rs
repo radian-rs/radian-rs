@@ -32,10 +32,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = sbi_core::nchf::ChfState::new();
+    // Require an NRF-issued `CHF`-audience access token on every Nchf call when SBI
+    // security is on (design/149, G1). Open SBI (no verifier) is unchanged.
+    let router = sbi_core::oauth::protect(
+        sbi_core::nchf::router(state),
+        "CHF",
+        sbi_core::oauth::verifier(&nrf_base),
+    );
+    if sbi_core::oauth::verifier(&nrf_base).is_some() {
+        info!("Nchf protected by OAuth2 (audience CHF)");
+    }
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     match tls {
-        Some(id) => sbi_core::tls::serve(sbi, sbi_core::nchf::router(state), id).await?,
-        None => sbi_core::run(sbi, sbi_core::nchf::router(state)).await?,
+        Some(id) => sbi_core::tls::serve(sbi, router, id).await?,
+        None => sbi_core::run(sbi, router).await?,
     }
     Ok(())
 }

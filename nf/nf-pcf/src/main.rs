@@ -64,6 +64,12 @@ async fn main() -> anyhow::Result<()> {
     let am_state = sbi_core::npcf_am::AmPcfState::new(sbi_core::npcf_am::AmPolicyConfig::demo())
         .with_udr(udr);
     let router = sbi_core::npcf::router(state).merge(sbi_core::npcf_am::router(am_state));
+    // Require an NRF-issued `PCF`-audience access token on every Npcf call when SBI
+    // security is on (design/149, G1). Open SBI (no verifier) is unchanged.
+    let router = sbi_core::oauth::protect(router, "PCF", sbi_core::oauth::verifier(&nrf_base));
+    if sbi_core::oauth::verifier(&nrf_base).is_some() {
+        info!("Npcf protected by OAuth2 (audience PCF)");
+    }
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     match tls {
         Some(id) => sbi_core::tls::serve(sbi, router, id).await?,

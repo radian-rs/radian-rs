@@ -175,10 +175,21 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("NRF registration failed (continuing without discovery): {e}"),
     }
 
+    // Require an NRF-issued `SMF`-audience access token on every Nsmf call when SBI
+    // security is on (design/149, G1) — the AMF is the caller for PDU-session create.
+    // Open SBI (no verifier) is unchanged.
+    let router = sbi_core::oauth::protect(
+        pdu_session::router(smf),
+        "SMF",
+        sbi_core::oauth::verifier(&nrf_base),
+    );
+    if sbi_core::oauth::verifier(&nrf_base).is_some() {
+        tracing::info!("Nsmf protected by OAuth2 (audience SMF)");
+    }
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     match tls {
-        Some(id) => sbi_core::tls::serve(sbi, pdu_session::router(smf), id).await?,
-        None => sbi_core::run(sbi, pdu_session::router(smf)).await?,
+        Some(id) => sbi_core::tls::serve(sbi, router, id).await?,
+        None => sbi_core::run(sbi, router).await?,
     }
     Ok(())
 }

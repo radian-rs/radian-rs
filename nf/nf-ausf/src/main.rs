@@ -63,10 +63,21 @@ async fn main() -> anyhow::Result<()> {
         Some(t) => sbi_core::nausf::AusfState::with_tokens(udm_base, t),
         None => sbi_core::nausf::AusfState::new(udm_base),
     };
+    // Require an NRF-issued `AUSF`-audience access token on every Nausf call when SBI
+    // security is on (design/149, G1) — the AUSF drives 5G-AKA and returns Kseaf, so it
+    // must not answer unauthenticated callers. Open SBI (no verifier) is unchanged.
+    let router = sbi_core::oauth::protect(
+        sbi_core::nausf::router(state),
+        "AUSF",
+        sbi_core::oauth::verifier(&nrf_base),
+    );
+    if sbi_core::oauth::verifier(&nrf_base).is_some() {
+        tracing::info!("Nausf protected by OAuth2 (audience AUSF)");
+    }
     let sbi: SocketAddr = format!("0.0.0.0:{sbi_port}").parse()?;
     match tls {
-        Some(id) => sbi_core::tls::serve(sbi, sbi_core::nausf::router(state), id).await?,
-        None => sbi_core::run(sbi, sbi_core::nausf::router(state)).await?,
+        Some(id) => sbi_core::tls::serve(sbi, router, id).await?,
+        None => sbi_core::run(sbi, router).await?,
     }
     Ok(())
 }

@@ -41,10 +41,20 @@ async fn main() -> anyhow::Result<()> {
         tracking_areas = state.availability().len(),
         "NSSF up: per-TA slice availability provisioned"
     );
+    // Require an NRF-issued `NSSF`-audience access token on every Nnssf call when SBI
+    // security is on (design/149, G1). Open SBI (no verifier) is unchanged.
+    let router = sbi_core::oauth::protect(
+        sbi_core::nnssf::router(state),
+        "NSSF",
+        sbi_core::oauth::verifier(&nrf_base),
+    );
+    if sbi_core::oauth::verifier(&nrf_base).is_some() {
+        info!("Nnssf protected by OAuth2 (audience NSSF)");
+    }
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
     match tls {
-        Some(id) => sbi_core::tls::serve(sbi, sbi_core::nnssf::router(state), id).await?,
-        None => sbi_core::run(sbi, sbi_core::nnssf::router(state)).await?,
+        Some(id) => sbi_core::tls::serve(sbi, router, id).await?,
+        None => sbi_core::run(sbi, router).await?,
     }
     Ok(())
 }
