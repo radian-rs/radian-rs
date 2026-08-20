@@ -152,6 +152,8 @@ where
 #[given("a clean test environment")]
 async fn clean_environment(world: &mut World) {
     assert!(!world.feature_tag.is_empty(), "feature must declare a tag for resource scoping");
+    // A clean environment is unsecured by default; the secured feature opts in after.
+    SBI_SECURED.store(false, std::sync::atomic::Ordering::Relaxed);
     // Sweep whatever a crashed prior run of this feature left behind.
     let _ = netns::kill_host_procs("target/debug/nf-").await;
     let _ = netns::kill_host_procs("target/debug/radian-du").await;
@@ -303,6 +305,17 @@ impl UpMode {
 
 #[when("I start the radian core")]
 async fn start_core(world: &mut World) {
+    SBI_SECURED.store(false, std::sync::atomic::Ordering::Relaxed);
+    start_core_inner(world, UpMode::Single).await;
+}
+
+/// Bring the core up with **SBI security on** (design/152): every NF shares the HS256
+/// secret, so the NRF issues OAuth2 access tokens, producers enforce them, and
+/// consumers attach them — the whole secured mesh, across real processes. Otherwise
+/// identical to a single-UPF `I start the radian core`.
+#[when("I start the secured radian core")]
+async fn start_secured_core(world: &mut World) {
+    SBI_SECURED.store(true, std::sync::atomic::Ordering::Relaxed);
     start_core_inner(world, UpMode::Single).await;
 }
 
@@ -551,6 +564,17 @@ async fn start_core_inner(world: &mut World, mode: UpMode) {
     }
 }
 
+/// Shared HS256 SBI secret (hex) for the `@sbi_security` feature (design/152). When
+/// [`SBI_SECURED`] is set, [`spawn_core_as`] adds it to every NF as `RADIAN_SBI_SECRET`,
+/// so the NRF issues OAuth2 tokens, producers enforce them (design/149) and consumers
+/// attach them (design/150) — the whole secured mesh, over real processes.
+const BDD_SBI_SECRET: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+/// Whether the core being spawned runs with SBI security on. Set by "I start the
+/// secured radian core", cleared by the plain start/stop steps. The suite is serial
+/// (`max_concurrent_scenarios(1)`), so a process-global flag is safe.
+static SBI_SECURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Spawn one radian NF in the host namespace (under sudo when `root`), tracking it;
 /// its stdout+stderr are captured to `/tmp/<tag>_<nf>.log` for log-assertion steps.
 async fn spawn_core(tag: &str, root: bool, env: &[(&str, &str)], name: &str) -> tokio::process::Child {
@@ -569,7 +593,14 @@ async fn spawn_core_as(
 ) -> tokio::process::Child {
     let bin = radian_bin(bin_name);
     assert!(bin.exists(), "nf-{bin_name} not found at {} — run `cargo build`", bin.display());
-    netns::spawn_host_env_logged(root, env, &bin.to_string_lossy(), &[], &nf_log(tag, log_name))
+    // With SBI security on (@sbi_security), every NF shares the same HS256 secret: the
+    // NRF then issues OAuth2 tokens, producers enforce them (design/149), and consumers
+    // attach them (design/150). The UPF has no SBI, so it just ignores the var.
+    let mut env = env.to_vec();
+    if SBI_SECURED.load(std::sync::atomic::Ordering::Relaxed) {
+        env.push(("RADIAN_SBI_SECRET", BDD_SBI_SECRET));
+    }
+    netns::spawn_host_env_logged(root, &env, &bin.to_string_lossy(), &[], &nf_log(tag, log_name))
         .await
         .unwrap_or_else(|e| panic!("spawn nf-{bin_name}: {e}"))
 }
@@ -1657,6 +1688,7 @@ async fn scripted_core_running(_world: &mut World) {
 
 #[when("I stop the radian core")]
 async fn stop_core_only(_world: &mut World) {
+    SBI_SECURED.store(false, std::sync::atomic::Ordering::Relaxed);
     netns::kill_host_procs("target/debug/nf-").await.expect("kill radian core");
     // Killing the UPFs removes their TUNs (and any route bound to them); the breakout
     // anchor's `ip rule` is device-independent, so clear it explicitly (Phase 3d).
