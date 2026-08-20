@@ -37,7 +37,7 @@ state and predictable identifiers on unauthenticated network segments.
 | # | Sev | Finding | Location | Reachability |
 |---|-----|---------|----------|--------------|
 | F1 | **HIGH** ✅ | NAS integrity has no COUNT monotonicity → message replay | `nas/src/lib.rs:1790` | Malicious gNB / on-path N2 |
-| F2 | **HIGH** ◐ | NEF northbound fully unauthenticated (external trust boundary) | `nf-nef/src/main.rs:76`, `nnef.rs:266` | External AF / anyone reachable |
+| F2 | **HIGH** ✅ | NEF northbound fully unauthenticated (external trust boundary) | `nf-nef/src/main.rs:76`, `nnef.rs:266` | External AF / anyone reachable |
 | F3 | **HIGH** ✅ | UDM serves auth vectors (K_AUSF) + subscriber data with no token check | `nf-udm/src/main.rs:55`, `nudm.rs:383` | Plaintext: network; mTLS: any core cert |
 | F4 | **HIGH** ◐ | NRF issues OAuth tokens not bound to caller; scope never enforced | `nnrf.rs:308`, `oauth.rs:305,434` | Any registrable/core peer |
 | F5 | **HIGH** ✅ | User-plane anti-spoofing is family-conditional → source spoof onto N6 | `n6/src/lib.rs:98-109` | **Any ordinary subscriber** |
@@ -74,7 +74,7 @@ line. Progress so far:
 | F7 | **PARTIAL** | `crates/pfcp/src/lib.rs` — DoS sub-issue closed: the session table is capped (`DEFAULT_MAX_SESSIONS`, `set_max_sessions`, `RADIAN_UPF_MAX_SESSIONS`), a full UPF rejects further establishment with `NoResourcesAvailable`; test `session_table_is_capped_against_an_establishment_flood`. **Deferred** (see detail): unpredictable TEID/SEID, N3/N4 peer-source validation, `valid_gnb_target` RAN-prefix allowlist |
 | F3 | **FIXED** | `nf/nf-udm/src/main.rs` wraps `nudm::router` in `oauth::protect(_, "UDM", verifier)`; the UDM's clients (AUSF, AMF, SMF) attach an NRF-issued `UDM` token when SBI security is on (`NudmClient::with_tokens`, `AusfState::with_tokens`). Opt-in — no change when OAuth is off. Test `protected_udm_requires_a_valid_access_token`; BDD 45/501 green |
 | F4 | **PARTIAL** | mTLS cert-binding (RFC 8705): `tls.rs` surfaces the peer cert thumbprint (`oauth::ClientCert`/`cert_thumbprint`) to handlers; the NRF binds each NF registration to it and refuses to issue a token — or re-register — under a different certificate (`nnrf.rs` register/`access_token`). Closes identity-spoofing + registration-hijack. Tests `nrf_binds_tokens_to_the_registering_client_certificate`, mTLS thumbprint assertion; opt-in, BDD 45/501 green. **Deferred:** per-consumer-type authorization of `targetNfType`/`scope`, and resource-server `cnf` thumbprint verification (token non-replayability) |
-| F2 | **PARTIAL** | `crates/sbi-core/src/nnef.rs` + `nf/nf-nef/src/main.rs` — the NEF northbound now authenticates the calling AF: with `RADIAN_NEF_AF_KEYS=af:key[,…]` set (`NefState::with_af_keys`), `create_subscription`/`delete_subscription` require `Authorization: Bearer <key>` matching the key provisioned for the request's path `af_id` (constant-time `ct_eq`); a missing/wrong key — or an AF acting under another's `af_id` — is refused `401` with a uniform status (no `af_id` enumeration). Opt-in — unset ⇒ open (dev), logged as a warning. **No automated test yet** (siblings ship one). **Deferred** (see detail): per-request authorization of the target `supi`/`dnn`/`dnai` against an AF SLA |
+| F2 | **FIXED** | `crates/sbi-core/src/nnef.rs` + `nf/nf-nef/src/main.rs`. **Authentication:** with `RADIAN_NEF_AF_KEYS=af:key[,…]` (`with_af_keys`), a request must carry `Authorization: Bearer <key>` matching the key provisioned for its path `af_id` (constant-time `ct_eq`); missing/wrong key — or an AF reusing another's `af_id` — is `401` (uniform, no enumeration). **Authorization:** with `RADIAN_NEF_AF_SLA=af\|dnns\|dnais\|supis\|group` (`with_af_slas`/`parse_af_slas`, `AfSla`), `authorize_request` bounds each request to the AF's contracted DNN, DNAIs (all routes), SUPI scope (prefix), and group/any-UE permission — out-of-scope ⇒ `403`, deny-by-default (an AF with no SLA is refused). A subscription is owned by its creating `af_id`, so one AF cannot delete another's (`take_owned`). Both opt-in; unset ⇒ open (dev), warned. Tests `api_key_authenticates_the_af`, `sla_confines_an_af_to_its_contracted_scope`, `an_af_cannot_delete_another_afs_subscription`, `parse_af_slas_reads_the_env_grammar` |
 
 All other findings are open.
 
@@ -106,19 +106,32 @@ All other findings are open.
 
 ### F2 — NEF northbound is unauthenticated (external boundary)
 
-- **Status:** ◐ **PARTIAL** (branch `audit`). **Done — AF authentication:** the NEF
-  northbound now authenticates the calling AF with a per-AF API key. With
-  `RADIAN_NEF_AF_KEYS=af:key[,…]` set (`NefState::with_af_keys`), `create_subscription`
-  and `delete_subscription` require `Authorization: Bearer <key>` whose key is the one
-  provisioned for the request's path `af_id`, compared in constant time (`ct_eq`); a
-  missing/wrong key — or an AF presenting another AF's `af_id` — is refused `401` with a
-  uniform status so provisioned `af_id`s cannot be enumerated. Opt-in: with the env unset
-  the northbound is open (dev default), logged as a warning so it is never silently
-  unauthenticated, and the default/BDD path is unchanged. **No automated test yet**
-  (siblings F3/F4 ship one). **Deferred:** per-request *authorization* — validating the
-  target `supi`/`dnn`/`dnai` against an AF SLA (allowed DNNs, DNAIs, UE scope) before
-  translating to SMF/PCF/UDR — so an authenticated AF still cannot steer subscribers
-  outside its contracted scope.
+- **Status:** ✅ **FIXED** (branch `audit`). The NEF now both **authenticates** the
+  calling AF and **authorizes** what it may do.
+  - *Authentication.* With `RADIAN_NEF_AF_KEYS=af:key[,…]` (`NefState::with_af_keys`),
+    `create_subscription`/`delete_subscription` require `Authorization: Bearer <key>` whose
+    key is the one provisioned for the request's path `af_id`, compared in constant time
+    (`ct_eq`); a missing/wrong key — or an AF presenting another AF's `af_id` — is refused
+    `401` with a uniform status so provisioned `af_id`s cannot be enumerated.
+  - *Authorization (the F2 SLA).* With `RADIAN_NEF_AF_SLA` (`with_af_slas` / `parse_af_slas`,
+    grammar `af_id|dnns|dnais|supis|group`), `authorize_request` bounds every request to the
+    AF's contracted scope **before** translating it to the SMF/PCF/UDR: the target `dnn` must
+    be granted, **every** `trafficRoutes[].dnai` must be granted (not just the first the
+    handler applies), the target/group `supi`s must fall inside the AF's SUPI prefixes, and a
+    group / any-UE influence is refused unless the SLA grants it — the exact verb the exploit
+    used to reprogram routing network-wide. Each dimension is deny-by-default (`*` opens it),
+    an AF absent from the SLA map is refused, and a violation returns `403`.
+  - *Resource ownership.* A subscription records its creating `af_id`; a delete is honored
+    only for the owner (`take_owned`), so one AF cannot withdraw — or probe for — another's
+    influence.
+  - Both controls are opt-in (unset ⇒ open dev default, logged as a warning; the default/BDD
+    path is unchanged), consistent with the rest of the SBI security posture; configuring an
+    SLA without keys is warned at startup, since the `af_id` selecting it is then unverified.
+    Tests: `api_key_authenticates_the_af`, `sla_confines_an_af_to_its_contracted_scope`,
+    `an_af_cannot_delete_another_afs_subscription`, `parse_af_slas_reads_the_env_grammar`.
+    **Residual (deployment, not a code gap):** the SLA is operator-provisioned static config,
+    and external-group membership (`externalGroupId` → `supis`) is still resolved by the
+    caller rather than at the UDM/UDR.
 - **Class:** Broken access control at the exposure boundary. **File:**
   `nf/nf-nef/src/main.rs:76-81` (serves `nnef::router` directly, never `protect`);
   handlers `crates/sbi-core/src/nnef.rs:266-323` (`create_subscription`), `404-441`.
