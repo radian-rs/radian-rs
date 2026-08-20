@@ -12,7 +12,7 @@
 //! The first slice is AF → NEF → SMF **direct**; the PCF-mediated path is design/135 Phase 2.
 
 use crate::otel::Traced;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -107,9 +107,94 @@ impl Applied {
 /// What a live subscription steers, remembered so a delete can reverse it — and *how* it
 /// was applied, since that decides how it is withdrawn.
 struct Subscription {
+    /// The `af_id` that created it — a delete is honored only for the owning AF, so one AF
+    /// cannot withdraw another's influence (design/137 F2).
+    af_id: String,
     supi: String,
     dnn: Option<String>,
     applied: Applied,
+}
+
+/// A per-AF **service-level agreement** — the scope of traffic-influence an authenticated
+/// AF is contracted for (design/137 F2). Authentication (the API key) proves *who* the AF
+/// is; the SLA bounds *what* it may do, so an AF cannot steer subscribers, DNNs, or edges
+/// outside its contract even with a valid key.
+///
+/// Every allow-list is **deny-by-default**: an empty set permits nothing in that dimension,
+/// and the wildcard `"*"` permits anything. An AF that is authenticated but has no SLA entry
+/// is refused outright (see [`NefState::authorize_request`]).
+#[derive(Debug, Clone, Default)]
+pub struct AfSla {
+    /// DNNs the AF may influence. A request naming a DNN outside this set — or omitting the
+    /// DNN under anything but a `"*"` contract — is refused.
+    pub dnns: HashSet<String>,
+    /// DNAIs (breakout edges) the AF may steer traffic to. **Every** `trafficRoutes[].dnai`
+    /// must be permitted, so an AF cannot smuggle an attacker-chosen edge past the first.
+    pub dnais: HashSet<String>,
+    /// SUPIs the AF may target, matched as **prefixes**: an IMSI/PLMN prefix scopes a whole
+    /// range, an exact SUPI scopes one UE. Applies to the single-UE `supi`/`gpsi` target and
+    /// to each explicit member of a group influence.
+    pub supis: HashSet<String>,
+    /// Whether the AF may create **group / any-UE** influences (`anyUeInd` / `externalGroupId`),
+    /// which write UDR influence data every PCF applies network-wide. Off by default — the
+    /// broadest, most dangerous verb, so it must be granted explicitly.
+    pub allow_group: bool,
+}
+
+impl AfSla {
+    /// Membership with a `"*"` wildcard escape.
+    fn permits(set: &HashSet<String>, value: &str) -> bool {
+        set.contains("*") || set.contains(value)
+    }
+
+    fn permits_dnn(&self, dnn: Option<&str>) -> bool {
+        match dnn {
+            Some(d) => Self::permits(&self.dnns, d),
+            // An unspecified DNN can't be checked against a specific contract, so it is
+            // allowed only under a wildcard grant.
+            None => self.dnns.contains("*"),
+        }
+    }
+
+    /// A SUPI is in scope if the contract is `"*"`, or the SUPI starts with a listed prefix.
+    /// (Empty prefixes are dropped at parse time so they can't match everything by accident.)
+    fn permits_supi(&self, supi: &str) -> bool {
+        self.supis.contains("*") || self.supis.iter().any(|p| supi.starts_with(p.as_str()))
+    }
+}
+
+/// Parse the `RADIAN_NEF_AF_SLA` grammar into a per-AF SLA map. AFs are separated by `;`,
+/// and each AF is five `|`-separated fields:
+/// `af_id | dnns | dnais | supis | group`, where the three list fields are comma-separated
+/// (or `*` for any, empty for none) and `group` is `yes`/`true`/`1` for group-influence
+/// permission (anything else, including empty, is `false`). Malformed AF entries (missing
+/// fields, empty id) are skipped. Example:
+/// `app1|internet,ims|mec,edge1|imsi-99970|no;app2|*|edge2|*|yes`.
+pub fn parse_af_slas(spec: &str) -> HashMap<String, AfSla> {
+    let set = |field: &str| -> HashSet<String> {
+        field
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    spec.split(';')
+        .filter_map(|entry| {
+            let mut fields = entry.split('|');
+            let af_id = fields.next()?.trim();
+            let (dnns, dnais, supis, group) =
+                (fields.next()?, fields.next()?, fields.next()?, fields.next()?);
+            if af_id.is_empty() {
+                return None;
+            }
+            let allow_group = matches!(group.trim(), "yes" | "true" | "1");
+            Some((
+                af_id.to_string(),
+                AfSla { dnns: set(dnns), dnais: set(dnais), supis: set(supis), allow_group },
+            ))
+        })
+        .collect()
 }
 
 /// NEF runtime: how to reach the PCF/SMF, plus the live subscriptions.
@@ -134,6 +219,11 @@ pub struct NefState {
     /// wrong) AF cannot steer subscribers' traffic. The NEF is the external trust boundary,
     /// so — unlike the intra-core OAuth mesh — the AF is authenticated by a shared key.
     af_keys: Option<Arc<HashMap<String, String>>>,
+    /// Per-AF SLAs (`af_id` → [`AfSla`]) authorizing the **content** of a request — the DNN,
+    /// DNAIs, subscribers, and group scope the AF is contracted for (design/137 F2). `None` ⇒
+    /// authorization is disabled (dev default); when set, an authenticated AF may only
+    /// influence what its SLA permits, and an AF with no SLA entry is refused.
+    af_slas: Option<Arc<HashMap<String, AfSla>>>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -174,6 +264,17 @@ impl NefState {
         self
     }
 
+    /// Authorize each AF request against a per-AF SLA (design/137 F2): once set, an
+    /// authenticated AF may only influence the DNNs/DNAIs/subscribers — and the group scope —
+    /// its [`AfSla`] grants, and an AF with no SLA entry is refused. An empty map is treated
+    /// as "no SLAs configured" (authorization disabled). See [`parse_af_slas`] for the env
+    /// grammar. Pair this with [`with_af_keys`](Self::with_af_keys): without authentication
+    /// the `af_id` is only an unverified path segment, so the SLA it selects is spoofable.
+    pub fn with_af_slas(mut self, slas: HashMap<String, AfSla>) -> Self {
+        self.af_slas = (!slas.is_empty()).then(|| Arc::new(slas));
+        self
+    }
+
     fn build(
         nrf_base: Option<String>,
         smf_base: Option<String>,
@@ -185,6 +286,7 @@ impl NefState {
             pcf_base,
             udr_base: None,
             af_keys: None,
+            af_slas: None,
             inner: Arc::new(Mutex::new(Inner {
                 next_id: AtomicU64::new(1),
                 subs: HashMap::new(),
@@ -228,6 +330,70 @@ impl NefState {
         }
     }
 
+    /// Authorize the **content** of an AF request against the AF's SLA (design/137 F2): the
+    /// authenticated AF may only influence DNNs/DNAIs/subscribers it is contracted for, and
+    /// may only create network-wide group / any-UE influences if its SLA permits it. This is
+    /// what stops an AF — even one holding a valid API key — from steering an arbitrary
+    /// subscriber to an attacker-chosen edge or reprogramming routing network-wide.
+    ///
+    /// With no SLA map configured this is a no-op (authorization disabled — the dev default).
+    /// With a map configured, enforcement is **deny-by-default**: an AF absent from the map is
+    /// refused. Failures return `403` (authenticated but not authorized — distinct from the
+    /// `401` of [`authorize_af`](Self::authorize_af)); the reason is echoed to the AF (which
+    /// knows its own contract) and logged.
+    fn authorize_request(
+        &self,
+        af_id: &str,
+        sub: &TrafficInfluSub,
+    ) -> Result<(), axum::response::Response> {
+        let Some(slas) = &self.af_slas else {
+            return Ok(()); // no SLAs configured — authorization disabled (dev)
+        };
+        let deny = |reason: &str| -> axum::response::Response {
+            tracing::warn!(%af_id, reason, "NEF refused an AF request: outside SLA");
+            (
+                StatusCode::FORBIDDEN,
+                Json(crate::ProblemDetails {
+                    status: Some(403),
+                    title: Some("Forbidden".into()),
+                    cause: Some("AF_NOT_AUTHORIZED".into()),
+                    detail: Some(format!("request outside AF SLA: {reason}")),
+                    ..Default::default()
+                }),
+            )
+                .into_response()
+        };
+        let Some(sla) = slas.get(af_id) else {
+            return Err(deny("no SLA provisioned for this AF"));
+        };
+        if !sla.permits_dnn(sub.dnn.as_deref()) {
+            return Err(deny("DNN not permitted"));
+        }
+        // Every route target must be in scope — not just the first one the handler applies.
+        for route in &sub.traffic_routes {
+            if !AfSla::permits(&sla.dnais, &route.dnai) {
+                return Err(deny("DNAI not permitted"));
+            }
+        }
+        // UE scope. A group / any-UE influence is the broadest verb, gated by `allow_group`;
+        // a bounded group (explicit SUPIs, not any-UE) must additionally stay within scope.
+        if sub.any_ue_ind || sub.external_group_id.is_some() {
+            if !sla.allow_group {
+                return Err(deny("group / any-UE influence not permitted"));
+            }
+            if !sub.any_ue_ind {
+                for supi in &sub.supis {
+                    if !sla.permits_supi(supi) {
+                        return Err(deny("group member SUPI outside scope"));
+                    }
+                }
+            }
+        } else if sub.supi.as_deref().or(sub.gpsi.as_deref()).is_some_and(|t| !sla.permits_supi(t)) {
+            return Err(deny("target SUPI outside scope"));
+        }
+        Ok(())
+    }
+
     /// The SMF base URL — the explicit override, else NRF discovery.
     async fn smf_base(&self) -> Option<String> {
         self.peer_base(self.smf_base.as_ref(), "SMF").await
@@ -258,16 +424,25 @@ impl NefState {
             .service_base()
     }
 
-    fn record(&self, supi: String, dnn: Option<String>, applied: Applied) -> String {
+    fn record(&self, af_id: String, supi: String, dnn: Option<String>, applied: Applied) -> String {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
         let sub_id = format!("sub-{id}");
-        inner.subs.insert(sub_id.clone(), Subscription { supi, dnn, applied });
+        inner.subs.insert(sub_id.clone(), Subscription { af_id, supi, dnn, applied });
         sub_id
     }
 
-    fn take(&self, sub_id: &str) -> Option<Subscription> {
-        self.inner.lock().unwrap().subs.remove(sub_id)
+    /// Remove and return a subscription **only if `af_id` owns it**. A caller asking to
+    /// delete an unknown subscription, or one owned by another AF, gets `None` (and the
+    /// subscription is left untouched) — so a delete neither withdraws another AF's influence
+    /// nor reveals that the id exists.
+    fn take_owned(&self, sub_id: &str, af_id: &str) -> Option<Subscription> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.subs.get(sub_id).is_some_and(|s| s.af_id == af_id) {
+            inner.subs.remove(sub_id)
+        } else {
+            None
+        }
     }
 
     /// Number of live subscriptions (test/introspection).
@@ -333,6 +508,11 @@ async fn create_subscription(
     if let Err(resp) = nef.authorize_af(&af_id, &headers) {
         return resp;
     }
+    // Authentication proved *who* the AF is; the SLA bounds *what* it may steer, before we
+    // translate anything to the SMF/PCF/UDR (design/137 F2).
+    if let Err(resp) = nef.authorize_request(&af_id, &sub) {
+        return resp;
+    }
     let Some(prefix) = steer_prefix(&sub) else {
         return (StatusCode::BAD_REQUEST, "no traffic prefix (prefix or a filter destination)")
             .into_response();
@@ -373,7 +553,8 @@ async fn create_subscription(
     };
     match applied {
         Ok(applied) => {
-            let sub_id = nef.record(single_ue.unwrap_or_default(), sub.dnn.clone(), applied.clone());
+            let sub_id =
+                nef.record(af_id.clone(), single_ue.unwrap_or_default(), sub.dnn.clone(), applied.clone());
             let self_link = format!("/3gpp-traffic-influence/v1/{af_id}/subscriptions/{sub_id}");
             tracing::info!(%af_id, %sub_id, %prefix, %dnai, how = applied.label(), "AF traffic influence authorized");
             (
@@ -475,8 +656,10 @@ async fn delete_subscription(
     if let Err(resp) = nef.authorize_af(&af_id, &headers) {
         return resp;
     }
-    // Idempotent: an unknown subscription is already gone.
-    let Some(sub) = nef.take(&sub_id) else {
+    // Idempotent, and scoped to the owner: an unknown subscription — or one belonging to a
+    // different AF — is treated as already gone, so an AF can neither withdraw another's
+    // influence nor probe for foreign subscription ids (design/137 F2).
+    let Some(sub) = nef.take_owned(&sub_id, &af_id) else {
         return StatusCode::NO_CONTENT.into_response();
     };
     // Withdraw the way it was authorized: delete the PCF app-session (the PCF drops the
@@ -604,5 +787,210 @@ mod tests {
         assert_eq!(seen[1]["supi"], "imsi-1");
         assert_eq!(seen[1]["dnn"], "internet");
         assert_eq!(seen[1]["remove"], true);
+    }
+
+    /// A mock SMF recording every `/oam/v1/breakout` body; returns its base URL and the buffer.
+    async fn spawn_mock_smf() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        use axum::routing::post;
+        let recorder: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec = recorder.clone();
+        let smf = Router::new()
+            .route(
+                "/oam/v1/breakout",
+                post(
+                    |State(rec): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+                     Json(b): Json<serde_json::Value>| async move {
+                        rec.lock().unwrap().push(b);
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(rec);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(l, smf).await.unwrap() });
+        (format!("http://{addr}"), recorder)
+    }
+
+    /// Serve `state` as a NEF; returns its base URL.
+    async fn spawn_nef(state: NefState) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { crate::run_on(l, router(state)).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// A minimal single-UE influence body, targeting `supi`/`dnn` and steering to `dnai`.
+    fn influence(supi: &str, dnn: &str, dnai: &str) -> serde_json::Value {
+        serde_json::json!({
+            "supi": supi, "dnn": dnn, "prefix": "10.99.0.0/16",
+            "trafficRoutes": [{ "dnai": dnai }]
+        })
+    }
+
+    /// The `RADIAN_NEF_AF_SLA` grammar parses per-AF scopes, with `*` = any and empty = none;
+    /// malformed entries are skipped.
+    #[test]
+    fn parse_af_slas_reads_the_env_grammar() {
+        let map = parse_af_slas("app1|internet,ims|mec,edge1|imsi-99970|no;app2|*|edge2|*|yes");
+        assert_eq!(map.len(), 2);
+
+        let a1 = &map["app1"];
+        assert!(a1.permits_dnn(Some("internet")) && a1.permits_dnn(Some("ims")));
+        assert!(!a1.permits_dnn(Some("operator")));
+        assert!(!a1.permits_dnn(None), "a bare DNN needs a wildcard grant");
+        assert!(AfSla::permits(&a1.dnais, "mec") && AfSla::permits(&a1.dnais, "edge1"));
+        assert!(!AfSla::permits(&a1.dnais, "edge2"));
+        assert!(a1.permits_supi("imsi-999700000000001"), "IMSI prefix match");
+        assert!(!a1.permits_supi("imsi-001010000000001"));
+        assert!(!a1.allow_group);
+
+        let a2 = &map["app2"];
+        assert!(a2.permits_dnn(Some("anything")) && a2.permits_dnn(None), "wildcard DNN");
+        assert!(a2.permits_supi("imsi-anything"), "wildcard SUPI");
+        assert!(!AfSla::permits(&a2.dnais, "mec"), "app2 is scoped to edge2 only");
+        assert!(a2.allow_group);
+
+        // Too few fields, or an empty id, are skipped rather than half-parsed.
+        assert!(parse_af_slas("bad|only|three").is_empty());
+        assert!(parse_af_slas("|a|b|c|yes").is_empty());
+    }
+
+    /// design/137 F2 (authentication): with per-AF keys configured, the NEF refuses a request
+    /// that carries no key, a wrong key, or another AF's key reused under a foreign `af_id`;
+    /// the AF's own key on its own path is accepted.
+    #[tokio::test]
+    async fn api_key_authenticates_the_af() {
+        let (smf, _rec) = spawn_mock_smf().await;
+        let nef = NefState::with_smf_base(smf)
+            .with_af_keys(HashMap::from([("app1".to_string(), "s3cret-key".to_string())]));
+        let base = spawn_nef(nef.clone()).await;
+        let client = crate::sbi_client();
+        let url = format!("{base}/3gpp-traffic-influence/v1/app1/subscriptions");
+        let body = influence("imsi-1", "internet", "mec");
+
+        // No Authorization header → 401.
+        let anon = client.post(&url).json(&body).traced().send().await.unwrap();
+        assert_eq!(anon.status(), StatusCode::UNAUTHORIZED, "a keyless request is rejected");
+
+        // Wrong key → 401.
+        let wrong =
+            client.post(&url).bearer_auth("nope").json(&body).traced().send().await.unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        // app1's key presented under app2's path → 401: a key can't be reused under another id.
+        let cross = format!("{base}/3gpp-traffic-influence/v1/app2/subscriptions");
+        let reused =
+            client.post(&cross).bearer_auth("s3cret-key").json(&body).traced().send().await.unwrap();
+        assert_eq!(reused.status(), StatusCode::UNAUTHORIZED, "a key is bound to its af_id");
+
+        // The right key on the right path → accepted.
+        let ok =
+            client.post(&url).bearer_auth("s3cret-key").json(&body).traced().send().await.unwrap();
+        assert_eq!(ok.status(), StatusCode::CREATED);
+        assert_eq!(nef.subscription_count(), 1);
+    }
+
+    /// design/137 F2 (authorization): a per-AF SLA confines an authenticated AF to the DNN,
+    /// DNAI, subscriber, and group scope it is contracted for — every out-of-scope request is
+    /// refused `403` and never reaches the SMF, and an AF with no SLA at all is denied.
+    #[tokio::test]
+    async fn sla_confines_an_af_to_its_contracted_scope() {
+        let (smf, rec) = spawn_mock_smf().await;
+        let sla = AfSla {
+            dnns: ["internet"].into_iter().map(String::from).collect(),
+            dnais: ["mec"].into_iter().map(String::from).collect(),
+            supis: ["imsi-9997"].into_iter().map(String::from).collect(),
+            allow_group: false,
+        };
+        let nef = NefState::with_smf_base(smf)
+            .with_af_slas(HashMap::from([("app1".to_string(), sla)]));
+        let base = spawn_nef(nef.clone()).await;
+        let client = crate::sbi_client();
+        let url = format!("{base}/3gpp-traffic-influence/v1/app1/subscriptions");
+
+        // In scope: DNN internet, DNAI mec, an imsi-9997… subscriber → created, reaches the SMF.
+        let ok = client
+            .post(&url)
+            .json(&influence("imsi-999700000000001", "internet", "mec"))
+            .traced()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::CREATED);
+        assert_eq!(rec.lock().unwrap().len(), 1, "the in-scope influence reached the SMF");
+
+        // Each out-of-scope dimension is refused with 403.
+        let cases = [
+            (influence("imsi-999700000000001", "internet", "attacker-edge"), "DNAI"),
+            (influence("imsi-999700000000001", "ims", "mec"), "DNN"),
+            (influence("imsi-001010000000001", "internet", "mec"), "SUPI"),
+            (
+                serde_json::json!({
+                    "anyUeInd": true, "dnn": "internet", "prefix": "10.99.0.0/16",
+                    "trafficRoutes": [{ "dnai": "mec" }]
+                }),
+                "any-UE",
+            ),
+        ];
+        for (body, which) in cases {
+            let resp = client.post(&url).json(&body).traced().send().await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{which} out of scope must be 403");
+        }
+
+        // An AF with no SLA entry is denied outright (deny-by-default).
+        let other = format!("{base}/3gpp-traffic-influence/v1/app2/subscriptions");
+        let no_sla = client
+            .post(&other)
+            .json(&influence("imsi-999700000000001", "internet", "mec"))
+            .traced()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_sla.status(), StatusCode::FORBIDDEN, "an AF with no SLA is refused");
+
+        // Only the single in-scope influence was ever translated to the SMF.
+        assert_eq!(rec.lock().unwrap().len(), 1, "no denied influence reached the SMF");
+        assert_eq!(nef.subscription_count(), 1);
+    }
+
+    /// design/137 F2: a subscription is owned by the AF that created it — another AF's delete
+    /// is a no-op (and non-revealing), only the owner can withdraw it.
+    #[tokio::test]
+    async fn an_af_cannot_delete_another_afs_subscription() {
+        let (smf, _rec) = spawn_mock_smf().await;
+        let nef = NefState::with_smf_base(smf); // ownership holds even with auth/authz off
+        let base = spawn_nef(nef.clone()).await;
+        let client = crate::sbi_client();
+
+        // app1 creates a subscription.
+        let created = client
+            .post(format!("{base}/3gpp-traffic-influence/v1/app1/subscriptions"))
+            .json(&influence("imsi-1", "internet", "mec"))
+            .traced()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let self_link =
+            created.headers().get("location").unwrap().to_str().unwrap().to_string();
+        let sub_id = self_link.rsplit('/').next().unwrap();
+        assert_eq!(nef.subscription_count(), 1);
+
+        // app2 tries to delete it by id → 204, but nothing is withdrawn.
+        let foreign = client
+            .delete(format!("{base}/3gpp-traffic-influence/v1/app2/subscriptions/{sub_id}"))
+            .traced()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::NO_CONTENT);
+        assert_eq!(nef.subscription_count(), 1, "a foreign delete must not withdraw the influence");
+
+        // The owner deletes it → gone.
+        let owner =
+            client.delete(format!("{base}{self_link}")).traced().send().await.unwrap();
+        assert_eq!(owner.status(), StatusCode::NO_CONTENT);
+        assert_eq!(nef.subscription_count(), 0);
     }
 }

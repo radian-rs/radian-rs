@@ -26,6 +26,12 @@ const UDR_ENV: &str = "RADIAN_NEF_UDR";
 /// Per-AF API keys authenticating the northbound (design/137 F2), as
 /// `af1:key1,af2:key2`. Unset ⇒ the northbound is open (dev).
 const AF_KEYS_ENV: &str = "RADIAN_NEF_AF_KEYS";
+/// Per-AF SLAs authorizing the *content* of a request (design/137 F2): the DNNs, DNAIs,
+/// subscribers, and group scope each AF is contracted for. Grammar (see
+/// `nnef::parse_af_slas`): `af_id|dnns|dnais|supis|group` per AF, `;`-separated, list fields
+/// comma-separated (`*` = any, empty = none), `group` = `yes`/`true`/`1`. Unset ⇒ authorization
+/// is disabled (dev).
+const AF_SLA_ENV: &str = "RADIAN_NEF_AF_SLA";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -91,6 +97,21 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => warn!(
             "NEF northbound is UNAUTHENTICATED — set {AF_KEYS_ENV}=af:key[,…] to require AF API keys"
         ),
+    }
+    // AF authorization (design/137 F2): bound each AF to its contracted DNN/DNAI/subscriber
+    // and group scope. Unset ⇒ authorization is disabled (an authenticated AF may steer
+    // anything). Configuring SLAs without keys is weak — the `af_id` selecting the SLA is then
+    // just an unverified path segment — so warn on that combination.
+    if let Ok(spec) = std::env::var(AF_SLA_ENV) {
+        let slas = sbi_core::nnef::parse_af_slas(&spec);
+        info!(afs = slas.len(), "NEF authorizes AF requests against per-AF SLAs");
+        if std::env::var(AF_KEYS_ENV).is_err() {
+            warn!(
+                "{AF_SLA_ENV} is set but {AF_KEYS_ENV} is not — the af_id selecting an SLA is \
+                 unauthenticated and spoofable; provision AF API keys alongside SLAs"
+            );
+        }
+        state = state.with_af_slas(slas);
     }
 
     let sbi: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
