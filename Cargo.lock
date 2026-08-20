@@ -1879,6 +1879,8 @@ dependencies = [
  "anyhow",
  "common",
  "sbi-core",
+ "serde",
+ "serde_yml",
  "tokio",
  "tracing",
 ]
@@ -1991,6 +1993,8 @@ dependencies = [
  "gtpu",
  "n6",
  "pfcp",
+ "serde",
+ "serde_yml",
  "tokio",
  "tracing",
 ]

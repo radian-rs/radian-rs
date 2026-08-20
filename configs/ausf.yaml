@@ -1,0 +1,10 @@
+# radian-rs AUSF configuration (design/147 G5 foundation, extended to the AUSF in
+# design/148). Point RADIAN_AUSF_CONFIG at this file. Any RADIAN_AUSF_* env var overrides
+# the value here (env > file > default). Unknown keys are rejected (deny-unknown-fields).
+
+# SBI listen port (Nausf_UEAuthentication).
+sbi-port: 8003
+# NRF base URL — the AUSF registers here and discovers peers through it.
+nrf: http://127.0.0.1:8000
+# UDM base URL for Nudm_UEAuthentication (NRF-based discovery of the UDM is a follow-up).
+udm: http://127.0.0.1:8004

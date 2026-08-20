@@ -60,6 +60,9 @@ const N6_MASK_ENV: &str = "RADIAN_UPF_N6_MASK";
 const N6_ADDR6_ENV: &str = "RADIAN_UPF_N6_ADDR6";
 /// Override the ceiling on concurrent PFCP sessions (design/137 F7).
 const MAX_SESSIONS_ENV: &str = "RADIAN_UPF_MAX_SESSIONS";
+/// Path to this UPF's YAML config file (design/147 G5, extended to the UPF in
+/// design/148). Each `RADIAN_UPF_*` env var still overrides the file value.
+const CONFIG_ENV: &str = "RADIAN_UPF_CONFIG";
 const N6_TUN_NAME: &str = "n6upf0";
 const N6_UPF_ADDR: Ipv4Addr = Ipv4Addr::new(10, 45, 0, 1);
 const N6_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 0, 0);
@@ -69,9 +72,26 @@ const N6_MTU: u16 = 1400; // headroom under 1500 for the N3 GTP-U/UDP/IP outer h
 const N6_UPF_ADDR6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
 const N6_PREFIX_LEN6: u8 = 32;
 
-/// Read an env var of type `T` (parsed), falling back to `default`.
-fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+/// The UPF's YAML config (design/147 G5 foundation, extended to the UPF in design/148)
+/// — one file replacing the scattered `RADIAN_UPF_*` env reads. Every field is
+/// optional: an absent field falls through to its env var (which always overrides) or
+/// the built-in default. Keys are kebab-case (`n3-addr`, `n6-tun`, …).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct UpfConfig {
+    /// N3/N4 address advertised to peers (the F-TEID address the gNB sends uplink to).
+    n3_addr: Option<Ipv4Addr>,
+    /// Local bind address for the N3/N4 sockets.
+    bind: Option<String>,
+    /// Ceiling on concurrent PFCP sessions (design/137 F7).
+    max_sessions: Option<usize>,
+    /// N6 TUN device name.
+    n6_tun: Option<String>,
+    /// The UPF's N6 gateway address (inside the UE IP pool).
+    n6_addr: Option<Ipv4Addr>,
+    n6_mask: Option<Ipv4Addr>,
+    /// IPv6 gateway, or the string `none` for a v4-only N6.
+    n6_addr6: Option<String>,
 }
 
 type Upf = Arc<Mutex<pfcp::UpfState>>;
@@ -81,18 +101,20 @@ async fn main() -> anyhow::Result<()> {
     common::init_telemetry("upf");
     common::banner("upf");
 
+    // Per-NF config (design/147 G5): load the YAML file if RADIAN_UPF_CONFIG points at
+    // one, then read each setting as env > file > default via `config::resolve`.
+    let cfg: UpfConfig = common::config::load(CONFIG_ENV)?;
+    use common::config::{resolve, resolve_opt};
+
     let mut upf = pfcp::UpfState::new();
-    // Bound the session table (design/137 F7); override the default per deployment.
-    if let Some(n) = std::env::var(MAX_SESSIONS_ENV).ok().and_then(|v| v.parse().ok()) {
+    // Bound the session table (design/137 F7); env overrides the config value.
+    if let Some(n) = resolve_opt(MAX_SESSIONS_ENV, cfg.max_sessions) {
         upf.set_max_sessions(n);
     }
     let state: Upf = Arc::new(Mutex::new(upf));
 
-    let node_ip: Ipv4Addr = std::env::var(N3_ADDR_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(Ipv4Addr::LOCALHOST);
-    let bind = std::env::var(BIND_ENV).unwrap_or_else(|_| "0.0.0.0".to_string());
+    let node_ip: Ipv4Addr = resolve(N3_ADDR_ENV, cfg.n3_addr, Ipv4Addr::LOCALHOST);
+    let bind = resolve(BIND_ENV, cfg.bind, "0.0.0.0".to_string());
 
     let n4 = Arc::new(
         tokio::net::UdpSocket::bind(format!("{bind}:{}", pfcp::N4_PORT))
@@ -107,15 +129,16 @@ async fn main() -> anyhow::Result<()> {
     info!(%bind, %node_ip, n4_port = pfcp::N4_PORT, n3_port = gtpu::GTPU_PORT, "UPF up: N4 (PFCP) + N3 (GTP-U)");
 
     // N6 config: env-overridable so a second anchor can host its own DN (design/134).
-    let n6_tun = std::env::var(N6_TUN_ENV).unwrap_or_else(|_| N6_TUN_NAME.to_string());
-    let n6_addr = env_or(N6_ADDR_ENV, N6_UPF_ADDR);
-    let n6_mask = env_or(N6_MASK_ENV, N6_NETMASK);
-    // The v6 gateway is opt-out: `RADIAN_UPF_N6_ADDR6=none` disables v6 (a v4-only
-    // breakout anchor), else the env value or the default 2001:db8::1.
-    let n6_addr6 = match std::env::var(N6_ADDR6_ENV).as_deref() {
-        Ok("none") => None,
-        Ok(v) => v.parse().ok().map(|a| (a, N6_PREFIX_LEN6)),
-        Err(_) => Some((N6_UPF_ADDR6, N6_PREFIX_LEN6)),
+    let n6_tun = resolve(N6_TUN_ENV, cfg.n6_tun, N6_TUN_NAME.to_string());
+    let n6_addr = resolve(N6_ADDR_ENV, cfg.n6_addr, N6_UPF_ADDR);
+    let n6_mask = resolve(N6_MASK_ENV, cfg.n6_mask, N6_NETMASK);
+    // The v6 gateway is opt-out: `RADIAN_UPF_N6_ADDR6=none` (or `n6-addr6: none` in the
+    // file) disables v6 for a v4-only breakout anchor; else the resolved address, else
+    // the default 2001:db8::1.
+    let n6_addr6 = match resolve_opt::<String>(N6_ADDR6_ENV, cfg.n6_addr6).as_deref() {
+        Some("none") => None,
+        Some(v) => v.parse().ok().map(|a| (a, N6_PREFIX_LEN6)),
+        None => Some((N6_UPF_ADDR6, N6_PREFIX_LEN6)),
     };
 
     // N6 is the privileged edge: opening a TUN needs CAP_NET_ADMIN. Degrade gracefully.
@@ -401,6 +424,19 @@ mod tests {
     use std::net::Ipv4Addr;
 
     const UE_IP: Ipv4Addr = Ipv4Addr::new(10, 45, 0, 2);
+
+    /// The shipped sample config parses into `UpfConfig` — `deny_unknown_fields` keeps
+    /// `configs/upf.yaml` and the struct from drifting apart (design/148).
+    #[test]
+    fn sample_config_matches_struct() {
+        let cfg: super::UpfConfig = serde_yml::from_str(include_str!("../../../configs/upf.yaml"))
+            .expect("configs/upf.yaml parses");
+        assert_eq!(cfg.n3_addr, Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(cfg.n6_tun.as_deref(), Some("n6upf0"));
+        assert_eq!(cfg.n6_addr, Some(Ipv4Addr::new(10, 45, 0, 1)));
+        assert_eq!(cfg.n6_addr6.as_deref(), Some("2001:db8::1"));
+        assert!(cfg.max_sessions.is_none(), "the commented-out field stays absent");
+    }
 
     /// Establish a session through the real N4 path (UPF allocates the N3 TEID) and, if
     /// `gnb` is given, install the downlink target via Session Modification.

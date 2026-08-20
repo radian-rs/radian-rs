@@ -9,4 +9,8 @@ common.workspace = true
 sbi-core.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+serde.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+serde_yml = "0.0.12"
