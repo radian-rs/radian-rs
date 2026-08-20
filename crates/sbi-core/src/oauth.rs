@@ -512,6 +512,21 @@ async fn require_token(State(cfg): State<AuthConfig>, req: Request, next: Next) 
                     return unauthorized("access token bound to a different certificate");
                 }
             }
+            // Per-scope authorization (design/154): beyond the audience, the token's
+            // granted `scope` must cover the invoked *service*. SBI service APIs are
+            // `/{serviceName}/v{n}/...` (e.g. `/nudm-sdm/v2/...`) and a token's scope is
+            // the space-separated list of service names the NRF granted, so the first
+            // path segment must appear in it. Callback surfaces (`n<nf>-callback`) are
+            // audience-authorized only — a notification is not a service operation and
+            // its sender does not request a per-service scope.
+            let service = req.uri().path().trim_start_matches('/').split('/').next().unwrap_or("");
+            if !service.is_empty()
+                && !service.ends_with("-callback")
+                && !claims.scope.split_whitespace().any(|g| g.eq_ignore_ascii_case(service))
+            {
+                tracing::warn!(nf_type = %cfg.nf_type, service, scope = %claims.scope, "SBI request rejected: token scope does not authorize this service");
+                return unauthorized("access token scope does not authorize this service");
+            }
             next.run(req).await
         }
         other => {
@@ -709,47 +724,71 @@ mod tests {
     /// `None` verifier (SBI security off — the default and BDD path) leaves the router
     /// open so unauthenticated calls still succeed.
     #[tokio::test]
-    async fn protect_enforces_audience_and_is_open_without_a_verifier() {
+    async fn protect_enforces_audience_scope_and_is_open_without_a_verifier() {
         use axum::body::Body;
         use axum::http::{header::AUTHORIZATION, Request, StatusCode};
         use axum::{routing::get, Router};
         use tower::ServiceExt; // oneshot
 
-        // Audience "AUSF" — one of the producers protected by this slice.
+        // A realistic AUSF service path: the middleware derives the required scope
+        // (`nausf-auth`) from the first path segment (design/154).
+        const PATH: &str = "/nausf-auth/v1/ue-authentications";
         let app = || {
             protect(
-                Router::new().route("/x", get(|| async { "ok" })),
+                Router::new().route(PATH, get(|| async { "ok" })),
                 "AUSF",
                 Some(TokenVerifier::Shared(SECRET.to_vec())),
             )
         };
-        let get_x = |bearer: Option<String>| {
-            let mut b = Request::builder().uri("/x");
+        let get_path = |bearer: Option<String>| {
+            let mut b = Request::builder().uri(PATH);
             if let Some(t) = bearer {
                 b = b.header(AUTHORIZATION, format!("Bearer {t}"));
             }
             b.body(Body::empty()).unwrap()
         };
+        let token = |aud: &str, scope: &str| {
+            mint(
+                SECRET,
+                &AccessTokenClaims {
+                    iss: "nrf-1".into(),
+                    sub: "amf-1".into(),
+                    aud: aud.into(),
+                    scope: scope.into(),
+                    iat: 1000,
+                    exp: now_secs() + 100,
+                    cnf: None,
+                },
+            )
+        };
+        let status = |app: Router, bearer: Option<String>| async move {
+            app.oneshot(get_path(bearer)).await.unwrap().status()
+        };
 
         // No token → 401.
-        let rsp = app().oneshot(get_x(None)).await.unwrap();
-        assert_eq!(rsp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(status(app(), None).await, StatusCode::UNAUTHORIZED);
+        // Valid token for a *different* audience → 401 (audience mismatch).
+        assert_eq!(
+            status(app(), Some(token("SMF", "nausf-auth"))).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Right audience, but a scope that doesn't cover `nausf-auth` → 401 (design/154).
+        assert_eq!(
+            status(app(), Some(token("AUSF", "nudm-sdm"))).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Right audience + a scope covering the service → 200.
+        assert_eq!(status(app(), Some(token("AUSF", "nausf-auth"))).await, StatusCode::OK);
+        // A multi-service scope that includes it also passes.
+        assert_eq!(
+            status(app(), Some(token("AUSF", "nausf-auth nudm-sdm"))).await,
+            StatusCode::OK
+        );
 
-        // A valid token for a *different* audience → 401 (audience mismatch).
-        let wrong = mint(SECRET, &claims("SMF", now_secs() + 100));
-        let rsp = app().oneshot(get_x(Some(wrong))).await.unwrap();
-        assert_eq!(rsp.status(), StatusCode::UNAUTHORIZED);
-
-        // A valid AUSF-audience token → passes through (200).
-        let ok = mint(SECRET, &claims("AUSF", now_secs() + 100));
-        let rsp = app().oneshot(get_x(Some(ok))).await.unwrap();
-        assert_eq!(rsp.status(), StatusCode::OK);
-
-        // No verifier (open SBI) → unauthenticated call still succeeds — proving the
-        // rollout is a no-op when SBI security is off.
-        let open = protect(Router::new().route("/x", get(|| async { "ok" })), "AUSF", None);
-        let rsp = open.oneshot(get_x(None)).await.unwrap();
-        assert_eq!(rsp.status(), StatusCode::OK);
+        // No verifier (open SBI) → unauthenticated call still succeeds — the rollout is
+        // a no-op when SBI security is off.
+        let open = protect(Router::new().route(PATH, get(|| async { "ok" })), "AUSF", None);
+        assert_eq!(status(open, None).await, StatusCode::OK);
     }
 
     /// design/137 F4 (RFC 8705 sender-constraint): a protected NF binds a `cnf`-carrying
@@ -765,8 +804,12 @@ mod tests {
         };
         // A protected router that presents `client_cert` as the mTLS serve path would.
         fn make(client_cert: Option<&str>) -> Router {
+            // A real UDR service path, so the `nudr-dr` scope covers it and only the
+            // `cnf` binding is under test here (design/154 scope check is exercised by
+            // `protect_enforces_audience_scope_and_is_open_without_a_verifier`).
             let mut app = protect(
-                Router::new().route("/x", axum::routing::get(|| async { StatusCode::OK })),
+                Router::new()
+                    .route("/nudr-dr/v2/x", axum::routing::get(|| async { StatusCode::OK })),
                 "UDR",
                 Some(TokenVerifier::Shared(SECRET.to_vec())),
             );
@@ -782,7 +825,13 @@ mod tests {
             format!("http://{addr}")
         }
         async fn status(base: &str, tok: String) -> StatusCode {
-            crate::sbi_client().get(format!("{base}/x")).bearer_auth(tok).send().await.unwrap().status()
+            crate::sbi_client()
+                .get(format!("{base}/nudr-dr/v2/x"))
+                .bearer_auth(tok)
+                .send()
+                .await
+                .unwrap()
+                .status()
         }
 
         // A server that presents client cert "cert-A".
