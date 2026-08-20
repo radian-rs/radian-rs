@@ -894,11 +894,21 @@ async fn main() -> anyhow::Result<()> {
 
     // SBI callback surface (namf-callback): the UDR notifies subscription
     // withdrawals here (design/38). Registered with the NRF so it can be found.
+    // Require an NRF-issued `AMF`-audience access token on every callback when SBI
+    // security is on (design/149, G1). Open SBI (no verifier) is unchanged.
     let sbi_addr: SocketAddr = format!("0.0.0.0:{SBI_PORT}").parse()?;
+    let namf_router = sbi_core::oauth::protect(
+        namf_callback_router(),
+        "AMF",
+        sbi_core::oauth::verifier(NRF_BASE.as_str()),
+    );
+    if sbi_core::oauth::verifier(NRF_BASE.as_str()).is_some() {
+        info!("Namf callback surface protected by OAuth2 (audience AMF)");
+    }
     tokio::spawn(async move {
         let serve = match tls {
-            Some(id) => sbi_core::tls::serve(sbi_addr, namf_callback_router(), id).await,
-            None => sbi_core::run(sbi_addr, namf_callback_router()).await,
+            Some(id) => sbi_core::tls::serve(sbi_addr, namf_router, id).await,
+            None => sbi_core::run(sbi_addr, namf_router).await,
         };
         if let Err(e) = serve {
             error!("AMF SBI server failed: {e}");

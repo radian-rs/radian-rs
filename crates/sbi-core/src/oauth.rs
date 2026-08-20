@@ -635,4 +635,53 @@ mod tests {
         let claims = validate(SECRET, &rsp.access_token, "UDR", now_secs()).expect("valid now");
         assert_eq!((claims.iss.as_str(), claims.sub.as_str()), ("nrf-1", "udm-1"));
     }
+
+    /// The `protect` middleware end-to-end (design/149, G1): the enforcement primitive
+    /// every producer NF now wraps its router with. A `Some` verifier rejects a request
+    /// with no / wrong-audience token (401) and passes a correct-audience token; a
+    /// `None` verifier (SBI security off — the default and BDD path) leaves the router
+    /// open so unauthenticated calls still succeed.
+    #[tokio::test]
+    async fn protect_enforces_audience_and_is_open_without_a_verifier() {
+        use axum::body::Body;
+        use axum::http::{header::AUTHORIZATION, Request, StatusCode};
+        use axum::{routing::get, Router};
+        use tower::ServiceExt; // oneshot
+
+        // Audience "AUSF" — one of the producers protected by this slice.
+        let app = || {
+            protect(
+                Router::new().route("/x", get(|| async { "ok" })),
+                "AUSF",
+                Some(TokenVerifier::Shared(SECRET.to_vec())),
+            )
+        };
+        let get_x = |bearer: Option<String>| {
+            let mut b = Request::builder().uri("/x");
+            if let Some(t) = bearer {
+                b = b.header(AUTHORIZATION, format!("Bearer {t}"));
+            }
+            b.body(Body::empty()).unwrap()
+        };
+
+        // No token → 401.
+        let rsp = app().oneshot(get_x(None)).await.unwrap();
+        assert_eq!(rsp.status(), StatusCode::UNAUTHORIZED);
+
+        // A valid token for a *different* audience → 401 (audience mismatch).
+        let wrong = mint(SECRET, &claims("SMF", now_secs() + 100));
+        let rsp = app().oneshot(get_x(Some(wrong))).await.unwrap();
+        assert_eq!(rsp.status(), StatusCode::UNAUTHORIZED);
+
+        // A valid AUSF-audience token → passes through (200).
+        let ok = mint(SECRET, &claims("AUSF", now_secs() + 100));
+        let rsp = app().oneshot(get_x(Some(ok))).await.unwrap();
+        assert_eq!(rsp.status(), StatusCode::OK);
+
+        // No verifier (open SBI) → unauthenticated call still succeeds — proving the
+        // rollout is a no-op when SBI security is off.
+        let open = protect(Router::new().route("/x", get(|| async { "ok" })), "AUSF", None);
+        let rsp = open.oneshot(get_x(None)).await.unwrap();
+        assert_eq!(rsp.status(), StatusCode::OK);
+    }
 }
