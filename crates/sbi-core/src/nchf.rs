@@ -25,8 +25,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::SbiError;
 
-/// One used-unit container (TS 32.291 §6.1.6.2.24, trimmed): the volume consumed
-/// under one rating group since the previous report.
+/// One used-unit container (TS 32.291 §6.1.6.2.24, trimmed): the volume **and packet
+/// count** consumed under one rating group since the previous report. The UPF measures
+/// both (design/155, G18); packet counts default to `0` for a peer that omits them.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsedUnitContainer {
@@ -35,6 +36,12 @@ pub struct UsedUnitContainer {
     pub uplink_volume: u64,
     pub downlink_volume: u64,
     pub total_volume: u64,
+    #[serde(default)]
+    pub uplink_packets: u64,
+    #[serde(default)]
+    pub downlink_packets: u64,
+    #[serde(default)]
+    pub total_packets: u64,
 }
 
 /// PDU-session identity on a charging session (TS 32.291, trimmed).
@@ -92,6 +99,9 @@ impl Cdr {
             e.uplink_volume += c.uplink_volume;
             e.downlink_volume += c.downlink_volume;
             e.total_volume += c.total_volume;
+            e.uplink_packets += c.uplink_packets;
+            e.downlink_packets += c.downlink_packets;
+            e.total_packets += c.total_packets;
         }
     }
 }
@@ -314,12 +324,15 @@ mod tests {
         (state, ChfClient::new(format!("http://{addr}")))
     }
 
-    fn usage(rating_group: u32, ul: u64, dl: u64) -> UsedUnitContainer {
+    fn usage(rating_group: u32, ul: u64, dl: u64, ulp: u64, dlp: u64) -> UsedUnitContainer {
         UsedUnitContainer {
             rating_group,
             uplink_volume: ul,
             downlink_volume: dl,
             total_volume: ul + dl,
+            uplink_packets: ulp,
+            downlink_packets: dlp,
+            total_packets: ulp + dlp,
         }
     }
 
@@ -341,13 +354,13 @@ mod tests {
         assert_eq!(state.open_sessions(), 1);
 
         // Two mid-session usage reports (session-level rating group 0 + QFI 2).
-        req.used_unit_containers = vec![usage(0, 1000, 500)];
+        req.used_unit_containers = vec![usage(0, 1000, 500, 10, 5)];
         client.update(&charging_ref, &req).await.expect("update 1");
-        req.used_unit_containers = vec![usage(0, 200, 100), usage(2, 50, 25)];
+        req.used_unit_containers = vec![usage(0, 200, 100, 2, 1), usage(2, 50, 25, 1, 1)];
         client.update(&charging_ref, &req).await.expect("update 2");
 
         // Release with the final delta; the CDR closes with everything summed.
-        req.used_unit_containers = vec![usage(0, 10, 5)];
+        req.used_unit_containers = vec![usage(0, 10, 5, 1, 0)];
         client.release(&charging_ref, &req).await.expect("release");
 
         let cdr = state.cdr(&charging_ref).expect("CDR exists");
@@ -356,6 +369,10 @@ mod tests {
         assert_eq!(cdr.usage[&0].uplink_volume, 1210);
         assert_eq!(cdr.usage[&0].downlink_volume, 605);
         assert_eq!(cdr.usage[&2].total_volume, 75);
+        // Packet counts accumulate per rating group alongside volume (design/155).
+        assert_eq!(cdr.usage[&0].uplink_packets, 13);
+        assert_eq!(cdr.usage[&0].total_packets, 19);
+        assert_eq!(cdr.usage[&2].total_packets, 2);
         assert_eq!(state.open_sessions(), 0);
 
         // A released session refuses further updates; unknown refs are 404.

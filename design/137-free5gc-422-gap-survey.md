@@ -182,10 +182,11 @@ Gaps (control plane — Go is far more spec-faithful):
   mid-session); GBR is ceiling-only; precedence written but never evaluated (branch
   order = PDR id); RemoveFar/RemoveUrr/UpdatePdr unread; ~~QueryUrr unread~~ **honoured now**
   ([153](153-n4-query-urr.md) — a Query URR in a Session Modification returns the URR's
-  live cumulative usage as a report in the response); no PERIO/duration/quota measurement,
-  no packet counts (flags hardcoded TOVOL|ULVOL|DLVOL), fake URSEQN, no StartTime/EndTime,
-  ~~no reports in Modification Response~~ (query reports now emitted). → **G18** (GateStatus
-  + QueryURR done; rest remain)
+  live cumulative usage as a report in the response); no PERIO/duration/quota measurement;
+  ~~no packet counts (flags hardcoded TOVOL|ULVOL|DLVOL)~~ **packet counts measured +
+  reported + accumulated in the CHF now** ([155](155-n4-urr-packet-counts.md)); fake
+  URSEQN, no StartTime/EndTime, ~~no reports in Modification Response~~ (query reports now
+  emitted). → **G18** (GateStatus + QueryURR + packet-counts done; rest remain)
 - ~~**Downlink G-PDUs carry no QFI/PDU Session Container**~~ **CLOSED**
   ([139](139-upf-downlink-qfi.md)): `n6::downlink` (v4+v6), the buffered flush,
   and SLAAC RAs now stamp the QFI (matched GBR flow's, else `DEFAULT_QFI`) — the
@@ -413,7 +414,7 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 | **G15** | SMContextStatusNotify + UpPathChg event notification (SMF→AMF, SMF→NEF/AF) | Minor–Mod | S | P2 | completes the NEF story ([135](135-nef-af-traffic-influence.md)) |
 | **G16** | **Nsmf wire fidelity** — multipart N1/N2 containers, SMF-side NAS-SM + N2 transfer-IE codecs, n2SmInfoType/hoState | Moderate (interop) | **L** | P2 | §2; decide via §7 pivot question first |
 | **G17** | NSSF conformance: GET+query wire shape, PDU-session path, NsiInformation, TAI keying, rejected-in-PLMN/TA split | Moderate | M | P2 | §3.5 |
-| **G18** | **N4 generic rule engine** — real PDR/FAR/QER/URR tables, precedence evaluation, IPFilterRule SDF parser, ~~GateStatus~~, ~~QueryURR~~, BAR, OHR honoured | Major (interop) | **L** | **partial** | §2/§3.3; **GateStatus DONE** ([151](151-n4-qer-gate-status.md)) + **QueryURR/mid-session usage-report DONE** ([153](153-n4-query-urr.md)). Remaining: precedence eval, IPFilterRule SDF, OHR, BAR, URR packet-counts/StartTime, Remove/Update PDR-FAR-URR |
+| **G18** | **N4 generic rule engine** — real PDR/FAR/QER/URR tables, precedence evaluation, IPFilterRule SDF parser, ~~GateStatus~~, ~~QueryURR~~, ~~packet-counts~~, BAR, OHR honoured | Major (interop) | **L** | **partial** | §2/§3.3; **GateStatus** ([151](151-n4-qer-gate-status.md)) + **QueryURR** ([153](153-n4-query-urr.md)) + **URR packet-counts→CHF** ([155](155-n4-urr-packet-counts.md)) **DONE**. Remaining: precedence eval, IPFilterRule SDF, OHR, BAR, URR StartTime/URSEQN, Remove/Update PDR-FAR-URR |
 | **G19** | UPF datapath scaling: TEID/UE-IP hash indexes, drop the global mutex (sharded or lock-free), TEID/SEID reclaim | Moderate | M | P2 | O(n)+Mutex per packet today |
 | **G20** | **BSF** — new `nf-bsf` (Nbsf_Management pcfBindings) + PCF binding registration + SMF/NEF binding query | Moderate | M | P2 | the 130 correction; unlocks AF→PCF lookup |
 | **G21** | UP topology Phase 3 — config-driven graph (G5 format), >2-hop chains, >1 ULCL branch, PSA/ULCL selection | Moderate | L | P2 | [134](134-ulcl-multi-upf.md) Phase 3 |
@@ -432,12 +433,13 @@ Suggested first wave by value-per-effort: **G1 → ~~G11~~ (done, [139](139-upf-
 [141](141-pfcp-liveness.md)) → ~~G7~~ (done, [142](142-amf-nas-retransmission.md))
 → ~~G2~~ (done, [143](143-suci-deconcealment.md)) → ~~G23~~ (CLI done,
 [144](144-subscriber-provisioning-cli.md)) → ~~G5~~ (foundation + SMF/UPF/AUSF done,
-[147](147-per-nf-config.md) + [148](148-config-upf-ausf.md)) → **G18 slices 1–2**
-(GateStatus [151](151-n4-qer-gate-status.md), QueryURR [153](153-n4-query-urr.md))**.
-**First wave complete + G18 opened** — the two G18 slices took its self-contained
-*capability* remnants (policy-driven flow blocking; on-demand mid-session usage reads);
-the §7 pivot question still governs the remaining wire-fidelity refactors (G16 + generic
-rule tables / IPFilterRule).
+[147](147-per-nf-config.md) + [148](148-config-upf-ausf.md)) → **G18 slices 1–3**
+(GateStatus [151](151-n4-qer-gate-status.md), QueryURR [153](153-n4-query-urr.md),
+URR packet-counts [155](155-n4-urr-packet-counts.md))**. **First wave complete + G18
+opened** — the three G18 slices took its self-contained *capability* remnants
+(policy-driven flow blocking; on-demand mid-session usage reads; per-packet
+measurement→charging); the §7 pivot question still governs the remaining wire-fidelity
+refactors (G16 + generic rule tables / IPFilterRule).
 
 ## Sources
 
