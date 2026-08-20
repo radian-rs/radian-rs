@@ -220,13 +220,38 @@ fn parse32(h: &str) -> Option<[u8; 32]> {
 pub struct AusfClient {
     base: String,
     http: reqwest::Client,
+    tokens: Option<std::sync::Arc<crate::oauth::TokenSource>>,
 }
+
+/// The AUSF service an `AUSF`-audience token authorizes.
+const AUSF_SCOPE: &str = "nausf-auth";
 
 impl AusfClient {
     pub fn new(base: impl Into<String>) -> Self {
         Self {
             base: base.into(),
             http: crate::sbi_client(),
+            tokens: None,
+        }
+    }
+
+    /// Like [`new`], but attaches an NRF-issued `AUSF` access token on every request —
+    /// required once the AUSF is protected (SBI security on, design/149).
+    pub fn with_tokens(
+        base: impl Into<String>,
+        tokens: std::sync::Arc<crate::oauth::TokenSource>,
+    ) -> Self {
+        Self { base: base.into(), http: crate::sbi_client(), tokens: Some(tokens) }
+    }
+
+    /// Attach an `AUSF` Bearer token to a request when a token source is configured.
+    async fn bearer(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.tokens {
+            Some(ts) => match ts.token_for("AUSF", AUSF_SCOPE).await {
+                Some(tok) => rb.bearer_auth(tok),
+                None => rb,
+            },
+            None => rb,
         }
     }
 
@@ -260,13 +285,16 @@ impl AusfClient {
         resynchronization_info: Option<ResynchronizationInfo>,
     ) -> Result<UeAuthenticationCtx, SbiError> {
         let resp = self
-            .http
-            .post(format!("{}/nausf-auth/v1/ue-authentications", self.base))
-            .json(&AuthenticationInfo {
-                supi_or_suci: supi_or_suci.to_string(),
-                serving_network_name: serving_network_name.to_string(),
-                resynchronization_info,
-            })
+            .bearer(
+                self.http
+                    .post(format!("{}/nausf-auth/v1/ue-authentications", self.base))
+                    .json(&AuthenticationInfo {
+                        supi_or_suci: supi_or_suci.to_string(),
+                        serving_network_name: serving_network_name.to_string(),
+                        resynchronization_info,
+                    }),
+            )
+            .await
             .traced()
             .send()
             .await?
@@ -281,14 +309,17 @@ impl AusfClient {
         res_star_hex: &str,
     ) -> Result<ConfirmationDataResponse, SbiError> {
         let resp = self
-            .http
-            .put(format!(
-                "{}/nausf-auth/v1/ue-authentications/{}/5g-aka-confirmation",
-                self.base, ctx_id
-            ))
-            .json(&ConfirmationData {
-                res_star: res_star_hex.to_string(),
-            })
+            .bearer(
+                self.http
+                    .put(format!(
+                        "{}/nausf-auth/v1/ue-authentications/{}/5g-aka-confirmation",
+                        self.base, ctx_id
+                    ))
+                    .json(&ConfirmationData {
+                        res_star: res_star_hex.to_string(),
+                    }),
+            )
+            .await
             .traced()
             .send()
             .await?

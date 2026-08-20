@@ -221,11 +221,22 @@ pub struct AmfSmf {
     /// The serving PLMN this AMF passes in CreateSMContext (TS 29.502 `servingNetwork`).
     mcc: String,
     mnc: String,
+    /// The AMF's shared token source for the (protected) SMF (design/149 G1); `None`
+    /// when SBI security is off, in which case every Nsmf call goes out untokened.
+    tokens: Option<std::sync::Arc<sbi_core::oauth::TokenSource>>,
 }
+
+/// The SMF service an `SMF`-audience token authorizes.
+const SMF_SCOPE: &str = "nsmf-pdusession";
 
 impl AmfSmf {
     pub fn new(nrf_base: impl Into<String>, mcc: impl Into<String>, mnc: impl Into<String>) -> Self {
-        Self { nrf: NrfClient::new(nrf_base.into()), mcc: mcc.into(), mnc: mnc.into() }
+        Self {
+            nrf: NrfClient::new(nrf_base.into()),
+            mcc: mcc.into(),
+            mnc: mnc.into(),
+            tokens: crate::AMF_TOKENS.clone(),
+        }
     }
 
     /// Discover the SMF and create an SM context; returns the UPF N3 F-TEID and the
@@ -260,13 +271,19 @@ impl AmfSmf {
             }
             body["sNssai"] = slice;
         }
-        let resp = sbi_core::sbi_client()
-            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts"))
-            .json(&body)
-            .traced()
-            .send()
-            .await
-            .map_err(|e| format!("Nsmf CreateSMContext request failed: {e}"))?;
+        let resp = sbi_core::oauth::with_bearer(
+            sbi_core::sbi_client()
+                .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts"))
+                .json(&body),
+            &self.tokens,
+            "SMF",
+            SMF_SCOPE,
+        )
+        .await
+        .traced()
+        .send()
+        .await
+        .map_err(|e| format!("Nsmf CreateSMContext request failed: {e}"))?;
         if resp.status().as_u16() == 403 {
             return Err(CreateSmError::Forbidden);
         }
@@ -292,13 +309,19 @@ impl AmfSmf {
         smf_base: &str,
         sm_ref: &str,
     ) -> Result<SmContextCreated, String> {
-        let resp = sbi_core::sbi_client()
-            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
-            .json(&serde_json::json!({ "upCnxState": "ACTIVATING" }))
-            .traced()
-            .send()
-            .await
-            .map_err(|e| format!("Nsmf UpdateSMContext (activate) request failed: {e}"))?;
+        let resp = sbi_core::oauth::with_bearer(
+            sbi_core::sbi_client()
+                .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
+                .json(&serde_json::json!({ "upCnxState": "ACTIVATING" })),
+            &self.tokens,
+            "SMF",
+            SMF_SCOPE,
+        )
+        .await
+        .traced()
+        .send()
+        .await
+        .map_err(|e| format!("Nsmf UpdateSMContext (activate) request failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Nsmf UpdateSMContext (activate) returned {}", resp.status()));
         }
@@ -310,12 +333,18 @@ impl AmfSmf {
     /// Release an SM context (TS 29.502) — the SMF tears the N4 session down at
     /// the UPF. Driven by deregistration.
     pub async fn release_sm_context(&self, smf_base: &str, sm_ref: &str) -> Result<(), String> {
-        let resp = sbi_core::sbi_client()
-            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release"))
-            .traced()
-            .send()
-            .await
-            .map_err(|e| format!("Nsmf ReleaseSMContext request failed: {e}"))?;
+        let resp = sbi_core::oauth::with_bearer(
+            sbi_core::sbi_client()
+                .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/release")),
+            &self.tokens,
+            "SMF",
+            SMF_SCOPE,
+        )
+        .await
+        .traced()
+        .send()
+        .await
+        .map_err(|e| format!("Nsmf ReleaseSMContext request failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Nsmf ReleaseSMContext returned {}", resp.status()));
         }
@@ -331,16 +360,22 @@ impl AmfSmf {
         gnb_teid: u32,
         gnb_addr: Ipv4Addr,
     ) -> Result<(), String> {
-        let resp = sbi_core::sbi_client()
-            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
-            .json(&serde_json::json!({
-                "gnbN3Teid": format!("{gnb_teid:08x}"),
-                "gnbN3Addr": gnb_addr.to_string(),
-            }))
-            .traced()
-            .send()
-            .await
-            .map_err(|e| format!("Nsmf UpdateSMContext request failed: {e}"))?;
+        let resp = sbi_core::oauth::with_bearer(
+            sbi_core::sbi_client()
+                .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
+                .json(&serde_json::json!({
+                    "gnbN3Teid": format!("{gnb_teid:08x}"),
+                    "gnbN3Addr": gnb_addr.to_string(),
+                })),
+            &self.tokens,
+            "SMF",
+            SMF_SCOPE,
+        )
+        .await
+        .traced()
+        .send()
+        .await
+        .map_err(|e| format!("Nsmf UpdateSMContext request failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Nsmf UpdateSMContext returned {}", resp.status()));
         }
@@ -358,16 +393,24 @@ impl AmfSmf {
         target_teid: u32,
         target_addr: Ipv4Addr,
     ) -> Result<(u32, Ipv4Addr), String> {
-        let resp = sbi_core::sbi_client()
-            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/indirect-forwarding"))
-            .json(&serde_json::json!({
-                "targetN3Teid": format!("{target_teid:08x}"),
-                "targetN3Addr": target_addr.to_string(),
-            }))
-            .traced()
-            .send()
-            .await
-            .map_err(|e| format!("Nsmf indirect-forwarding request failed: {e}"))?;
+        let resp = sbi_core::oauth::with_bearer(
+            sbi_core::sbi_client()
+                .post(format!(
+                    "{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/indirect-forwarding"
+                ))
+                .json(&serde_json::json!({
+                    "targetN3Teid": format!("{target_teid:08x}"),
+                    "targetN3Addr": target_addr.to_string(),
+                })),
+            &self.tokens,
+            "SMF",
+            SMF_SCOPE,
+        )
+        .await
+        .traced()
+        .send()
+        .await
+        .map_err(|e| format!("Nsmf indirect-forwarding request failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Nsmf indirect-forwarding returned {}", resp.status()));
         }
@@ -389,13 +432,21 @@ impl AmfSmf {
     /// Release an indirect data forwarding tunnel at the SMF (handover complete or
     /// failed). Idempotent.
     pub async fn release_indirect_forwarding(&self, smf_base: &str, sm_ref: &str) -> Result<(), String> {
-        let resp = sbi_core::sbi_client()
-            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/indirect-forwarding"))
-            .json(&serde_json::json!({ "release": true }))
-            .traced()
-            .send()
-            .await
-            .map_err(|e| format!("Nsmf indirect-forwarding release failed: {e}"))?;
+        let resp = sbi_core::oauth::with_bearer(
+            sbi_core::sbi_client()
+                .post(format!(
+                    "{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/indirect-forwarding"
+                ))
+                .json(&serde_json::json!({ "release": true })),
+            &self.tokens,
+            "SMF",
+            SMF_SCOPE,
+        )
+        .await
+        .traced()
+        .send()
+        .await
+        .map_err(|e| format!("Nsmf indirect-forwarding release failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Nsmf indirect-forwarding release returned {}", resp.status()));
         }
@@ -406,13 +457,19 @@ impl AmfSmf {
     /// TS 23.502 §4.2.6): the SMF runs an N4 modification that DROPs downlink at
     /// the UPF. The session persists — a later Service Request re-activates it.
     pub async fn deactivate_up(&self, smf_base: &str, sm_ref: &str) -> Result<(), String> {
-        let resp = sbi_core::sbi_client()
-            .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
-            .json(&serde_json::json!({ "upCnxState": "DEACTIVATED" }))
-            .traced()
-            .send()
-            .await
-            .map_err(|e| format!("Nsmf UpdateSMContext (deactivate) request failed: {e}"))?;
+        let resp = sbi_core::oauth::with_bearer(
+            sbi_core::sbi_client()
+                .post(format!("{smf_base}/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify"))
+                .json(&serde_json::json!({ "upCnxState": "DEACTIVATED" })),
+            &self.tokens,
+            "SMF",
+            SMF_SCOPE,
+        )
+        .await
+        .traced()
+        .send()
+        .await
+        .map_err(|e| format!("Nsmf UpdateSMContext (deactivate) request failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Nsmf UpdateSMContext (deactivate) returned {}", resp.status()));
         }

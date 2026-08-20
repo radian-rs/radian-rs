@@ -217,9 +217,11 @@ struct ModifyPolicy {
 /// serving-AMF registration.
 static AMF_INSTANCE_ID: LazyLock<String> = LazyLock::new(sbi_core::new_nf_instance_id);
 
-/// The AMF's OAuth token source for calling the (protected) UDM — `Some` only when SBI
-/// security is enabled (design/137 F3), keyed by this AMF's registered instance id.
-static AMF_UDM_TOKENS: LazyLock<Option<Arc<sbi_core::oauth::TokenSource>>> = LazyLock::new(|| {
+/// The AMF's OAuth token source for calling the protected producers it consumes —
+/// UDM, AUSF, SMF, PCF, NSSF (design/137 F3, design/149 G1). `Some` only when SBI
+/// security is enabled, keyed by this AMF's registered instance id. One source
+/// suffices: it caches a separate token per (target NF, scope).
+static AMF_TOKENS: LazyLock<Option<Arc<sbi_core::oauth::TokenSource>>> = LazyLock::new(|| {
     sbi_core::oauth::client_tokens_enabled().then(|| {
         Arc::new(sbi_core::oauth::TokenSource::new(NRF_BASE.clone(), AMF_INSTANCE_ID.clone()))
     })
@@ -228,9 +230,27 @@ static AMF_UDM_TOKENS: LazyLock<Option<Arc<sbi_core::oauth::TokenSource>>> = Laz
 /// A Nudm client for `base` that attaches an NRF-issued `UDM` access token when SBI
 /// security is on (design/137 F3), else calls the UDM openly.
 fn udm_client(base: impl Into<String>) -> sbi_core::nudm::NudmClient {
-    match &*AMF_UDM_TOKENS {
+    match &*AMF_TOKENS {
         Some(t) => sbi_core::nudm::NudmClient::with_tokens(base, t.clone()),
         None => sbi_core::nudm::NudmClient::new(base),
+    }
+}
+
+/// An Npcf AM-policy client for `base` that attaches an NRF-issued `PCF` access token
+/// when SBI security is on (design/149 G1), else calls the PCF openly.
+fn am_policy_client(base: impl Into<String>) -> sbi_core::npcf_am::AmPolicyClient {
+    match &*AMF_TOKENS {
+        Some(t) => sbi_core::npcf_am::AmPolicyClient::with_tokens(base, t.clone()),
+        None => sbi_core::npcf_am::AmPolicyClient::new(base),
+    }
+}
+
+/// An Nnssf client for `base` that attaches an NRF-issued `NSSF` access token when SBI
+/// security is on (design/149 G1), else calls the NSSF openly.
+fn nssf_client(base: impl Into<String>) -> sbi_core::nnssf::NssfClient {
+    match &*AMF_TOKENS {
+        Some(t) => sbi_core::nnssf::NssfClient::with_tokens(base, t.clone()),
+        None => sbi_core::nnssf::NssfClient::new(base),
     }
 }
 
@@ -4484,7 +4504,7 @@ async fn select_slices(
     subscribed: &[(u8, Option<[u8; 3]>)],
 ) -> Option<(Vec<(u8, Option<[u8; 3]>)>, Vec<(u8, Option<[u8; 3]>)>)> {
     let nssf = discover_nf(nrf_base, "NSSF").await.ok()?;
-    match sbi_core::nnssf::NssfClient::new(nssf).ns_selection(tac, requested, subscribed).await {
+    match nssf_client(nssf).ns_selection(tac, requested, subscribed).await {
         Ok((allowed, rejected)) => {
             info!("NSSF slice selection (TAC {tac:02x?}): allowed {allowed:?}, rejected {rejected:?}");
             Some((allowed, rejected))
@@ -4513,7 +4533,7 @@ async fn create_am_policy(
             &*ADVERTISE_ADDR
         )),
     };
-    match sbi_core::npcf_am::AmPolicyClient::new(pcf.clone()).create(&req).await {
+    match am_policy_client(pcf.clone()).create(&req).await {
         Ok(created) => Some((pcf, created.assoc_id, created.policy)),
         Err(e) => {
             debug!("AM policy association not created ({e}); using subscribed policy");
@@ -4529,7 +4549,7 @@ fn spawn_am_policy_delete(am_policy: Option<(String, String)>) {
         return;
     };
     tokio::spawn(async move {
-        match sbi_core::npcf_am::AmPolicyClient::new(pcf_base).delete(&assoc_id).await {
+        match am_policy_client(pcf_base).delete(&assoc_id).await {
             Ok(()) => info!("deleted AM policy association {assoc_id}"),
             Err(e) => warn!("AM policy association delete failed: {e}"),
         }

@@ -197,20 +197,51 @@ async fn get_cdr(
 pub struct ChfClient {
     base: String,
     http: reqwest::Client,
+    tokens: Option<std::sync::Arc<crate::oauth::TokenSource>>,
 }
+
+/// The CHF service a `CHF`-audience token authorizes.
+const CHF_SCOPE: &str = "nchf-convergedcharging";
 
 impl ChfClient {
     pub fn new(base: impl Into<String>) -> Self {
-        Self { base: base.into(), http: crate::sbi_client() }
+        Self {
+            base: base.into(),
+            http: crate::sbi_client(),
+            tokens: None,
+        }
+    }
+
+    /// Like [`new`], but attaches an NRF-issued `CHF` access token on every request —
+    /// required once the CHF is protected (SBI security on, design/149).
+    pub fn with_tokens(
+        base: impl Into<String>,
+        tokens: std::sync::Arc<crate::oauth::TokenSource>,
+    ) -> Self {
+        Self { base: base.into(), http: crate::sbi_client(), tokens: Some(tokens) }
+    }
+
+    /// Attach a `CHF` Bearer token to a request when a token source is configured.
+    async fn bearer(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.tokens {
+            Some(ts) => match ts.token_for("CHF", CHF_SCOPE).await {
+                Some(tok) => rb.bearer_auth(tok),
+                None => rb,
+            },
+            None => rb,
+        }
     }
 
     /// Open a charging data session; returns the charging-data reference
     /// (from `Location`).
     pub async fn create(&self, req: &ChargingDataRequest) -> Result<String, SbiError> {
         let resp = self
-            .http
-            .post(format!("{}/nchf-convergedcharging/v3/chargingdata", self.base))
-            .json(req)
+            .bearer(
+                self.http
+                    .post(format!("{}/nchf-convergedcharging/v3/chargingdata", self.base))
+                    .json(req),
+            )
+            .await
             .traced()
             .send()
             .await?
@@ -231,16 +262,19 @@ impl ChfClient {
         charging_ref: &str,
         req: &ChargingDataRequest,
     ) -> Result<(), SbiError> {
-        self.http
-            .post(format!(
-                "{}/nchf-convergedcharging/v3/chargingdata/{charging_ref}/update",
-                self.base
-            ))
-            .json(req)
-            .traced()
-            .send()
-            .await?
-            .error_for_status()?;
+        self.bearer(
+            self.http
+                .post(format!(
+                    "{}/nchf-convergedcharging/v3/chargingdata/{charging_ref}/update",
+                    self.base
+                ))
+                .json(req),
+        )
+        .await
+        .traced()
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
@@ -250,16 +284,19 @@ impl ChfClient {
         charging_ref: &str,
         req: &ChargingDataRequest,
     ) -> Result<(), SbiError> {
-        self.http
-            .post(format!(
-                "{}/nchf-convergedcharging/v3/chargingdata/{charging_ref}/release",
-                self.base
-            ))
-            .json(req)
-            .traced()
-            .send()
-            .await?
-            .error_for_status()?;
+        self.bearer(
+            self.http
+                .post(format!(
+                    "{}/nchf-convergedcharging/v3/chargingdata/{charging_ref}/release",
+                    self.base
+                ))
+                .json(req),
+        )
+        .await
+        .traced()
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 }

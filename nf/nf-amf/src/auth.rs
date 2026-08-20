@@ -7,6 +7,16 @@
 use sbi_core::nausf::AusfClient;
 use sbi_core::nnrf::NrfClient;
 
+/// An `AusfClient` for `base` that attaches an NRF-issued `AUSF` access token when SBI
+/// security is on (design/149 G1) — the AUSF is a protected producer — else calls it
+/// openly. Uses the AMF's shared token source.
+fn ausf_client(base: impl Into<String>) -> AusfClient {
+    match &*crate::AMF_TOKENS {
+        Some(t) => AusfClient::with_tokens(base, t.clone()),
+        None => AusfClient::new(base),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("sbi: {0}")]
@@ -59,7 +69,7 @@ impl AmfAuth {
     pub async fn begin(&self, supi_or_suci: &str) -> Result<(PendingAuth, Vec<u8>), AuthError> {
         let ausf_base = self.discover_ausf().await?;
         let snn = aka::serving_network_name(&self.mcc, &self.mnc);
-        let ctx = AusfClient::new(ausf_base.clone())
+        let ctx = ausf_client(ausf_base.clone())
             .authenticate(supi_or_suci, &snn)
             .await?;
 
@@ -91,7 +101,7 @@ impl AmfAuth {
         auts: &[u8],
     ) -> Result<(PendingAuth, Vec<u8>), AuthError> {
         let snn = aka::serving_network_name(&self.mcc, &self.mnc);
-        let ctx = AusfClient::new(pending.ausf_base.clone())
+        let ctx = ausf_client(pending.ausf_base.clone())
             .authenticate_resync(supi_or_suci, &snn, &hex::encode(pending.rand), &hex::encode(auts))
             .await?;
 
@@ -133,7 +143,7 @@ impl AmfAuth {
             });
         }
 
-        let conf = AusfClient::new(pending.ausf_base.clone())
+        let conf = ausf_client(pending.ausf_base.clone())
             .confirm(&pending.ctx_id, &hex::encode(res_star))
             .await?;
         Ok(AuthOutcome {
