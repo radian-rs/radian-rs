@@ -12,6 +12,9 @@ use tracing::{info, warn};
 const SBI_PORT: u16 = 8007;
 const NRF_ENV: &str = "RADIAN_CHF_NRF";
 const DEFAULT_NRF: &str = "http://127.0.0.1:8000";
+/// Per-session volume quota (bytes) this CHF grants before signalling
+/// `FinalUnitIndication: TERMINATE` (design/157, G14). Unset ⇒ unlimited (pure accumulator).
+const QUOTA_ENV: &str = "RADIAN_CHF_QUOTA_BYTES";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,7 +34,15 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => warn!("NRF registration failed (continuing without discovery): {e}"),
     }
 
-    let state = sbi_core::nchf::ChfState::new();
+    // Online charging (design/157, G14): with a quota configured, the CHF enforces it via
+    // FinalUnitIndication; without one it stays a pure usage accumulator.
+    let state = match std::env::var(QUOTA_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(bytes) => {
+            info!(quota_bytes = bytes, "CHF online charging: per-session volume quota enforced");
+            sbi_core::nchf::ChfState::with_quota(bytes)
+        }
+        None => sbi_core::nchf::ChfState::new(),
+    };
     // Require an NRF-issued `CHF`-audience access token on every Nchf call when SBI
     // security is on (design/149, G1). Open SBI (no verifier) is unchanged.
     let router = sbi_core::oauth::protect(
