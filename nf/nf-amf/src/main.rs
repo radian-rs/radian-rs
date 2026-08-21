@@ -755,6 +755,11 @@ struct UeContext {
     /// §5.3.4.3) from the PCF — signalled to the RAN in a UE Context Modification.
     /// `None` when the PCF provided no RFSP.
     rfsp: Option<u16>,
+    /// The UE's radio capability, as reported by the NG-RAN in a
+    /// `UERadioCapabilityInfoIndication` (opaque octet string). Replayed in a later
+    /// InitialContextSetup (e.g. a Service Request resume) so the gNB needn't re-run a
+    /// UE Capability Enquiry (design/158, G39). `None` until the RAN has reported it.
+    ue_radio_capability: Option<Vec<u8>>,
     /// The AM policy service area restriction from the PCF as
     /// `(allowed_tacs, non_allowed_tacs)` (3-octet TACs) — signalled to the RAN as a
     /// Mobility Restriction List on the Registration Accept. `None` = unrestricted.
@@ -2073,6 +2078,9 @@ async fn handle_ngap(
                     send_or_log(conn, &dl, "UEContextReleaseCommand").await;
                 }
             }
+            InitiatingMessageValue::Id_UERadioCapabilityInfoIndication(_) => {
+                on_ue_radio_capability_indication(ues, &pdu);
+            }
             InitiatingMessageValue::Id_PathSwitchRequest(_) => {
                 if let Some((ack, label)) = on_path_switch(ues, amf_smf, &pdu, dereg_tx).await {
                     send_or_log(conn, &ack, label).await;
@@ -2190,6 +2198,23 @@ async fn handle_ngap(
             ..
         }) => on_release_response(ues, &pdu),
         _ => info!("unhandled PDU: {}", pdu.procedure_name()),
+    }
+}
+
+/// Handle a `UERadioCapabilityInfoIndication` (TS 38.413 §8.5.2, a class-2 procedure —
+/// no response): store the NG-RAN-reported radio capability against the UE so a later
+/// InitialContextSetup (e.g. a Service Request resume) replays it, sparing the gNB a
+/// UE Capability Enquiry (design/158, G39). Ignored for an unknown UE.
+fn on_ue_radio_capability_indication(ues: &mut HashMap<u64, UeContext>, pdu: &ngap::NGAP_PDU) {
+    let Some((amf_ue_id, cap)) = ngap::ue_radio_capability_from_indication(pdu) else {
+        return;
+    };
+    match ues.get_mut(&amf_ue_id) {
+        Some(ctx) => {
+            info!("UE {amf_ue_id}: stored UE radio capability ({} bytes)", cap.len());
+            ctx.ue_radio_capability = Some(cap);
+        }
+        None => warn!("UERadioCapabilityInfoIndication for unknown AMF-UE-NGAP-ID {amf_ue_id}"),
     }
 }
 
@@ -2502,6 +2527,9 @@ async fn on_service_request(
     let ue_sec_cap = ctx.replayed_ue_sec_cap.unwrap_or(UE_SEC_CAP);
     let rfsp = ctx.rfsp;
     let area_restriction = ctx.area_restriction.clone();
+    // Replay the UE's reported radio capability (design/158, G39) in the resume ICS —
+    // extracted before `ctx` is moved back into the table below.
+    let ue_radio_capability = ctx.ue_radio_capability.clone();
     let accept = ctx.sec.as_mut().map(|s| {
         // `unprotect` already advanced ul_count past the Service Request /
         // mobility Registration Request that triggered this return.
@@ -2622,6 +2650,7 @@ async fn on_service_request(
                         .then_some((allowed_tacs, not_allowed_tacs)),
                     pdu_sessions: ics_sessions,
                     nas: bytes,
+                    ue_radio_capability: ue_radio_capability.clone(),
                 };
                 downlinks.push((
                     ngap::initial_context_setup_request(amf_ue_id, ran_ue_id, PLMN_MCC, PLMN_MNC, &ic),
@@ -3494,6 +3523,7 @@ impl UeContext {
             pcf_ue_ambr: None,
             ue_ambr: None,
             rfsp: None,
+            ue_radio_capability: None,
             area_restriction: None,
             allowed_nssai: None,
             requested_nssai: Vec::new(),
@@ -4421,6 +4451,9 @@ async fn on_security_mode_complete(
             .then_some((allowed_tacs, not_allowed_tacs)),
         pdu_sessions: Vec::new(), // no PDU sessions exist yet at initial registration
         nas: bytes,
+        // Usually `None` here — the RAN reports the capability after this ICS — but read
+        // it from the context so a re-registration with a known capability replays it.
+        ue_radio_capability: ctx.ue_radio_capability.clone(),
     };
     vec![(
         ngap::initial_context_setup_request(amf_ue_id, ran_ue_id, PLMN_MCC, PLMN_MNC, &ic),
@@ -4726,6 +4759,24 @@ mod tests {
 
     fn registration_request() -> Vec<u8> {
         hex::decode(REG_REQUEST_HEX).unwrap()
+    }
+
+    #[test]
+    fn ue_radio_capability_indication_stores_for_replay() {
+        let caps = vec![0xAAu8, 0xBB, 0xCC];
+        let mut ues: HashMap<u64, UeContext> = HashMap::new();
+        ues.insert(7, UeContext::new(3, RegState::Registered, Some("imsi-999700000000001".into())));
+        assert!(ues[&7].ue_radio_capability.is_none(), "unset until the RAN reports it");
+
+        // The gNB reports the capability for AMF-UE-NGAP-ID 7 → stored against that UE.
+        let ind = ngap::ue_radio_capability_info_indication(7, 3, caps.clone());
+        on_ue_radio_capability_indication(&mut ues, &ind);
+        assert_eq!(ues[&7].ue_radio_capability, Some(caps));
+
+        // An indication for an unknown UE is ignored (no panic, no phantom context).
+        let other = ngap::ue_radio_capability_info_indication(99, 1, vec![0x01]);
+        on_ue_radio_capability_indication(&mut ues, &other);
+        assert!(!ues.contains_key(&99));
     }
 
     #[test]

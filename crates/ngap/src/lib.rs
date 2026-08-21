@@ -735,6 +735,12 @@ pub struct InitialContext {
     pub pdu_sessions: Vec<IcsPduSession>,
     /// The NAS PDU the gNB relays to the UE (the protected Registration Accept).
     pub nas: Vec<u8>,
+    /// The UE's radio capability — an opaque octet string the gNB reported via
+    /// `UERadioCapabilityInfoIndication` (TS 38.413 §9.2.3.19). Replayed as the
+    /// `UERadioCapability` IE so the NG-RAN can configure the UE's radio bearers
+    /// without a separate UE Capability Enquiry (design/158, G39). `None` until the
+    /// gNB has reported it.
+    pub ue_radio_capability: Option<Vec<u8>>,
 }
 
 /// A PDU session to set up inline in an Initial Context Setup: its id, the UPF's
@@ -821,6 +827,12 @@ pub fn initial_context_setup_request(
         ies.push(build_ngap_ie!(InitialContextSetupRequest, REJECT PDUSessionResourceSetupListCxtReq(list)));
     }
     ies.push(build_ngap_ie!(InitialContextSetupRequest, IGNORE NAS_PDU(NAS_PDU(ic.nas.clone()))));
+    // The UE's radio capability (design/158, G39): replayed from what the gNB reported,
+    // so the NG-RAN configures the radio bearers without a separate UE Capability
+    // Enquiry. Criticality IGNORE — a gNB that doesn't want it can skip it.
+    if let Some(cap) = &ic.ue_radio_capability {
+        ies.push(build_ngap_ie!(InitialContextSetupRequest, IGNORE UERadioCapability(UERadioCapability(cap.clone()))));
+    }
     // InitialContextSetup = procedure code 14 (TS 38.413 §9.3.5).
     NGAP_PDU::InitiatingMessage(InitiatingMessage {
         procedure_code: ProcedureCode(14),
@@ -829,6 +841,55 @@ pub fn initial_context_setup_request(
             protocol_i_es: InitialContextSetupRequestProtocolIEs(ies),
         }),
     })
+}
+
+/// Build a `UERadioCapabilityInfoIndication` (TS 38.413 §9.2.3.19) carrying the UE's
+/// radio capability — the message the NG-RAN sends the AMF after a UE Capability
+/// Enquiry (design/158, G39). The inverse of [`ue_radio_capability_from_indication`];
+/// used by tests and by a driving gNB.
+pub fn ue_radio_capability_info_indication(amf_ue_id: u64, ran_ue_id: u32, cap: Vec<u8>) -> NGAP_PDU {
+    let ies = vec![
+        build_ngap_ie!(UERadioCapabilityInfoIndication, REJECT AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf_ue_id))),
+        build_ngap_ie!(UERadioCapabilityInfoIndication, REJECT RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_id))),
+        build_ngap_ie!(UERadioCapabilityInfoIndication, IGNORE UERadioCapability(UERadioCapability(cap))),
+    ];
+    NGAP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(44), // id-UERadioCapabilityInfoIndication
+        criticality: Criticality(Criticality::IGNORE),
+        value: InitiatingMessageValue::Id_UERadioCapabilityInfoIndication(
+            UERadioCapabilityInfoIndication {
+                protocol_i_es: UERadioCapabilityInfoIndicationProtocolIEs(ies),
+            },
+        ),
+    })
+}
+
+/// Extract `(amf_ue_id, ue_radio_capability)` from a `UERadioCapabilityInfoIndication`
+/// (TS 38.413 §9.2.3.19). The NG-RAN sends this after an RRC UE Capability Enquiry; the
+/// AMF stores the octet string against that UE and replays it in a later
+/// InitialContextSetup / HandoverRequest so a target node needn't re-enquire
+/// (design/158, G39). Returns `None` for any other PDU, or an indication missing the
+/// AMF-UE-NGAP-ID or the capability IE.
+pub fn ue_radio_capability_from_indication(pdu: &NGAP_PDU) -> Option<(u64, Vec<u8>)> {
+    let NGAP_PDU::InitiatingMessage(InitiatingMessage { value, .. }) = pdu else {
+        return None;
+    };
+    let InitiatingMessageValue::Id_UERadioCapabilityInfoIndication(ind) = value else {
+        return None;
+    };
+    let (mut amf_ue_id, mut cap) = (None, None);
+    for ie in &ind.protocol_i_es.0 {
+        match &ie.value {
+            UERadioCapabilityInfoIndicationProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(v) => {
+                amf_ue_id = Some(v.0)
+            }
+            UERadioCapabilityInfoIndicationProtocolIEs_EntryValue::Id_UERadioCapability(c) => {
+                cap = Some(c.0.clone())
+            }
+            _ => {}
+        }
+    }
+    Some((amf_ue_id?, cap?))
 }
 
 /// Parse an `InitialContextSetupRequest` back into `(amf_ue_id, ran_ue_id,
@@ -902,6 +963,9 @@ pub fn initial_context_setup_params(pdu: &NGAP_PDU) -> Option<(u64, u32, Initial
             }
             InitialContextSetupRequestProtocolIEs_EntryValue::Id_NAS_PDU(nas) => {
                 ic.nas = nas.0.clone()
+            }
+            InitialContextSetupRequestProtocolIEs_EntryValue::Id_UERadioCapability(cap) => {
+                ic.ue_radio_capability = Some(cap.0.clone())
             }
             _ => {}
         }
@@ -3050,6 +3114,34 @@ mod release_tests {
     }
 
     #[test]
+    fn ue_radio_capability_replays_through_ics_and_parses_from_indication() {
+        let caps = vec![0xDEu8, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
+
+        // The capability the gNB reported, replayed in InitialContextSetup: it survives
+        // an APER encode/decode and the parser recovers it (design/158, G39).
+        let ic = InitialContext {
+            allowed_nssai: vec![(1, None)],
+            ue_sec_cap: [0x20, 0x20],
+            security_key: [0x11u8; 32],
+            nas: vec![0x7e],
+            ue_radio_capability: Some(caps.clone()),
+            ..Default::default()
+        };
+        let pdu = initial_context_setup_request(9, 5, "999", "70", &ic);
+        let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
+        let (_, _, parsed) = initial_context_setup_params(&back).expect("parse");
+        assert_eq!(parsed.ue_radio_capability, Some(caps.clone()));
+
+        // The AMF extracts (amf_ue_id, capability) from a UERadioCapabilityInfoIndication,
+        // and it survives an APER encode/decode.
+        let ind = ue_radio_capability_info_indication(42, 3, caps.clone());
+        let ind_back = NGAP_PDU::decode(&ind.encode().expect("encode")).expect("decode");
+        assert_eq!(ue_radio_capability_from_indication(&ind_back), Some((42, caps)));
+        // A non-indication PDU (the ICS above) yields nothing.
+        assert_eq!(ue_radio_capability_from_indication(&pdu), None);
+    }
+
+    #[test]
     fn initial_context_setup_roundtrips() {
         let ic = InitialContext {
             allowed_nssai: vec![(1, Some([1, 2, 3])), (2, None)],
@@ -3060,6 +3152,7 @@ mod release_tests {
             area_restriction: Some((vec![[0, 0, 1]], Vec::new())),
             pdu_sessions: Vec::new(),
             nas: vec![0x7e, 0x02, 0x42],
+            ue_radio_capability: None,
         };
         let pdu = initial_context_setup_request(7, 3, "999", "70", &ic);
         let back = NGAP_PDU::decode(&pdu.encode().expect("encode")).expect("decode");
@@ -3082,6 +3175,7 @@ mod release_tests {
                 upf_addr: addr,
             }],
             nas: vec![0x7e],
+            ue_radio_capability: None,
             ..Default::default()
         };
         let pdu = initial_context_setup_request(8, 4, "999", "70", &with_session);
@@ -3117,6 +3211,7 @@ mod release_tests {
             ue_sec_cap: [0x20, 0x20],
             security_key: [0x11u8; 32],
             nas: vec![0x7e],
+            ue_radio_capability: None,
             ..Default::default()
         };
         let pdu = initial_context_setup_request(1, 2, "999", "70", &bare);
@@ -3313,6 +3408,7 @@ mod gnb_side_tests {
                 upf_addr: Ipv4Addr::LOCALHOST,
             }],
             nas: vec![0x7e],
+            ue_radio_capability: None,
             ..Default::default()
         };
         let pdu = initial_context_setup_request(1, 2, "999", "70", &ic);
