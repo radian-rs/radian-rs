@@ -136,10 +136,12 @@ Gaps:
   RAII `IpLease` freeing addresses on every failure path; exhaustion → 503/#26.
   *Remaining:* per-(S-NSSAI,DNN,UPF) pools, static pools, per-subscriber static
   IP from UDM, overlap checks (Go: `ue_ip_pool.go` + `lazyReusePool`). → **G6** (leak done)
-- **No granted-quota loop**: no VolumeQuota/Volqu, no `updateGrantedQuota` —
-  **online charging cannot be enforced at the UPF**; triggers limited to
-  VOLTH+FINAL (no ADDITION_OF_UPF / USER_LOCATION_CHANGE / QUOTA_EXHAUSTED /
-  validity-time / start-of-SDF). → **G14**
+- ~~**No granted-quota loop**~~ **enforcement landed** ([157](157-online-charging-quota.md)):
+  the CHF grants a per-session volume quota and answers a spent quota with
+  `FinalUnitIndication: TERMINATE`; the SMF tears the session down off the existing VOLTH
+  report loop. *Remaining:* UPF **VolumeQuota/VOLQU** (blocked on an rs-pfcp IE gap),
+  `updateGrantedQuota` incremental grants, per-rating-group quotas, other triggers
+  (ADDITION_OF_UPF / USER_LOCATION_CHANGE / validity-time / start-of-SDF). → **G14** (SMF-side enforcement done)
 - No BAR; no rule-state model (RULE_INITIAL/UPDATE/REMOVE) or generic
   Remove/Update ops; no URR measurement period / time threshold / quota.
 - No SSC modes (Go pins mode 1 in the accept), no Ethernet PDU type, no
@@ -262,9 +264,10 @@ termination-request notifications; no SuppFeat. ▲ ahead: typed
 populated (Go TODO), flow→rating-group resolution.
 
 **CHF** — parity: the three ConvergedCharging ops + per-rating-group volume
-accumulation. Gaps: **it is a usage accumulator, not a charging function** —
-no quota/reservation state machine (MultipleUnitInformation, GrantedServiceUnit,
-FinalUnitIndication…), no rating, no ABMF/balance, no **ASN.1 CDR encoding or
+accumulation; **now also a per-session volume quota + `FinalUnitIndication:
+TERMINATE`** when spent, enforced by the SMF ([157](157-online-charging-quota.md), G14).
+Gaps: still no incremental grants (`updateGrantedQuota`) / per-rating-group
+`MultipleUnitInformation`/`GrantedServiceUnit`, no rating, no ABMF/balance, no **ASN.1 CDR encoding or
 CDR files** (JSON in a HashMap), no CGF/FTP export, no recharge endpoints, no
 ChargingNotify push. (Diameter Ro/Gy: optional for greenfield.)
 SpendingLimit/OfflineOnly: Go 501 — nominal. → **G14/G27**
@@ -410,7 +413,7 @@ P2 = unlocks scenario classes · P3 = breadth/ecosystem.
 | ~~**G11**~~ | ~~**UPF downlink QFI marking**~~ — **DONE** ([139](139-upf-downlink-qfi.md)): `n6::downlink` v4+v6 + buffered flush + SLAAC RAs stamp the QFI (matched GBR flow's, else `DEFAULT_QFI`); N9-chain final hop deferred | Moderate | **S** | ✓ | closed the one gap all three references agreed on |
 | **G12** | Admission checks: supportTaiList/plmnSupportList (#15/#11), AUSF serving-network authorization | Moderate | S | P1 | config from G5 |
 | **G13** | Multi-AMF: AMF set, GUAMI routing, UEContextTransfer/RegistrationStatusUpdate, RerouteNASRequest | Moderate | L | P2 | 130's P-item confirmed; needs G9 |
-| **G14** | Online charging: CHF quota grant (MultipleUnitInformation/FUI) + SMF VolumeQuota loop + UPF VOLQU + charging-notify callback | Moderate | M–L | P2 | §3.2/3.5 |
+| **G14** | Online charging: CHF quota grant (MultipleUnitInformation/FUI) + SMF VolumeQuota loop + UPF VOLQU + charging-notify callback | Moderate | M–L | **partial** | §3.2/3.5; **CHF quota + FUI + SMF teardown DONE** ([157](157-online-charging-quota.md)) off the VOLTH loop. Remaining: UPF VolumeQuota/VOLQU (rs-pfcp IE gap), incremental grants, per-RG quotas, AMF/UE notify (G15) |
 | **G15** | SMContextStatusNotify + UpPathChg event notification (SMF→AMF, SMF→NEF/AF) | Minor–Mod | S | P2 | completes the NEF story ([135](135-nef-af-traffic-influence.md)) |
 | **G16** | **Nsmf wire fidelity** — multipart N1/N2 containers, SMF-side NAS-SM + N2 transfer-IE codecs, n2SmInfoType/hoState | Moderate (interop) | **L** | P2 | §2; decide via §7 pivot question first |
 | **G17** | NSSF conformance: GET+query wire shape, PDU-session path, NsiInformation, TAI keying, rejected-in-PLMN/TA split | Moderate | M | P2 | §3.5 |

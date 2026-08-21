@@ -64,15 +64,37 @@ pub struct ChargingDataRequest {
     pub used_unit_containers: Vec<UsedUnitContainer>,
 }
 
+/// `FinalUnitIndication` (TS 32.291 §6.1.6.2.1.13, trimmed): the CHF telling the SMF
+/// what to do once the granted quota is spent. radian signals `TERMINATE` — the SMF
+/// tears the PDU session down (online-charging enforcement, design/157, G14).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinalUnitIndication {
+    /// `TERMINATE` | `REDIRECT` | `RESTRICT_ACCESS` (radian issues `TERMINATE`).
+    pub final_unit_action: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChargingDataResponse {
     pub invocation_result: String,
+    /// Present when the session's granted quota is exhausted — the SMF must stop the
+    /// session (TS 32.291 online charging). Absent while quota remains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_unit_indication: Option<FinalUnitIndication>,
 }
 
 impl ChargingDataResponse {
     fn success() -> Self {
-        Self { invocation_result: "SUCCESS".into() }
+        Self { invocation_result: "SUCCESS".into(), final_unit_indication: None }
+    }
+
+    /// The quota is spent — carry a `TERMINATE` final-unit action.
+    fn quota_exhausted() -> Self {
+        Self {
+            invocation_result: "SUCCESS".into(),
+            final_unit_indication: Some(FinalUnitIndication { final_unit_action: "TERMINATE".into() }),
+        }
     }
 }
 
@@ -90,6 +112,12 @@ pub struct Cdr {
 }
 
 impl Cdr {
+    /// Total volume (bytes) accumulated across all rating groups — measured against the
+    /// CHF's granted quota to decide online-charging exhaustion (design/157).
+    fn total_volume(&self) -> u64 {
+        self.usage.values().map(|u| u.total_volume).sum()
+    }
+
     fn absorb(&mut self, containers: &[UsedUnitContainer]) {
         for c in containers {
             let e = self.usage.entry(c.rating_group).or_insert(UsedUnitContainer {
@@ -111,11 +139,21 @@ impl Cdr {
 pub struct ChfState {
     cdrs: Arc<Mutex<std::collections::HashMap<String, Cdr>>>,
     next: Arc<AtomicU64>,
+    /// The per-session volume quota (bytes) this CHF grants. Once a session's total usage
+    /// reaches it, the next update answers with `FinalUnitIndication: TERMINATE` so the
+    /// SMF stops the session. `None` ⇒ unlimited (the CHF stays a pure accumulator).
+    quota_bytes: Option<u64>,
 }
 
 impl ChfState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A CHF that grants `bytes` of volume per session and enforces it via
+    /// `FinalUnitIndication` when the session's usage reaches it (design/157, G14).
+    pub fn with_quota(bytes: u64) -> Self {
+        Self { quota_bytes: Some(bytes), ..Default::default() }
     }
 
     /// Number of open (unreleased) charging sessions — test/observability hook.
@@ -172,12 +210,21 @@ async fn update(
         return Err(StatusCode::CONFLICT);
     }
     cdr.absorb(&req.used_unit_containers);
+    // Online charging (design/157, G14): once the session's accumulated usage reaches the
+    // granted quota, answer with FinalUnitIndication: TERMINATE so the SMF stops it.
+    let exhausted = chf.quota_bytes.is_some_and(|q| cdr.total_volume() >= q);
     tracing::info!(
         charging_ref = %charging_ref,
         containers = req.used_unit_containers.len(),
+        total_bytes = cdr.total_volume(),
+        exhausted,
         "charging session updated (mid-session usage)"
     );
-    Ok(Json(ChargingDataResponse::success()))
+    Ok(Json(if exhausted {
+        ChargingDataResponse::quota_exhausted()
+    } else {
+        ChargingDataResponse::success()
+    }))
 }
 
 async fn release(
@@ -267,25 +314,30 @@ impl ChfClient {
     }
 
     /// Report mid-session usage.
+    /// Report mid-session usage and return the CHF's decision — a `FinalUnitIndication`
+    /// is present once the granted quota is spent (design/157, G14).
     pub async fn update(
         &self,
         charging_ref: &str,
         req: &ChargingDataRequest,
-    ) -> Result<(), SbiError> {
-        self.bearer(
-            self.http
-                .post(format!(
-                    "{}/nchf-convergedcharging/v3/chargingdata/{charging_ref}/update",
-                    self.base
-                ))
-                .json(req),
-        )
-        .await
-        .traced()
-        .send()
-        .await?
-        .error_for_status()?;
-        Ok(())
+    ) -> Result<ChargingDataResponse, SbiError> {
+        let resp = self
+            .bearer(
+                self.http
+                    .post(format!(
+                        "{}/nchf-convergedcharging/v3/chargingdata/{charging_ref}/update",
+                        self.base
+                    ))
+                    .json(req),
+            )
+            .await
+            .traced()
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ChargingDataResponse>()
+            .await?;
+        Ok(resp)
     }
 
     /// Close the charging session with the final usage.
@@ -315,13 +367,16 @@ impl ChfClient {
 mod tests {
     use super::*;
 
-    async fn serve() -> (ChfState, ChfClient) {
-        let state = ChfState::new();
+    async fn serve_with(state: ChfState) -> (ChfState, ChfClient) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let router = router(state.clone());
         tokio::spawn(async move { crate::run_on(listener, router).await.unwrap() });
         (state, ChfClient::new(format!("http://{addr}")))
+    }
+
+    async fn serve() -> (ChfState, ChfClient) {
+        serve_with(ChfState::new()).await
     }
 
     fn usage(rating_group: u32, ul: u64, dl: u64, ulp: u64, dlp: u64) -> UsedUnitContainer {
@@ -378,5 +433,33 @@ mod tests {
         // A released session refuses further updates; unknown refs are 404.
         assert!(client.update(&charging_ref, &req).await.is_err(), "update after release → 409");
         assert!(client.update("999", &req).await.is_err(), "unknown ref → 404");
+    }
+
+    /// Online charging (design/157, G14): a quota-enforcing CHF answers updates with a
+    /// `FinalUnitIndication: TERMINATE` once the session's usage reaches the granted quota.
+    #[tokio::test]
+    async fn charging_quota_signals_final_unit_indication() {
+        // A CHF that grants 2500 bytes per session.
+        let (_, client) = serve_with(ChfState::with_quota(2500)).await;
+        let mut req = ChargingDataRequest {
+            subscriber_identifier: "imsi-999700000000042".into(),
+            pdu_session_charging_information: None,
+            used_unit_containers: vec![],
+        };
+        let charging_ref = client.create(&req).await.expect("Nchf create");
+
+        // 2000 bytes so far — under quota, so the session may continue.
+        req.used_unit_containers = vec![usage(0, 1200, 800, 12, 8)];
+        let resp = client.update(&charging_ref, &req).await.expect("update 1");
+        assert!(resp.final_unit_indication.is_none(), "2000 < 2500 — no FUI yet");
+
+        // Another 1000 bytes → 3000 ≥ 2500 → quota exhausted → TERMINATE.
+        req.used_unit_containers = vec![usage(0, 600, 400, 6, 4)];
+        let resp = client.update(&charging_ref, &req).await.expect("update 2");
+        assert_eq!(
+            resp.final_unit_indication.map(|f| f.final_unit_action).as_deref(),
+            Some("TERMINATE"),
+            "quota reached → FinalUnitIndication TERMINATE"
+        );
     }
 }

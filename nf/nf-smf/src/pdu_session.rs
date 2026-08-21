@@ -2181,9 +2181,21 @@ async fn remove_breakout(
 
 /// `Nsmf_PDUSession_ReleaseSMContext` (TS 29.502 §5.2.2.4): tear the N4 session
 /// down at the UPF and drop the SM context. Driven by the AMF on deregistration.
+/// HTTP handler for Nsmf SM-context release (the AMF's DELETE). Delegates to the shared
+/// teardown so an internal trigger — a charging-quota `FinalUnitIndication` — can reuse it.
 async fn release_sm_context(
     State(smf): State<Arc<SmfState>>,
     Path(sm_ref): Path<String>,
+) -> Result<StatusCode, SbiProblem> {
+    teardown_sm_context(smf, sm_ref).await
+}
+
+/// Tear a PDU session down: N4-delete every leg, relay final usage + release the CHF
+/// session, and free the SMF-side resources (IP, GFBR, UECM registration, PCF policy).
+/// Reused by the AMF-initiated release and by charging-quota enforcement (design/157, G14).
+async fn teardown_sm_context(
+    smf: Arc<SmfState>,
+    sm_ref: String,
 ) -> Result<StatusCode, SbiProblem> {
     let (up_seid, chain, path, supi, psi, sm_policy, reserved_gfbr, charging, policy, ue_ip, ue_ipv6) = {
         let ctxs = smf.contexts.lock().unwrap();
@@ -2324,11 +2336,11 @@ pub async fn handle_usage_reports(smf: Arc<SmfState>) {
         // The report addresses the session by OUR (CP) F-SEID.
         let ctx = {
             let ctxs = smf.contexts.lock().unwrap();
-            ctxs.values().find(|c| c.cp_seid == cp_seid).map(|c| {
-                (c.up_seid, c.supi.clone(), c.charging.clone(), c.policy.clone(), c.path.anchor.clone())
+            ctxs.iter().find(|(_, c)| c.cp_seid == cp_seid).map(|(sm_ref, c)| {
+                (sm_ref.clone(), c.up_seid, c.supi.clone(), c.charging.clone(), c.policy.clone(), c.path.anchor.clone())
             })
         };
-        let Some((up_seid, supi, charging, policy, anchor)) = ctx else {
+        let Some((sm_ref, up_seid, supi, charging, policy, anchor)) = ctx else {
             tracing::warn!(cp_seid, "usage report for an unknown session — dropped");
             continue;
         };
@@ -2344,7 +2356,9 @@ pub async fn handle_usage_reports(smf: Arc<SmfState>) {
             downlink_bytes = usage.downlink,
             "usage threshold report from the UPF"
         );
-        // Relay to the CHF (Nchf update) when the session is billed.
+        // Relay to the CHF (Nchf update) when the session is billed. The CHF answers with
+        // a FinalUnitIndication once the granted quota is spent — online-charging
+        // enforcement: the SMF tears the session down (design/157, G14).
         if let Some((chf_base, charging_ref)) = charging {
             let update = sbi_core::nchf::ChargingDataRequest {
                 subscriber_identifier: supi,
@@ -2352,7 +2366,15 @@ pub async fn handle_usage_reports(smf: Arc<SmfState>) {
                 used_unit_containers: vec![container_for(&usage, &policy)],
             };
             match chf_client(&smf.nrf_base, chf_base).update(&charging_ref, &update).await {
-                Ok(()) => tracing::info!(charging_ref = %charging_ref, "usage relayed to the CHF"),
+                Ok(resp) => {
+                    tracing::info!(charging_ref = %charging_ref, "usage relayed to the CHF");
+                    if resp.final_unit_indication.as_ref().is_some_and(|f| f.final_unit_action == "TERMINATE") {
+                        tracing::info!(%sm_ref, up_seid, "charging quota exhausted (FUI TERMINATE) — stopping the session");
+                        if let Err(e) = teardown_sm_context(smf.clone(), sm_ref).await {
+                            tracing::warn!(?e, "quota-triggered teardown failed");
+                        }
+                    }
+                }
                 Err(e) => tracing::warn!("Nchf update failed: {e}"),
             }
         }
